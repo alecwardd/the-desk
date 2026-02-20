@@ -1,0 +1,78 @@
+#!/bin/bash
+# The Desk — Pre-commit hook
+# Enforces code quality before commits are created.
+#
+# Install: git config core.hooksPath .githooks
+#
+# This hook runs automatically before every commit. If any check fails,
+# the commit is rejected. Fix the issue and commit again.
+
+set -e
+
+echo "🔍 Running pre-commit checks..."
+
+# ─── Secret Scanning ───────────────────────────────────────────────
+echo "  Checking for secrets..."
+if grep -rn "sk-ant-\|sk_live\|ANTHROPIC_API_KEY\s*=\s*['\"]" \
+    --include="*.ts" --include="*.tsx" --include="*.rs" \
+    --include="*.toml" --include="*.json" --include="*.env" \
+    src/ src-tauri/ 2>/dev/null; then
+    echo "❌ FAILED: Found potential API keys in staged files!"
+    echo "   Remove secrets and use environment variables or config files."
+    exit 1
+fi
+echo "  ✓ No secrets found"
+
+# ─── Rust Checks (only if Rust files changed) ─────────────────────
+if git diff --cached --name-only | grep -q '\.rs$'; then
+    echo "  Checking Rust formatting..."
+    if [ -d "src-tauri" ]; then
+        (cd src-tauri && cargo fmt --check 2>/dev/null) || {
+            echo "❌ FAILED: Rust formatting issues. Run: cd src-tauri && cargo fmt"
+            exit 1
+        }
+        echo "  ✓ Rust formatting OK"
+
+        echo "  Running Rust linter..."
+        (cd src-tauri && cargo clippy -- -D warnings 2>/dev/null) || {
+            echo "❌ FAILED: Clippy warnings found. Fix and re-commit."
+            exit 1
+        }
+        echo "  ✓ Clippy OK"
+
+        echo "  Running Rust tests..."
+        (cd src-tauri && cargo test --quiet 2>/dev/null) || {
+            echo "❌ FAILED: Rust tests failing. Fix and re-commit."
+            exit 1
+        }
+        echo "  ✓ Rust tests passing"
+    fi
+fi
+
+# ─── TypeScript Checks (only if TS files changed) ─────────────────
+if git diff --cached --name-only | grep -qE '\.(ts|tsx)$'; then
+    echo "  Checking TypeScript types..."
+    if [ -f "tsconfig.json" ]; then
+        npx tsc --noEmit 2>/dev/null || {
+            echo "❌ FAILED: TypeScript type errors. Fix and re-commit."
+            exit 1
+        }
+        echo "  ✓ TypeScript types OK"
+    fi
+fi
+
+# ─── Compliance Language Check ────────────────────────────────────
+# Check for advisory language in coaching prompts and UI copy
+if git diff --cached --name-only | grep -qE '\.(ts|tsx)$'; then
+    echo "  Checking for advisory language..."
+    ADVISORY_PATTERNS="you should (buy|sell)|this is a good trade|I recommend (buying|selling)|trading opportunity"
+    if git diff --cached -U0 -- '*.ts' '*.tsx' | grep -iP "$ADVISORY_PATTERNS" 2>/dev/null; then
+        echo "⚠️  WARNING: Possible advisory language detected in coaching prompts."
+        echo "   The Desk must use 'your rules say...' not 'you should...'"
+        echo "   Review the flagged lines. See skills/compliance-research/SKILL.md"
+        # Warning only, not blocking — may have false positives
+    fi
+    echo "  ✓ Language check complete"
+fi
+
+echo "✅ All pre-commit checks passed"

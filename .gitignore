@@ -1,0 +1,57 @@
+# Dependencies
+node_modules/
+target/
+
+# Build output
+dist/
+dist-tauri/
+build/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# API keys and config with secrets
+config.toml
+*.key
+*.pem
+
+# IDE
+.vscode/
+!.vscode/settings.json
+!.vscode/extensions.json
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Rust
+target/
+**/*.rs.bk
+Cargo.lock
+
+# Session recordings (large binary files)
+recordings/
+
+# SQLite databases
+*.db
+*.db-wal
+*.db-shm
+
+# Logs
+*.log
+logs/
+
+# Tauri
+src-tauri/target/
+src-tauri/WixTools/
+src-tauri/icons/
+
+# Temporary files
+*.tmp
+*.bak
+*.swp
+*~

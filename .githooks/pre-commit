@@ -10,21 +10,31 @@
 set -e
 
 echo "🔍 Running pre-commit checks..."
+STAGED_FILES="$(git diff --cached --name-only --diff-filter=ACMR)"
 
 # ─── Secret Scanning ───────────────────────────────────────────────
 echo "  Checking for secrets..."
-if grep -rn "sk-ant-\|sk_live\|ANTHROPIC_API_KEY\s*=\s*['\"]" \
-    --include="*.ts" --include="*.tsx" --include="*.rs" \
-    --include="*.toml" --include="*.json" --include="*.env" \
-    src/ src-tauri/ 2>/dev/null; then
-    echo "❌ FAILED: Found potential API keys in staged files!"
-    echo "   Remove secrets and use environment variables or config files."
-    exit 1
+SECRET_PATTERNS="sk-ant-[A-Za-z0-9_-]\{20,\}\|sk_live_[A-Za-z0-9_-]\{20,\}\|ANTHROPIC_API_KEY\s*=\s*['\"][A-Za-z0-9_-]\{20,\}"
+if [ -n "$STAGED_FILES" ]; then
+    while IFS= read -r file; do
+        [ -z "$file" ] && continue
+        case "$file" in
+            *.ts|*.tsx|*.rs|*.toml|*.json|*.env|*.md|*.mdc|.cursorrules|AGENT.md|CLAUDE.md)
+                if git show ":$file" | grep -n "$SECRET_PATTERNS" >/dev/null 2>&1; then
+                    echo "❌ FAILED: Found potential secret in staged file: $file"
+                    echo "   Remove secrets and use environment variables or local config."
+                    exit 1
+                fi
+                ;;
+        esac
+    done <<EOF
+$STAGED_FILES
+EOF
 fi
 echo "  ✓ No secrets found"
 
 # ─── Rust Checks (only if Rust files changed) ─────────────────────
-if git diff --cached --name-only | grep -q '\.rs$'; then
+if echo "$STAGED_FILES" | grep -q '\.rs$'; then
     echo "  Checking Rust formatting..."
     if [ -d "src-tauri" ]; then
         (cd src-tauri && cargo fmt --check 2>/dev/null) || {
@@ -50,7 +60,7 @@ if git diff --cached --name-only | grep -q '\.rs$'; then
 fi
 
 # ─── TypeScript Checks (only if TS files changed) ─────────────────
-if git diff --cached --name-only | grep -qE '\.(ts|tsx)$'; then
+if echo "$STAGED_FILES" | grep -qE '\.(ts|tsx)$'; then
     echo "  Checking TypeScript types..."
     if [ -f "tsconfig.json" ]; then
         npx tsc --noEmit 2>/dev/null || {
@@ -63,10 +73,12 @@ fi
 
 # ─── Compliance Language Check ────────────────────────────────────
 # Check for advisory language in coaching prompts and UI copy
-if git diff --cached --name-only | grep -qE '\.(ts|tsx)$'; then
+if echo "$STAGED_FILES" | grep -qE '\.(ts|tsx|md|mdc)$|(^|/)AGENT\.md$|(^|/)CLAUDE\.md$|(^|/)\.cursorrules$'; then
     echo "  Checking for advisory language..."
     ADVISORY_PATTERNS="you should (buy|sell)|this is a good trade|I recommend (buying|selling)|trading opportunity"
-    if git diff --cached -U0 -- '*.ts' '*.tsx' | grep -iP "$ADVISORY_PATTERNS" 2>/dev/null; then
+    if git diff --cached -U0 -- '*.ts' '*.tsx' '*.md' '*.mdc' '.cursorrules' 'AGENT.md' 'CLAUDE.md' \
+        | grep -iE "$ADVISORY_PATTERNS" \
+        | grep -ivE "never|forbidden|do not|must use|no advisory" 2>/dev/null; then
         echo "⚠️  WARNING: Possible advisory language detected in coaching prompts."
         echo "   The Desk must use 'your rules say...' not 'you should...'"
         echo "   Review the flagged lines. See skills/compliance-research/SKILL.md"

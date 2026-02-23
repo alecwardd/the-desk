@@ -1,0 +1,17 @@
+---
+description: Always apply AGENT.md project instructions
+alwaysApply: true
+---
+
+# AGENT.md Always-Apply Rule
+
+Read `AGENT.md` at the project root as baseline context for every task.
+
+Priority and conflict handling:
+- Follow `CLAUDE.md` first when guidance overlaps.
+- Use `AGENT.md` as cross-agent workflow and implementation guidance.
+- If instructions conflict, prefer repository-level safety/compliance constraints.
+
+When starting work:
+- Confirm planned changes align with `AGENT.md` architecture boundaries.
+- Follow its implementation workflow and testing expectations.

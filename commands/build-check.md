@@ -31,7 +31,7 @@ Run the complete build and test pipeline.
 
 5. **Secret scan** (check for accidentally committed API keys):
    ```bash
-   grep -r "sk-ant-\|sk_live\|ANTHROPIC_API_KEY\s*=" --include="*.ts" --include="*.rs" --include="*.toml" --include="*.json" src/ src-tauri/ || echo "No secrets found"
+   rg -n -i "(sk-ant-[A-Za-z0-9_-]{20,}|sk_live_[A-Za-z0-9_-]{20,}|anthropic_api_key\\s*=\\s*['\"][A-Za-z0-9_-]{20,})" src src-tauri agents commands skills AGENT.md CLAUDE.md .cursorrules
    ```
 
 6. Report:

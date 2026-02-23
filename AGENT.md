@@ -30,27 +30,29 @@ Sierra Chart (DTC Server) → Rust Pipelines → Rust Rules Engine → Claude AP
 
 ## Subagent Patterns
 
-When you need specialized help, spawn subagents for these tasks:
+When you need specialized help, spawn subagents for these tasks.
+
+> **Path note:** Agent definitions live in `agents/` at the project root. Cursor also discovers them at `.cursor/agents/` (symlinked). Both paths resolve to the same files.
 
 ### DTC Protocol Research
 **When:** Working on the DTC client, encountering protocol questions
-**How:** Spawn an Explore agent with context from `skills/dtc-protocol/SKILL.md`
-**Instruction:** "Read `skills/dtc-protocol/SKILL.md` then investigate [specific DTC question]. Check the Sierra Chart DTC documentation at sierrachart.com if needed."
+**How:** Delegate to project subagent `dtc-protocol-researcher` (defined in `agents/dtc-protocol-researcher.md`)
+**Instruction:** "Use `dtc-protocol-researcher` for [specific DTC question/failure]. Ensure it reads `skills/dtc-protocol/SKILL.md`, validates the protocol sequence, and returns findings + fix plan + verification checklist."
 
 ### Pipeline Verification
 **When:** After implementing or modifying a market structure pipeline
-**How:** Spawn a test agent that validates calculations
-**Instruction:** "Read `skills/trading-domain/SKILL.md` for domain knowledge. Verify that the [VWAP/TPO/Delta] pipeline produces correct output for this test data: [provide known input/output pairs]."
+**How:** Delegate to project subagent `pipeline-verifier` (defined in `agents/pipeline-verifier.md`)
+**Instruction:** "Use `pipeline-verifier` to validate [VWAP/TPO/Delta/Levels] changes. Ensure it reads `skills/trading-domain/SKILL.md`, follows `commands/pipeline-test.md`, and returns pass/fail, expected-vs-actual mismatches, and a fix + verification checklist."
 
 ### Prompt Quality Evaluation
 **When:** After writing or modifying LLM coaching prompts
-**How:** Spawn an evaluation agent
-**Instruction:** "Read `skills/compliance-research/SKILL.md`. Evaluate these coaching prompts for: (1) compliance with language rules (never 'you should buy'), (2) traceability to playbook rules, (3) clarity and usefulness. Test prompts: [provide sample prompts]."
+**How:** Delegate to project subagent `prompt-quality-evaluator` (defined in `agents/prompt-quality-evaluator.md`)
+**Instruction:** "Use `prompt-quality-evaluator` to assess coaching prompt changes. Ensure it reads `skills/compliance-research/SKILL.md`, follows `commands/coaching-test.md`, and returns compliance status, traceability status, quality findings, and a rewrite + verification checklist."
 
 ### Options API Research
 **When:** Working on Phase 2 options data integration
-**How:** Spawn a research agent with web search
-**Instruction:** "Research the [Unusual Whales / CBOE / OptionData.io] API for: available endpoints, authentication, rate limits, data format, and relevance to gamma exposure / dealer positioning calculation."
+**How:** Delegate to project subagent `options-api-researcher` (defined in `agents/options-api-researcher.md`)
+**Instruction:** "Use `options-api-researcher` to evaluate options data providers for The Desk. Require web-backed comparison of endpoints, auth, rate limits, symbol model, latency, pricing/licensing, and fit for gamma/dealer-positioning workflows. Return a ranked recommendation with integration checklist and PoC plan."
 
 ---
 

@@ -151,11 +151,27 @@ the-desk/
 │   ├── phase-1-prd.md              # Phase 1 requirements
 │   ├── phase-2-prd.md              # Phase 2 placeholder
 │   └── phase-3-prd.md              # Phase 3 placeholder
-├── skills/                         # Domain knowledge for agents
+├── agents/                         # Subagent definitions (source of truth)
+│   ├── dtc-protocol-researcher.md
+│   ├── pipeline-verifier.md
+│   ├── prompt-quality-evaluator.md
+│   └── options-api-researcher.md
+├── commands/                       # Slash commands (source of truth)
+├── skills/                         # Domain knowledge (source of truth)
 │   ├── trading-domain/SKILL.md
-│   ├── dtc-protocol/SKILL.md
+│   ├── dtc-protocol/
+│   │   ├── SKILL.md
+│   │   └── reference.md            # Wire-level protocol details
 │   ├── compliance-research/SKILL.md
-│   └── tauri-bridge/SKILL.md
+│   └── tauri-bridge/
+│       ├── SKILL.md
+│       ├── examples.md              # Copy-paste IPC patterns
+│       └── anti-patterns.md         # Common mistakes with fixes
+├── .cursor/                        # Cursor IDE integration
+│   ├── agents/   → symlink to ../agents/
+│   ├── commands/ → symlink to ../commands/
+│   ├── skills/   → symlink to ../skills/
+│   └── rules/                      # Cursor-specific rules
 ├── src-tauri/                      # Rust backend
 │   ├── src/
 │   │   ├── main.rs
@@ -172,11 +188,14 @@ the-desk/
 │   ├── lib/                        # Shared utilities and types
 │   ├── context/                    # React context providers
 │   └── App.tsx
+├── .githooks/                      # Git hooks (pre-commit checks)
 ├── CLAUDE.md                       # This file (Claude Code rules)
-├── .cursorrules                    # Cursor rules
+├── .cursorrules                    # Cursor rules (condensed reference)
 ├── AGENT.md                        # Universal agent instructions
 └── README.md
 ```
+
+> **Symlink convention:** `agents/`, `commands/`, and `skills/` at root are the single source of truth. `.cursor/` contains symlinks pointing to these root directories so both Claude Code and Cursor read the same files. Edit files in root — changes appear in both tools automatically.
 
 ---
 

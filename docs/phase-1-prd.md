@@ -1,8 +1,14 @@
 # The Desk — Product Requirements Document
 
-**Version:** 1.0
-**Date:** 2026-02-20
+**Version:** 1.1
+**Date:** 2026-02-25
 **Status:** Draft
+
+**Companion specs:**
+- [tech-plan.md](tech-plan.md) — Architecture, data model, recording format, component design
+- [core-flows.md](core-flows.md) — User flows with wireframes and interaction principles
+- [design-spec.md](design-spec.md) — UI/UX design specification
+- [prompt-spec.md](prompt-spec.md) — LLM prompt engineering specification
 
 ---
 
@@ -228,6 +234,14 @@ Adaptive coaching, multi-instrument support, advanced analytics, playbook versio
 | LLM-10 | Prompt engineering: all prompts trace to specific playbook rules and data — never speculative | P0 |
 | LLM-11 | Fallback for connectivity: if Claude API is unreachable, display raw rules engine alerts without LLM synthesis | P0 |
 | LLM-12 | Token-efficient context: send structured data summaries, not raw market data | P0 |
+| LLM-13 | When a live position is logged (via "Took it"), management prompts reference actual position state: entry price, size, targets hit, current P&L in R | P0 |
+| LLM-14 | When no live position is logged, management prompts are condition-based (e.g., "Price at T1 level — your rules say consider trimming here if you're in this trade") | P0 |
+| LLM-15 | The LLM Orchestrator checks for an open `Trade` record before assembling the management prompt context. If a trade is open, include position state; if not, use condition-based framing | P0 |
+
+**Acceptance criteria (LLM-13..15):**
+- Management prompts reference actual P&L when a trade is logged
+- Management prompts use conditional framing when no trade is logged
+- Both paths produce compliant, non-advisory language
 
 **Technical notes:**
 - Claude Sonnet for real-time coaching (fast, good enough quality for structured prompts)
@@ -266,6 +280,8 @@ Adaptive coaching, multi-instrument support, advanced analytics, playbook versio
 | RPL-07 | Trader can "take" simulated trades during replay for practice | P1 |
 | RPL-08 | Ship with curated library of notable NQ sessions (trend days, chop, FOMC, gap fills) | P1 |
 | RPL-09 | Traders can save and organize their own recorded sessions | P0 |
+| RPL-10 | After replay ends (or trader stops it), display an optional post-replay summary: total prompts fired, trader responses (took it / watching / passed), and simulated trade results if any trades were taken | P1 |
+| RPL-11 | Post-replay summary is dismissible. It does not auto-save to session history (replay sessions are separate from live sessions) | P1 |
 
 ### 3.7 Pre-Session Briefing
 
@@ -278,6 +294,8 @@ Adaptive coaching, multi-instrument support, advanced analytics, playbook versio
 | BRIEF-05 | Display current risk state (daily P&L if multi-session day) | P0 |
 | BRIEF-06 | Flag scheduled news/events during today's session (manual input or calendar integration) | P1 |
 | BRIEF-07 | Configurable briefing time (default: 15 min before RTH open) | P1 |
+| BRIEF-08 | Display a free-text "Your Note for Today" input field at the bottom of the pre-session briefing | P0 |
+| BRIEF-09 | Save the pre-session note with the session record. Pre-populate the post-session journal entry field with this note as a starting point | P0 |
 
 ### 3.8 Basic Session Log & Trade Import
 
@@ -290,6 +308,24 @@ Adaptive coaching, multi-instrument support, advanced analytics, playbook versio
 | LOG-05 | Tag each trade: planned/unplanned, rules followed/deviated, emotional state (trader input) | P1 |
 | LOG-06 | Post-session summary: trades taken, plan adherence, P&L, key moments | P0 |
 | LOG-07 | Searchable session history | P1 |
+| LOG-08 | Display three response options on every coaching prompt card: **Took it**, **Watching**, **Passed** | P0 |
+| LOG-09 | Store each prompt response as a `SessionEvent` with `event_type = "prompt_response"`. Data payload: `{ prompt_event_id, response: "took_it"\|"watching"\|"passed", note: string\|null }` | P0 |
+| LOG-10 | When trader selects "Passed", display an optional quick note field: "Why did you pass?" Dismissible without entering a note | P0 |
+| LOG-11 | When trader selects "Took it", open a quick trade entry form pre-filled with alert-inferred direction (long/short). Trader enters size and entry price. Creates a live `Trade` record and activates in-trade management prompts | P0 |
+| LOG-12 | Calculate two adherence metrics per session: **Prompt Adherence** (% of setup prompts where response = "took_it") and **Rules Adherence** (% of "took_it" trades marked `rules_followed = true` during review). Display both in post-session summary | P0 |
+| LOG-13 | "Watching" response keeps the prompt active in the feed. Conditions continue to be monitored. Trader can respond again if conditions persist | P0 |
+| LOG-14 | When importing trades from Sierra Chart CSV, auto-match each trade to the nearest coaching prompt by time proximity (within 30 seconds) and price proximity (within 5 NQ points). Display match confidence for trader confirmation | P1 |
+| LOG-15 | Allow trader to skip trade import entirely. Review is saved with coaching log only (no trade data). Prompt Adherence is still calculated; Rules Adherence shown as N/A until trade review is completed | P0 |
+| LOG-16 | Post-session summary card displays: total prompts sent, breakdown by response type, Prompt Adherence, Rules Adherence (if available), and session P&L (if trades are logged) | P0 |
+
+**Acceptance criteria (LOG-08..16):**
+- Every coaching prompt card shows all three response buttons
+- Responses are stored and queryable by session
+- Prompt Adherence appears in the post-session summary (always); Rules Adherence appears when trade review is completed
+- "Took it" flow opens trade entry without requiring mouse interaction
+- Auto-matching surfaces the most likely prompt-trade pair for each imported trade
+- "Skip import" path saves a complete session record without trade data
+- Summary card is visible immediately after session ends
 
 ### 3.9 User Interface
 
@@ -313,6 +349,25 @@ Adaptive coaching, multi-instrument support, advanced analytics, playbook versio
 | UI-14 | Keyboard-first interaction (traders don't want to grab the mouse during a session) | P0 |
 | UI-15 | Notification sounds for high-priority alerts (setup triggered, risk limit warning) | P1 |
 | UI-16 | Font size and information density configurable | P1 |
+| UI-17 | `N` key opens the quick note input during a live session. `Enter` saves the note. `Escape` dismisses without saving | P0 |
+| UI-18 | `Ctrl+E` triggers "End Session" with a confirmation dialog. `Enter` confirms, `Escape` cancels | P0 |
+| UI-19 | Prompt response buttons are keyboard-accessible: `1` = Took it, `2` = Watching, `3` = Passed, when a prompt card is focused | P1 |
+| UI-20 | Display a keyboard shortcut reference accessible via `?` key or a help icon | P1 |
+
+### 3.10 Onboarding
+
+**Description:** First-time setup experience guiding the trader through DTC connection, risk configuration, and optional playbook definition.
+
+| ID | Requirement | Priority |
+|----|-------------|----------|
+| ONBOARD-01 | During onboarding Step 4 (Playbook Setup), provide a "Skip for now — I'll add setups later" option that bypasses setup definition and proceeds directly to the main dashboard | P0 |
+| ONBOARD-02 | When no setups are active, display a persistent banner on the main dashboard: "No active setups — The Desk is watching but won't alert on setups. Add a setup to unlock coaching." Banner includes a direct link to the playbook builder | P0 |
+| ONBOARD-03 | The app is fully functional with no active setups: DTC connection, market state display, risk tracking, and quick notes all work. Only setup alerts and coaching prompts are suppressed | P0 |
+
+**Acceptance criteria:**
+- Trader can complete onboarding in under 10 minutes without defining a setup
+- Banner is visible and persistent until at least one setup is activated
+- All non-coaching features work without an active setup
 
 ---
 
@@ -382,7 +437,7 @@ id: UUID
 session_id: UUID
 timestamp: timestamp
 event_type: enum (alert_fired, coaching_prompt, risk_warning, trader_note,
-                  trade_entry, trade_exit, setup_condition_met)
+                  trade_entry, trade_exit, setup_condition_met, prompt_response)
 setup_id: UUID | null
 data: JSON                            // Event-specific payload
 ```
@@ -537,12 +592,17 @@ Configuration stored at `~/.the-desk/config.toml`.
 ```
 the-desk/
 ├── docs/
-│   ├── the-desk-vision-v2.md        # Vision document
-│   ├── the-desk-prd.md              # This document
-│   ├── epic-brief.md                # Epic brief (Traycer AI)
-│   ├── tech-doc.md                  # Architecture & technical approach
+│   ├── the-desk-vision.md           # Product vision and philosophy
+│   ├── phase-1-prd.md               # This document (Phase 1 requirements)
+│   ├── phase-2-prd.md               # Phase 2 requirements (Intelligence Expansion)
+│   ├── phase-3-prd.md               # Phase 3 requirements (Maturity)
+│   ├── epic-brief.md                # Epic brief — problem, scope, constraints
+│   ├── tech-plan.md                 # Architecture, data model, component design
+│   ├── core-flows.md                # User flows with wireframes
 │   ├── design-spec.md               # UI/UX design specification
-│   └── api-spec.md                  # API contracts & integrations
+│   ├── prompt-spec.md               # LLM prompt engineering specification
+│   ├── decision-log.md              # ADR-style key decisions and rationale
+│   └── roadmap.md                   # Phase sequencing, traceability, entry/exit criteria
 ├── src-tauri/                        # Rust backend
 │   ├── src/
 │   │   ├── main.rs
@@ -567,14 +627,19 @@ the-desk/
 │   │   ├── replay/                  # Tape replay controls
 │   │   ├── review/                  # Session review
 │   │   └── settings/                # Configuration
+│   ├── hooks/                        # Tauri event listener hooks
 │   ├── lib/
 │   │   ├── claude.ts                # Claude API integration
 │   │   ├── tauri-bridge.ts          # Rust ↔ React IPC
 │   │   └── types.ts                 # Shared TypeScript types
+│   ├── context/                      # React context providers
 │   ├── App.tsx
 │   └── main.tsx
-├── recordings/                       # Session recordings (gitignored)
+├── agents/                           # Subagent definitions
+├── skills/                           # Domain knowledge
+├── commands/                         # Slash commands
 ├── .cursorrules                      # Cursor AI rules
+├── CLAUDE.md                         # Project rules (read first)
 ├── AGENT.md                          # LLM coding agent instructions
 ├── package.json
 └── README.md
@@ -584,7 +649,7 @@ the-desk/
 
 **Spec-driven development with LLM coding agents.**
 
-1. **Planning documents first** — Vision, PRD, epic brief, tech doc, design spec, API spec
+1. **Planning documents first** — Vision, PRD, epic brief, tech plan, core flows, design spec, prompt spec
 2. **AGENT.md and project rules** — Clear instructions for LLM coding agents (Cursor, Claude Code, Codex)
 3. **Phase-based implementation** — Each phase broken into discrete, testable chunks
 4. **AI-assisted coding** — LLMs handle bulk implementation from detailed specs
@@ -635,7 +700,7 @@ The Desk is a **coaching and discipline tool**, not an investment advisory servi
 | **OR** | Opening Range — the price range established in the first 30 minutes of regular trading |
 | **POC** | Point of Control — the price level with the highest volume (or TPO count) in a profile |
 | **R** | Risk unit — the amount risked on a single trade (e.g., if stop is 8 NQ points with 1 contract, 1R = 8 points × $5/point = $40) |
-| **RTH** | Regular Trading Hours — 9:30 AM to 4:00 PM ET for US futures |
+| **RTH** | Regular Trading Hours — 9:30 AM to 4:15 PM ET for NQ futures (4:00 PM ET is the cash settlement time; NQ futures continue trading until 4:15 PM ET) |
 | **TPO** | Time Price Opportunity — a unit of time spent at a price level in Market Profile analysis |
 | **VA** | Value Area — the price range encompassing 70% of trading activity (by volume or TPO) |
 

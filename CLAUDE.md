@@ -147,10 +147,17 @@ Read these before working on related components:
 ```
 the-desk/
 ├── docs/                           # Planning documentation
-│   ├── the-desk-vision.md          # Product vision
-│   ├── phase-1-prd.md              # Phase 1 requirements
-│   ├── phase-2-prd.md              # Phase 2 placeholder
-│   └── phase-3-prd.md              # Phase 3 placeholder
+│   ├── the-desk-vision.md          # Product vision and philosophy
+│   ├── phase-1-prd.md              # Phase 1 requirements (Live Co-Pilot)
+│   ├── phase-2-prd.md              # Phase 2 requirements (Intelligence Expansion)
+│   ├── phase-3-prd.md              # Phase 3 requirements (Maturity)
+│   ├── epic-brief.md               # Epic brief — problem, scope, constraints
+│   ├── tech-plan.md                # Architecture, data model, component design
+│   ├── core-flows.md               # User flows with wireframes
+│   ├── design-spec.md              # UI/UX design specification
+│   ├── prompt-spec.md              # LLM prompt engineering specification
+│   ├── decision-log.md             # ADR-style key decisions and rationale
+│   └── roadmap.md                  # Phase sequencing, traceability, entry/exit criteria
 ├── agents/                         # Subagent definitions (source of truth)
 │   ├── dtc-protocol-researcher.md
 │   ├── pipeline-verifier.md

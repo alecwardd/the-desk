@@ -6,6 +6,7 @@ target/
 dist/
 dist-tauri/
 build/
+*.tsbuildinfo
 
 # Environment and secrets
 .env

@@ -34,8 +34,15 @@ LAYER 2: Rules Engine (Rust)
   - Fires typed alerts when conditions are met.
   - 9 pre-built setup templates from PTT methodology.
 
+LAYER 2.5: Research Infrastructure (Rust)
+  - EventDetector: detects structured market events (level tests, extensions, day type changes)
+  - Backfill pipeline: processes historical .scid data through all pipelines
+  - Query engine: frequency, conditional probability, distribution analysis
+  - Signal outcomes: tracks MFE/MAE/R-result after signals fire
+  - Pure math over historical data. No LLM calls.
+
 LAYER 3: MCP Server + LLM Orchestration
-  - 24 MCP tools expose pipeline state, rules evaluation, and data queries
+  - 33 MCP tools expose pipeline state, rules evaluation, research queries, and data queries
   - Cursor agents call tools for market context during conversation
   - Claude API synthesizes coaching from structured data (1-5s latency acceptable)
 ```
@@ -119,7 +126,7 @@ These terms have precise meanings. Using them incorrectly will produce a broken 
 
 ## Never Do List
 
-1. **Never build a backtesting engine.** We import backtest results from external tools.
+1. **The Desk includes a deterministic market structure research module.** It logs structured events during pipeline processing, tracks signal outcomes, and answers historical queries (frequencies, conditional probabilities, distributions). It does NOT simulate order fills with slippage models -- it reports what actually happened in the market relative to computed levels.
 2. **Never place or manage trades.** The Desk is coaching only.
 3. **Never generate proprietary trading signals.** Every alert traces to the trader's own playbook rules.
 4. **Never use language like "you should buy/sell" or "this is a good trade."** Always frame as "your rules say..." or "your playbook indicates..."
@@ -150,10 +157,13 @@ Read these before working on related components:
 ```
 the-desk/
 ├── src-tauri/src/                    # Rust backend (core)
-│   ├── bin/the-desk-mcp.rs           # MCP server binary (24 tools)
+│   ├── bin/the-desk-mcp.rs           # MCP server binary (33 tools)
 │   ├── main.rs                       # Tauri app entry + processing loop
-│   ├── pipelines/                    # 14 pipeline modules
+│   ├── backfill.rs                   # Historical .scid backfill engine
+│   ├── research/mod.rs               # Query engine (frequency, conditional, distribution)
+│   ├── pipelines/                    # 14 pipeline modules + event detector
 │   │   ├── mod.rs                    # PipelineEngine, MarketState
+│   │   ├── event_detector.rs         # Structured event detection layer
 │   │   ├── vwap.rs                   # VWAP + std dev bands
 │   │   ├── tpo.rs                    # TPO profile, VA, POC, single prints
 │   │   ├── delta.rs                  # Delta profile, DNVA, DNP

@@ -59,6 +59,18 @@ When you need specialized help, spawn subagents for these tasks.
 **When:** Investigating market behavior or validating pipeline outputs against theory
 **How:** Use `market-structure-analyst` or `orderflow-analyst`
 
+### Levels Analysis
+**When:** Investigating key level behavior, IB extensions, proximity dynamics
+**How:** Delegate to `levels-analyst` (defined in `agents/levels-analyst.md`)
+
+### Performance Analysis
+**When:** Evaluating trading performance, setup efficacy, signal outcomes
+**How:** Delegate to `performance-analyst` (defined in `agents/performance-analyst.md`)
+
+### Backtesting / Historical Research
+**When:** Running historical queries, backfilling data, analyzing event frequencies
+**How:** Delegate to `backtest-analyst` (defined in `agents/backtest-analyst.md`)
+
 ### Data Integrity Validation
 **When:** After ingestion changes or before analysis
 **How:** Delegate to `data-integrity-validator` (defined in `agents/data-integrity-validator.md`)
@@ -106,7 +118,7 @@ When implementing a feature:
 
 ## MCP Tools Reference
 
-The MCP server (`src/bin/the-desk-mcp.rs`) exposes 24 tools. Key categories:
+The MCP server (`src/bin/the-desk-mcp.rs`) exposes 33 tools. Key categories:
 
 | Category | Tools |
 |----------|-------|
@@ -117,6 +129,9 @@ The MCP server (`src/bin/the-desk-mcp.rs`) exposes 24 tools. Key categories:
 | **Rules** | `evaluate_setups`, `get_setup_context`, `check_delta_confirmation` |
 | **Data** | `query_ticks`, `get_prior_day_levels`, `get_proximity_report` |
 | **Integrity** | `validate_data_integrity` |
+| **Research** | `query_event_frequency`, `query_conditional`, `query_distribution`, `compare_sessions`, `get_session_history`, `get_signal_performance`, `get_research_summary` |
+| **Backfill** | `backfill_history` |
+| **Storage** | `archive_status` |
 
 ---
 
@@ -125,11 +140,16 @@ The MCP server (`src/bin/the-desk-mcp.rs`) exposes 24 tools. Key categories:
 For development without a live Sierra Chart connection, use `.scid` files from Sierra Chart's data directory. The feed system supports both live tail-reading and bulk historical backfill.
 
 ```bash
-# Run all tests (79 tests)
+# Run all tests
 cd src-tauri && cargo test
 
 # Run specific pipeline tests
 cd src-tauri && cargo test pipelines::tpo
 cd src-tauri && cargo test pipelines::delta
 cd src-tauri && cargo test pipelines::pinch
+cd src-tauri && cargo test pipelines::event_detector
+
+# Run research / backfill tests
+cd src-tauri && cargo test backfill
+cd src-tauri && cargo test research
 ```

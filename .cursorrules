@@ -30,7 +30,7 @@ You are working on The Desk, a backend intelligence platform for discretionary N
 - Tool params: `Parameters(params): Parameters<T>` where T derives `Deserialize + JsonSchema + Default`
 
 ### MCP Server (src/bin/the-desk-mcp.rs)
-- 24 tools exposed via stdio transport
+- 33 tools exposed via stdio transport
 - All tools return `Result<CallToolResult, McpError>`
 - Database access through `Arc<Mutex<Database>>`
 - New tools follow the pattern: add param struct, add `#[tool(...)]` handler, register in router

@@ -4,18 +4,20 @@ mod commands;
 
 use std::time::{Duration, Instant};
 
-use chrono::{TimeZone, Timelike, Utc};
-use chrono_tz::US::Eastern;
 use tauri::async_runtime::JoinHandle;
 use tauri::{AppHandle, Emitter, Manager};
 use the_desk_backend::db::Database;
 use the_desk_backend::dtc::DtcClient;
 use the_desk_backend::feed::scid_reader::ScidReader;
 use the_desk_backend::feed::{load_feed_config, FeedEvent, TradeSide};
-use the_desk_backend::pipelines::PipelineEngine;
+use the_desk_backend::pipelines::{EventDetector, PipelineEngine};
 use the_desk_backend::recording::{RecordingEntry, SessionRecorder};
 use the_desk_backend::risk::{RiskConfig, RiskTracker};
 use the_desk_backend::rules::RulesEngine;
+use the_desk_backend::{
+    classify_session, et_minutes_from_timestamp, globex_open_ms, minute_of_session_from_timestamp,
+    session_date_from_timestamp_ms, SessionType,
+};
 use tokio::sync::{broadcast, watch, Mutex};
 
 pub(crate) struct ReplayRuntime {
@@ -45,6 +47,7 @@ impl Default for ReplayRuntime {
 pub(crate) struct AppState {
     pub dtc: Mutex<DtcClient>,
     pub pipelines: Mutex<PipelineEngine>,
+    pub detector: Mutex<EventDetector>,
     pub rules: Mutex<RulesEngine>,
     pub risk: Mutex<RiskTracker>,
     pub db: Mutex<Database>,
@@ -65,39 +68,8 @@ fn data_dir() -> std::path::PathBuf {
     dir
 }
 
-/// NQ session boundaries in Eastern Time (hour * 60 + minute).
-const RTH_OPEN_ET: i32 = 9 * 60 + 30; // 09:30
-const RTH_CLOSE_ET: i32 = 16 * 60 + 15; // 16:15
-const GLOBEX_OPEN_ET: i32 = 18 * 60; // 18:00
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SessionType {
-    Rth,
-    Globex,
-    Unknown,
-}
-
-fn classify_session(et_minutes: i32) -> SessionType {
-    if (RTH_OPEN_ET..RTH_CLOSE_ET).contains(&et_minutes) {
-        SessionType::Rth
-    } else if !(RTH_OPEN_ET..GLOBEX_OPEN_ET).contains(&et_minutes) {
-        SessionType::Globex
-    } else {
-        SessionType::Unknown
-    }
-}
-
-fn et_minutes_from_timestamp(timestamp_ms: f64) -> Option<i32> {
-    let ts = timestamp_ms as i64;
-    Utc.timestamp_millis_opt(ts).single().map(|utc| {
-        let et = utc.with_timezone(&Eastern);
-        (et.hour() as i32 * 60) + et.minute() as i32
-    })
-}
-
 /// Background task: listens to feed events and drives pipelines, rules, and UI emission.
 async fn processing_loop(handle: AppHandle, mut rx: broadcast::Receiver<FeedEvent>) {
-    let session_start = Instant::now();
     let mut last_market_emit = Instant::now();
     let mut last_risk_emit = Instant::now();
     let mut last_snapshot_persist = Instant::now();
@@ -110,6 +82,7 @@ async fn processing_loop(handle: AppHandle, mut rx: broadcast::Receiver<FeedEven
     let mut last_ask: f64 = 0.0;
     let mut current_session_type = SessionType::Unknown;
     let mut tick_buffer: Vec<(f64, f64, f64, f64, f64, bool, String)> = Vec::with_capacity(128);
+    let mut event_buffer: Vec<the_desk_backend::pipelines::MarketEvent> = Vec::new();
 
     loop {
         match rx.recv().await {
@@ -160,6 +133,18 @@ async fn processing_loop(handle: AppHandle, mut rx: broadcast::Receiver<FeedEven
                             );
                         }
                         pipelines.reset_session();
+                        state.detector.lock().await.reset();
+
+                        // Flush pending events before session boundary
+                        if !event_buffer.is_empty() {
+                            let _ = state
+                                .db
+                                .lock()
+                                .await
+                                .insert_market_events_batch(&event_buffer);
+                            event_buffer.clear();
+                        }
+
                         handle
                             .emit(
                                 "session-boundary",
@@ -174,7 +159,7 @@ async fn processing_loop(handle: AppHandle, mut rx: broadcast::Receiver<FeedEven
                     current_session_type = new_session;
                 }
 
-                let minute_of_session = minute_of_session(timestamp, session_start);
+                let minute_of_session = minute_of_session_from_timestamp(timestamp);
 
                 // Update pipelines
                 {
@@ -186,6 +171,35 @@ async fn processing_loop(handle: AppHandle, mut rx: broadcast::Receiver<FeedEven
                         minute_of_session,
                         timestamp,
                     );
+
+                    // Detect market events (RTH only)
+                    if current_session_type == SessionType::Rth {
+                        let bid = if last_bid > 0.0 {
+                            last_bid
+                        } else {
+                            price - 0.25
+                        };
+                        let ask = if last_ask > 0.0 {
+                            last_ask
+                        } else {
+                            price + 0.25
+                        };
+                        let snapshot = pipelines.snapshot(bid, ask);
+                        let session_date = session_date_from_timestamp_ms(timestamp);
+                        let mut detector = state.detector.lock().await;
+                        let events =
+                            detector.detect(&snapshot, timestamp, &session_date, minute_of_session);
+                        event_buffer.extend(events);
+
+                        if event_buffer.len() >= 50 {
+                            let _ = state
+                                .db
+                                .lock()
+                                .await
+                                .insert_market_events_batch(&event_buffer);
+                            event_buffer.clear();
+                        }
+                    }
 
                     if last_market_emit.elapsed() >= market_interval {
                         let bid = if last_bid > 0.0 {
@@ -355,44 +369,21 @@ async fn processing_loop(handle: AppHandle, mut rx: broadcast::Receiver<FeedEven
                 eprintln!("Processing loop lagged by {n} messages");
             }
             Err(broadcast::error::RecvError::Closed) => {
-                // Flush remaining ticks before exit
                 let state = handle.state::<AppState>();
                 if !tick_buffer.is_empty() {
                     let _ = state.db.lock().await.insert_raw_ticks_batch(&tick_buffer);
+                }
+                if !event_buffer.is_empty() {
+                    let _ = state
+                        .db
+                        .lock()
+                        .await
+                        .insert_market_events_batch(&event_buffer);
                 }
                 break;
             }
         }
     }
-}
-
-fn session_date_from_timestamp_ms(timestamp_ms: f64) -> String {
-    let ts = timestamp_ms as i64;
-    if let Some(dt) = Utc.timestamp_millis_opt(ts).single() {
-        dt.with_timezone(&Eastern).format("%Y-%m-%d").to_string()
-    } else {
-        chrono::Local::now().format("%Y-%m-%d").to_string()
-    }
-}
-
-fn minute_of_session(timestamp: f64, session_start: Instant) -> i32 {
-    let dt_utc = if timestamp > 1_000_000_000_000.0 {
-        Utc.timestamp_millis_opt(timestamp as i64).single()
-    } else if timestamp > 1_000_000_000.0 {
-        Utc.timestamp_opt(timestamp as i64, 0).single()
-    } else {
-        None
-    };
-
-    if let Some(utc) = dt_utc {
-        let et = utc.with_timezone(&Eastern);
-        let total_minutes = (et.hour() as i32 * 60) + et.minute() as i32;
-        let rth_open_minutes = (9 * 60) + 30;
-        return total_minutes - rth_open_minutes;
-    }
-
-    // Mock feeds often emit synthetic timestamps; keep a short overnight pre-roll.
-    session_start.elapsed().as_secs() as i32 - 30
 }
 
 fn main() {
@@ -417,6 +408,7 @@ fn main() {
     let state = AppState {
         dtc: Mutex::new(DtcClient::new(tx.clone())),
         pipelines: Mutex::new(pipelines),
+        detector: Mutex::new(EventDetector::new()),
         rules: Mutex::new(RulesEngine::default()),
         risk: Mutex::new(risk),
         db: Mutex::new(db),
@@ -481,19 +473,32 @@ fn main() {
                 let config = load_feed_config();
                 let reader = ScidReader::from_feed_config(&config);
                 if !reader.path().exists() {
+                    eprintln!(
+                        "SCID file not found: {} — skipping auto-feed",
+                        reader.path().display()
+                    );
                     return;
                 }
+                eprintln!("SCID file found: {}", reader.path().display());
                 let state = app_handle.state::<AppState>();
 
-                // Bulk backfill: feed directly into pipeline engine (bypass broadcast channel)
-                if let Ok(ticks) = reader.read_bulk() {
-                    if !ticks.is_empty() {
+                // Backfill from the most recent Globex open (6 PM ET yesterday).
+                // This gives us the full overnight + RTH session without reading
+                // the entire contract history (24M+ ticks).
+                let backfill_since_ms = globex_open_ms(1);
+
+                let t0 = Instant::now();
+                eprintln!("Starting session backfill (since Globex open)...");
+
+                match reader.read_bulk_since(Some(backfill_since_ms)) {
+                    Ok(ticks) if !ticks.is_empty() => {
+                        let tick_count = ticks.len();
                         let mut pipelines = state.pipelines.lock().await;
                         let mut last_bid = 0.0_f64;
                         let mut last_ask = 0.0_f64;
                         for tick in &ticks {
                             let is_buy = matches!(tick.side, TradeSide::Buy);
-                            let minute = minute_of_session(tick.timestamp_ms, Instant::now());
+                            let minute = minute_of_session_from_timestamp(tick.timestamp_ms);
                             pipelines.on_trade_with_timestamp(
                                 tick.price,
                                 tick.volume,
@@ -526,18 +531,29 @@ fn main() {
                                 .unwrap_or_else(|_| serde_json::json!({})),
                         );
                         eprintln!(
-                            "Backfill complete: {} ticks replayed into pipelines",
-                            ticks.len()
+                            "Backfill complete: {} ticks in {:.1}s",
+                            tick_count,
+                            t0.elapsed().as_secs_f64()
                         );
+                    }
+                    Ok(_) => {
+                        eprintln!("No ticks found since Globex open");
+                    }
+                    Err(e) => {
+                        eprintln!("Backfill error: {e}");
                     }
                 }
 
-                // Start live tail loop using broadcast channel for new ticks only
+                // Start live tail loop for new ticks
                 let (stop_tx, stop_rx) = watch::channel(false);
                 *state.scid_shutdown_tx.lock().await = Some(stop_tx);
                 let task =
                     reader.spawn_tail_loop(state.dtc_tx.clone(), stop_rx, config.flush_poll_ms);
                 *state.scid_feed_task.lock().await = Some(task);
+                eprintln!(
+                    "Live tail loop started (polling every {}ms)",
+                    config.flush_poll_ms
+                );
             });
             Ok(())
         })

@@ -45,6 +45,14 @@ pub struct FeedConfig {
     pub sierra_data_dir: String,
     pub symbol: String,
     pub flush_poll_ms: u64,
+    /// Divisor applied to raw .scid prices. Rithmic stores NQ prices
+    /// multiplied by 100 (e.g., 24966.75 → 2496675), so set this to 100.
+    #[serde(default = "default_price_scale")]
+    pub price_scale: f64,
+}
+
+fn default_price_scale() -> f64 {
+    100.0
 }
 
 impl Default for FeedConfig {
@@ -53,6 +61,46 @@ impl Default for FeedConfig {
             sierra_data_dir: "C:\\SierraChart\\Data".to_string(),
             symbol: "NQ".to_string(),
             flush_poll_ms: 1_000,
+            price_scale: 100.0,
+        }
+    }
+}
+
+/// Storage tier lifecycle configuration.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct StorageConfig {
+    /// Days to keep raw ticks in SQLite (warm tier). Default: 30.
+    #[serde(default = "default_warm_days")]
+    pub warm_retention_days: u32,
+    /// Directory for zstd-compressed cold archives.
+    #[serde(default = "default_archive_dir")]
+    pub cold_archive_dir: String,
+    /// Whether to auto-archive at session close.
+    #[serde(default)]
+    pub auto_archive: bool,
+}
+
+fn default_warm_days() -> u32 {
+    30
+}
+
+fn default_archive_dir() -> String {
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home)
+        .join(".the-desk")
+        .join("archive")
+        .to_string_lossy()
+        .to_string()
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            warm_retention_days: 30,
+            cold_archive_dir: default_archive_dir(),
+            auto_archive: false,
         }
     }
 }
@@ -61,6 +109,8 @@ impl Default for FeedConfig {
 struct RootConfig {
     #[serde(default)]
     feed: FeedConfig,
+    #[serde(default)]
+    storage: StorageConfig,
 }
 
 /// Resolve `~/.the-desk/config.toml` for feed startup.
@@ -80,5 +130,17 @@ pub fn load_feed_config() -> FeedConfig {
             .map(|cfg| cfg.feed)
             .unwrap_or_default(),
         Err(_) => FeedConfig::default(),
+    }
+}
+
+/// Load storage config from disk; fall back to defaults if missing/invalid.
+pub fn load_storage_config() -> StorageConfig {
+    let path = default_config_path();
+    let raw = std::fs::read_to_string(path);
+    match raw {
+        Ok(content) => toml::from_str::<RootConfig>(&content)
+            .map(|cfg| cfg.storage)
+            .unwrap_or_default(),
+        Err(_) => StorageConfig::default(),
     }
 }

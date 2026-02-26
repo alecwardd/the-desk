@@ -41,16 +41,24 @@ struct ScidHeader {
 #[derive(Debug, Clone)]
 pub struct ScidReader {
     path: PathBuf,
+    /// Divisor for raw prices (e.g., 100.0 for Rithmic NQ data).
+    price_scale: f64,
 }
 
 impl ScidReader {
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+        Self {
+            path: path.into(),
+            price_scale: 1.0,
+        }
     }
 
     pub fn from_feed_config(config: &FeedConfig) -> Self {
         let path = PathBuf::from(&config.sierra_data_dir).join(symbol_to_scid_file(&config.symbol));
-        Self::new(path)
+        Self {
+            path,
+            price_scale: config.price_scale,
+        }
     }
 
     pub fn path(&self) -> &Path {
@@ -84,18 +92,23 @@ impl ScidReader {
         })
     }
 
-    fn parse_record(record: &[u8]) -> Option<ScidTick> {
+    fn parse_record(&self, record: &[u8]) -> Option<ScidTick> {
         if record.len() < SCID_RECORD_SIZE {
             return None;
         }
 
         let sc_time_us = i64::from_le_bytes(record[0..8].try_into().ok()?);
-        let ask = f32::from_le_bytes(record[12..16].try_into().ok()?) as f64;
-        let bid = f32::from_le_bytes(record[16..20].try_into().ok()?) as f64;
-        let price = f32::from_le_bytes(record[20..24].try_into().ok()?) as f64;
+        let raw_ask = f32::from_le_bytes(record[12..16].try_into().ok()?) as f64;
+        let raw_bid = f32::from_le_bytes(record[16..20].try_into().ok()?) as f64;
+        let raw_price = f32::from_le_bytes(record[20..24].try_into().ok()?) as f64;
         let volume = u32::from_le_bytes(record[28..32].try_into().ok()?) as f64;
         let bid_volume = u32::from_le_bytes(record[32..36].try_into().ok()?) as f64;
         let ask_volume = u32::from_le_bytes(record[36..40].try_into().ok()?) as f64;
+
+        let s = self.price_scale;
+        let price = if s > 1.0 { raw_price / s } else { raw_price };
+        let bid = if s > 1.0 { raw_bid / s } else { raw_bid };
+        let ask = if s > 1.0 { raw_ask / s } else { raw_ask };
 
         let unix_us = sc_time_us.saturating_sub(SC_TO_UNIX_EPOCH_US);
         let timestamp_ms = unix_us as f64 / 1_000.0;
@@ -104,9 +117,9 @@ impl ScidReader {
             TradeSide::Buy
         } else if bid_volume > ask_volume {
             TradeSide::Sell
-        } else if price >= ask && ask > 0.0 {
+        } else if raw_price >= raw_ask && raw_ask > 0.0 {
             TradeSide::Buy
-        } else if price <= bid && bid > 0.0 {
+        } else if raw_price <= raw_bid && raw_bid > 0.0 {
             TradeSide::Sell
         } else {
             TradeSide::Unknown
@@ -124,18 +137,74 @@ impl ScidReader {
 
     /// Read an entire SCID file in-order for historical backfill.
     pub fn read_bulk(&self) -> Result<Vec<ScidTick>, ScidError> {
+        self.read_bulk_since(None)
+    }
+
+    /// Read ticks from the SCID file, optionally starting from a minimum timestamp.
+    ///
+    /// If `since_ms` is provided, uses binary search on the sorted file to skip
+    /// directly to the approximate position, avoiding a full sequential scan.
+    pub fn read_bulk_since(&self, since_ms: Option<f64>) -> Result<Vec<ScidTick>, ScidError> {
         let mut file = File::open(&self.path)?;
         let header = Self::read_header(&mut file)?;
-        file.seek(SeekFrom::Start(header.header_size as u64))?;
+        let data_start = header.header_size as u64;
+        let file_len = file.metadata()?.len();
 
-        let mut out = Vec::new();
+        if file_len <= data_start {
+            return Ok(Vec::new());
+        }
+
+        let total_records = (file_len - data_start) / SCID_RECORD_SIZE as u64;
+        let start_record = match since_ms {
+            Some(ts) => self.binary_search_record(&mut file, data_start, total_records, ts)?,
+            None => 0,
+        };
+
+        let offset = data_start + start_record * SCID_RECORD_SIZE as u64;
+        file.seek(SeekFrom::Start(offset))?;
+
+        let estimated = (total_records - start_record) as usize;
+        let mut out = Vec::with_capacity(estimated);
         let mut record = [0_u8; SCID_RECORD_SIZE];
         while file.read_exact(&mut record).is_ok() {
-            if let Some(tick) = Self::parse_record(&record) {
-                out.push(tick);
+            if let Some(tick) = self.parse_record(&record) {
+                if since_ms.is_none() || tick.timestamp_ms >= since_ms.unwrap_or(0.0) {
+                    out.push(tick);
+                }
             }
         }
         Ok(out)
+    }
+
+    /// Binary search for the first record at or after `target_ms`.
+    fn binary_search_record(
+        &self,
+        file: &mut File,
+        data_start: u64,
+        total_records: u64,
+        target_ms: f64,
+    ) -> Result<u64, ScidError> {
+        if total_records == 0 {
+            return Ok(0);
+        }
+        let target_us = (target_ms * 1_000.0) as i64 + SC_TO_UNIX_EPOCH_US;
+        let mut lo: u64 = 0;
+        let mut hi: u64 = total_records;
+        let mut buf = [0_u8; 8];
+
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let pos = data_start + mid * SCID_RECORD_SIZE as u64;
+            file.seek(SeekFrom::Start(pos))?;
+            file.read_exact(&mut buf)?;
+            let sc_time_us = i64::from_le_bytes(buf);
+            if sc_time_us < target_us {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        Ok(lo)
     }
 
     /// Start a continuous tail loop over a live SCID file.
@@ -146,6 +215,7 @@ impl ScidReader {
         poll_ms: u64,
     ) -> JoinHandle<()> {
         let path = self.path.clone();
+        let price_scale = self.price_scale;
         tokio::spawn(async move {
             let _ = tx.send(FeedEvent::Connected);
 
@@ -207,7 +277,7 @@ impl ScidReader {
                 let mut record = [0_u8; SCID_RECORD_SIZE];
                 while file.read_exact(&mut record).is_ok() {
                     offset = offset.saturating_add(SCID_RECORD_SIZE as u64);
-                    if let Some(tick) = Self::parse_record(&record) {
+                    if let Some(tick) = parse_record_scaled(&record, price_scale) {
                         let _ = tx.send(FeedEvent::Quote {
                             symbol_id: 1,
                             bid: tick.bid,
@@ -233,6 +303,50 @@ impl ScidReader {
             }
         })
     }
+}
+
+/// Standalone record parser with explicit price scale (for use in spawned tasks).
+pub fn parse_record_scaled(record: &[u8], price_scale: f64) -> Option<ScidTick> {
+    if record.len() < SCID_RECORD_SIZE {
+        return None;
+    }
+
+    let sc_time_us = i64::from_le_bytes(record[0..8].try_into().ok()?);
+    let raw_ask = f32::from_le_bytes(record[12..16].try_into().ok()?) as f64;
+    let raw_bid = f32::from_le_bytes(record[16..20].try_into().ok()?) as f64;
+    let raw_price = f32::from_le_bytes(record[20..24].try_into().ok()?) as f64;
+    let volume = u32::from_le_bytes(record[28..32].try_into().ok()?) as f64;
+    let bid_volume = u32::from_le_bytes(record[32..36].try_into().ok()?) as f64;
+    let ask_volume = u32::from_le_bytes(record[36..40].try_into().ok()?) as f64;
+
+    let s = price_scale;
+    let price = if s > 1.0 { raw_price / s } else { raw_price };
+    let bid = if s > 1.0 { raw_bid / s } else { raw_bid };
+    let ask = if s > 1.0 { raw_ask / s } else { raw_ask };
+
+    let unix_us = sc_time_us.saturating_sub(SC_TO_UNIX_EPOCH_US);
+    let timestamp_ms = unix_us as f64 / 1_000.0;
+
+    let side = if ask_volume > bid_volume {
+        TradeSide::Buy
+    } else if bid_volume > ask_volume {
+        TradeSide::Sell
+    } else if raw_price >= raw_ask && raw_ask > 0.0 {
+        TradeSide::Buy
+    } else if raw_price <= raw_bid && raw_bid > 0.0 {
+        TradeSide::Sell
+    } else {
+        TradeSide::Unknown
+    };
+
+    Some(ScidTick {
+        timestamp_ms,
+        price,
+        volume,
+        bid,
+        ask,
+        side,
+    })
 }
 
 fn symbol_to_scid_file(symbol: &str) -> String {

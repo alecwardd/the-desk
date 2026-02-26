@@ -200,6 +200,37 @@ Each decision follows this structure:
 
 ---
 
+### ADR-011: Deterministic research infrastructure replaces external backtesting
+
+**Date:** 2026-02-26
+**Status:** Decided
+**Supersedes:** ADR-001 (Import backtests, don't build an engine)
+
+**Context:** The original ADR-001 rejected an in-repo backtesting engine to avoid scope creep. As the MCP-based architecture matured, it became clear that agents need historical statistical context to provide useful coaching — questions like "how often is IB-mid tested?" or "if price breaks above IB 3 times, how often does it close above?" require structured historical data that external tools cannot efficiently provide in the conversational flow.
+
+**Decision:** Build a deterministic research infrastructure within the repo:
+1. **EventDetector** — logs ~30 structured market events during live pipeline processing and historical backfill
+2. **Session summaries** — 35+ field end-of-session snapshots for cross-session comparison
+3. **Signal outcomes** — MFE/MAE/R-result tracking per playbook signal
+4. **Research query engine** — frequency, conditional probability, distribution, and session comparison queries
+5. **Backfill pipeline** — process historical .scid files through all pipelines to populate the research database
+6. **9 MCP research tools** — expose all research capabilities to specialized subagents
+
+This is NOT a backtesting engine in the traditional sense — it does not simulate order fills, model slippage, or calculate equity curves. It answers structural and statistical questions about market behavior deterministically.
+
+**Alternatives considered:**
+- Keep importing from external tools (ADR-001) — rejected (too slow for conversational flow, agents can't ask ad-hoc questions)
+- Build a full backtesting engine with order simulation — rejected (out of scope, unnecessary for coaching use case)
+
+**Consequences:**
+- Agents can answer statistical questions in-conversation without manual data preparation
+- Requires historical .scid data to be backfilled (one-time operation per symbol)
+- All research queries are deterministic — same data always produces same answers
+- MCP tool count increased from 24 to 33
+- Four specialized subagents (levels-analyst, performance-analyst, backtest-analyst, plus updated market-structure-analyst and orderflow-analyst) leverage the research tools
+
+---
+
 ## Pending Decisions
 
 ### ADR-P06: NQ contract rollover handling

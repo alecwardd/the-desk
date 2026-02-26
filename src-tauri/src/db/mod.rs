@@ -1,3 +1,4 @@
+use crate::pipelines::event_detector::MarketEvent;
 use crate::risk::RiskState;
 use crate::rules::SetupDefinition;
 use rusqlite::{params, Connection};
@@ -124,6 +125,66 @@ pub struct RawTickRecord {
     pub session_date: String,
 }
 
+/// End-of-session summary with key metrics for historical research.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSummary {
+    pub session_date: String,
+    pub session_type: String,
+    pub open_price: f64,
+    pub high: f64,
+    pub low: f64,
+    pub close: f64,
+    pub poc: f64,
+    pub vah: f64,
+    pub val: f64,
+    pub ib_high: f64,
+    pub ib_low: f64,
+    pub ib_range: f64,
+    pub ib_mid: f64,
+    pub or_high: f64,
+    pub or_low: f64,
+    pub day_type: String,
+    pub total_volume: f64,
+    pub tick_count: i64,
+    pub session_delta: f64,
+    pub cumulative_delta: f64,
+    pub dnp: f64,
+    pub dnva_high: f64,
+    pub dnva_low: f64,
+    pub vwap_close: f64,
+    pub signal_count: i64,
+    pub single_prints_direction: String,
+    pub excess_high: bool,
+    pub excess_low: bool,
+    pub poor_high: bool,
+    pub poor_low: bool,
+    pub rvol_ratio: f64,
+    pub close_vs_ib_mid: String,
+    pub close_vs_vwap: String,
+    pub close_vs_poc: String,
+    pub snapshot_json: Option<String>,
+}
+
+/// Signal outcome tracking record.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignalOutcome {
+    pub signal_id: String,
+    pub setup_id: String,
+    pub setup_name: Option<String>,
+    pub fired_at_ms: f64,
+    pub fired_price: f64,
+    pub target_price: Option<f64>,
+    pub stop_price: Option<f64>,
+    pub outcome: String,
+    pub outcome_at_ms: Option<f64>,
+    pub max_favorable_excursion: Option<f64>,
+    pub max_adverse_excursion: Option<f64>,
+    pub r_result: Option<f64>,
+    pub time_to_outcome_ms: Option<f64>,
+}
+
 impl Default for RiskConfigRecord {
     fn default() -> Self {
         Self {
@@ -182,6 +243,9 @@ impl Database {
         }
         if version < 3 {
             self.migrate_v3()?;
+        }
+        if version < 4 {
+            self.migrate_v4()?;
         }
 
         Ok(())
@@ -411,6 +475,76 @@ impl Database {
             );
 
             UPDATE schema_version SET version = 3;
+            ",
+        )?;
+        Ok(())
+    }
+
+    /// V4: market structure research tables — events, session summaries, signal outcomes.
+    fn migrate_v4(&self) -> Result<(), DbError> {
+        self.conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS market_events (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              session_date TEXT NOT NULL,
+              timestamp_ms REAL NOT NULL,
+              event_type TEXT NOT NULL,
+              level_name TEXT,
+              price REAL NOT NULL,
+              direction TEXT,
+              sequence_num INTEGER,
+              metadata_json TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_market_events_session
+              ON market_events(session_date);
+            CREATE INDEX IF NOT EXISTS idx_market_events_type
+              ON market_events(event_type, session_date);
+
+            CREATE TABLE IF NOT EXISTS session_summaries (
+              session_date TEXT PRIMARY KEY,
+              session_type TEXT NOT NULL,
+              open_price REAL, high REAL, low REAL, close REAL,
+              poc REAL, vah REAL, val REAL,
+              ib_high REAL, ib_low REAL, ib_range REAL,
+              ib_mid REAL,
+              or_high REAL, or_low REAL,
+              day_type TEXT,
+              total_volume REAL, tick_count INTEGER,
+              session_delta REAL, cumulative_delta REAL,
+              dnp REAL, dnva_high REAL, dnva_low REAL,
+              vwap_close REAL,
+              signal_count INTEGER DEFAULT 0,
+              single_prints_direction TEXT,
+              excess_high INTEGER DEFAULT 0, excess_low INTEGER DEFAULT 0,
+              poor_high INTEGER DEFAULT 0, poor_low INTEGER DEFAULT 0,
+              rvol_ratio REAL,
+              close_vs_ib_mid TEXT,
+              close_vs_vwap TEXT,
+              close_vs_poc TEXT,
+              snapshot_json TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS signal_outcomes (
+              signal_id TEXT PRIMARY KEY,
+              setup_id TEXT NOT NULL,
+              setup_name TEXT,
+              fired_at_ms REAL NOT NULL,
+              fired_price REAL NOT NULL,
+              target_price REAL,
+              stop_price REAL,
+              outcome TEXT NOT NULL DEFAULT 'pending',
+              outcome_at_ms REAL,
+              max_favorable_excursion REAL,
+              max_adverse_excursion REAL,
+              r_result REAL,
+              time_to_outcome_ms REAL
+            );
+            CREATE INDEX IF NOT EXISTS idx_signal_outcomes_setup
+              ON signal_outcomes(setup_id);
+            CREATE INDEX IF NOT EXISTS idx_signal_outcomes_outcome
+              ON signal_outcomes(outcome);
+
+            UPDATE schema_version SET version = 4;
             ",
         )?;
         Ok(())
@@ -1371,6 +1505,473 @@ impl Database {
         )?;
 
         Ok(count)
+    }
+
+    // ------------------------------------------------------------------
+    // Market events (research infrastructure)
+    // ------------------------------------------------------------------
+
+    /// Batch-insert market events in a single transaction.
+    pub fn insert_market_events_batch(&self, events: &[MarketEvent]) -> Result<(), DbError> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare_cached(
+                "INSERT OR IGNORE INTO market_events
+                 (session_date, timestamp_ms, event_type, level_name, price, direction, sequence_num, metadata_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            )?;
+            for e in events {
+                let meta = e
+                    .metadata
+                    .as_ref()
+                    .map(|m| serde_json::to_string(m).unwrap_or_default());
+                stmt.execute(params![
+                    e.session_date,
+                    e.timestamp_ms,
+                    e.event_type,
+                    e.level_name,
+                    e.price,
+                    e.direction,
+                    e.sequence_num,
+                    meta,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Count events of a given type, optionally filtered by date range.
+    pub fn count_events_by_type(
+        &self,
+        event_type: &str,
+        start_date: Option<&str>,
+        end_date: Option<&str>,
+    ) -> Result<(i64, i64, i64), DbError> {
+        let (total_events, sessions_with, total_sessions) = match (start_date, end_date) {
+            (Some(sd), Some(ed)) => {
+                let total: i64 = self.conn.query_row(
+                    "SELECT COUNT(1) FROM market_events WHERE event_type = ?1 AND session_date BETWEEN ?2 AND ?3",
+                    params![event_type, sd, ed],
+                    |r| r.get(0),
+                )?;
+                let with: i64 = self.conn.query_row(
+                    "SELECT COUNT(DISTINCT session_date) FROM market_events WHERE event_type = ?1 AND session_date BETWEEN ?2 AND ?3",
+                    params![event_type, sd, ed],
+                    |r| r.get(0),
+                )?;
+                let sessions: i64 = self.conn.query_row(
+                    "SELECT COUNT(1) FROM session_summaries WHERE session_date BETWEEN ?1 AND ?2",
+                    params![sd, ed],
+                    |r| r.get(0),
+                )?;
+                (total, with, sessions)
+            }
+            _ => {
+                let total: i64 = self.conn.query_row(
+                    "SELECT COUNT(1) FROM market_events WHERE event_type = ?1",
+                    params![event_type],
+                    |r| r.get(0),
+                )?;
+                let with: i64 = self.conn.query_row(
+                    "SELECT COUNT(DISTINCT session_date) FROM market_events WHERE event_type = ?1",
+                    params![event_type],
+                    |r| r.get(0),
+                )?;
+                let sessions: i64 =
+                    self.conn
+                        .query_row("SELECT COUNT(1) FROM session_summaries", [], |r| r.get(0))?;
+                (total, with, sessions)
+            }
+        };
+        Ok((total_events, sessions_with, total_sessions))
+    }
+
+    /// Count events of a specific type per session for conditional queries.
+    pub fn event_counts_per_session(
+        &self,
+        event_type: &str,
+        start_date: Option<&str>,
+        end_date: Option<&str>,
+    ) -> Result<Vec<(String, i64)>, DbError> {
+        let mut results = Vec::new();
+        match (start_date, end_date) {
+            (Some(sd), Some(ed)) => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT session_date, COUNT(1) FROM market_events
+                     WHERE event_type = ?1 AND session_date BETWEEN ?2 AND ?3
+                     GROUP BY session_date",
+                )?;
+                let rows = stmt.query_map(params![event_type, sd, ed], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })?;
+                for v in rows.flatten() {
+                    results.push(v);
+                }
+            }
+            _ => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT session_date, COUNT(1) FROM market_events
+                     WHERE event_type = ?1
+                     GROUP BY session_date",
+                )?;
+                let rows = stmt.query_map(params![event_type], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })?;
+                for v in rows.flatten() {
+                    results.push(v);
+                }
+            }
+        }
+        Ok(results)
+    }
+
+    // ------------------------------------------------------------------
+    // Session summaries (research infrastructure)
+    // ------------------------------------------------------------------
+
+    /// Insert or replace a session summary.
+    pub fn upsert_session_summary(&self, s: &SessionSummary) -> Result<(), DbError> {
+        self.conn.execute(
+            "INSERT INTO session_summaries
+             (session_date, session_type, open_price, high, low, close,
+              poc, vah, val, ib_high, ib_low, ib_range, ib_mid,
+              or_high, or_low, day_type, total_volume, tick_count,
+              session_delta, cumulative_delta, dnp, dnva_high, dnva_low,
+              vwap_close, signal_count, single_prints_direction,
+              excess_high, excess_low, poor_high, poor_low, rvol_ratio,
+              close_vs_ib_mid, close_vs_vwap, close_vs_poc, snapshot_json)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35)
+             ON CONFLICT(session_date) DO UPDATE SET
+               session_type=excluded.session_type, open_price=excluded.open_price,
+               high=excluded.high, low=excluded.low, close=excluded.close,
+               poc=excluded.poc, vah=excluded.vah, val=excluded.val,
+               ib_high=excluded.ib_high, ib_low=excluded.ib_low, ib_range=excluded.ib_range,
+               ib_mid=excluded.ib_mid, or_high=excluded.or_high, or_low=excluded.or_low,
+               day_type=excluded.day_type, total_volume=excluded.total_volume,
+               tick_count=excluded.tick_count, session_delta=excluded.session_delta,
+               cumulative_delta=excluded.cumulative_delta, dnp=excluded.dnp,
+               dnva_high=excluded.dnva_high, dnva_low=excluded.dnva_low,
+               vwap_close=excluded.vwap_close, signal_count=excluded.signal_count,
+               single_prints_direction=excluded.single_prints_direction,
+               excess_high=excluded.excess_high, excess_low=excluded.excess_low,
+               poor_high=excluded.poor_high, poor_low=excluded.poor_low,
+               rvol_ratio=excluded.rvol_ratio, close_vs_ib_mid=excluded.close_vs_ib_mid,
+               close_vs_vwap=excluded.close_vs_vwap, close_vs_poc=excluded.close_vs_poc,
+               snapshot_json=excluded.snapshot_json",
+            params![
+                s.session_date, s.session_type, s.open_price, s.high, s.low, s.close,
+                s.poc, s.vah, s.val, s.ib_high, s.ib_low, s.ib_range, s.ib_mid,
+                s.or_high, s.or_low, s.day_type, s.total_volume, s.tick_count,
+                s.session_delta, s.cumulative_delta, s.dnp, s.dnva_high, s.dnva_low,
+                s.vwap_close, s.signal_count, s.single_prints_direction,
+                i64::from(s.excess_high), i64::from(s.excess_low),
+                i64::from(s.poor_high), i64::from(s.poor_low), s.rvol_ratio,
+                s.close_vs_ib_mid, s.close_vs_vwap, s.close_vs_poc, s.snapshot_json,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Check if a session summary exists for a given date.
+    pub fn has_session_summary(&self, session_date: &str) -> Result<bool, DbError> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(1) FROM session_summaries WHERE session_date = ?1",
+            params![session_date],
+            |r| r.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// List session summaries with optional filters.
+    pub fn list_session_summaries(
+        &self,
+        start_date: Option<&str>,
+        end_date: Option<&str>,
+        day_type_filter: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<SessionSummary>, DbError> {
+        let mut conditions = Vec::new();
+        let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+        if let Some(sd) = start_date {
+            conditions.push(format!("session_date >= ?{}", bind_values.len() + 1));
+            bind_values.push(Box::new(sd.to_string()));
+        }
+        if let Some(ed) = end_date {
+            conditions.push(format!("session_date <= ?{}", bind_values.len() + 1));
+            bind_values.push(Box::new(ed.to_string()));
+        }
+        if let Some(dt) = day_type_filter {
+            conditions.push(format!("day_type = ?{}", bind_values.len() + 1));
+            bind_values.push(Box::new(dt.to_string()));
+        }
+
+        let where_clause = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", conditions.join(" AND "))
+        };
+
+        let sql = format!(
+            "SELECT session_date, session_type, open_price, high, low, close,
+                    poc, vah, val, ib_high, ib_low, ib_range, ib_mid,
+                    or_high, or_low, day_type, total_volume, tick_count,
+                    session_delta, cumulative_delta, dnp, dnva_high, dnva_low,
+                    vwap_close, signal_count, single_prints_direction,
+                    excess_high, excess_low, poor_high, poor_low, rvol_ratio,
+                    close_vs_ib_mid, close_vs_vwap, close_vs_poc, snapshot_json
+             FROM session_summaries {where_clause}
+             ORDER BY session_date DESC LIMIT ?{}",
+            bind_values.len() + 1
+        );
+        bind_values.push(Box::new(limit as i64));
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+            bind_values.iter().map(|b| b.as_ref()).collect();
+        let rows = stmt.query_map(params_ref.as_slice(), |row| {
+            Ok(SessionSummary {
+                session_date: row.get(0)?,
+                session_type: row.get(1)?,
+                open_price: row.get(2)?,
+                high: row.get(3)?,
+                low: row.get(4)?,
+                close: row.get(5)?,
+                poc: row.get(6)?,
+                vah: row.get(7)?,
+                val: row.get(8)?,
+                ib_high: row.get(9)?,
+                ib_low: row.get(10)?,
+                ib_range: row.get(11)?,
+                ib_mid: row.get(12)?,
+                or_high: row.get(13)?,
+                or_low: row.get(14)?,
+                day_type: row.get::<_, Option<String>>(15)?.unwrap_or_default(),
+                total_volume: row.get(16)?,
+                tick_count: row.get(17)?,
+                session_delta: row.get(18)?,
+                cumulative_delta: row.get(19)?,
+                dnp: row.get(20)?,
+                dnva_high: row.get(21)?,
+                dnva_low: row.get(22)?,
+                vwap_close: row.get(23)?,
+                signal_count: row.get(24)?,
+                single_prints_direction: row.get::<_, Option<String>>(25)?.unwrap_or_default(),
+                excess_high: row.get::<_, i64>(26)? != 0,
+                excess_low: row.get::<_, i64>(27)? != 0,
+                poor_high: row.get::<_, i64>(28)? != 0,
+                poor_low: row.get::<_, i64>(29)? != 0,
+                rvol_ratio: row.get(30)?,
+                close_vs_ib_mid: row.get::<_, Option<String>>(31)?.unwrap_or_default(),
+                close_vs_vwap: row.get::<_, Option<String>>(32)?.unwrap_or_default(),
+                close_vs_poc: row.get::<_, Option<String>>(33)?.unwrap_or_default(),
+                snapshot_json: row.get(34)?,
+            })
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Get metric values from session_summaries for distribution analysis.
+    pub fn metric_values(
+        &self,
+        column: &str,
+        start_date: Option<&str>,
+        end_date: Option<&str>,
+    ) -> Result<Vec<f64>, DbError> {
+        let allowed = [
+            "ib_range",
+            "high",
+            "low",
+            "close",
+            "open_price",
+            "poc",
+            "vah",
+            "val",
+            "ib_high",
+            "ib_low",
+            "ib_mid",
+            "or_high",
+            "or_low",
+            "total_volume",
+            "tick_count",
+            "session_delta",
+            "cumulative_delta",
+            "dnp",
+            "dnva_high",
+            "dnva_low",
+            "vwap_close",
+            "signal_count",
+            "rvol_ratio",
+        ];
+        if !allowed.contains(&column) {
+            return Ok(Vec::new());
+        }
+        let sql = match (start_date, end_date) {
+            (Some(sd), Some(ed)) => {
+                let mut stmt = self.conn.prepare(&format!(
+                    "SELECT {column} FROM session_summaries WHERE session_date BETWEEN ?1 AND ?2 AND {column} IS NOT NULL ORDER BY session_date"
+                ))?;
+                let rows = stmt.query_map(params![sd, ed], |row| row.get::<_, f64>(0))?;
+                return Ok(rows.filter_map(|r| r.ok()).collect());
+            }
+            _ => {
+                format!("SELECT {column} FROM session_summaries WHERE {column} IS NOT NULL ORDER BY session_date")
+            }
+        };
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map([], |row| row.get::<_, f64>(0))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    // ------------------------------------------------------------------
+    // Signal outcomes (research infrastructure)
+    // ------------------------------------------------------------------
+
+    /// Insert a new pending signal outcome.
+    pub fn insert_signal_outcome(&self, o: &SignalOutcome) -> Result<(), DbError> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO signal_outcomes
+             (signal_id, setup_id, setup_name, fired_at_ms, fired_price,
+              target_price, stop_price, outcome, outcome_at_ms,
+              max_favorable_excursion, max_adverse_excursion, r_result, time_to_outcome_ms)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+            params![
+                o.signal_id,
+                o.setup_id,
+                o.setup_name,
+                o.fired_at_ms,
+                o.fired_price,
+                o.target_price,
+                o.stop_price,
+                o.outcome,
+                o.outcome_at_ms,
+                o.max_favorable_excursion,
+                o.max_adverse_excursion,
+                o.r_result,
+                o.time_to_outcome_ms,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Update a signal outcome after resolution.
+    #[allow(clippy::too_many_arguments)]
+    pub fn resolve_signal_outcome(
+        &self,
+        signal_id: &str,
+        outcome: &str,
+        outcome_at_ms: f64,
+        mfe: f64,
+        mae: f64,
+        r_result: Option<f64>,
+    ) -> Result<(), DbError> {
+        let time_to = outcome_at_ms;
+        self.conn.execute(
+            "UPDATE signal_outcomes SET outcome=?2, outcome_at_ms=?3,
+             max_favorable_excursion=?4, max_adverse_excursion=?5,
+             r_result=?6, time_to_outcome_ms=?7
+             WHERE signal_id=?1",
+            params![
+                signal_id,
+                outcome,
+                outcome_at_ms,
+                mfe,
+                mae,
+                r_result,
+                time_to
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// List pending signal outcomes (for the outcome evaluator to track).
+    pub fn pending_signal_outcomes(&self) -> Result<Vec<SignalOutcome>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT signal_id, setup_id, setup_name, fired_at_ms, fired_price,
+                    target_price, stop_price, outcome, outcome_at_ms,
+                    max_favorable_excursion, max_adverse_excursion, r_result, time_to_outcome_ms
+             FROM signal_outcomes WHERE outcome = 'pending'",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(SignalOutcome {
+                signal_id: row.get(0)?,
+                setup_id: row.get(1)?,
+                setup_name: row.get(2)?,
+                fired_at_ms: row.get(3)?,
+                fired_price: row.get(4)?,
+                target_price: row.get(5)?,
+                stop_price: row.get(6)?,
+                outcome: row.get(7)?,
+                outcome_at_ms: row.get(8)?,
+                max_favorable_excursion: row.get(9)?,
+                max_adverse_excursion: row.get(10)?,
+                r_result: row.get(11)?,
+                time_to_outcome_ms: row.get(12)?,
+            })
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Get signal performance stats for a setup.
+    pub fn signal_performance(
+        &self,
+        setup_id: Option<&str>,
+        start_date: Option<&str>,
+        end_date: Option<&str>,
+    ) -> Result<serde_json::Value, DbError> {
+        let base = match setup_id {
+            Some(sid) => {
+                let total: i64 = self.conn.query_row(
+                    "SELECT COUNT(1) FROM signal_outcomes WHERE setup_id = ?1",
+                    params![sid],
+                    |r| r.get(0),
+                )?;
+                let resolved: i64 = self.conn.query_row(
+                    "SELECT COUNT(1) FROM signal_outcomes WHERE setup_id = ?1 AND outcome != 'pending'",
+                    params![sid], |r| r.get(0),
+                )?;
+                let target_hit: i64 = self.conn.query_row(
+                    "SELECT COUNT(1) FROM signal_outcomes WHERE setup_id = ?1 AND outcome = 'target_hit'",
+                    params![sid], |r| r.get(0),
+                )?;
+                let stop_hit: i64 = self.conn.query_row(
+                    "SELECT COUNT(1) FROM signal_outcomes WHERE setup_id = ?1 AND outcome = 'stop_hit'",
+                    params![sid], |r| r.get(0),
+                )?;
+                let avg_r: f64 = self.conn.query_row(
+                    "SELECT COALESCE(AVG(r_result), 0) FROM signal_outcomes WHERE setup_id = ?1 AND r_result IS NOT NULL",
+                    params![sid], |r| r.get(0),
+                )?;
+                serde_json::json!({
+                    "setupId": sid,
+                    "totalSignals": total,
+                    "resolved": resolved,
+                    "targetHit": target_hit,
+                    "stopHit": stop_hit,
+                    "winRate": if resolved > 0 { target_hit as f64 / resolved as f64 } else { 0.0 },
+                    "avgR": avg_r,
+                })
+            }
+            None => {
+                let total: i64 =
+                    self.conn
+                        .query_row("SELECT COUNT(1) FROM signal_outcomes", [], |r| r.get(0))?;
+                serde_json::json!({"totalSignals": total})
+            }
+        };
+        let _ = (start_date, end_date); // reserved for future date filtering
+        Ok(base)
+    }
+
+    /// Count of session summaries in the database.
+    pub fn session_summary_count(&self) -> Result<i64, DbError> {
+        Ok(self
+            .conn
+            .query_row("SELECT COUNT(1) FROM session_summaries", [], |r| r.get(0))?)
     }
 }
 

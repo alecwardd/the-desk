@@ -13,9 +13,12 @@ Sierra Chart (.scid files) → Rust Pipeline Engine → SQLite → MCP Server �
 1. **Sierra Chart** writes tick data to `.scid` files as part of normal operation
 2. **The Desk** tail-reads those files, parsing 40-byte binary records (price, bid, ask, volume, aggressor side)
 3. **14 pipeline modules** compute market structure incrementally on every tick
-4. **SQLite** stores raw ticks, computed state, session history, and playbook signals
-5. **MCP server** exposes 24 tools that any Cursor agent can call for market context
-6. **You chat with agents** in Cursor who reference live (1-5s delayed) market data
+4. **EventDetector** logs ~30 structured market events (level tests, IB extensions, day type changes, etc.)
+5. **SQLite** stores raw ticks, computed state, session summaries, market events, signal outcomes, and playbook signals
+6. **Research query engine** answers frequency, conditional probability, and distribution questions over historical data
+7. **MCP server** exposes 33 tools that any Cursor agent can call for market context and historical research
+8. **Specialized subagents** (market structure, order flow, levels, performance) access domain-specific tools and report to the orchestrator
+9. **You chat with agents** in Cursor who reference live (1-5s delayed) market data and historical statistics
 
 ## What It Computes
 
@@ -45,6 +48,13 @@ Sierra Chart (.scid files) → Rust Pipeline Engine → SQLite → MCP Server �
 - Setup state machine: NotActive → Approaching → ConditionsMet → Confirmed → InTrade → Closed
 - 9 pre-built setup templates (OR5 Mid Retest, Rebid at Support, Delta Pinch Reversal, etc.)
 
+### Research Infrastructure
+- **EventDetector** — logs ~30 structured event types (level tests, IB extensions, day type changes, new session highs/lows, poor highs/lows, excess, RVOL spikes, DNP crosses)
+- **Session Summaries** — end-of-session snapshots with 35+ fields (OHLC, IB range, day type, delta, close vs key levels)
+- **Signal Outcomes** — tracks MFE/MAE/R-result after playbook signals fire
+- **Query Engine** — frequency, conditional probability, distribution, and session comparison queries
+- **Backfill Pipeline** — process historical .scid data through all pipelines to build the research database
+
 ## What It Does NOT Do
 
 - Place or manage trades
@@ -69,8 +79,14 @@ Sierra Chart (.scid files) → Rust Pipeline Engine → SQLite → MCP Server �
 ```
 the-desk/
 ├── src-tauri/src/
-│   ├── bin/the-desk-mcp.rs     # MCP server binary (24 tools)
-│   ├── pipelines/              # 14 pipeline modules
+│   ├── bin/the-desk-mcp.rs     # MCP server binary (33 tools)
+│   ├── main.rs                 # Tauri app entry + processing loop
+│   ├── lib.rs                  # Module exports
+│   ├── backfill.rs             # Historical .scid backfill engine
+│   ├── research/mod.rs         # Query engine (frequency, conditional, distribution)
+│   ├── pipelines/              # 14 pipeline modules + event detector
+│   │   ├── mod.rs              # PipelineEngine, MarketState
+│   │   ├── event_detector.rs   # Structured event detection (~30 event types)
 │   │   ├── vwap.rs             # VWAP + std dev bands
 │   │   ├── tpo.rs              # TPO profile, VA, POC, single prints
 │   │   ├── delta.rs            # Delta profile, DNVA, DNP
@@ -89,9 +105,9 @@ the-desk/
 │   │   ├── mod.rs              # Rules engine + condition evaluator
 │   │   └── setup_templates.rs  # 9 pre-built playbook templates
 │   ├── feed/
-│   │   ├── mod.rs              # FeedEvent abstraction
+│   │   ├── mod.rs              # FeedEvent, FeedConfig, StorageConfig
 │   │   └── scid_reader.rs      # .scid binary file parser
-│   ├── db/mod.rs               # SQLite schema + operations
+│   ├── db/mod.rs               # SQLite schema (V4) + operations
 │   ├── risk/mod.rs             # Risk state tracking
 │   ├── recording/mod.rs        # Session recording + replay
 │   └── dtc/                    # DTC protocol client (legacy)
@@ -100,7 +116,7 @@ the-desk/
 │   ├── dtc-protocol/           # DTC protocol reference
 │   ├── compliance-research/    # Coaching vs advisory positioning
 │   └── tauri-bridge/           # IPC patterns
-├── agents/                     # Cursor agent definitions
+├── agents/                     # Cursor agent definitions (10 agents)
 ├── CLAUDE.md                   # Project rules for all agents
 └── AGENT.md                    # Agent workflow instructions
 ```
@@ -145,7 +161,7 @@ Once running, any Cursor agent can call tools like `get_market_snapshot`, `get_d
 ### Development
 
 ```bash
-# Run all tests (79 tests across pipelines, rules, db, dtc, recording)
+# Run all tests (89 tests across pipelines, event detector, rules, db, research, dtc, recording)
 cd src-tauri && cargo test
 
 # Check compilation
@@ -153,6 +169,8 @@ cd src-tauri && cargo check
 
 # Build MCP server (release)
 cd src-tauri && cargo build --release --bin the-desk-mcp
+
+# Backfill historical data (run via MCP tool `backfill_history`)
 ```
 
 ## Data Flow & Latency
@@ -172,11 +190,19 @@ Designed for directional trading with 15-minute to 1-hour holds — not HFT.
 
 ## Storage
 
-- **Hot (current session):** all ticks in SQLite, full pipeline state in memory
-- **Warm (past 30 days):** ticks + snapshots in SQLite, fully queryable
-- **Cold (30+ days):** zstd-compressed monthly archives, session summaries retained
+- **Hot (current session):** all ticks in SQLite, full pipeline state in memory, live event detection
+- **Warm (past 30 days):** ticks + snapshots in SQLite, fully queryable, session summaries + events
+- **Cold (30+ days):** zstd-compressed monthly archives, session summaries retained in SQLite
 
 ~250K ticks/day for NQ. ~1.5-2 GB total after a year including warm + cold tiers.
+
+### Research Database (SQLite)
+
+| Table | Purpose | Populated by |
+|-------|---------|-------------|
+| `market_events` | ~30 event types with timestamp, price, metadata | Live EventDetector + backfill |
+| `session_summaries` | End-of-session snapshots (35+ fields) | Live processing + backfill |
+| `signal_outcomes` | MFE/MAE/R-result per playbook signal | Rules engine + manual resolution |
 
 ## License
 

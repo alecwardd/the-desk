@@ -1,6 +1,7 @@
 mod absorption;
 mod day_type;
 mod delta;
+pub mod event_detector;
 mod footprint;
 mod levels;
 mod opening_range_5min;
@@ -16,6 +17,7 @@ mod vwap;
 pub use absorption::{AbsorptionEvent, AbsorptionPipeline};
 pub use day_type::{BalanceState, DayType, DayTypeClassifier, ProfileShape, SinglePrintsDirection};
 pub use delta::DeltaPipeline;
+pub use event_detector::{EventDetector, MarketEvent};
 pub use footprint::{FootprintLevel, FootprintPipeline};
 pub use levels::{KeyLevel, KeyLevelType, LevelsPipeline, ProximityLevel};
 pub use opening_range_5min::{OpeningRange5MinPipeline, Or5BreakDirection};
@@ -31,6 +33,8 @@ pub use trade_size::{TradeSizePipeline, TradeSizeSnapshot};
 pub use vwap::VwapPipeline;
 
 use serde::{Deserialize, Serialize};
+
+use crate::{classify_session, et_minutes_from_timestamp, SessionType};
 
 /// Snapshot of session-ending data for prior-day level archival.
 #[derive(Debug, Clone)]
@@ -278,10 +282,14 @@ impl PipelineEngine {
         minute_of_session: i32,
         timestamp_ms: f64,
     ) {
+        let is_overnight = et_minutes_from_timestamp(timestamp_ms)
+            .map(|et_min| classify_session(et_min) != SessionType::Rth)
+            .unwrap_or(minute_of_session < 0);
+
         self.vwap.add_trade(price, volume);
         self.tpo.add_trade(price, minute_of_session);
         self.delta.add_trade(price, volume, is_buy);
-        self.levels.on_trade(price, minute_of_session);
+        self.levels.on_trade(price, is_overnight);
         self.tape_pace.on_trade(timestamp_ms, volume, price);
         self.footprint.on_trade(price, volume, is_buy, timestamp_ms);
         let move_ticks = if let Some(prev) = self.last_trade_price {

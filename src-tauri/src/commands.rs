@@ -5,7 +5,9 @@ use the_desk_backend::db::{
     JournalEntry, RiskConfigRecord, SessionEventInput, SessionEventRecord, SessionRecord,
     TradeRecord,
 };
-use the_desk_backend::dtc::{run_mock_dtc_server, DtcEvent, TradeSide};
+use the_desk_backend::dtc::{run_mock_dtc_server, TradeSide};
+use the_desk_backend::feed::scid_reader::ScidReader;
+use the_desk_backend::feed::{load_feed_config, FeedEvent};
 use the_desk_backend::recording::{ReplayEngine, SessionRecorder};
 use the_desk_backend::risk::RiskState;
 use the_desk_backend::rules::SetupDefinition;
@@ -379,7 +381,7 @@ pub async fn start_replay(state: State<'_, AppState>, speed: Option<f64>) -> Res
     let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
     replay.stop_tx = Some(stop_tx);
     replay.task = Some(tauri::async_runtime::spawn(async move {
-        let _ = tx.send(DtcEvent::Connected);
+        let _ = tx.send(FeedEvent::Connected);
         for index in start_index..entries.len() {
             if *stop_rx.borrow() {
                 break;
@@ -393,11 +395,11 @@ pub async fn start_replay(state: State<'_, AppState>, speed: Option<f64>) -> Res
                     _ = stop_rx.changed() => { break; }
                 }
             }
-            if let Some(event) = replay_entry_to_dtc_event(&entries[index]) {
+            if let Some(event) = replay_entry_to_feed_event(&entries[index]) {
                 let _ = tx.send(event);
             }
         }
-        let _ = tx.send(DtcEvent::Disconnected);
+        let _ = tx.send(FeedEvent::Disconnected);
     }));
     replay.speed = speed;
     replay.is_playing = true;
@@ -461,6 +463,45 @@ pub async fn start_mock_feed(state: State<'_, AppState>) -> Result<(), String> {
     dtc.start_live_feed("127.0.0.1", 11099, "NQ")
         .await
         .map_err(|e| e.to_string())
+}
+
+/// Start SCID tail feed using `~/.the-desk/config.toml` feed settings.
+#[tauri::command]
+pub async fn start_scid_feed(state: State<'_, AppState>) -> Result<(), String> {
+    // Stop previous feed task, if any.
+    if let Some(stop_tx) = state.scid_shutdown_tx.lock().await.take() {
+        let _ = stop_tx.send(true);
+    }
+    if let Some(task) = state.scid_feed_task.lock().await.take() {
+        task.abort();
+    }
+
+    let cfg = load_feed_config();
+    let reader = ScidReader::from_feed_config(&cfg);
+    if !reader.path().exists() {
+        return Err(format!(
+            "SCID file not found: {}",
+            reader.path().to_string_lossy()
+        ));
+    }
+
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let task = reader.spawn_tail_loop(state.dtc_tx.clone(), stop_rx, cfg.flush_poll_ms);
+    *state.scid_shutdown_tx.lock().await = Some(stop_tx);
+    *state.scid_feed_task.lock().await = Some(task);
+    Ok(())
+}
+
+/// Stop the active SCID tail feed, if running.
+#[tauri::command]
+pub async fn stop_scid_feed(state: State<'_, AppState>) -> Result<(), String> {
+    if let Some(stop_tx) = state.scid_shutdown_tx.lock().await.take() {
+        let _ = stop_tx.send(true);
+    }
+    if let Some(task) = state.scid_feed_task.lock().await.take() {
+        task.abort();
+    }
+    Ok(())
 }
 
 /// Manually set prior-day high/low/close levels and persist them.
@@ -698,9 +739,9 @@ pub async fn list_recordings() -> Result<Vec<the_desk_backend::recording::Record
 // Replay helpers
 // ---------------------------------------------------------------------------
 
-fn replay_entry_to_dtc_event(
+fn replay_entry_to_feed_event(
     entry: &the_desk_backend::recording::RecordingEntry,
-) -> Option<DtcEvent> {
+) -> Option<FeedEvent> {
     match entry.record_type.as_str() {
         "trade" => {
             let price = entry.payload.get("price")?.as_f64()?;
@@ -710,7 +751,7 @@ fn replay_entry_to_dtc_event(
                 Some("sell") => TradeSide::Sell,
                 _ => TradeSide::Unknown,
             };
-            Some(DtcEvent::Trade {
+            Some(FeedEvent::Trade {
                 symbol_id: 1,
                 price,
                 volume,
@@ -731,7 +772,7 @@ fn replay_entry_to_dtc_event(
                 .get("askSize")
                 .and_then(|v| v.as_f64())
                 .unwrap_or(0.0);
-            Some(DtcEvent::Quote {
+            Some(FeedEvent::Quote {
                 symbol_id: 1,
                 bid,
                 ask,

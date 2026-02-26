@@ -1,14 +1,47 @@
+mod absorption;
+mod day_type;
 mod delta;
+mod footprint;
 mod levels;
+mod opening_range_5min;
+mod pinch;
+mod rebid_reoffer;
+mod rvol;
+mod session_inventory;
+mod tape_pace;
 mod tpo;
+mod trade_size;
 mod vwap;
 
+pub use absorption::{AbsorptionEvent, AbsorptionPipeline};
+pub use day_type::{BalanceState, DayType, DayTypeClassifier, ProfileShape, SinglePrintsDirection};
 pub use delta::DeltaPipeline;
-pub use levels::{KeyLevel, KeyLevelType, LevelsPipeline};
+pub use footprint::{FootprintLevel, FootprintPipeline};
+pub use levels::{KeyLevel, KeyLevelType, LevelsPipeline, ProximityLevel};
+pub use opening_range_5min::{OpeningRange5MinPipeline, Or5BreakDirection};
+pub use pinch::{PinchEvent, PinchPipeline};
+pub use rebid_reoffer::{AccelerationZone, RebidReofferPipeline, ZoneStatus, ZoneType};
+pub use rvol::{RvolClassification, RvolPipeline};
+pub use session_inventory::{
+    InventoryDirection, InventoryState, PriorSessionData, SessionInventoryPipeline,
+};
+pub use tape_pace::{TapePacePipeline, TapePaceSnapshot};
 pub use tpo::{SinglePrint, SinglePrintPeriod, TpoPipeline};
+pub use trade_size::{TradeSizePipeline, TradeSizeSnapshot};
 pub use vwap::VwapPipeline;
 
 use serde::{Deserialize, Serialize};
+
+/// Snapshot of session-ending data for prior-day level archival.
+#[derive(Debug, Clone)]
+pub struct SessionEndState {
+    pub high: f64,
+    pub low: f64,
+    pub close: f64,
+    pub va_high: f64,
+    pub va_low: f64,
+    pub poc: f64,
+}
 
 /// Consolidated snapshot of all pipeline outputs for the current session.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -74,6 +107,78 @@ pub struct MarketState {
     pub ib_high: f64,
     /// Initial balance low (first 60 minutes of RTH).
     pub ib_low: f64,
+    /// Rolling 5-second tape pace (ticks/sec).
+    pub tape_pace_5s: f64,
+    /// Rolling 30-second tape pace (ticks/sec).
+    pub tape_pace_30s: f64,
+    /// Rolling 5-minute tape pace (ticks/sec).
+    pub tape_pace_5m: f64,
+    /// Tape pace acceleration proxy (5s minus 30s).
+    pub tape_acceleration: f64,
+    /// Current pace percentile vs session distribution (0.0-1.0).
+    pub pace_percentile: f64,
+    /// Recent stacked imbalance count.
+    pub imbalance_count: usize,
+    /// Number of recent absorption events.
+    pub absorption_event_count: usize,
+    /// Average trade size for current session.
+    pub avg_trade_size: f64,
+
+    // --- 5-Min Opening Range (Leo's setup) ---
+    /// 5-min OR high.
+    pub or5_high: f64,
+    /// 5-min OR low.
+    pub or5_low: f64,
+    /// 5-min OR midpoint (key level).
+    pub or5_mid: f64,
+    /// Whether OR5 range is locked (past 5 minutes).
+    pub or5_locked: bool,
+    /// Break direction from OR5.
+    pub or5_break_direction: Or5BreakDirection,
+    /// Whether price has retested the OR5 midpoint after a break.
+    pub or5_mid_retested: bool,
+
+    // --- Relative Volume ---
+    /// RVOL ratio (1.0 = tracking average).
+    pub rvol_ratio: f64,
+    /// RVOL classification.
+    pub rvol_classification: RvolClassification,
+
+    // --- Day Type ---
+    /// Current day type classification.
+    pub day_type: DayType,
+    /// Profile shape.
+    pub profile_shape: ProfileShape,
+    /// Balance state.
+    pub balance_state: BalanceState,
+    /// Single prints direction relative to POC.
+    pub single_prints_direction: SinglePrintsDirection,
+
+    // --- Pinch Events ---
+    /// Number of recent pinch events.
+    pub pinch_event_count: usize,
+
+    // --- Session Inventory ---
+    /// Cross-session inventory state.
+    pub inventory_state: InventoryState,
+    /// Cross-session inventory direction.
+    pub inventory_direction: InventoryDirection,
+    /// Consecutive sessions with same-direction delta.
+    pub sessions_in_trend: usize,
+
+    // --- Rebid/Reoffer ---
+    /// Number of active acceleration zones.
+    pub active_zone_count: usize,
+
+    // --- TPO Enhancements ---
+    /// Whether the session high is a "poor high" (multiple prints at extreme).
+    pub poor_high: bool,
+    /// Whether the session low is a "poor low" (multiple prints at extreme).
+    pub poor_low: bool,
+    /// Excess at top of profile.
+    pub excess_high: bool,
+    /// Excess at bottom of profile.
+    pub excess_low: bool,
 }
 
 pub struct PipelineEngine {
@@ -81,6 +186,18 @@ pub struct PipelineEngine {
     pub tpo: TpoPipeline,
     pub delta: DeltaPipeline,
     pub levels: LevelsPipeline,
+    pub tape_pace: TapePacePipeline,
+    pub footprint: FootprintPipeline,
+    pub absorption: AbsorptionPipeline,
+    pub trade_size: TradeSizePipeline,
+    pub or5: OpeningRange5MinPipeline,
+    pub rvol: RvolPipeline,
+    pub day_type: DayTypeClassifier,
+    pub rebid_reoffer: RebidReofferPipeline,
+    pub pinch: PinchPipeline,
+    pub session_inventory: SessionInventoryPipeline,
+    last_trade_price: Option<f64>,
+    cumulative_delta: f64,
 }
 
 impl Default for PipelineEngine {
@@ -97,30 +214,118 @@ impl PipelineEngine {
             tpo: TpoPipeline::new(0.25),
             delta: DeltaPipeline::new(0.25),
             levels: LevelsPipeline::default(),
+            tape_pace: TapePacePipeline::new(),
+            footprint: FootprintPipeline::new(0.25),
+            absorption: AbsorptionPipeline::new(0.25),
+            trade_size: TradeSizePipeline::new(),
+            or5: OpeningRange5MinPipeline::new(),
+            rvol: RvolPipeline::new(),
+            day_type: DayTypeClassifier::new(),
+            rebid_reoffer: RebidReofferPipeline::new(),
+            pinch: PinchPipeline::new(),
+            session_inventory: SessionInventoryPipeline::new(),
+            last_trade_price: None,
+            cumulative_delta: 0.0,
         }
     }
 
     /// Reset all pipelines for a new trading session.
-    /// Current session data rolls into prior-day references.
+    /// Accumulates outgoing session delta into the cross-session cumulative total
+    /// before clearing.
     pub fn reset_session(&mut self) {
+        self.cumulative_delta += self.delta.session_delta();
         self.levels.reset_session();
         self.vwap.reset();
         self.tpo.reset();
         self.delta.reset();
+        self.tape_pace.reset();
+        self.footprint.reset();
+        self.absorption.reset();
+        self.trade_size.reset();
+        self.or5.reset();
+        self.rvol.reset();
+        self.day_type.reset();
+        self.rebid_reoffer.reset();
+        self.pinch.reset();
+        self.session_inventory.reset();
+        self.last_trade_price = None;
+    }
+
+    /// Current session's ending state for archival into prior-day levels.
+    pub fn session_end_state(&self) -> SessionEndState {
+        SessionEndState {
+            high: self.levels.session_high,
+            low: self.levels.session_low,
+            close: self.levels.last_price,
+            va_high: self.tpo.va_high(),
+            va_low: self.tpo.va_low(),
+            poc: self.tpo.poc(),
+        }
     }
 
     /// Apply a single trade incrementally to all pipelines.
     pub fn on_trade(&mut self, price: f64, volume: f64, is_buy: bool, minute_of_session: i32) {
+        let now_ms = chrono::Utc::now().timestamp_millis() as f64;
+        self.on_trade_with_timestamp(price, volume, is_buy, minute_of_session, now_ms);
+    }
+
+    /// Apply one trade with explicit timestamp from feed source.
+    pub fn on_trade_with_timestamp(
+        &mut self,
+        price: f64,
+        volume: f64,
+        is_buy: bool,
+        minute_of_session: i32,
+        timestamp_ms: f64,
+    ) {
         self.vwap.add_trade(price, volume);
         self.tpo.add_trade(price, minute_of_session);
         self.delta.add_trade(price, volume, is_buy);
         self.levels.on_trade(price, minute_of_session);
+        self.tape_pace.on_trade(timestamp_ms, volume, price);
+        self.footprint.on_trade(price, volume, is_buy, timestamp_ms);
+        let move_ticks = if let Some(prev) = self.last_trade_price {
+            (price - prev) / 0.25
+        } else {
+            0.0
+        };
+        self.absorption
+            .on_trade(timestamp_ms, price, volume, move_ticks, is_buy);
+        self.trade_size.on_trade(volume, price);
+        self.or5.on_trade(price, minute_of_session);
+        self.rvol.on_trade(volume, minute_of_session);
+        self.rebid_reoffer
+            .on_trade(price, volume, is_buy, timestamp_ms);
+        self.pinch.on_trade(timestamp_ms, price, volume, is_buy);
+        self.session_inventory
+            .update(self.delta.session_delta(), self.delta.dnp());
+
+        // Periodically update day type classifier (every ~30 trades to avoid overhead)
+        if self.vwap.trade_count().is_multiple_of(30) {
+            let tpo_counts = self.tpo.tpo_count_by_price();
+            let single_prints = self.tpo.single_print_prices();
+            self.day_type.update(
+                &tpo_counts,
+                self.tpo.va_high(),
+                self.tpo.va_low(),
+                self.tpo.poc(),
+                self.tpo.ib_high(),
+                self.tpo.ib_low(),
+                self.levels.session_high,
+                self.levels.session_low,
+                &single_prints,
+            );
+        }
+        self.last_trade_price = Some(price);
     }
 
     /// Build current market state snapshot.
     pub fn snapshot(&self, bid: f64, ask: f64) -> MarketState {
         let sd = self.vwap.std_dev();
         let vwap = self.vwap.vwap();
+        let now_ms = chrono::Utc::now().timestamp_millis() as f64;
+        let tape = self.tape_pace.snapshot(now_ms);
+        let size = self.trade_size.snapshot();
         MarketState {
             last_price: self.levels.last_price,
             bid,
@@ -139,7 +344,7 @@ impl PipelineEngine {
             dnva_low: self.delta.dnva_low(),
             dnp: self.delta.dnp(),
             session_delta: self.delta.session_delta(),
-            cumulative_delta: self.delta.session_delta(),
+            cumulative_delta: self.cumulative_delta + self.delta.session_delta(),
             prior_day_high: self.levels.prior_day_high,
             prior_day_low: self.levels.prior_day_low,
             prior_day_close: self.levels.prior_day_close,
@@ -152,6 +357,118 @@ impl PipelineEngine {
             or_low: self.tpo.or_low(),
             ib_high: self.tpo.ib_high(),
             ib_low: self.tpo.ib_low(),
+            tape_pace_5s: tape.ticks_per_sec_5s,
+            tape_pace_30s: tape.ticks_per_sec_30s,
+            tape_pace_5m: tape.ticks_per_sec_5m,
+            tape_acceleration: tape.acceleration,
+            pace_percentile: tape.pace_percentile,
+            imbalance_count: self.footprint.stacked_imbalances(2.0, 3).len(),
+            absorption_event_count: self.absorption.recent_events().len(),
+            avg_trade_size: size.avg_trade_size,
+
+            or5_high: self.or5.or5_high(),
+            or5_low: self.or5.or5_low(),
+            or5_mid: self.or5.or5_mid(),
+            or5_locked: self.or5.is_locked(),
+            or5_break_direction: self.or5.break_direction(),
+            or5_mid_retested: self.or5.mid_retested(),
+
+            rvol_ratio: self.rvol.rvol_ratio(),
+            rvol_classification: self.rvol.classification(),
+
+            day_type: self.day_type.day_type(),
+            profile_shape: self.day_type.profile_shape(),
+            balance_state: self.day_type.balance_state(),
+            single_prints_direction: self.day_type.single_prints_direction(),
+
+            pinch_event_count: self.pinch.recent_events().len(),
+
+            inventory_state: self.session_inventory.state(),
+            inventory_direction: self.session_inventory.direction(),
+            sessions_in_trend: self.session_inventory.sessions_in_trend(),
+
+            active_zone_count: self.rebid_reoffer.active_zones().len(),
+
+            poor_high: self.tpo.poor_high(),
+            poor_low: self.tpo.poor_low(),
+            excess_high: {
+                let (top, _) = self.tpo.excess();
+                top
+            },
+            excess_low: {
+                let (_, bottom) = self.tpo.excess();
+                bottom
+            },
         }
+    }
+
+    /// Run pipeline consistency invariant checks. Returns a list of (check_name, passed, detail).
+    pub fn validate_invariants(&self) -> Vec<(String, bool, String)> {
+        let mut checks = Vec::new();
+
+        let poc = self.tpo.poc();
+        let va_high = self.tpo.va_high();
+        let va_low = self.tpo.va_low();
+
+        // POC should be within the value area
+        let poc_in_va = va_low <= poc && poc <= va_high;
+        checks.push((
+            "poc_within_va".to_string(),
+            poc_in_va,
+            format!("POC={poc:.2} VA=[{va_low:.2}, {va_high:.2}]"),
+        ));
+
+        // Value area should contain approximately 70% of TPOs
+        let tpo_counts = self.tpo.tpo_count_by_price();
+        let total_tpos: usize = tpo_counts.iter().map(|(_, c)| c).sum();
+        if total_tpos > 0 {
+            let va_tpos: usize = tpo_counts
+                .iter()
+                .filter(|(p, _)| *p >= va_low && *p <= va_high)
+                .map(|(_, c)| c)
+                .sum();
+            let va_pct = va_tpos as f64 / total_tpos as f64;
+            let va_valid = (0.60..=0.85).contains(&va_pct);
+            checks.push((
+                "va_contains_70pct_tpos".to_string(),
+                va_valid,
+                format!(
+                    "VA contains {:.1}% of TPOs ({va_tpos}/{total_tpos})",
+                    va_pct * 100.0
+                ),
+            ));
+        }
+
+        // Sum of delta-by-price should equal session delta (within tolerance)
+        let delta_profile = self.delta.profile();
+        let profile_sum: f64 = delta_profile.iter().map(|(_, d)| d).sum();
+        let session_delta = self.delta.session_delta();
+        let delta_diff = (profile_sum - session_delta).abs();
+        let delta_consistent = delta_diff < 0.01;
+        checks.push((
+            "delta_sum_consistency".to_string(),
+            delta_consistent,
+            format!(
+                "profile_sum={profile_sum:.2} session_delta={session_delta:.2} diff={delta_diff:.4}"
+            ),
+        ));
+
+        // DNVA should be within overall price range
+        let dnva_high = self.delta.dnva_high();
+        let dnva_low = self.delta.dnva_low();
+        if !delta_profile.is_empty() {
+            let price_low = delta_profile.first().map(|(p, _)| *p).unwrap_or(0.0);
+            let price_high = delta_profile.last().map(|(p, _)| *p).unwrap_or(0.0);
+            let dnva_valid = dnva_low >= price_low && dnva_high <= price_high;
+            checks.push((
+                "dnva_within_range".to_string(),
+                dnva_valid,
+                format!(
+                    "DNVA=[{dnva_low:.2}, {dnva_high:.2}] range=[{price_low:.2}, {price_high:.2}]"
+                ),
+            ));
+        }
+
+        checks
     }
 }

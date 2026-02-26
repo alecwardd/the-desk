@@ -139,83 +139,80 @@ Each decision follows this structure:
 
 ---
 
+### ADR-008: Pivot from Tauri GUI to Backend Intelligence Platform with MCP
+
+**Date:** 2026-02-26
+**Status:** Decided
+**Supersedes:** ADR-002 (TypeScript context assembly), ADR-005 (4Hz UI throttle)
+
+**Context:** Sierra Chart intentionally blocks CME Group market data from being served over the DTC protocol to third-party clients. This made the original architecture (DTC → Rust → React UI) unviable for NQ futures. Separately, the emergence of MCP (Model Context Protocol) in Cursor IDE created a more powerful interaction pattern than a dedicated GUI — agents with full context can serve as the trading partner interface.
+
+**Decision:** Pivot from a Tauri desktop GUI app with DTC connectivity to a backend intelligence platform that:
+1. Reads Sierra Chart's `.scid` binary tick data files directly (no DTC dependency)
+2. Computes all market structure and microstructure analytics in Rust
+3. Stores raw ticks and computed state in SQLite
+4. Exposes intelligence via MCP server (24 tools) callable by any Cursor agent
+5. Retains Tauri as an optional visualization layer, not the primary interface
+
+**Alternatives considered:**
+- Alternative data providers (Databento, Polygon, CME direct) — viable but adds subscription cost; `.scid` reading is free with existing Sierra Chart license
+- Keep building the Tauri GUI with a different data source — rejected (MCP interface is strictly more capable than a custom GUI for AI-assisted workflows)
+- WebSocket server instead of MCP — rejected (MCP is natively supported by Cursor, no custom client needed)
+
+**Consequences:**
+- Data latency is 1-5 seconds (Sierra Chart file flush interval) — acceptable for directional trading (15-min to 1-hr holds)
+- Not suitable for HFT or sub-second scalping strategies
+- AI agents become first-class consumers of market data, not just a coaching afterthought
+- Prior planning docs (vision, PRDs, design spec, core flows, tech plan) are archived to `docs/archive/v0-tauri-gui/`
+- The project is significantly simpler: no custom DTC client needed for data, no mandatory React UI
+
+---
+
+### ADR-009: .scid file format as canonical data source
+
+**Date:** 2026-02-26
+**Status:** Decided
+
+**Context:** With DTC blocked for CME data, we needed an alternative ingestion path. Sierra Chart stores all intraday data as `.scid` binary files (56-byte header + sequential 40-byte records) on the local filesystem as part of normal operation.
+
+**Decision:** Read `.scid` files directly from Sierra Chart's data directory. Each record contains timestamp, open, high, low, close, volume, bid volume, ask volume — everything needed for all pipeline calculations.
+
+**Alternatives considered:**
+- Sierra Chart DTC server for non-CME data — works but irrelevant for NQ
+- Sierra Chart spreadsheet export — rejected (manual, not real-time)
+- Sierra Chart ACSIL plugin to push data — rejected (requires C++ plugin development and maintenance)
+
+**Consequences:** Zero additional cost. Depends on Sierra Chart being open and writing data. Latency equals Sierra Chart's flush interval (configurable, typically ~1s). The .scid reader must handle partial writes at EOF gracefully.
+
+---
+
+### ADR-010: Trade direction from .scid bid/ask volumes
+
+**Date:** 2026-02-26
+**Status:** Decided
+**Resolves:** ADR-P02 (Trade direction classification)
+
+**Context:** Each `.scid` record includes `BidVolume` and `AskVolume` fields. When `AskVolume > 0`, the trade was at the ask (buyer-initiated). When `BidVolume > 0`, the trade was at the bid (seller-initiated).
+
+**Decision:** Use Sierra Chart's native bid/ask volume classification directly from `.scid` records. No secondary classification needed.
+
+**Consequences:** Delta calculations are as accurate as Sierra Chart's own classification, which uses the exchange-provided aggressor flag where available.
+
+---
+
 ## Pending Decisions
-
-These decisions need to be resolved before or during Phase 1 implementation.
-
-### ADR-P01: DTC message flow quirks in Sierra Chart
-
-**Source:** phase-1-prd.md Section 9, Question 1
-**Impact:** DTC client development
-**Owner:** _TBD_
-**Deadline:** Before DTC client implementation
-
----
-
-### ADR-P02: Trade direction classification between bid and ask
-
-**Source:** phase-1-prd.md Section 9, Question 2
-**Impact:** Delta calculation accuracy
-**Owner:** _TBD_
-**Deadline:** Before delta pipeline implementation
-
-**Candidates:**
-- Proximity-based: classify by nearest of bid/ask
-- Last-trade-direction: inherit direction of previous trade
-- Split: count as 0.5 buy + 0.5 sell
-
----
-
-### ADR-P03: Sierra Chart CSV trade log format
-
-**Source:** phase-1-prd.md Section 9, Question 3
-**Impact:** Trade import feature (LOG-03)
-**Owner:** _TBD_
-**Deadline:** Before trade import implementation
-**Action needed:** Obtain a sample CSV file from a real Sierra Chart trade log
-
----
-
-### ADR-P04: Claude API latency benchmarking
-
-**Source:** phase-1-prd.md Section 9, Question 4
-**Impact:** LLM-05 (coaching prompt <2s)
-**Owner:** _TBD_
-**Deadline:** Early Phase 1 prototyping
-
----
-
-### ADR-P05: Tauri 2.x Windows maturity assessment
-
-**Source:** phase-1-prd.md Section 9, Question 5
-**Impact:** Framework choice
-**Owner:** _TBD_
-**Deadline:** Before full Phase 1 implementation
-
----
 
 ### ADR-P06: NQ contract rollover handling
 
-**Source:** phase-1-prd.md Section 9, Question 6
-**Impact:** Continuous operation
+**Impact:** Symbol naming in `.scid` file paths, continuous data across quarters
 **Owner:** _TBD_
 **Deadline:** Before first live deployment near a rollover date
 
 ---
 
-### ADR-P07: Replay library licensing
-
-**Source:** phase-1-prd.md Section 9, Question 7
-**Impact:** RPL-08 (curated session library)
-**Owner:** _TBD_
-**Deadline:** Before shipping curated replays
-
----
-
 ### ADR-P08: Options data provider selection
 
-**Source:** phase-1-prd.md Section 9, Question 8; phase-2-prd.md Section 3.1
-**Impact:** Phase 2 options pipeline
+**Impact:** Phase 2 options pipeline (gamma, charm, dealer positioning)
 **Owner:** _TBD_
 **Deadline:** Before Phase 2 implementation begins
 **Action needed:** Use `options-api-researcher` subagent to evaluate providers
@@ -224,11 +221,10 @@ These decisions need to be resolved before or during Phase 1 implementation.
 
 ### ADR-P09: Multi-session day handling
 
-**Impact:** Risk tracking, session boundaries, recording
+**Impact:** Risk tracking, session boundaries
 **Owner:** _TBD_
-**Deadline:** Phase 1 implementation
 
-**Question:** Some traders trade the London open, take a break, then trade RTH. How should sessions, risk tracking, and recordings handle this?
+**Question:** The trader often trades the London open, takes a break, then trades RTH. How should sessions and risk tracking handle this?
 
 **Candidates:**
 - Each sit-down is a separate session with independent risk tracking

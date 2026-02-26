@@ -1,0 +1,1 @@
+{"mcpServers":{"the-desk":{"command":"cargo","args":["run","--release","--bin","the-desk-mcp"],"cwd":"src-tauri"}}}

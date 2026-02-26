@@ -6,6 +6,14 @@ pub use messages::{decode_trade_side, DtcMessageType, RawDtcMessage};
 pub use mock_server::run_mock_dtc_server;
 pub use parser::DtcFrameParser;
 
+use crate::feed::FeedEvent;
+pub use crate::feed::TradeSide;
+use messages::{
+    build_encoding_request_payload, build_heartbeat_payload, build_logon_request_payload,
+    build_market_data_request_payload, decode_trade_side_u16, parse_reject_text, LogonResult,
+    DEFAULT_HEARTBEAT_INTERVAL,
+};
+
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
@@ -17,43 +25,7 @@ use tokio::sync::broadcast;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-/// Side of a trade execution (buy, sell, or unclassified).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum TradeSide {
-    Buy,
-    Sell,
-    Unknown,
-}
-
-/// Events emitted by the DTC client to downstream consumers.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum DtcEvent {
-    /// DTC connection established and ready.
-    Connected,
-    /// DTC connection lost or closed.
-    Disconnected,
-    /// A trade execution received from the data feed.
-    Trade {
-        symbol_id: u32,
-        price: f64,
-        volume: f64,
-        side: TradeSide,
-        timestamp: f64,
-    },
-    /// A bid/ask quote update received from the data feed.
-    Quote {
-        symbol_id: u32,
-        bid: f64,
-        ask: f64,
-        bid_size: f64,
-        ask_size: f64,
-        timestamp: f64,
-    },
-    /// An error encountered during DTC communication.
-    Error { message: String },
-}
+pub type DtcEvent = FeedEvent;
 
 /// DTC connection lifecycle states for the handshake state machine.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,6 +71,8 @@ pub enum DtcError {
     InvalidTransition(ConnectionState, ConnectionState),
     #[error("connection error: {0}")]
     Connection(String),
+    #[error("server rejected logon: {0}")]
+    Rejected(String),
 }
 
 /// Manages a DTC protocol connection with handshake, heartbeat, and reconnect logic.
@@ -215,8 +189,29 @@ impl DtcClient {
 
 fn parse_dtc_frame(msg: &RawDtcMessage) -> Option<DtcEvent> {
     match msg.message_type {
-        DtcMessageType::MarketDataUpdateTrade => parse_trade_payload(&msg.payload),
-        DtcMessageType::MarketDataUpdateBidAsk => parse_quote_payload(&msg.payload),
+        DtcMessageType::MarketDataUpdateTrade => parse_trade_107(&msg.payload),
+        DtcMessageType::MarketDataUpdateBidAsk => parse_quote_108(&msg.payload),
+        DtcMessageType::MarketDataUpdateTradeCompact => parse_trade_compact_112(&msg.payload),
+        DtcMessageType::MarketDataUpdateBidAskCompact => parse_quote_compact_117(&msg.payload),
+        DtcMessageType::MarketDataUpdateTradeWithUnbundledIndicator => {
+            parse_trade_unbundled_137(&msg.payload)
+        }
+        DtcMessageType::MarketDataUpdateTradeNoTimestamp => parse_trade_no_ts_142(&msg.payload),
+        DtcMessageType::MarketDataUpdateBidAskNoTimestamp => parse_quote_no_ts_143(&msg.payload),
+        DtcMessageType::MarketDataUpdateBidAskFloatWithMilliseconds => {
+            parse_quote_float_ms_144(&msg.payload)
+        }
+        DtcMessageType::MarketDataReject => {
+            let (sym_id, text) = parse_reject_text(&msg.payload);
+            eprintln!("[DTC] MARKET_DATA_REJECT sym_id={sym_id}: {text}");
+            Some(DtcEvent::Error {
+                message: format!("Market data rejected for symbol {sym_id}: {text}"),
+            })
+        }
+        DtcMessageType::MarketDataSnapshot => {
+            eprintln!("[DTC] Received MARKET_DATA_SNAPSHOT — subscription accepted");
+            None
+        }
         _ => None,
     }
 }
@@ -235,57 +230,103 @@ fn set_atomic_state(state: &Arc<AtomicU8>, next: ConnectionState) {
 }
 
 async fn perform_handshake(stream: &mut TcpStream) -> Result<(), DtcError> {
-    stream
-        .write_all(&build_frame(
-            DtcMessageType::EncodingRequest as u16,
-            &0i32.to_le_bytes(),
-        ))
-        .await
-        .map_err(|e| DtcError::Connection(format!("Failed to write encoding request: {e}")))?;
-    stream
-        .write_all(&build_frame(
-            DtcMessageType::LogonRequest as u16,
-            &[1, 0, 0, 0],
-        ))
-        .await
-        .map_err(|e| DtcError::Connection(format!("Failed to write logon request: {e}")))?;
-
     let mut parser = DtcFrameParser::default();
     let mut buf = [0u8; 4096];
     let mut got_encoding = false;
-    let mut got_logon = false;
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut early_logon: Option<LogonResult> = None;
 
-    while !(got_encoding && got_logon) {
+    // Step 1: Send ENCODING_REQUEST with protocol version 8, binary encoding.
+    stream
+        .write_all(&build_frame(
+            DtcMessageType::EncodingRequest as u16,
+            &build_encoding_request_payload(),
+        ))
+        .await
+        .map_err(|e| DtcError::Connection(format!("Failed to write encoding request: {e}")))?;
+
+    // Step 2: Wait for ENCODING_RESPONSE (buffer any early LOGON_RESPONSE).
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !got_encoding {
         let remaining = deadline
             .checked_duration_since(Instant::now())
             .unwrap_or(Duration::from_millis(1));
-        let read_result = tokio::time::timeout(remaining, stream.read(&mut buf))
+        let n = tokio::time::timeout(remaining, stream.read(&mut buf))
             .await
-            .map_err(|_| DtcError::Connection("Handshake timed out".to_string()))?
-            .map_err(|e| DtcError::Connection(format!("Handshake read failed: {e}")))?;
-        if read_result == 0 {
+            .map_err(|_| {
+                DtcError::Connection("Timed out waiting for encoding response".to_string())
+            })?
+            .map_err(|e| DtcError::Connection(format!("Read failed during encoding: {e}")))?;
+        if n == 0 {
             return Err(DtcError::Connection(
-                "Server closed during handshake".to_string(),
+                "Server closed during encoding negotiation".to_string(),
             ));
         }
-        parser.push_bytes(&buf[..read_result]);
+        parser.push_bytes(&buf[..n]);
         while let Some(msg) = parser.next_message() {
             match msg.message_type {
                 DtcMessageType::EncodingResponse => got_encoding = true,
-                DtcMessageType::LogonResponse => got_logon = true,
+                DtcMessageType::LogonResponse => {
+                    early_logon = Some(LogonResult::from_payload(&msg.payload));
+                }
                 _ => {}
             }
         }
     }
-    Ok(())
+
+    // Step 3: Send LOGON_REQUEST with protocol version 8, heartbeat, client name.
+    stream
+        .write_all(&build_frame(
+            DtcMessageType::LogonRequest as u16,
+            &build_logon_request_payload(DEFAULT_HEARTBEAT_INTERVAL),
+        ))
+        .await
+        .map_err(|e| DtcError::Connection(format!("Failed to write logon request: {e}")))?;
+
+    // Step 4: Check for early logon response or wait for one.
+    if let Some(logon) = early_logon {
+        return validate_logon(logon);
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .unwrap_or(Duration::from_millis(1));
+        let n = tokio::time::timeout(remaining, stream.read(&mut buf))
+            .await
+            .map_err(|_| DtcError::Connection("Timed out waiting for logon response".to_string()))?
+            .map_err(|e| DtcError::Connection(format!("Read failed during logon: {e}")))?;
+        if n == 0 {
+            return Err(DtcError::Connection(
+                "Server closed during logon".to_string(),
+            ));
+        }
+        parser.push_bytes(&buf[..n]);
+        while let Some(msg) = parser.next_message() {
+            if matches!(msg.message_type, DtcMessageType::LogonResponse) {
+                return validate_logon(LogonResult::from_payload(&msg.payload));
+            }
+        }
+    }
+}
+
+fn validate_logon(logon: LogonResult) -> Result<(), DtcError> {
+    if logon.is_success() {
+        return Ok(());
+    }
+    let reason = if logon.result_text.is_empty() {
+        format!("Logon rejected (result code {})", logon.result)
+    } else {
+        logon.result_text
+    };
+    Err(DtcError::Rejected(reason))
 }
 
 async fn subscribe_symbol(stream: &mut TcpStream, symbol: &str) -> Result<(), DtcError> {
     stream
         .write_all(&build_frame(
             DtcMessageType::MarketDataRequest as u16,
-            symbol.as_bytes(),
+            &build_market_data_request_payload(1, symbol),
         ))
         .await
         .map_err(|e| DtcError::Connection(format!("Failed to write market data request: {e}")))?;
@@ -348,6 +389,14 @@ async fn run_connection_manager(
                             break;
                         }
                     }
+                    Err(DtcError::Rejected(reason)) => {
+                        set_atomic_state(&state, ConnectionState::Disconnected);
+                        let _ = tx.send(DtcEvent::Error {
+                            message: format!("Server rejected logon: {reason}"),
+                        });
+                        let _ = tx.send(DtcEvent::Disconnected);
+                        break; // deterministic failure — do not retry
+                    }
                     Err(err) => {
                         set_atomic_state(&state, ConnectionState::Disconnected);
                         let _ = tx.send(DtcEvent::Error {
@@ -396,7 +445,7 @@ async fn run_feed_loop(
             }
             _ = heartbeat_tick.tick() => {
                 write_half
-                    .write_all(&build_frame(DtcMessageType::Heartbeat as u16, &[]))
+                    .write_all(&build_frame(DtcMessageType::Heartbeat as u16, &build_heartbeat_payload()))
                     .await
                     .map_err(|e| DtcError::Connection(format!("Heartbeat write failed: {e}")))?;
                 if last_incoming.elapsed() > Duration::from_secs(30) {
@@ -415,6 +464,13 @@ async fn run_feed_loop(
                     if matches!(msg.message_type, DtcMessageType::Heartbeat) {
                         continue;
                     }
+                    if matches!(msg.message_type, DtcMessageType::Unknown) {
+                        eprintln!(
+                            "[DTC] Unhandled message type={} payload_len={}",
+                            msg.raw_type,
+                            msg.payload.len()
+                        );
+                    }
                     if let Some(event) = parse_dtc_frame(&msg) {
                         let _ = tx.send(event);
                     }
@@ -424,15 +480,28 @@ async fn run_feed_loop(
     }
 }
 
-fn parse_trade_payload(payload: &[u8]) -> Option<DtcEvent> {
-    if payload.len() < 29 {
+// ---------------------------------------------------------------------------
+// Trade parsers
+// ---------------------------------------------------------------------------
+
+/// Type 107 — `s_MarketDataUpdateTrade` (pack(8))
+///
+/// Payload offsets:
+///   0..4   SymbolID        (u32)
+///   4..6   AtBidOrAsk      (u16)
+///   6..12  _padding_
+///   12..20 Price            (f64)
+///   20..28 Volume           (f64)
+///   28..36 DateTime         (f64 / t_DateTimeWithMilliseconds)
+fn parse_trade_107(payload: &[u8]) -> Option<DtcEvent> {
+    if payload.len() < 36 {
         return None;
     }
     let symbol_id = u32::from_le_bytes(payload[0..4].try_into().ok()?);
-    let side = decode_trade_side(payload[4]);
-    let price = f64::from_le_bytes(payload[5..13].try_into().ok()?);
-    let volume = f64::from_le_bytes(payload[13..21].try_into().ok()?);
-    let timestamp = f64::from_le_bytes(payload[21..29].try_into().ok()?);
+    let side = decode_trade_side_u16(u16::from_le_bytes(payload[4..6].try_into().ok()?));
+    let price = f64::from_le_bytes(payload[12..20].try_into().ok()?);
+    let volume = f64::from_le_bytes(payload[20..28].try_into().ok()?);
+    let timestamp = f64::from_le_bytes(payload[28..36].try_into().ok()?);
     Some(DtcEvent::Trade {
         symbol_id,
         price,
@@ -442,17 +511,113 @@ fn parse_trade_payload(payload: &[u8]) -> Option<DtcEvent> {
     })
 }
 
-fn parse_quote_payload(payload: &[u8]) -> Option<DtcEvent> {
-    if payload.len() < 36 {
+/// Type 112 — `s_MarketDataUpdateTradeCompact` (pack(8))
+///
+/// Payload offsets:
+///   0..4   Price       (f32)
+///   4..8   Volume      (f32)
+///   8..12  DateTime    (u32 / t_DateTime4Byte)
+///   12..16 SymbolID    (u32)
+///   16..18 AtBidOrAsk  (u16)
+fn parse_trade_compact_112(payload: &[u8]) -> Option<DtcEvent> {
+    if payload.len() < 18 {
+        return None;
+    }
+    let price = f32::from_le_bytes(payload[0..4].try_into().ok()?) as f64;
+    let volume = f32::from_le_bytes(payload[4..8].try_into().ok()?) as f64;
+    let dt_raw = u32::from_le_bytes(payload[8..12].try_into().ok()?);
+    let symbol_id = u32::from_le_bytes(payload[12..16].try_into().ok()?);
+    let side = decode_trade_side_u16(u16::from_le_bytes(payload[16..18].try_into().ok()?));
+    Some(DtcEvent::Trade {
+        symbol_id,
+        price,
+        volume,
+        side,
+        timestamp: dt_raw as f64,
+    })
+}
+
+/// Type 137 — `s_MarketDataUpdateTradeWithUnbundledIndicator` (pack(8))
+///
+/// Payload offsets:
+///   0..4   SymbolID                    (u32)
+///   4      AtBidOrAsk                  (u8 / AtBidOrAskEnum8)
+///   5      UnbundledTradeIndicator     (u8)
+///   6      SaleCondition               (u8)
+///   7      Reserve_1                   (u8)
+///   8..12  Reserve_2                   (u32)
+///   12..16 _padding_ (align Price to 8)
+///   16..24 Price                       (f64)
+///   24..28 Volume                      (u32)
+///   28..32 Reserve_3                   (u32)
+///   32..40 DateTime                    (f64 / t_DateTimeWithMilliseconds)
+fn parse_trade_unbundled_137(payload: &[u8]) -> Option<DtcEvent> {
+    if payload.len() < 40 {
+        return None;
+    }
+    let symbol_id = u32::from_le_bytes(payload[0..4].try_into().ok()?);
+    let side = decode_trade_side(payload[4]);
+    let price = f64::from_le_bytes(payload[16..24].try_into().ok()?);
+    let volume = u32::from_le_bytes(payload[24..28].try_into().ok()?) as f64;
+    let timestamp = f64::from_le_bytes(payload[32..40].try_into().ok()?);
+    Some(DtcEvent::Trade {
+        symbol_id,
+        price,
+        volume,
+        side,
+        timestamp,
+    })
+}
+
+/// Type 142 — `s_MarketDataUpdateTradeNoTimestamp` (pack(1))
+///
+/// Payload offsets:
+///   0..4  SymbolID    (u32)
+///   4..8  Price       (f32)
+///   8..12 Volume      (u32)
+///   12    AtBidOrAsk  (u8 / AtBidOrAskEnum8)
+fn parse_trade_no_ts_142(payload: &[u8]) -> Option<DtcEvent> {
+    if payload.len() < 13 {
+        return None;
+    }
+    let symbol_id = u32::from_le_bytes(payload[0..4].try_into().ok()?);
+    let price = f32::from_le_bytes(payload[4..8].try_into().ok()?) as f64;
+    let volume = u32::from_le_bytes(payload[8..12].try_into().ok()?) as f64;
+    let side = decode_trade_side(payload[12]);
+    Some(DtcEvent::Trade {
+        symbol_id,
+        price,
+        volume,
+        side,
+        timestamp: 0.0,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Quote parsers
+// ---------------------------------------------------------------------------
+
+/// Type 108 — `s_MarketDataUpdateBidAsk` (pack(8))
+///
+/// Payload offsets:
+///   0..4   SymbolID      (u32)
+///   4..12  BidPrice      (f64)
+///   12..16 BidQuantity   (f32)
+///   16..20 _padding_
+///   20..28 AskPrice      (f64)
+///   28..32 AskQuantity   (f32)
+///   32..36 DateTime      (u32 / t_DateTime4Byte)
+fn parse_quote_108(payload: &[u8]) -> Option<DtcEvent> {
+    if payload.len() < 32 {
         return None;
     }
     let symbol_id = u32::from_le_bytes(payload[0..4].try_into().ok()?);
     let bid = f64::from_le_bytes(payload[4..12].try_into().ok()?);
-    let ask = f64::from_le_bytes(payload[12..20].try_into().ok()?);
-    let bid_size = f64::from_le_bytes(payload[20..28].try_into().ok()?);
-    let ask_size = f64::from_le_bytes(payload[28..36].try_into().ok()?);
-    let timestamp = if payload.len() >= 44 {
-        f64::from_le_bytes(payload[36..44].try_into().ok()?)
+    let bid_size = f32::from_le_bytes(payload[12..16].try_into().ok()?) as f64;
+    let ask = f64::from_le_bytes(payload[20..28].try_into().ok()?);
+    let ask_size = f32::from_le_bytes(payload[28..32].try_into().ok()?) as f64;
+    let timestamp = if payload.len() >= 36 {
+        u32::from_le_bytes(payload[32..36].try_into().ok()?) as f64
     } else {
         0.0
     };
@@ -463,6 +628,91 @@ fn parse_quote_payload(payload: &[u8]) -> Option<DtcEvent> {
         bid_size,
         ask_size,
         timestamp,
+    })
+}
+
+/// Type 117 — `s_MarketDataUpdateBidAskCompact` (pack(8), all float)
+///
+/// Payload offsets:
+///   0..4   BidPrice      (f32)
+///   4..8   BidQuantity   (f32)
+///   8..12  AskPrice      (f32)
+///   12..16 AskQuantity   (f32)
+///   16..20 DateTime      (u32)
+///   20..24 SymbolID      (u32)
+fn parse_quote_compact_117(payload: &[u8]) -> Option<DtcEvent> {
+    if payload.len() < 24 {
+        return None;
+    }
+    let bid = f32::from_le_bytes(payload[0..4].try_into().ok()?) as f64;
+    let bid_size = f32::from_le_bytes(payload[4..8].try_into().ok()?) as f64;
+    let ask = f32::from_le_bytes(payload[8..12].try_into().ok()?) as f64;
+    let ask_size = f32::from_le_bytes(payload[12..16].try_into().ok()?) as f64;
+    let dt_raw = u32::from_le_bytes(payload[16..20].try_into().ok()?);
+    let symbol_id = u32::from_le_bytes(payload[20..24].try_into().ok()?);
+    Some(DtcEvent::Quote {
+        symbol_id,
+        bid,
+        ask,
+        bid_size,
+        ask_size,
+        timestamp: dt_raw as f64,
+    })
+}
+
+/// Type 143 — `s_MarketDataUpdateBidAskNoTimeStamp` (pack(1))
+///
+/// Payload offsets:
+///   0..4   SymbolID      (u32)
+///   4..8   BidPrice      (f32)
+///   8..12  BidQuantity   (u32)
+///   12..16 AskPrice      (f32)
+///   16..20 AskQuantity   (u32)
+fn parse_quote_no_ts_143(payload: &[u8]) -> Option<DtcEvent> {
+    if payload.len() < 20 {
+        return None;
+    }
+    let symbol_id = u32::from_le_bytes(payload[0..4].try_into().ok()?);
+    let bid = f32::from_le_bytes(payload[4..8].try_into().ok()?) as f64;
+    let bid_size = u32::from_le_bytes(payload[8..12].try_into().ok()?) as f64;
+    let ask = f32::from_le_bytes(payload[12..16].try_into().ok()?) as f64;
+    let ask_size = u32::from_le_bytes(payload[16..20].try_into().ok()?) as f64;
+    Some(DtcEvent::Quote {
+        symbol_id,
+        bid,
+        ask,
+        bid_size,
+        ask_size,
+        timestamp: 0.0,
+    })
+}
+
+/// Type 144 — `s_MarketDataUpdateBidAskFloatWithMilliseconds` (pack(1))
+///
+/// Payload offsets:
+///   0..4   SymbolID      (u32)
+///   4..8   BidPrice      (f32)
+///   8..12  BidQuantity   (f32)
+///   12..16 AskPrice      (f32)
+///   16..20 AskQuantity   (f32)
+///   20..28 DateTime      (i64 / t_DateTimeWithMillisecondsInt)
+fn parse_quote_float_ms_144(payload: &[u8]) -> Option<DtcEvent> {
+    if payload.len() < 28 {
+        return None;
+    }
+    let symbol_id = u32::from_le_bytes(payload[0..4].try_into().ok()?);
+    let bid = f32::from_le_bytes(payload[4..8].try_into().ok()?) as f64;
+    let bid_size = f32::from_le_bytes(payload[8..12].try_into().ok()?) as f64;
+    let ask = f32::from_le_bytes(payload[12..16].try_into().ok()?) as f64;
+    let ask_size = f32::from_le_bytes(payload[16..20].try_into().ok()?) as f64;
+    let ts_raw = i64::from_le_bytes(payload[20..28].try_into().ok()?);
+    Some(DtcEvent::Quote {
+        symbol_id,
+        bid,
+        ask,
+        bid_size,
+        ask_size,
+        timestamp: ts_raw as f64,
     })
 }
 

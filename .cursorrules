@@ -1,12 +1,12 @@
 # The Desk — Cursor Rules
 
-You are working on The Desk, a real-time AI trading co-pilot for discretionary NQ futures traders. Read CLAUDE.md for full project rules. This file adds Cursor-specific guidance.
+You are working on The Desk, a backend intelligence platform for discretionary NQ futures traders. Read CLAUDE.md for full project rules. This file adds Cursor-specific guidance.
 
 ## Quick Reference
 
-**Architecture:** 3 layers — Rust pipelines (deterministic, fast) → Rust rules engine (deterministic) → TypeScript/Claude API orchestrator (coaching prompts)
+**Architecture:** Sierra Chart (.scid files) → Rust Pipeline Engine → SQLite → MCP Server → Cursor Agents
 
-**Stack:** Tauri 2.x + Rust backend + React/TypeScript frontend + shadcn/ui + SQLite + Claude API
+**Stack:** Rust backend + SQLite + MCP (rmcp) + Tauri 2.x (optional visualization) + React/TypeScript (optional UI)
 
 **Key constraint:** The Desk NEVER places trades, generates signals, or gives financial advice. It reflects the trader's own rules back to them.
 
@@ -15,32 +15,30 @@ You are working on The Desk, a real-time AI trading co-pilot for discretionary N
 1. Read `CLAUDE.md` for full project rules and "Never Do" list
 2. Read the relevant skill in `skills/` for domain knowledge:
    - Pipelines → `skills/trading-domain/SKILL.md`
-   - DTC client → `skills/dtc-protocol/SKILL.md`
+   - DTC/.scid → `skills/dtc-protocol/SKILL.md`
    - IPC → `skills/tauri-bridge/SKILL.md`
    - UI copy/prompts → `skills/compliance-research/SKILL.md`
-3. Check `docs/phase-1-prd.md` for specific requirements and acceptance criteria
 
 ## Coding Patterns
 
 ### Rust (src-tauri/)
 - All pipeline calculations are **incremental** — never recalculate from scratch
 - Use `tokio` async runtime, `serde` for serialization, `thiserror` for errors
-- `#[serde(rename_all = "camelCase")]` on all types that cross IPC boundary
 - NQ tick size = 0.25 points, tick value = $5.00. Never hardcode wrong values.
 - Delta: trades at ask = buy (positive), trades at bid = sell (negative)
+- MCP tools use `rmcp` with `#[tool_router]` / `#[tool_handler]` macros
+- Tool params: `Parameters(params): Parameters<T>` where T derives `Deserialize + JsonSchema + Default`
 
-### TypeScript (src/)
+### MCP Server (src/bin/the-desk-mcp.rs)
+- 24 tools exposed via stdio transport
+- All tools return `Result<CallToolResult, McpError>`
+- Database access through `Arc<Mutex<Database>>`
+- New tools follow the pattern: add param struct, add `#[tool(...)]` handler, register in router
+
+### TypeScript (src/) — Optional UI Layer
 - All Tauri `invoke()` calls go through `src/lib/tauri-bridge.ts`
-- All Tauri event listeners live in `src/hooks/use*.ts`
 - No `any` types. Define interfaces in `src/lib/types.ts`
 - Components use shadcn/ui with dark theme
-- Keyboard-first interaction (traders don't grab the mouse during sessions)
-
-### IPC
-- **Commands** (frontend → Rust): user actions, queries, config changes
-- **Events** (Rust → frontend): streaming data, alerts, status changes
-- Throttle market state events to ≤4 Hz (250ms) — never emit per-tick
-- Coaching prompts emit individually (not throttled)
 
 ## Trading Terms (Get These Right)
 
@@ -48,8 +46,10 @@ You are working on The Desk, a real-time AI trading co-pilot for discretionary N
 - **DNP** = Delta Neutral Pivot (where cumulative delta crosses zero)
 - **Single Prints** = exactly one TPO letter at a price (initiative activity)
 - **IB** = Initial Balance = first 60 minutes. **OR** = Opening Range = first 30 minutes.
+- **OR5** = 5-minute Opening Range (Leo's PTT setup)
 - **R** = trader-defined risk unit, NOT a fixed number of points
 - **NQ tick** = 0.25 points = $5.00/contract
+- **Pinch** = delta momentum reversal — heavy one-sided delta met by high-pace opposing flow
 
 ## Prompt/UI Copy Rules
 

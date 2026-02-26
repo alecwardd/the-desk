@@ -1,3 +1,5 @@
+pub mod setup_templates;
+
 use crate::pipelines::MarketState;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -57,6 +59,39 @@ pub enum ConditionField {
     PriceNearPoc,
     PriceInVa,
     PriceInDnva,
+
+    // --- Microstructure ---
+    TapePacePercentile,
+    AbsorptionAtPrice,
+    ExhaustionDetected,
+    PinchDetected,
+
+    // --- Profile / Day Type ---
+    DayType,
+    ProfileShape,
+    BalanceState,
+    SinglePrintsDirection,
+
+    // --- Volume Context ---
+    RvolClassification,
+
+    // --- 5-Min OR (Leo's setup) ---
+    PriceVsOr5High,
+    PriceVsOr5Low,
+    PriceVsOr5Mid,
+    Or5BrokenDirection,
+
+    // --- Zones ---
+    ActiveRebidZone,
+    ActiveReofferZone,
+    RebidZoneHeld,
+
+    // --- Inventory ---
+    SessionInventoryState,
+    DeltaConfirmationAtLevel,
+
+    // --- IB Extensions ---
+    PriceVsIbExtension,
 }
 
 /// Comparison operator for a condition.
@@ -346,6 +381,136 @@ fn evaluate_typed_condition(
                 return match &cond.operator {
                     ConditionOperator::GreaterThan | ConditionOperator::Above => width > *threshold,
                     ConditionOperator::LessThan | ConditionOperator::Below => width < *threshold,
+                    _ => false,
+                };
+            }
+            return false;
+        }
+
+        // --- Microstructure ---
+        ConditionField::TapePacePercentile => {
+            if let ConditionValue::Number(threshold) = &cond.value {
+                return match &cond.operator {
+                    ConditionOperator::GreaterThan | ConditionOperator::Above => {
+                        market.pace_percentile > *threshold
+                    }
+                    ConditionOperator::LessThan | ConditionOperator::Below => {
+                        market.pace_percentile < *threshold
+                    }
+                    _ => false,
+                };
+            }
+            return false;
+        }
+        ConditionField::AbsorptionAtPrice => {
+            return market.absorption_event_count > 0;
+        }
+        ConditionField::ExhaustionDetected => {
+            return market.absorption_event_count > 0;
+        }
+        ConditionField::PinchDetected => {
+            return market.pinch_event_count > 0;
+        }
+
+        // --- Profile / Day Type ---
+        ConditionField::DayType => {
+            if let ConditionValue::Text(expected) = &cond.value {
+                let actual = format!("{:?}", market.day_type);
+                return actual.to_lowercase() == expected.to_lowercase();
+            }
+            return false;
+        }
+        ConditionField::ProfileShape => {
+            if let ConditionValue::Text(expected) = &cond.value {
+                let actual = format!("{:?}", market.profile_shape);
+                return actual.to_lowercase() == expected.to_lowercase();
+            }
+            return false;
+        }
+        ConditionField::BalanceState => {
+            if let ConditionValue::Text(expected) = &cond.value {
+                let actual = format!("{:?}", market.balance_state);
+                return actual.to_lowercase() == expected.to_lowercase();
+            }
+            return false;
+        }
+        ConditionField::SinglePrintsDirection => {
+            if let ConditionValue::Text(expected) = &cond.value {
+                let actual = format!("{:?}", market.single_prints_direction);
+                return actual.to_lowercase() == expected.to_lowercase();
+            }
+            // Boolean check: any single prints present
+            return market.single_prints_direction != crate::pipelines::SinglePrintsDirection::None;
+        }
+
+        // --- Volume Context ---
+        ConditionField::RvolClassification => {
+            if let ConditionValue::Text(expected) = &cond.value {
+                let actual = format!("{:?}", market.rvol_classification);
+                return actual.to_lowercase() == expected.to_lowercase();
+            }
+            return false;
+        }
+
+        // --- 5-Min OR ---
+        ConditionField::PriceVsOr5High => {
+            if !market.or5_locked {
+                return false;
+            }
+            market.or5_high
+        }
+        ConditionField::PriceVsOr5Low => {
+            if !market.or5_locked {
+                return false;
+            }
+            market.or5_low
+        }
+        ConditionField::PriceVsOr5Mid => {
+            if !market.or5_locked {
+                return false;
+            }
+            market.or5_mid
+        }
+        ConditionField::Or5BrokenDirection => {
+            if let ConditionValue::Text(expected) = &cond.value {
+                let actual = format!("{:?}", market.or5_break_direction);
+                return actual.to_lowercase() == expected.to_lowercase();
+            }
+            return market.or5_break_direction != crate::pipelines::Or5BreakDirection::None;
+        }
+
+        // --- Zones ---
+        ConditionField::ActiveRebidZone => {
+            return market.active_zone_count > 0;
+        }
+        ConditionField::ActiveReofferZone => {
+            return market.active_zone_count > 0;
+        }
+        ConditionField::RebidZoneHeld => {
+            return false; // requires zone-level detail not in MarketState
+        }
+
+        // --- Inventory ---
+        ConditionField::SessionInventoryState => {
+            if let ConditionValue::Text(expected) = &cond.value {
+                let actual = format!("{:?}", market.inventory_state);
+                return actual.to_lowercase() == expected.to_lowercase();
+            }
+            return false;
+        }
+        ConditionField::DeltaConfirmationAtLevel => {
+            return false; // requires price + direction context not in MarketState
+        }
+
+        // --- IB Extensions ---
+        ConditionField::PriceVsIbExtension => {
+            if let ConditionValue::Number(multiplier) = &cond.value {
+                let ib_range = market.ib_high - market.ib_low;
+                let ext_high = market.ib_high + ib_range * multiplier;
+                let ext_low = market.ib_low - ib_range * multiplier;
+                return match &cond.operator {
+                    ConditionOperator::Above => price > ext_high,
+                    ConditionOperator::Below => price < ext_low,
                     _ => false,
                 };
             }

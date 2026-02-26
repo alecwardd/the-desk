@@ -28,6 +28,7 @@ impl DtcFrameParser {
         self.buffer.advance(size);
         Some(RawDtcMessage {
             message_type: DtcMessageType::from(msg_type_raw),
+            raw_type: msg_type_raw,
             payload,
         })
     }

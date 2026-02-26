@@ -19,17 +19,31 @@ pub async fn run_mock_dtc_server(bind_addr: &str) -> io::Result<()> {
     loop {
         let (mut socket, _) = listener.accept().await?;
         tokio::spawn(async move {
-            // encoding response
-            let _ = socket.write_all(&build_frame(7, &0i32.to_le_bytes())).await;
-            // logon response
-            let _ = socket.write_all(&build_frame(2, &[1, 0, 0, 0])).await;
+            // Encoding response: ProtocolVersion(8) | Encoding(0=binary) | "DTC\0"
+            let mut enc_resp = Vec::with_capacity(12);
+            enc_resp.extend_from_slice(&8i32.to_le_bytes());
+            enc_resp.extend_from_slice(&0i32.to_le_bytes());
+            enc_resp.extend_from_slice(b"DTC\0");
+            let _ = socket.write_all(&build_frame(7, &enc_resp)).await;
+
+            // Logon response: ProtocolVersion(8) | Result(1=success)
+            let mut logon_resp = Vec::with_capacity(8);
+            logon_resp.extend_from_slice(&8i32.to_le_bytes());
+            logon_resp.extend_from_slice(&1i32.to_le_bytes());
+            let _ = socket.write_all(&build_frame(2, &logon_resp)).await;
             let mut tick: u32 = 0;
             loop {
                 let price = 21000.0 + (tick as f64 * 0.25);
                 let volume = 1.0 + ((tick % 5) as f64);
-                let mut trade_payload = Vec::new();
-                trade_payload.extend_from_slice(&1u32.to_le_bytes()); // symbol_id
-                trade_payload.push(if tick.is_multiple_of(2) { 2 } else { 1 }); // at ask / at bid
+                let side: u16 = if tick.is_multiple_of(2) { 2 } else { 1 }; // AT_ASK / AT_BID
+
+                // s_MarketDataUpdateTrade (type 107, pack(8)):
+                //   SymbolID(u32) | AtBidOrAsk(u16) | padding(6) |
+                //   Price(f64) | Volume(f64) | DateTime(f64)
+                let mut trade_payload = Vec::with_capacity(36);
+                trade_payload.extend_from_slice(&1u32.to_le_bytes());
+                trade_payload.extend_from_slice(&side.to_le_bytes());
+                trade_payload.extend_from_slice(&[0u8; 6]);
                 trade_payload.extend_from_slice(&price.to_le_bytes());
                 trade_payload.extend_from_slice(&volume.to_le_bytes());
                 trade_payload.extend_from_slice(&(tick as f64).to_le_bytes());

@@ -41,6 +41,25 @@ impl DeltaPipeline {
         self.session_delta
     }
 
+    /// Delta at a specific price level.
+    pub fn delta_at_price(&self, price: f64) -> f64 {
+        self.delta_by_price
+            .get(&self.discretize(price))
+            .copied()
+            .unwrap_or(0.0)
+    }
+
+    /// Full delta profile as (price, delta), sorted by price.
+    pub fn profile(&self) -> Vec<(f64, f64)> {
+        let mut out: Vec<(f64, f64)> = self
+            .delta_by_price
+            .iter()
+            .map(|(k, v)| (*k as f64 * self.tick_size, *v))
+            .collect();
+        out.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        out
+    }
+
     /// Delta-neutral pivot where cumulative profile crosses zero.
     pub fn dnp(&self) -> f64 {
         if self.delta_by_price.is_empty() {
@@ -127,6 +146,16 @@ impl DeltaPipeline {
     /// DNVA low.
     pub fn dnva_low(&self) -> f64 {
         self.dnva_bounds().1
+    }
+
+    /// Check whether delta confirms a level for the trade direction.
+    pub fn delta_confirmation_at_price(&self, price: f64, is_buy_setup: bool) -> bool {
+        let d = self.delta_at_price(price);
+        if is_buy_setup {
+            d > 0.0
+        } else {
+            d < 0.0
+        }
     }
 }
 

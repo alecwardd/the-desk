@@ -4,6 +4,7 @@ pub struct VwapPipeline {
     sum_pv: f64,
     sum_v: f64,
     sum_p2v: f64,
+    count: u64,
 }
 
 impl VwapPipeline {
@@ -17,6 +18,7 @@ impl VwapPipeline {
         self.sum_pv = 0.0;
         self.sum_v = 0.0;
         self.sum_p2v = 0.0;
+        self.count = 0;
     }
 
     /// Add one trade incrementally.
@@ -27,6 +29,12 @@ impl VwapPipeline {
         self.sum_pv += price * volume;
         self.sum_v += volume;
         self.sum_p2v += price * price * volume;
+        self.count += 1;
+    }
+
+    /// Number of trades processed.
+    pub fn trade_count(&self) -> u64 {
+        self.count
     }
 
     /// Current VWAP.

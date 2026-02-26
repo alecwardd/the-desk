@@ -1,30 +1,35 @@
 # The Desk — Agent Instructions
 
-Universal instructions for any LLM coding agent (Claude Code, Cursor, Codex, Traycer AI) working in this repository.
+Universal instructions for any LLM coding agent (Claude Code, Cursor, Codex) working in this repository.
 
 ---
 
 ## Project Context
 
-The Desk is a real-time AI trading co-pilot. Read these documents in order:
+The Desk is a backend intelligence platform for discretionary NQ futures traders. It reads Sierra Chart `.scid` tick data, computes market structure and microstructure analytics in Rust, stores everything in SQLite, and exposes the intelligence layer via MCP (Model Context Protocol).
+
+Read these documents in order:
 
 1. **CLAUDE.md** — Project rules, architecture, conventions (READ FIRST)
-2. **docs/the-desk-vision.md** — Product vision and philosophy
-3. **docs/phase-1-prd.md** — Phase 1 detailed requirements
-4. **Relevant skill** from `skills/` — Domain knowledge for your task
+2. **README.md** — Architecture overview, project structure, data flow
+3. **Relevant skill** from `skills/` — Domain knowledge for your task
 
 ---
 
 ## Architecture Summary
 
 ```
-Sierra Chart (DTC Server) → Rust Pipelines → Rust Rules Engine → Claude API → React UI
-         ↑                        ↑                  ↑                ↑           ↑
-     Layer 0               Layer 1 (fast)      Layer 2 (fast)   Layer 3 (1-2s)  Layer 4
-     External              Deterministic       Deterministic    LLM inference    Display
+Sierra Chart (.scid) → Rust Pipeline Engine → SQLite → MCP Server → Cursor Agents
+       ↑                      ↑                  ↑           ↑            ↑
+   Data source          Layer 1+2 (fast)     Persistence   Layer 3      Interface
+   External file       Deterministic math     Local DB     Exposure     LLM-powered
 ```
 
-**Every layer must be independently testable.** Never skip layers.
+**Key principles:**
+- Layers 1 (pipelines) and 2 (rules engine) are pure Rust, no network calls, sub-millisecond
+- Layer 3 (MCP + LLM coaching) can tolerate 1-5s latency
+- The Tauri desktop frame exists but is an optional visualization layer — MCP is the primary interface
+- **Every layer must be independently testable.** Never skip layers.
 
 ---
 
@@ -35,24 +40,28 @@ When you need specialized help, spawn subagents for these tasks.
 > **Path note:** Agent definitions live in `agents/` at the project root. Cursor also discovers them at `.cursor/agents/` (symlinked). Both paths resolve to the same files.
 
 ### DTC Protocol Research
-**When:** Working on the DTC client, encountering protocol questions
-**How:** Delegate to project subagent `dtc-protocol-researcher` (defined in `agents/dtc-protocol-researcher.md`)
-**Instruction:** "Use `dtc-protocol-researcher` for [specific DTC question/failure]. Ensure it reads `skills/dtc-protocol/SKILL.md`, validates the protocol sequence, and returns findings + fix plan + verification checklist."
+**When:** Working on the DTC client or .scid data parsing
+**How:** Delegate to `dtc-protocol-researcher` (defined in `agents/dtc-protocol-researcher.md`)
 
 ### Pipeline Verification
 **When:** After implementing or modifying a market structure pipeline
-**How:** Delegate to project subagent `pipeline-verifier` (defined in `agents/pipeline-verifier.md`)
-**Instruction:** "Use `pipeline-verifier` to validate [VWAP/TPO/Delta/Levels] changes. Ensure it reads `skills/trading-domain/SKILL.md`, follows `commands/pipeline-test.md`, and returns pass/fail, expected-vs-actual mismatches, and a fix + verification checklist."
+**How:** Delegate to `pipeline-verifier` (defined in `agents/pipeline-verifier.md`)
 
 ### Prompt Quality Evaluation
 **When:** After writing or modifying LLM coaching prompts
-**How:** Delegate to project subagent `prompt-quality-evaluator` (defined in `agents/prompt-quality-evaluator.md`)
-**Instruction:** "Use `prompt-quality-evaluator` to assess coaching prompt changes. Ensure it reads `skills/compliance-research/SKILL.md`, follows `commands/coaching-test.md`, and returns compliance status, traceability status, quality findings, and a rewrite + verification checklist."
+**How:** Delegate to `prompt-quality-evaluator` (defined in `agents/prompt-quality-evaluator.md`)
 
 ### Options API Research
 **When:** Working on Phase 2 options data integration
-**How:** Delegate to project subagent `options-api-researcher` (defined in `agents/options-api-researcher.md`)
-**Instruction:** "Use `options-api-researcher` to evaluate options data providers for The Desk. Require web-backed comparison of endpoints, auth, rate limits, symbol model, latency, pricing/licensing, and fit for gamma/dealer-positioning workflows. Return a ranked recommendation with integration checklist and PoC plan."
+**How:** Delegate to `options-api-researcher` (defined in `agents/options-api-researcher.md`)
+
+### Market Structure / Orderflow Analysis
+**When:** Investigating market behavior or validating pipeline outputs against theory
+**How:** Use `market-structure-analyst` or `orderflow-analyst`
+
+### Data Integrity Validation
+**When:** After ingestion changes or before analysis
+**How:** Delegate to `data-integrity-validator` (defined in `agents/data-integrity-validator.md`)
 
 ---
 
@@ -60,63 +69,67 @@ When you need specialized help, spawn subagents for these tasks.
 
 When implementing a feature:
 
-1. **Find the requirement** in `docs/phase-1-prd.md` (look for the requirement ID, e.g., TPO-03)
-2. **Read the relevant skill** for domain knowledge
-3. **Write the Rust code** (if it involves data processing or rules)
-4. **Write tests** alongside the code
-5. **Wire up IPC** using patterns from `skills/tauri-bridge/SKILL.md`
-6. **Build the UI component** using shadcn/ui
-7. **Test end-to-end** with mock DTC data
-8. **Run `cargo test && npm test`** before declaring done
+1. **Read the relevant skill** from `skills/` for domain knowledge
+2. **Write the Rust code** in the appropriate module (`pipelines/`, `rules/`, `feed/`, `db/`)
+3. **Write tests** alongside the code — every pipeline must have unit tests
+4. **Integrate with `PipelineEngine`** if adding a new pipeline (update `mod.rs`, `MarketState`, `snapshot()`)
+5. **Add `ConditionField` variants** if the rules engine needs to evaluate the new data
+6. **Add MCP tool** in `src/bin/the-desk-mcp.rs` if agents need access
+7. **Run `cargo test`** before declaring done
 
 ---
 
 ## Decision Framework
 
-When you're unsure about an implementation choice:
-
 | Question | Guidance |
 |----------|----------|
-| Should this be in Rust or TypeScript? | If it processes market data or evaluates rules → Rust. If it's UI or LLM interaction → TypeScript. |
-| Should this be a command or an event? | User-triggered or request/response → command. Streaming or Rust-initiated → event. |
-| Should I use the LLM for this? | If it can be computed deterministically → no LLM. If it requires natural language or contextual synthesis → LLM. |
-| Should I add a new dependency? | Prefer existing deps. Check Cargo.toml and package.json first. |
+| Should this be in Rust or TypeScript? | If it processes market data or evaluates rules → Rust. If it's UI-only → TypeScript. |
+| Should I add an MCP tool for this? | If an agent would benefit from querying this data → yes. Keep tools focused. |
+| Should I use the LLM for this? | If it can be computed deterministically → no LLM. If it requires synthesis → LLM. |
+| Should I add a new dependency? | Prefer existing deps. Check `Cargo.toml` first. |
 | Should I create a new file? | Prefer editing existing files. Only create new files for genuinely new modules. |
 
 ---
 
 ## Common Mistakes to Avoid
 
-1. **Implementing a backtesting engine.** We import results. Never build an engine.
-2. **Using `f32` for prices.** Always `f64` — precision matters for financial data.
-3. **Forgetting incremental updates.** Pipelines MUST update incrementally, not recalculate.
-4. **Emitting events per tick.** Throttle UI updates to ≤4 Hz.
-5. **Blocking the main thread.** All I/O and computation in background tokio tasks.
-6. **Mixing RTH and Globex data.** Always scope calculations to the correct session.
-7. **Using advisory language in prompts.** "Your rules say..." not "You should..."
-8. **Skipping Layer 2.** The rules engine MUST evaluate before the LLM is called.
+1. **Using `f32` for prices.** Always `f64` — precision matters for financial data.
+2. **Forgetting incremental updates.** Pipelines MUST update incrementally, not recalculate.
+3. **Blocking the main thread.** All I/O and computation in background tokio tasks.
+4. **Mixing RTH and Globex data.** Always scope calculations to the correct session.
+5. **Using advisory language in prompts.** "Your rules say..." not "You should..."
+6. **Skipping the rules engine.** Layer 2 MUST evaluate before any LLM is called.
+7. **Calling the Claude API from Rust.** LLM orchestration is a downstream consumer, not part of pipelines.
+8. **Putting market data math in TypeScript.** All pipeline calculations belong in Rust.
 
 ---
 
-## Testing with Mock Data
+## MCP Tools Reference
 
-For development without a live Sierra Chart connection, use the mock DTC server:
+The MCP server (`src/bin/the-desk-mcp.rs`) exposes 24 tools. Key categories:
 
+| Category | Tools |
+|----------|-------|
+| **Snapshot** | `get_market_snapshot` |
+| **Structure** | `get_tpo_profile`, `get_delta_profile`, `get_vwap`, `get_key_levels` |
+| **Microstructure** | `get_tape_pace`, `get_footprint`, `get_absorption_events`, `get_trade_size` |
+| **PTT** | `get_or5_status`, `get_rvol`, `get_day_type`, `get_rebid_reoffer_zones`, `get_pinch_events`, `get_session_inventory` |
+| **Rules** | `evaluate_setups`, `get_setup_context`, `check_delta_confirmation` |
+| **Data** | `query_ticks`, `get_prior_day_levels`, `get_proximity_report` |
+| **Integrity** | `validate_data_integrity` |
+
+---
+
+## Testing with Mock / Historical Data
+
+For development without a live Sierra Chart connection, use `.scid` files from Sierra Chart's data directory. The feed system supports both live tail-reading and bulk historical backfill.
+
+```bash
+# Run all tests (79 tests)
+cd src-tauri && cargo test
+
+# Run specific pipeline tests
+cd src-tauri && cargo test pipelines::tpo
+cd src-tauri && cargo test pipelines::delta
+cd src-tauri && cargo test pipelines::pinch
 ```
-# Start mock server (generates synthetic NQ trades)
-cargo run --bin mock-dtc-server
-
-# The mock server:
-# - Listens on localhost:11099
-# - Responds to ENCODING_REQUEST and LOGON_REQUEST
-# - Streams synthetic NQ trades at realistic rates
-# - Supports MARKET_DEPTH_REQUEST with synthetic DOM
-# - Replays recorded sessions if provided a recording file
-```
-
-Mock data should simulate realistic NQ behavior:
-- Price range: ±200 points from a configurable center
-- Trade rate: 1-3 trades/second (quiet) to 10-20/second (active)
-- Tick size: 0.25 points
-- Volume: 1-50 contracts per trade
-- Include bid/ask spread of 0.25-0.50 points

@@ -111,6 +111,19 @@ pub struct RiskConfigRecord {
     pub no_trade_zones: Vec<serde_json::Value>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RawTickRecord {
+    pub id: i64,
+    pub timestamp_ms: f64,
+    pub price: f64,
+    pub volume: f64,
+    pub bid: f64,
+    pub ask: f64,
+    pub is_buy: bool,
+    pub session_date: String,
+}
+
 impl Default for RiskConfigRecord {
     fn default() -> Self {
         Self {
@@ -166,6 +179,9 @@ impl Database {
         }
         if version < 2 {
             self.migrate_v2()?;
+        }
+        if version < 3 {
+            self.migrate_v3()?;
         }
 
         Ok(())
@@ -318,6 +334,83 @@ impl Database {
               ON journal_entries(session_id);
 
             UPDATE schema_version SET version = 2;
+            ",
+        )?;
+        Ok(())
+    }
+
+    /// V3: backend intelligence schema for raw feed and computed snapshots.
+    fn migrate_v3(&self) -> Result<(), DbError> {
+        self.conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS raw_ticks (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              timestamp_ms REAL NOT NULL,
+              price REAL NOT NULL,
+              volume REAL NOT NULL,
+              bid REAL NOT NULL,
+              ask REAL NOT NULL,
+              is_buy INTEGER NOT NULL,
+              session_date TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_raw_ticks_timestamp ON raw_ticks(timestamp_ms);
+            CREATE INDEX IF NOT EXISTS idx_raw_ticks_session ON raw_ticks(session_date, timestamp_ms);
+
+            CREATE TABLE IF NOT EXISTS feature_state (
+              singleton INTEGER PRIMARY KEY DEFAULT 1,
+              timestamp_ms REAL NOT NULL,
+              payload TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS pipeline_snapshots (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              timestamp_ms REAL NOT NULL,
+              payload TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_pipeline_snapshots_ts ON pipeline_snapshots(timestamp_ms);
+
+            CREATE TABLE IF NOT EXISTS playbook_signals (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              timestamp_ms REAL NOT NULL,
+              setup_id TEXT NOT NULL,
+              payload TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_playbook_signals_ts ON playbook_signals(timestamp_ms);
+            CREATE INDEX IF NOT EXISTS idx_playbook_signals_setup ON playbook_signals(setup_id);
+
+            CREATE TABLE IF NOT EXISTS microstructure_snapshots (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              timestamp_ms REAL NOT NULL,
+              payload TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_microstructure_snapshots_ts ON microstructure_snapshots(timestamp_ms);
+
+            CREATE TABLE IF NOT EXISTS absorption_events (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              timestamp_ms REAL NOT NULL,
+              event_type TEXT NOT NULL,
+              price REAL NOT NULL,
+              severity REAL NOT NULL,
+              payload TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_absorption_events_ts ON absorption_events(timestamp_ms);
+
+            CREATE TABLE IF NOT EXISTS validation_runs (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              run_at_ms REAL NOT NULL,
+              status TEXT NOT NULL,
+              details TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS backtest_runs (
+              id TEXT PRIMARY KEY,
+              created_at_ms REAL NOT NULL,
+              params TEXT NOT NULL,
+              metrics TEXT NOT NULL,
+              trades TEXT NOT NULL
+            );
+
+            UPDATE schema_version SET version = 3;
             ",
         )?;
         Ok(())
@@ -979,6 +1072,305 @@ impl Database {
         } else {
             Ok(None)
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Backend intelligence storage
+    // ------------------------------------------------------------------
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_raw_tick(
+        &self,
+        timestamp_ms: f64,
+        price: f64,
+        volume: f64,
+        bid: f64,
+        ask: f64,
+        is_buy: bool,
+        session_date: &str,
+    ) -> Result<(), DbError> {
+        self.conn.execute(
+            "INSERT INTO raw_ticks (timestamp_ms, price, volume, bid, ask, is_buy, session_date)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                timestamp_ms,
+                price,
+                volume,
+                bid,
+                ask,
+                i64::from(is_buy),
+                session_date
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn upsert_feature_state(
+        &self,
+        timestamp_ms: f64,
+        payload: &serde_json::Value,
+    ) -> Result<(), DbError> {
+        self.conn.execute(
+            "INSERT INTO feature_state (singleton, timestamp_ms, payload)
+             VALUES (1, ?1, ?2)
+             ON CONFLICT(singleton) DO UPDATE SET
+               timestamp_ms=excluded.timestamp_ms,
+               payload=excluded.payload",
+            params![timestamp_ms, serde_json::to_string(payload)?],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_pipeline_snapshot(
+        &self,
+        timestamp_ms: f64,
+        payload: &serde_json::Value,
+    ) -> Result<(), DbError> {
+        self.conn.execute(
+            "INSERT INTO pipeline_snapshots (timestamp_ms, payload) VALUES (?1, ?2)",
+            params![timestamp_ms, serde_json::to_string(payload)?],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_playbook_signal(
+        &self,
+        timestamp_ms: f64,
+        setup_id: &str,
+        payload: &serde_json::Value,
+    ) -> Result<(), DbError> {
+        self.conn.execute(
+            "INSERT INTO playbook_signals (timestamp_ms, setup_id, payload) VALUES (?1, ?2, ?3)",
+            params![timestamp_ms, setup_id, serde_json::to_string(payload)?],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_microstructure_snapshot(
+        &self,
+        timestamp_ms: f64,
+        payload: &serde_json::Value,
+    ) -> Result<(), DbError> {
+        self.conn.execute(
+            "INSERT INTO microstructure_snapshots (timestamp_ms, payload) VALUES (?1, ?2)",
+            params![timestamp_ms, serde_json::to_string(payload)?],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_absorption_event(
+        &self,
+        timestamp_ms: f64,
+        event_type: &str,
+        price: f64,
+        severity: f64,
+        payload: &serde_json::Value,
+    ) -> Result<(), DbError> {
+        self.conn.execute(
+            "INSERT INTO absorption_events (timestamp_ms, event_type, price, severity, payload)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                timestamp_ms,
+                event_type,
+                price,
+                severity,
+                serde_json::to_string(payload)?
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_recent_ticks(&self, limit: usize) -> Result<Vec<RawTickRecord>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, timestamp_ms, price, volume, bid, ask, is_buy, session_date
+             FROM raw_ticks ORDER BY timestamp_ms DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit as i64], |row| {
+            Ok(RawTickRecord {
+                id: row.get(0)?,
+                timestamp_ms: row.get(1)?,
+                price: row.get(2)?,
+                volume: row.get(3)?,
+                bid: row.get(4)?,
+                ask: row.get(5)?,
+                is_buy: row.get::<_, i64>(6)? == 1,
+                session_date: row.get(7)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn raw_tick_count(&self) -> Result<i64, DbError> {
+        Ok(self
+            .conn
+            .query_row("SELECT COUNT(1) FROM raw_ticks", [], |r| r.get(0))?)
+    }
+
+    pub fn latest_feature_state(&self) -> Result<Option<serde_json::Value>, DbError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT payload FROM feature_state WHERE singleton = 1")?;
+        let mut rows = stmt.query([])?;
+        if let Some(row) = rows.next()? {
+            let payload: String = row.get(0)?;
+            Ok(serde_json::from_str(&payload).ok())
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn list_recent_absorption_events(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<serde_json::Value>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT timestamp_ms, event_type, price, severity, payload
+             FROM absorption_events ORDER BY timestamp_ms DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit as i64], |row| {
+            let payload_str: String = row.get(4)?;
+            let payload: serde_json::Value =
+                serde_json::from_str(&payload_str).unwrap_or_else(|_| serde_json::json!({}));
+            Ok(serde_json::json!({
+                "timestampMs": row.get::<_, f64>(0)?,
+                "eventType": row.get::<_, String>(1)?,
+                "price": row.get::<_, f64>(2)?,
+                "severity": row.get::<_, f64>(3)?,
+                "payload": payload
+            }))
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn latest_microstructure_snapshot(&self) -> Result<Option<serde_json::Value>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT payload FROM microstructure_snapshots ORDER BY timestamp_ms DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query([])?;
+        if let Some(row) = rows.next()? {
+            let payload: String = row.get(0)?;
+            Ok(serde_json::from_str(&payload).ok())
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn latest_tick_timestamp_ms(&self) -> Result<Option<f64>, DbError> {
+        let ts = self
+            .conn
+            .query_row("SELECT MAX(timestamp_ms) FROM raw_ticks", [], |r| r.get(0))
+            .ok()
+            .flatten();
+        Ok(ts)
+    }
+
+    pub fn count_playbook_signals(&self) -> Result<i64, DbError> {
+        Ok(self
+            .conn
+            .query_row("SELECT COUNT(1) FROM playbook_signals", [], |r| r.get(0))?)
+    }
+
+    /// Persist a data integrity validation run.
+    pub fn insert_validation_run(
+        &self,
+        run_at_ms: f64,
+        status: &str,
+        details: &serde_json::Value,
+    ) -> Result<(), DbError> {
+        self.conn.execute(
+            "INSERT INTO validation_runs (run_at_ms, status, details) VALUES (?1, ?2, ?3)",
+            params![run_at_ms, status, serde_json::to_string(details)?],
+        )?;
+        Ok(())
+    }
+
+    /// Batch-insert raw ticks inside a single transaction.
+    pub fn insert_raw_ticks_batch(
+        &self,
+        ticks: &[(f64, f64, f64, f64, f64, bool, String)],
+    ) -> Result<(), DbError> {
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare_cached(
+                "INSERT INTO raw_ticks (timestamp_ms, price, volume, bid, ask, is_buy, session_date)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )?;
+            for (ts, price, vol, bid, ask, is_buy, session_date) in ticks {
+                stmt.execute(params![
+                    ts,
+                    price,
+                    vol,
+                    bid,
+                    ask,
+                    i64::from(*is_buy),
+                    session_date
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Archive raw ticks older than `cutoff_date` (YYYY-MM-DD) into zstd-compressed
+    /// monthly files under `archive_dir`. Returns the number of ticks archived.
+    pub fn archive_cold_ticks(
+        &self,
+        cutoff_date: &str,
+        archive_dir: &std::path::Path,
+    ) -> Result<usize, DbError> {
+        std::fs::create_dir_all(archive_dir).ok();
+        let mut stmt = self.conn.prepare(
+            "SELECT timestamp_ms, price, volume, bid, ask, is_buy, session_date
+             FROM raw_ticks WHERE session_date < ?1 ORDER BY timestamp_ms",
+        )?;
+        let rows: Vec<(f64, f64, f64, f64, f64, i64, String)> = stmt
+            .query_map(params![cutoff_date], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        if rows.is_empty() {
+            return Ok(0);
+        }
+
+        // Group by month (YYYY-MM)
+        let mut by_month: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for (ts, price, vol, bid, ask, is_buy, session_date) in &rows {
+            let month = if session_date.len() >= 7 {
+                &session_date[..7]
+            } else {
+                "unknown"
+            };
+            let line = format!("{ts},{price},{vol},{bid},{ask},{is_buy},{session_date}");
+            by_month.entry(month.to_string()).or_default().push(line);
+        }
+
+        for (month, lines) in &by_month {
+            let path = archive_dir.join(format!("{month}.ticks.zst"));
+            let data = lines.join("\n");
+            let compressed = zstd::encode_all(data.as_bytes(), 3).map_err(|e| {
+                DbError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
+            })?;
+            std::fs::write(&path, compressed).ok();
+        }
+
+        let count = rows.len();
+        self.conn.execute(
+            "DELETE FROM raw_ticks WHERE session_date < ?1",
+            params![cutoff_date],
+        )?;
+
+        Ok(count)
     }
 }
 

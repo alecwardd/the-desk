@@ -11,7 +11,7 @@ These rules apply to ALL LLM coding agents working in this repository. Read full
 
 ## What This Project Is
 
-The Desk is a real-time AI trading co-pilot for discretionary NQ futures traders. It runs alongside Sierra Chart on a second monitor, connected via the DTC protocol, and provides contextual coaching based on the trader's own playbook.
+The Desk is a backend intelligence platform for discretionary NQ futures traders. It reads Sierra Chart's `.scid` tick data files, computes market structure and microstructure analytics in Rust, stores everything in SQLite, and exposes the intelligence layer via MCP (Model Context Protocol) — making any Cursor agent a trading partner.
 
 **It does NOT place trades, generate signals, or give financial advice.** It reflects the trader's own rules back to them.
 
@@ -23,42 +23,45 @@ The system has three layers. All code must respect this separation:
 
 ```
 LAYER 1: Deterministic Pipelines (Rust)
-  - Processes raw DTC market data into structured signals
-  - VWAP, TPO/Market Profile, Delta Neutral VA/Pivot, Key Levels, Risk Tracking
-  - Pure math. No LLM calls. No network requests. Sub-second.
+  - Reads .scid tick data and computes structured market intelligence
+  - 14 pipeline modules: VWAP, TPO, Delta, Levels, Tape Pace, Footprint,
+    Absorption, Trade Size, OR5, RVOL, Day Type, Rebid/Reoffer, Pinch, Session Inventory
+  - Pure math. No LLM calls. No network requests. Sub-millisecond.
 
 LAYER 2: Rules Engine (Rust)
   - Evaluates playbook conditions against Layer 1 signals
-  - Deterministic boolean logic. No LLM calls.
+  - 40+ typed condition fields. Deterministic boolean logic. No LLM calls.
   - Fires typed alerts when conditions are met.
+  - 9 pre-built setup templates from PTT methodology.
 
-LAYER 3: LLM Orchestrator (TypeScript → Claude API)
-  - Receives structured alerts from Layer 2
-  - Synthesizes context (alert + playbook + risk state + journal history)
-  - Produces human-readable coaching prompts
-  - 1-2 second latency acceptable here
+LAYER 3: MCP Server + LLM Orchestration
+  - 24 MCP tools expose pipeline state, rules evaluation, and data queries
+  - Cursor agents call tools for market context during conversation
+  - Claude API synthesizes coaching from structured data (1-5s latency acceptable)
 ```
 
 **Rules:**
 - Never call the Claude API from Rust code (Layer 1 or 2)
 - Never put market data processing in TypeScript (belongs in Rust)
-- Never put business logic in UI components (delegate to tauri-bridge.ts)
 - The rules engine must work without any network connectivity
 - Every coaching prompt must trace to a specific playbook rule — never speculative
+- MCP tools return structured data only — never raw tick streams
 
 ---
 
 ## Technology Stack
 
-| Layer | Technology | Notes |
-|-------|-----------|-------|
-| Desktop framework | Tauri 2.x | IPC between Rust and React |
-| Backend | Rust | All pipelines, rules engine, DTC client, SQLite, recording |
-| Frontend | React 19 + TypeScript | UI only |
-| UI components | shadcn/ui + Tailwind CSS | Dark theme, keyboard-first |
-| Database | SQLite (rusqlite) | All local data storage |
-| LLM | Claude API (Anthropic SDK) | Coaching prompts and analysis |
-| Compression | zstd | Session recordings |
+| Component | Technology | Notes |
+|-----------|-----------|-------|
+| Pipeline engine | Rust | 14 incremental pipeline modules, sub-ms per tick |
+| Rules engine | Rust | Typed conditions, setup state machine |
+| MCP server | `rmcp` crate | 24 tools via stdio transport |
+| Data source | Sierra Chart `.scid` | Binary tick data, 40-byte records |
+| Database | SQLite (rusqlite) | Raw ticks, computed state, session history |
+| Compression | zstd | Cold storage archival |
+| Desktop frame | Tauri 2.x | Optional visualization layer |
+| Frontend | React 19 + TypeScript | Optional UI (shadcn/ui, dark theme) |
+| LLM | Claude API | Coaching prompts via Cursor agents |
 
 ---
 
@@ -136,8 +139,8 @@ Read these before working on related components:
 | Skill | When to Read | Path |
 |-------|-------------|------|
 | Trading Domain | Before implementing any pipeline or playbook logic | `skills/trading-domain/SKILL.md` |
-| DTC Protocol | Before working on the data feed client | `skills/dtc-protocol/SKILL.md` |
-| Compliance | Before writing UI copy, prompts, or marketing text | `skills/compliance-research/SKILL.md` |
+| DTC Protocol | Before working on the data feed or .scid reader | `skills/dtc-protocol/SKILL.md` |
+| Compliance | Before writing prompts or marketing text | `skills/compliance-research/SKILL.md` |
 | Tauri Bridge | Before implementing IPC between Rust and React | `skills/tauri-bridge/SKILL.md` |
 
 ---
@@ -146,63 +149,56 @@ Read these before working on related components:
 
 ```
 the-desk/
-├── docs/                           # Planning documentation
-│   ├── the-desk-vision.md          # Product vision and philosophy
-│   ├── phase-1-prd.md              # Phase 1 requirements (Live Co-Pilot)
-│   ├── phase-2-prd.md              # Phase 2 requirements (Intelligence Expansion)
-│   ├── phase-3-prd.md              # Phase 3 requirements (Maturity)
-│   ├── epic-brief.md               # Epic brief — problem, scope, constraints
-│   ├── tech-plan.md                # Architecture, data model, component design
-│   ├── core-flows.md               # User flows with wireframes
-│   ├── design-spec.md              # UI/UX design specification
-│   ├── prompt-spec.md              # LLM prompt engineering specification
-│   ├── decision-log.md             # ADR-style key decisions and rationale
-│   └── roadmap.md                  # Phase sequencing, traceability, entry/exit criteria
-├── agents/                         # Subagent definitions (source of truth)
-│   ├── dtc-protocol-researcher.md
-│   ├── pipeline-verifier.md
-│   ├── prompt-quality-evaluator.md
-│   └── options-api-researcher.md
-├── commands/                       # Slash commands (source of truth)
-├── skills/                         # Domain knowledge (source of truth)
-│   ├── trading-domain/SKILL.md
-│   ├── dtc-protocol/
-│   │   ├── SKILL.md
-│   │   └── reference.md            # Wire-level protocol details
-│   ├── compliance-research/SKILL.md
-│   └── tauri-bridge/
-│       ├── SKILL.md
-│       ├── examples.md              # Copy-paste IPC patterns
-│       └── anti-patterns.md         # Common mistakes with fixes
-├── .cursor/                        # Cursor IDE integration
-│   ├── agents/   → symlink to ../agents/
-│   ├── commands/ → symlink to ../commands/
-│   ├── skills/   → symlink to ../skills/
-│   └── rules/                      # Cursor-specific rules
-├── src-tauri/                      # Rust backend
-│   ├── src/
-│   │   ├── main.rs
-│   │   ├── dtc/                    # DTC protocol client
-│   │   ├── pipelines/              # Market structure calculations
-│   │   ├── rules/                  # Playbook rules engine
-│   │   ├── recording/              # Session recording & replay
-│   │   ├── risk/                   # Risk tracking
-│   │   └── db/                     # SQLite operations
-│   └── Cargo.toml
-├── src/                            # React frontend
-│   ├── components/                 # UI components (by domain)
-│   ├── hooks/                      # Tauri event listeners
-│   ├── lib/                        # Shared utilities and types
-│   ├── context/                    # React context providers
-│   └── App.tsx
-├── .githooks/                      # Git hooks (pre-commit checks)
-├── CLAUDE.md                       # This file (Claude Code rules)
-├── .cursorrules                    # Cursor rules (condensed reference)
-├── AGENT.md                        # Universal agent instructions
-└── README.md
+├── src-tauri/src/                    # Rust backend (core)
+│   ├── bin/the-desk-mcp.rs           # MCP server binary (24 tools)
+│   ├── main.rs                       # Tauri app entry + processing loop
+│   ├── pipelines/                    # 14 pipeline modules
+│   │   ├── mod.rs                    # PipelineEngine, MarketState
+│   │   ├── vwap.rs                   # VWAP + std dev bands
+│   │   ├── tpo.rs                    # TPO profile, VA, POC, single prints
+│   │   ├── delta.rs                  # Delta profile, DNVA, DNP
+│   │   ├── levels.rs                 # Key levels, IB extensions, proximity
+│   │   ├── tape_pace.rs             # Tape speed, percentile, dwell
+│   │   ├── footprint.rs             # Volume at price, imbalances
+│   │   ├── absorption.rs            # Absorption, exhaustion, divergence
+│   │   ├── trade_size.rs            # Trade size distribution
+│   │   ├── opening_range_5min.rs    # Leo's 5-min Opening Range
+│   │   ├── rvol.rs                  # Relative volume
+│   │   ├── day_type.rs              # Day type classifier
+│   │   ├── rebid_reoffer.rs         # Acceleration zones
+│   │   ├── pinch.rs                 # Delta momentum reversals
+│   │   └── session_inventory.rs     # Cross-session positioning
+│   ├── rules/                        # Playbook rules engine
+│   │   ├── mod.rs                    # Condition evaluator (40+ fields)
+│   │   └── setup_templates.rs        # 9 pre-built PTT setup templates
+│   ├── feed/                         # Data ingestion
+│   │   ├── mod.rs                    # FeedEvent, FeedConfig
+│   │   └── scid_reader.rs           # .scid binary file parser
+│   ├── db/mod.rs                     # SQLite schema + operations
+│   ├── dtc/                          # DTC protocol (legacy reference)
+│   ├── risk/mod.rs                   # Risk state tracking
+│   └── recording/mod.rs             # Session recording + replay
+├── src/                              # React frontend (optional)
+├── docs/
+│   ├── decision-log.md               # ADR-style decisions (living)
+│   └── archive/v0-tauri-gui/         # Pre-pivot planning docs (reference)
+├── agents/                           # Cursor agent definitions
+├── skills/                           # Domain knowledge for agents
+│   ├── trading-domain/SKILL.md       # TPO, delta, PTT methodology
+│   ├── dtc-protocol/                 # DTC + .scid format reference
+│   ├── compliance-research/          # Coaching vs advisory
+│   └── tauri-bridge/                 # IPC patterns
+├── .cursor/                          # Cursor IDE integration
+│   ├── mcp.json                      # MCP server config
+│   ├── agents/ → ../agents/
+│   └── skills/ → ../skills/
+├── CLAUDE.md                         # This file (project rules)
+├── AGENT.md                          # Agent workflow instructions
+├── .cursorrules                      # Cursor-specific quick reference
+└── README.md                         # Project overview
 ```
 
-> **Symlink convention:** `agents/`, `commands/`, and `skills/` at root are the single source of truth. `.cursor/` contains symlinks pointing to these root directories so both Claude Code and Cursor read the same files. Edit files in root — changes appear in both tools automatically.
+> **Symlink convention:** `agents/` and `skills/` at root are the single source of truth. `.cursor/` contains symlinks so Cursor reads the same files. Edit files in root.
 
 ---
 
@@ -210,8 +206,8 @@ the-desk/
 
 - **Pipelines:** Unit tests with known NQ data. Compare VWAP, TPO, delta calculations against manually verified values.
 - **Rules engine:** Unit tests for each condition type. Test compound conditions. Test edge cases (no data, session boundary).
-- **DTC client:** Integration tests with mock DTC server.
-- **LLM coaching:** Snapshot tests for prompt templates. Test graceful degradation when API is down.
-- **UI:** Component tests for critical interactions (playbook builder form, session controls).
+- **MCP server:** Tool response format validation, database access under concurrent calls.
+- **Feed:** .scid parser tests with known binary data, session boundary detection.
+- **Data integrity:** Cross-pipeline invariant checks (POC in VA, VA = 70% of TPOs, delta sum, DNVA within range).
 
-Run `cargo test` for Rust, `npm test` for TypeScript before every commit.
+Run `cargo test` before every commit.

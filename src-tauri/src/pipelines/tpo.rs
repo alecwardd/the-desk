@@ -205,6 +205,63 @@ impl TpoPipeline {
             .map(|sp| sp.price)
             .collect()
     }
+
+    /// Raw TPO counts by price.
+    pub fn tpo_count_by_price(&self) -> Vec<(f64, usize)> {
+        let mut out: Vec<(f64, usize)> = self
+            .tpo_letters
+            .iter()
+            .map(|(k, v)| (*k as f64 * self.tick_size, v.len()))
+            .collect();
+        out.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        out
+    }
+
+    /// Poor high: top price has multiple prints (unfinished auction).
+    pub fn poor_high(&self) -> bool {
+        let Some((&high_key, letters)) = self.tpo_letters.iter().max_by_key(|(k, _)| *k) else {
+            return false;
+        };
+        let _ = high_key;
+        letters.len() > 1
+    }
+
+    /// Poor low: bottom price has multiple prints (unfinished auction).
+    pub fn poor_low(&self) -> bool {
+        let Some((&low_key, letters)) = self.tpo_letters.iter().min_by_key(|(k, _)| *k) else {
+            return false;
+        };
+        let _ = low_key;
+        letters.len() > 1
+    }
+
+    /// Direction of single prints relative to POC (for day type classifier).
+    pub fn single_prints_direction_vs_poc(&self) -> (usize, usize) {
+        let poc = self.poc();
+        let prints = self.single_print_prices();
+        let above = prints.iter().filter(|p| **p > poc).count();
+        let below = prints.iter().filter(|p| **p < poc).count();
+        (above, below)
+    }
+
+    /// Excess at top/bottom based on single-print tails.
+    pub fn excess(&self) -> (bool, bool) {
+        let mut top_excess = false;
+        let mut bottom_excess = false;
+        let mut prints = self.single_print_prices();
+        prints.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        if prints.len() >= 3 {
+            let top_tail = prints.iter().rev().take(3).copied().collect::<Vec<_>>();
+            let bottom_tail = prints.iter().take(3).copied().collect::<Vec<_>>();
+            top_excess = top_tail
+                .windows(2)
+                .all(|w| (w[0] - w[1]).abs() <= self.tick_size);
+            bottom_excess = bottom_tail
+                .windows(2)
+                .all(|w| (w[0] - w[1]).abs() <= self.tick_size);
+        }
+        (top_excess, bottom_excess)
+    }
 }
 
 #[cfg(test)]

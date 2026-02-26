@@ -24,6 +24,29 @@ pub enum KeyLevelType {
     SessionHigh,
     /// Current RTH session low.
     SessionLow,
+    /// 5-minute Opening Range midpoint.
+    Or5Mid,
+    /// IB 0.5x extension above.
+    IbExt05xHigh,
+    /// IB 0.5x extension below.
+    IbExt05xLow,
+    /// IB 1.0x extension above.
+    IbExt10xHigh,
+    /// IB 1.0x extension below.
+    IbExt10xLow,
+    /// IB 1.5x extension above.
+    IbExt15xHigh,
+    /// IB 1.5x extension below.
+    IbExt15xLow,
+}
+
+/// A key level with its distance from current price (in ticks).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProximityLevel {
+    pub level_type: KeyLevelType,
+    pub price: f64,
+    pub distance_ticks: f64,
 }
 
 /// A single key reference level with its type and price.
@@ -144,6 +167,75 @@ impl LevelsPipeline {
             self.session_high = self.session_high.max(price);
             self.session_low = self.session_low.min(price);
         }
+    }
+
+    /// IB extension levels: 0.5x, 1.0x, 1.5x of IB range projected above and below.
+    pub fn ib_extension_levels(&self, ib_high: f64, ib_low: f64) -> Vec<KeyLevel> {
+        let ib_range = ib_high - ib_low;
+        if ib_range <= 0.0 {
+            return Vec::new();
+        }
+        vec![
+            KeyLevel {
+                level_type: KeyLevelType::IbExt05xHigh,
+                price: ib_high + ib_range * 0.5,
+            },
+            KeyLevel {
+                level_type: KeyLevelType::IbExt05xLow,
+                price: ib_low - ib_range * 0.5,
+            },
+            KeyLevel {
+                level_type: KeyLevelType::IbExt10xHigh,
+                price: ib_high + ib_range,
+            },
+            KeyLevel {
+                level_type: KeyLevelType::IbExt10xLow,
+                price: ib_low - ib_range,
+            },
+            KeyLevel {
+                level_type: KeyLevelType::IbExt15xHigh,
+                price: ib_high + ib_range * 1.5,
+            },
+            KeyLevel {
+                level_type: KeyLevelType::IbExt15xLow,
+                price: ib_low - ib_range * 1.5,
+            },
+        ]
+    }
+
+    /// Which key levels is the current price near, sorted by distance ascending.
+    pub fn proximity_report(
+        &self,
+        current_price: f64,
+        max_distance_ticks: f64,
+        tick_size: f64,
+        extra_levels: &[KeyLevel],
+    ) -> Vec<ProximityLevel> {
+        let all = self
+            .key_levels()
+            .into_iter()
+            .chain(extra_levels.iter().cloned())
+            .collect::<Vec<_>>();
+        let max_dist = max_distance_ticks * tick_size;
+        let mut nearby: Vec<ProximityLevel> = all
+            .into_iter()
+            .filter(|kl| kl.price > 0.0)
+            .map(|kl| {
+                let dist = (current_price - kl.price).abs();
+                ProximityLevel {
+                    level_type: kl.level_type,
+                    price: kl.price,
+                    distance_ticks: dist / tick_size,
+                }
+            })
+            .filter(|pl| pl.distance_ticks <= max_distance_ticks || max_dist <= 0.0)
+            .collect();
+        nearby.sort_by(|a, b| {
+            a.distance_ticks
+                .partial_cmp(&b.distance_ticks)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        nearby
     }
 
     /// All active key levels for display.

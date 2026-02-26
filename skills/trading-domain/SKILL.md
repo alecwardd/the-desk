@@ -190,6 +190,124 @@ Options delta changes as time passes (theta). Charm measures this: how delta cha
 
 ---
 
+## PTT (Painting The Tape) Methodology
+
+### The "Key Level Is Not a Setup" Principle
+
+A key level (prior day high, POC, VWAP, etc.) is a *location*, not a trade signal. **Execution requires delta confirmation.** Price arriving at a key level only means "pay attention here." The setup is defined by what happens *at* the level:
+
+- Does delta confirm? (Stowe's requirement)
+- Is there absorption or exhaustion?
+- Does the rebid/reoffer zone hold?
+- Is the profile shape supportive?
+
+Never enter a trade solely because price reached a level. Levels tell you *where* to look; order flow tells you *what* to do.
+
+### Leo's Single Print Statistics
+
+From Leo's NQ playbook research:
+
+- **52% of NQ RTH sessions** produce single prints in the TPO profile
+- **72% of sessions with single prints** close in the direction of the single prints
+- Implication: when single prints are present, trade in their direction with a 72% statistical edge
+- "Never fade a day with single prints" — the initiative activity that created them indicates strong directional conviction
+
+### 5-Minute Opening Range (OR5)
+
+Leo's A+ setup. The first 5 minutes of RTH establish a micro Opening Range:
+
+1. Record high/low during RTH minutes 0-4
+2. After minute 5, the range locks — compute midpoint
+3. Wait for price to break above or below the OR5
+4. The **entry** is the retest of the midpoint after the breakout
+5. Targets: opposite OR5 extreme, then 75% and 100% extensions from mid
+
+Critical: don't chase the break. Wait for the mid retest.
+
+### Rebid / Reoffer (Acceleration Zones)
+
+Identifies zones of one-sided aggressive activity:
+
+- **Acceleration bar**: a period where price moves >= 2x average bar range with >70% one-sided delta
+- **Buy zone (Rebid)**: aggressive buying created the acceleration
+- **Sell zone (Reoffer)**: aggressive selling created the acceleration
+
+Zone lifecycle: Fresh → Retested (price returns) → Held (delta re-engages) or Failed (price breaks through)
+
+Key rule: if a zone is retested and **held** (buyers/sellers re-engage), trade in the zone's direction. If the zone **fails**, expect acceleration in the opposite direction.
+
+### Relative Volume (RVOL)
+
+Calibrate expectations by comparing current session volume to the N-day average at the same time of day:
+
+| RVOL | Classification | Implication |
+|------|---------------|-------------|
+| < 85% | Low | Rotational, don't force trades |
+| 85-100% | Normal | Standard conditions |
+| 100-115% | Elevated | Increased participation, setups more reliable |
+| > 115% | High | Strong conviction day, expect range expansion |
+
+RVOL is measured in 5-minute cumulative buckets against a 20-day lookback.
+
+### Day Type Classification (Dalton)
+
+Quantitative criteria for TPO-based day type classification:
+
+| Day Type | Profile Shape | VA Width vs Range | IB Behavior | Key Indicator |
+|----------|--------------|-------------------|-------------|---------------|
+| **Normal** | Gaussian bell | > 85% of range | Contains most activity | Balanced, participants satisfied |
+| **Normal Variation** | Bell with tail | 60-85% of range | Broken with return to value | Extension beyond IB but VA intact |
+| **Neutral** | Wide, flat | < 60% of range | Broken both sides | Rotational, no dominant POC |
+| **Trend** | Elongated | < 60% of range | Small IB, one-direction extension | Single prints, POC at extreme |
+| **Double Distribution** | D-shape (two peaks) | Two distinct VAs | Two separate balance areas | Market migrated from one value to another |
+
+Profile shapes:
+- **Gaussian** — balanced bell curve (participants satisfied)
+- **P-shape** — fat top, thin bottom (longs built above, shorts trapped below)
+- **b-shape** — fat bottom, thin top (shorts building below)
+- **D-shape** — double distribution (migration day)
+
+### Delta Pinch ("Pinch" Concept)
+
+The user's own trading concept. A "pinch" occurs when:
+
+1. **Sustained one-sided delta** accumulates in a time window (1m, 5m, 15m, or 30m)
+2. **Sudden opposing flow** arrives at a pace >= 2x the average flow rate
+3. **Delta collapses** or shifts sign as inventory rapidly transfers
+
+Pinch severity scoring (0-5):
+- Volume involved in the shift
+- Speed of the shift (seconds to flip direction)
+- How much delta was accumulated before the pinch
+- Price displacement during the pinch
+
+High-severity pinches at key levels create high-probability reversal setups.
+
+### Delta-Neutral Positioning (User's Framework)
+
+The user's approach to inventory analysis:
+
+1. Construct the **DNVA** — 70% of session's absolute delta concentrated around the highest-delta price
+2. Compute the **DNP** — where cumulative delta crosses zero
+3. Track how the neutral point **shifts** across sessions
+4. **Building**: current session delta extends in the same direction as prior session
+5. **Clearing**: current session delta opposes prior session direction
+6. Sessions often either build on prior inventory or "clear out" accumulated positioning
+
+### IB Extension Targets
+
+Standard IB expansion targets used for position management:
+
+| Extension | Calculation | Significance |
+|-----------|------------|---------------|
+| 0.5x | IB range * 0.5 projected from IB boundary | Partial profit target |
+| 1.0x | IB range * 1.0 projected from IB boundary | Full range extension (strong day) |
+| 1.5x | IB range * 1.5 projected from IB boundary | Exceptional extension (trend day) |
+
+Both upside (from IB high) and downside (from IB low) extensions are tracked.
+
+---
+
 ## Common Implementation Mistakes to Avoid
 
 1. **Confusing volume profile with TPO profile.** Volume profile uses volume at price; TPO uses time at price. They often look similar but can diverge significantly.

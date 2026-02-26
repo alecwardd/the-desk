@@ -10,6 +10,12 @@ pub enum KeyLevelType {
     PriorDayLow,
     /// Previous RTH session closing price.
     PriorDayClose,
+    /// Previous session value area high.
+    PriorVaHigh,
+    /// Previous session value area low.
+    PriorVaLow,
+    /// Previous session point of control.
+    PriorPoc,
     /// Overnight (Globex) session high.
     OvernightHigh,
     /// Overnight (Globex) session low.
@@ -39,6 +45,12 @@ pub struct LevelsPipeline {
     pub prior_day_low: f64,
     /// Previous RTH session closing price.
     pub prior_day_close: f64,
+    /// Previous session value area high.
+    pub prior_va_high: f64,
+    /// Previous session value area low.
+    pub prior_va_low: f64,
+    /// Previous session point of control.
+    pub prior_poc: f64,
     /// Overnight (Globex) session high.
     pub overnight_high: f64,
     /// Overnight (Globex) session low.
@@ -59,6 +71,9 @@ impl Default for LevelsPipeline {
             prior_day_high: 0.0,
             prior_day_low: 0.0,
             prior_day_close: 0.0,
+            prior_va_high: 0.0,
+            prior_va_low: 0.0,
+            prior_poc: 0.0,
             overnight_high: 0.0,
             overnight_low: 0.0,
             session_high: 0.0,
@@ -92,6 +107,13 @@ impl LevelsPipeline {
         self.prior_day_high = high;
         self.prior_day_low = low;
         self.prior_day_close = close;
+    }
+
+    /// Set prior session VA/POC from stored data.
+    pub fn set_prior_profile(&mut self, va_high: f64, va_low: f64, poc: f64) {
+        self.prior_va_high = va_high;
+        self.prior_va_low = va_low;
+        self.prior_poc = poc;
     }
 
     /// Apply one trade update and maintain key levels.
@@ -140,6 +162,21 @@ impl LevelsPipeline {
             levels.push(KeyLevel {
                 level_type: KeyLevelType::PriorDayClose,
                 price: self.prior_day_close,
+            });
+        }
+
+        if self.prior_va_high > 0.0 {
+            levels.push(KeyLevel {
+                level_type: KeyLevelType::PriorVaHigh,
+                price: self.prior_va_high,
+            });
+            levels.push(KeyLevel {
+                level_type: KeyLevelType::PriorVaLow,
+                price: self.prior_va_low,
+            });
+            levels.push(KeyLevel {
+                level_type: KeyLevelType::PriorPoc,
+                price: self.prior_poc,
             });
         }
 

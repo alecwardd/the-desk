@@ -32,6 +32,7 @@ function makeContext(): PromptContext {
       dailyPnlR: 0,
       tradeCount: 0,
       consecutiveLosses: 0,
+      consecutiveWins: 0,
       drawdownR: 0,
       maxDailyLossR: 3,
       atLimit: false

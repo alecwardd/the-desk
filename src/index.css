@@ -20,8 +20,16 @@
   --color-prompt-warning: #2a1a00;
   --color-prompt-critical: #2a1010;
   --color-prompt-info: #1a2a3a;
+  --color-prompt-risk-warning: #2a1a1a;
 
   --font-mono: "JetBrains Mono", "Cascadia Code", "Fira Code", ui-monospace, monospace;
+
+  --animate-pulse-border: pulse-border 2s ease-in-out infinite;
+
+  @keyframes pulse-border {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.5; }
+  }
 }
 
 :root {

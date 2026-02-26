@@ -1,11 +1,15 @@
 use std::time::Duration;
 
 use tauri::State;
-use the_desk_backend::db::{SessionEventInput, SessionEventRecord};
+use the_desk_backend::db::{
+    JournalEntry, RiskConfigRecord, SessionEventInput, SessionEventRecord, SessionRecord,
+    TradeRecord,
+};
 use the_desk_backend::dtc::{run_mock_dtc_server, DtcEvent, TradeSide};
 use the_desk_backend::recording::{ReplayEngine, SessionRecorder};
 use the_desk_backend::risk::RiskState;
 use the_desk_backend::rules::SetupDefinition;
+use the_desk_backend::templates;
 
 use super::AppState;
 
@@ -130,19 +134,20 @@ pub async fn start_session(state: State<'_, AppState>) -> Result<String, String>
 
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let db = state.db.lock().await;
-    if let Ok(Some((high, low, close))) = db.load_prior_day(&today) {
+    if let Ok(Some((high, low, close, va_h, va_l, p))) = db.load_prior_day_full(&today) {
         drop(db);
-        state
-            .pipelines
-            .lock()
-            .await
-            .levels
-            .set_prior_day(high, low, close);
+        let mut pipelines = state.pipelines.lock().await;
+        pipelines.levels.set_prior_day(high, low, close);
+        if let (Some(vh), Some(vl), Some(pc)) = (va_h, va_l, p) {
+            pipelines.levels.set_prior_profile(vh, vl, pc);
+        }
+        drop(pipelines);
         let db = state.db.lock().await;
         db.add_event(&SessionEventInput {
             event_type: "session_start".to_string(),
             setup_id: None,
             data: serde_json::json!({ "sessionId": session_id }),
+            session_id: Some(session_id.clone()),
         })
         .map_err(|e| e.to_string())?;
     } else {
@@ -150,16 +155,21 @@ pub async fn start_session(state: State<'_, AppState>) -> Result<String, String>
             event_type: "session_start".to_string(),
             setup_id: None,
             data: serde_json::json!({ "sessionId": session_id }),
+            session_id: Some(session_id.clone()),
         })
         .map_err(|e| e.to_string())?;
     }
 
     let dir = super::data_dir();
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let rec_path = dir
-        .join(format!("session_{session_id}.desk"))
+        .join(format!("{today}_{session_id}.desk"))
         .to_string_lossy()
         .to_string();
-    *state.recorder.lock().await = SessionRecorder::new(rec_path);
+    let mut recorder = state.recorder.lock().await;
+    *recorder = SessionRecorder::new(rec_path);
+    recorder.start();
+    drop(recorder);
 
     Ok(session_id)
 }
@@ -179,14 +189,28 @@ pub async fn stop_session(state: State<'_, AppState>) -> Result<(), String> {
     db.add_event(&SessionEventInput {
         event_type: "session_stop".to_string(),
         setup_id: None,
-        data: serde_json::json!({ "sessionId": session_id }),
+        data: serde_json::json!({ "sessionId": &session_id }),
+        session_id: session_id.clone(),
     })
     .map_err(|e| e.to_string())?;
 
     if session_high > 0.0 {
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-        db.save_prior_day(&today, session_high, session_low, last_price)
-            .map_err(|e| e.to_string())?;
+        let pipelines = state.pipelines.lock().await;
+        let va_high = pipelines.tpo.va_high();
+        let va_low = pipelines.tpo.va_low();
+        let poc = pipelines.tpo.poc();
+        drop(pipelines);
+        db.save_prior_day_full(
+            &today,
+            session_high,
+            session_low,
+            last_price,
+            va_high,
+            va_low,
+            poc,
+        )
+        .map_err(|e| e.to_string())?;
     }
     drop(db);
 
@@ -203,13 +227,15 @@ pub async fn add_session_event(
     event: SessionEventInput,
 ) -> Result<(), String> {
     let db = state.db.lock().await;
-    db.add_event(&event).map_err(|e| e.to_string())
+    db.add_event(&event).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// Record a trade event and update risk state if a result is provided.
 #[tauri::command]
 pub async fn add_trade(state: State<'_, AppState>, trade: TradeInput) -> Result<(), String> {
     let db = state.db.lock().await;
+    let session_id = state.session_id.lock().await.clone();
     db.add_event(&SessionEventInput {
         event_type: "trade_entry".to_string(),
         setup_id: trade.setup_id.clone(),
@@ -220,6 +246,7 @@ pub async fn add_trade(state: State<'_, AppState>, trade: TradeInput) -> Result<
             "exitPrice": trade.exit_price,
             "resultR": trade.result_r,
         }),
+        session_id,
     })
     .map_err(|e| e.to_string())?;
     if let Some(result_r) = trade.result_r {
@@ -235,18 +262,26 @@ pub async fn add_trade(state: State<'_, AppState>, trade: TradeInput) -> Result<
 }
 
 /// Send messages to the Anthropic Claude API and return the text response.
+/// The `model` parameter selects the model tier: "opus" for high-reasoning tasks,
+/// "sonnet" for real-time coaching, or omit for the configured default.
 #[tauri::command]
 pub async fn call_claude_api(
     messages: Vec<ClaudeMessage>,
     system: Option<String>,
+    model: Option<String>,
 ) -> Result<String, String> {
     if messages.is_empty() {
         return Err("No messages provided".to_string());
     }
 
     let api_key = anthropic_api_key()?;
-    let model =
-        std::env::var("ANTHROPIC_MODEL").unwrap_or_else(|_| "claude-3-5-haiku-latest".to_string());
+    let model = match model.as_deref() {
+        Some("opus") => "claude-sonnet-4-20250514".to_string(),
+        Some("sonnet") => "claude-3-5-haiku-latest".to_string(),
+        Some(explicit) => explicit.to_string(),
+        None => std::env::var("ANTHROPIC_MODEL")
+            .unwrap_or_else(|_| "claude-3-5-haiku-latest".to_string()),
+    };
     let request_body = ClaudeRequest {
         model,
         max_tokens: 300,
@@ -448,6 +483,220 @@ pub async fn set_prior_day_levels(
         .map_err(|e| e.to_string())?;
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Setup management commands (B1)
+// ---------------------------------------------------------------------------
+
+/// Update an existing setup definition.
+#[tauri::command]
+pub async fn update_setup(
+    state: State<'_, AppState>,
+    setup: SetupDefinition,
+) -> Result<SetupDefinition, String> {
+    let db = state.db.lock().await;
+    db.upsert_setup(&setup).map_err(|e| e.to_string())?;
+    Ok(setup)
+}
+
+/// Delete a setup by ID.
+#[tauri::command]
+pub async fn delete_setup(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    let db = state.db.lock().await;
+    db.delete_setup(&id).map_err(|e| e.to_string())
+}
+
+/// Duplicate a setup with a new UUID and "(Copy)" suffix.
+#[tauri::command]
+pub async fn duplicate_setup(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<SetupDefinition, String> {
+    let db = state.db.lock().await;
+    let original = db
+        .get_setup(&id)
+        .map_err(|e| e.to_string())?
+        .ok_or("Setup not found")?;
+    let mut copy = original;
+    copy.id = uuid::Uuid::new_v4().to_string();
+    copy.name = format!("{} (Copy)", copy.name);
+    db.upsert_setup(&copy).map_err(|e| e.to_string())?;
+    Ok(copy)
+}
+
+/// Toggle a setup active/inactive.
+#[tauri::command]
+pub async fn toggle_setup(
+    state: State<'_, AppState>,
+    id: String,
+    active: bool,
+) -> Result<(), String> {
+    let db = state.db.lock().await;
+    db.toggle_setup(&id, active).map_err(|e| e.to_string())
+}
+
+/// Return the list of built-in setup templates.
+#[tauri::command]
+pub async fn list_templates() -> Result<Vec<SetupDefinition>, String> {
+    Ok(templates::builtin_templates())
+}
+
+// ---------------------------------------------------------------------------
+// Trade commands (B2)
+// ---------------------------------------------------------------------------
+
+/// Create a trade record from the "Took it" flow.
+#[tauri::command]
+pub async fn create_trade(
+    state: State<'_, AppState>,
+    trade: TradeRecord,
+) -> Result<TradeRecord, String> {
+    let db = state.db.lock().await;
+    db.insert_trade(&trade).map_err(|e| e.to_string())?;
+    Ok(trade)
+}
+
+/// Close an open trade with exit details.
+#[tauri::command]
+pub async fn close_trade(
+    state: State<'_, AppState>,
+    id: String,
+    exit_price: f64,
+    result_r: f64,
+) -> Result<(), String> {
+    let exit_time = chrono::Utc::now().timestamp_millis() as f64;
+    let db = state.db.lock().await;
+    db.update_trade_exit(&id, exit_time, exit_price, result_r)
+        .map_err(|e| e.to_string())?;
+    drop(db);
+
+    let mut risk = state.risk.lock().await;
+    risk.record_trade_result(result_r);
+    let snapshot = risk.state();
+    drop(risk);
+
+    let db = state.db.lock().await;
+    db.save_risk_state(&snapshot).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// List trades for a session.
+#[tauri::command]
+pub async fn list_trades(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<Vec<TradeRecord>, String> {
+    let db = state.db.lock().await;
+    db.list_trades_for_session(&session_id)
+        .map_err(|e| e.to_string())
+}
+
+/// Get the currently open trade for a session (if any).
+#[tauri::command]
+pub async fn get_open_trade(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<Option<TradeRecord>, String> {
+    let db = state.db.lock().await;
+    db.get_open_trade(&session_id).map_err(|e| e.to_string())
+}
+
+/// Update trade review fields (planned, rules_followed, emotional_state, notes).
+#[tauri::command]
+pub async fn review_trade(
+    state: State<'_, AppState>,
+    id: String,
+    planned: bool,
+    rules_followed: Option<bool>,
+    emotional_state: Option<String>,
+    notes: String,
+) -> Result<(), String> {
+    let db = state.db.lock().await;
+    db.update_trade_review(
+        &id,
+        planned,
+        rules_followed,
+        emotional_state.as_deref(),
+        &notes,
+    )
+    .map_err(|e| e.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Session management commands (extended)
+// ---------------------------------------------------------------------------
+
+/// List saved sessions.
+#[tauri::command]
+pub async fn list_sessions(
+    state: State<'_, AppState>,
+    limit: Option<usize>,
+) -> Result<Vec<SessionRecord>, String> {
+    let db = state.db.lock().await;
+    db.list_sessions(limit.unwrap_or(50))
+        .map_err(|e| e.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Journal commands
+// ---------------------------------------------------------------------------
+
+/// Save a journal entry.
+#[tauri::command]
+pub async fn save_journal_entry(
+    state: State<'_, AppState>,
+    entry: JournalEntry,
+) -> Result<(), String> {
+    let db = state.db.lock().await;
+    db.insert_journal_entry(&entry).map_err(|e| e.to_string())
+}
+
+/// Get journal entries for a session.
+#[tauri::command]
+pub async fn get_journal(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<Vec<JournalEntry>, String> {
+    let db = state.db.lock().await;
+    db.get_journal_for_session(&session_id)
+        .map_err(|e| e.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Risk config commands
+// ---------------------------------------------------------------------------
+
+/// Get the trader's risk configuration.
+#[tauri::command]
+pub async fn get_risk_config(state: State<'_, AppState>) -> Result<RiskConfigRecord, String> {
+    let db = state.db.lock().await;
+    db.load_risk_config().map_err(|e| e.to_string())
+}
+
+/// Save updated risk configuration.
+#[tauri::command]
+pub async fn save_risk_config(
+    state: State<'_, AppState>,
+    config: RiskConfigRecord,
+) -> Result<(), String> {
+    let db = state.db.lock().await;
+    db.save_risk_config(&config).map_err(|e| e.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Recording management
+// ---------------------------------------------------------------------------
+
+/// List saved session recordings.
+#[tauri::command]
+pub async fn list_recordings() -> Result<Vec<the_desk_backend::recording::RecordingInfo>, String> {
+    let dir = super::data_dir();
+    the_desk_backend::recording::list_recordings(&dir.to_string_lossy()).map_err(|e| e.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Replay helpers
+// ---------------------------------------------------------------------------
 
 fn replay_entry_to_dtc_event(
     entry: &the_desk_backend::recording::RecordingEntry,

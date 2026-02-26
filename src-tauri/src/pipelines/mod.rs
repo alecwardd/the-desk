@@ -5,7 +5,7 @@ mod vwap;
 
 pub use delta::DeltaPipeline;
 pub use levels::{KeyLevel, KeyLevelType, LevelsPipeline};
-pub use tpo::TpoPipeline;
+pub use tpo::{SinglePrint, SinglePrintPeriod, TpoPipeline};
 pub use vwap::VwapPipeline;
 
 use serde::{Deserialize, Serialize};
@@ -26,6 +26,14 @@ pub struct MarketState {
     pub vwap_1sd_upper: f64,
     /// VWAP minus one standard deviation.
     pub vwap_1sd_lower: f64,
+    /// VWAP plus two standard deviations.
+    pub vwap_2sd_upper: f64,
+    /// VWAP minus two standard deviations.
+    pub vwap_2sd_lower: f64,
+    /// VWAP plus three standard deviations.
+    pub vwap_3sd_upper: f64,
+    /// VWAP minus three standard deviations.
+    pub vwap_3sd_lower: f64,
     /// TPO value area high (70% of TPOs).
     pub va_high: f64,
     /// TPO value area low (70% of TPOs).
@@ -48,6 +56,12 @@ pub struct MarketState {
     pub prior_day_low: f64,
     /// Previous RTH session closing price.
     pub prior_day_close: f64,
+    /// Previous session value area high.
+    pub prior_va_high: f64,
+    /// Previous session value area low.
+    pub prior_va_low: f64,
+    /// Previous session point of control.
+    pub prior_poc: f64,
     /// Overnight (Globex) session high.
     pub overnight_high: f64,
     /// Overnight (Globex) session low.
@@ -105,13 +119,19 @@ impl PipelineEngine {
 
     /// Build current market state snapshot.
     pub fn snapshot(&self, bid: f64, ask: f64) -> MarketState {
+        let sd = self.vwap.std_dev();
+        let vwap = self.vwap.vwap();
         MarketState {
             last_price: self.levels.last_price,
             bid,
             ask,
-            vwap: self.vwap.vwap(),
-            vwap_1sd_upper: self.vwap.vwap() + self.vwap.std_dev(),
-            vwap_1sd_lower: self.vwap.vwap() - self.vwap.std_dev(),
+            vwap,
+            vwap_1sd_upper: vwap + sd,
+            vwap_1sd_lower: vwap - sd,
+            vwap_2sd_upper: vwap + 2.0 * sd,
+            vwap_2sd_lower: vwap - 2.0 * sd,
+            vwap_3sd_upper: vwap + 3.0 * sd,
+            vwap_3sd_lower: vwap - 3.0 * sd,
             va_high: self.tpo.va_high(),
             va_low: self.tpo.va_low(),
             poc: self.tpo.poc(),
@@ -123,6 +143,9 @@ impl PipelineEngine {
             prior_day_high: self.levels.prior_day_high,
             prior_day_low: self.levels.prior_day_low,
             prior_day_close: self.levels.prior_day_close,
+            prior_va_high: self.levels.prior_va_high,
+            prior_va_low: self.levels.prior_va_low,
+            prior_poc: self.levels.prior_poc,
             overnight_high: self.levels.overnight_high,
             overnight_low: self.levels.overnight_low,
             or_high: self.tpo.or_high(),

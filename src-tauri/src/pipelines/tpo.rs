@@ -1,4 +1,25 @@
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+
+/// Which session period a single print occurred in.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum SinglePrintPeriod {
+    /// Within the Opening Range (first 30 minutes).
+    Or,
+    /// Within the Initial Balance (first 60 minutes, but after OR).
+    Ib,
+    /// During regular session after IB.
+    Regular,
+}
+
+/// A single-print price level with its session period.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SinglePrint {
+    pub price: f64,
+    pub period: SinglePrintPeriod,
+}
 
 /// Incremental TPO profile with OR/IB tracking.
 #[derive(Debug)]
@@ -141,21 +162,48 @@ impl TpoPipeline {
         self.ib_low
     }
 
-    /// Price levels that have exactly one TPO letter.
-    pub fn single_prints(&self) -> Vec<f64> {
-        let mut levels: Vec<f64> = self
+    /// Price levels that have exactly one TPO letter, tagged by session period.
+    pub fn single_prints(&self) -> Vec<SinglePrint> {
+        let or_high_key = self.discretize(self.or_high);
+        let or_low_key = self.discretize(self.or_low);
+        let ib_high_key = self.discretize(self.ib_high);
+        let ib_low_key = self.discretize(self.ib_low);
+
+        let mut prints: Vec<SinglePrint> = self
             .tpo_letters
             .iter()
             .filter_map(|(price, letters)| {
-                if letters.len() == 1 {
-                    Some(*price as f64 * self.tick_size)
-                } else {
-                    None
+                if letters.len() != 1 {
+                    return None;
                 }
+                let bracket = *letters.iter().next().unwrap();
+                let period = if bracket == 0 && *price >= or_low_key && *price <= or_high_key {
+                    SinglePrintPeriod::Or
+                } else if bracket <= 1 && *price >= ib_low_key && *price <= ib_high_key {
+                    SinglePrintPeriod::Ib
+                } else {
+                    SinglePrintPeriod::Regular
+                };
+                Some(SinglePrint {
+                    price: *price as f64 * self.tick_size,
+                    period,
+                })
             })
             .collect();
-        levels.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        levels
+        prints.sort_by(|a, b| {
+            a.price
+                .partial_cmp(&b.price)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        prints
+    }
+
+    /// Simple list of single-print price levels (untagged, for backward compat).
+    pub fn single_print_prices(&self) -> Vec<f64> {
+        self.single_prints()
+            .into_iter()
+            .map(|sp| sp.price)
+            .collect()
     }
 }
 

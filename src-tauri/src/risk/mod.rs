@@ -29,6 +29,8 @@ pub struct RiskState {
     pub trade_count: usize,
     /// Current streak of consecutive losing trades.
     pub consecutive_losses: usize,
+    /// Current streak of consecutive winning trades.
+    pub consecutive_wins: usize,
     /// Drawdown from session high-water mark in R units.
     pub drawdown_r: f64,
     /// Configured maximum daily loss limit in R units.
@@ -64,7 +66,9 @@ impl RiskTracker {
         self.state.daily_pnl_r += result_r;
         if result_r < 0.0 {
             self.state.consecutive_losses += 1;
+            self.state.consecutive_wins = 0;
         } else {
+            self.state.consecutive_wins += 1;
             self.state.consecutive_losses = 0;
         }
         self.high_water_pnl_r = self.high_water_pnl_r.max(self.state.daily_pnl_r);

@@ -4,6 +4,7 @@ import { CoachingFeed } from "./components/coaching/coaching-feed";
 import { MarketSidebar } from "./components/dashboard/market-sidebar";
 import { OnboardingWizard } from "./components/onboarding/onboarding-wizard";
 import { PlaybookBuilder } from "./components/playbook/playbook-builder";
+import { SetupList } from "./components/playbook/setup-list";
 import { ReplayControls } from "./components/replay/replay-controls";
 import { SessionReview } from "./components/review/session-review";
 import { RiskBar } from "./components/risk/risk-bar";
@@ -13,13 +14,13 @@ import { useMarketState } from "./hooks/use-market-state";
 import { useRiskState } from "./hooks/use-risk-state";
 import { useSetupAlerts } from "./hooks/use-setup-alerts";
 import { generateCoachingPrompt } from "./lib/claude";
-import { sessionBridge, setupBridge } from "./lib/tauri-bridge";
-import type { CoachingPrompt, SessionEventRecord, Setup } from "./lib/types";
+import { sessionBridge, setupBridge, tradeBridge } from "./lib/tauri-bridge";
+import type { CoachingPrompt, SessionEventRecord, Setup, TradeRecord } from "./lib/types";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Card, CardContent } from "@/components/ui/card";
 
-type View = "dashboard" | "briefing" | "review";
+type View = "dashboard" | "briefing" | "review" | "settings" | "playbook";
 
 export default function App() {
   const connection = useConnection();
@@ -29,27 +30,41 @@ export default function App() {
   const streamPrompts = useCoachingPrompts();
   const [localPrompts, setLocalPrompts] = useState<CoachingPrompt[]>([]);
   const [setups, setSetups] = useState<Setup[]>([]);
+  const [templates, setTemplates] = useState<Setup[]>([]);
   const [showOnboarding, setShowOnboarding] = useState(true);
   const [quickNote, setQuickNote] = useState("");
   const [view, setView] = useState<View>("dashboard");
   const [sessionEvents, setSessionEvents] = useState<SessionEventRecord[]>([]);
+  const [sessionId, setSessionId] = useState<string | null>(null);
+  const [preSessionNote, setPreSessionNote] = useState("");
   const [appStatus, setAppStatus] = useState<string | null>(null);
+  const [editingSetup, setEditingSetup] = useState<Setup | null>(null);
 
   const prompts = useMemo(
     () => [...localPrompts, ...streamPrompts],
     [localPrompts, streamPrompts]
   );
 
+  const hasActiveSetups = setups.some((s) => s.active);
+
   useEffect(() => {
+    refreshSetups();
     setupBridge
-      .list()
-      .then((loaded) => setSetups(loaded))
-      .catch(() => setAppStatus("Setups unavailable; working in local-only mode"));
+      .listTemplates()
+      .then(setTemplates)
+      .catch(() => {});
     sessionBridge
       .listEvents(300)
-      .then((events) => setSessionEvents(events))
+      .then(setSessionEvents)
       .catch(() => {});
   }, []);
+
+  function refreshSetups() {
+    setupBridge
+      .list()
+      .then(setSetups)
+      .catch(() => setAppStatus("Setups unavailable; working in local-only mode"));
+  }
 
   useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {
@@ -75,10 +90,16 @@ export default function App() {
           setView("review");
         }
       }
+      if (event.key === "?") {
+        event.preventDefault();
+        setShowShortcuts((prev) => !prev);
+      }
     }
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [prompts]);
+
+  const [showShortcuts, setShowShortcuts] = useState(false);
 
   useEffect(() => {
     const latestAlert = setupAlerts[0];
@@ -106,9 +127,52 @@ export default function App() {
       eventType: "prompt_response",
       setupId: prompt.setupId,
       data: { promptEventId: prompt.sessionEventId, response, note: null },
+      sessionId,
     });
     const latest = await sessionBridge.listEvents(300).catch(() => null);
     if (latest) setSessionEvents(latest);
+  }
+
+  async function handleTookIt(
+    prompt: CoachingPrompt,
+    direction: "long" | "short",
+    size: number,
+    entryPrice: number
+  ) {
+    await handlePromptResponse(prompt, "took_it");
+
+    if (sessionId) {
+      const trade: TradeRecord = {
+        id: crypto.randomUUID(),
+        sessionId,
+        setupId: prompt.setupId,
+        entryTime: Date.now(),
+        entryPrice,
+        exitTime: null,
+        exitPrice: null,
+        direction,
+        size,
+        stopPrice: null,
+        targetPrices: [],
+        resultR: null,
+        planned: true,
+        rulesFollowed: null,
+        emotionalState: null,
+        notes: "",
+        source: "manual",
+      };
+      try {
+        await tradeBridge.create(trade);
+      } catch {
+        // Fall back to legacy addTrade
+        await sessionBridge.addTrade({
+          setupId: prompt.setupId,
+          direction,
+          size,
+          entryPrice,
+        });
+      }
+    }
   }
 
   function handleOnboardingComplete(newSetups: Setup[]) {
@@ -119,11 +183,14 @@ export default function App() {
 
   async function handleStartSession(focusNote?: string) {
     try {
-      await sessionBridge.start();
+      const sid = await sessionBridge.start();
+      setSessionId(sid);
       if (focusNote) {
+        setPreSessionNote(focusNote);
         await sessionBridge.addEvent({
           eventType: "focus_note",
           data: { note: focusNote },
+          sessionId: sid,
         });
       }
       setView("dashboard");
@@ -134,8 +201,21 @@ export default function App() {
     }
   }
 
+  const noSetupBanner = !hasActiveSetups && !showOnboarding ? (
+    <Card className="mx-3 mt-2 border-warning/30 shrink-0">
+      <CardContent className="py-3 flex items-center justify-between">
+        <p className="text-text-secondary text-sm">
+          No active setups — The Desk is watching but won't alert on setups.
+        </p>
+        <Button variant="outline" size="sm" onClick={() => setView("playbook")}>
+          Add a Setup
+        </Button>
+      </CardContent>
+    </Card>
+  ) : null;
+
   const statusBanner = (appStatus || connection !== "connected") ? (
-    <Card className="mx-3 mt-3 shrink-0">
+    <Card className="mx-3 mt-2 shrink-0">
       <CardContent className="py-3">
         {appStatus && <p className="text-text-secondary text-sm">{appStatus}</p>}
         {connection !== "connected" && (
@@ -145,6 +225,34 @@ export default function App() {
         )}
       </CardContent>
     </Card>
+  ) : null;
+
+  const shortcutModal = showShortcuts ? (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60"
+      onClick={() => setShowShortcuts(false)}
+    >
+      <Card className="w-80" onClick={(e) => e.stopPropagation()}>
+        <CardContent className="p-4 space-y-2">
+          <h3 className="text-text-primary font-semibold mb-3">Keyboard Shortcuts</h3>
+          {[
+            ["N", "Quick note"],
+            ["1", "Took it (respond to latest prompt)"],
+            ["2", "Watching"],
+            ["3", "Passed"],
+            ["Ctrl+E", "End session"],
+            ["?", "Toggle this help"],
+          ].map(([key, desc]) => (
+            <div key={key} className="flex justify-between text-sm">
+              <kbd className="bg-surface px-2 py-0.5 rounded text-text-primary font-mono">
+                {key}
+              </kbd>
+              <span className="text-text-secondary">{desc}</span>
+            </div>
+          ))}
+        </CardContent>
+      </Card>
+    </div>
   ) : null;
 
   return (
@@ -164,10 +272,12 @@ export default function App() {
       ) : view === "briefing" ? (
         <div className="flex flex-col overflow-auto">
           {statusBanner}
+          {noSetupBanner}
           <main className="flex justify-center p-3 flex-1">
             <PreSessionBriefing
               marketState={marketState}
               setups={setups}
+              riskState={riskState}
               onStartSession={handleStartSession}
             />
           </main>
@@ -181,21 +291,59 @@ export default function App() {
               alerts={setupAlerts}
               riskState={riskState}
               sessionEvents={sessionEvents}
+              sessionId={sessionId}
+              preSessionNote={preSessionNote}
             />
             <Button variant="outline" onClick={() => setView("dashboard")}>
               Back to Dashboard
             </Button>
           </main>
         </div>
+      ) : view === "playbook" ? (
+        <div className="flex flex-col overflow-auto">
+          {statusBanner}
+          <main className="grid grid-cols-[1fr_1fr] gap-3 p-3 flex-1 min-h-0 overflow-auto">
+            <SetupList
+              setups={setups}
+              onUpdate={refreshSetups}
+              onEdit={(setup) => {
+                setEditingSetup(setup);
+              }}
+            />
+            <PlaybookBuilder
+              onCreated={(setup) => {
+                setSetups((existing) => [setup, ...existing]);
+                refreshSetups();
+              }}
+              templates={templates}
+            />
+          </main>
+        </div>
+      ) : view === "settings" ? (
+        <div className="flex flex-col overflow-auto">
+          {statusBanner}
+          <main className="flex justify-center p-3 flex-1">
+            <SettingsPanel />
+          </main>
+        </div>
       ) : (
         <div className="flex flex-col overflow-hidden">
           {statusBanner}
+          {noSetupBanner}
           <main className="grid grid-cols-[240px_1fr_300px] gap-3 p-3 flex-1 min-h-0 overflow-auto">
             <MarketSidebar marketState={marketState} setupAlerts={setupAlerts} />
-            <CoachingFeed prompts={prompts} onRespond={handlePromptResponse} />
+            <CoachingFeed
+              prompts={prompts}
+              onRespond={handlePromptResponse}
+              onTookIt={handleTookIt}
+            />
             <section className="flex flex-col gap-3 overflow-y-auto">
               <PlaybookBuilder
-                onCreated={(setup) => setSetups((existing) => [setup, ...existing])}
+                onCreated={(setup) => {
+                  setSetups((existing) => [setup, ...existing]);
+                  refreshSetups();
+                }}
+                templates={templates}
               />
               <ReplayControls
                 onStartReplay={() => {
@@ -226,11 +374,139 @@ export default function App() {
           <Button variant="ghost" size="sm" onClick={() => setView("dashboard")}>
             Dashboard
           </Button>
+          <Button variant="ghost" size="sm" onClick={() => setView("playbook")}>
+            Playbook
+          </Button>
           <Button variant="ghost" size="sm" onClick={() => setView("review")}>
             Review
           </Button>
+          <Button variant="ghost" size="sm" onClick={() => setView("settings")}>
+            Settings
+          </Button>
         </div>
       </footer>
+
+      {shortcutModal}
+    </div>
+  );
+}
+
+function SettingsPanel() {
+  const [riskConfig, setRiskConfig] = useState({
+    rValuePoints: 8,
+    rValueDollars: 40,
+    maxDailyLossR: 3,
+    maxConsecutiveLosses: 3,
+    maxTradesPerSession: 8 as number | null,
+    noTradeZones: [] as unknown[],
+  });
+  const [dtcHost, setDtcHost] = useState("127.0.0.1");
+  const [dtcPort, setDtcPort] = useState(11099);
+  const [symbol, setSymbol] = useState("NQ");
+  const [saved, setSaved] = useState(false);
+
+  useEffect(() => {
+    import("./lib/tauri-bridge").then(({ riskBridge }) => {
+      riskBridge.getConfig().then((config) => {
+        setRiskConfig({
+          rValuePoints: config.rValuePoints,
+          rValueDollars: config.rValueDollars,
+          maxDailyLossR: config.maxDailyLossR,
+          maxConsecutiveLosses: config.maxConsecutiveLosses,
+          maxTradesPerSession: config.maxTradesPerSession ?? null,
+          noTradeZones: config.noTradeZones,
+        });
+      }).catch(() => {});
+    });
+  }, []);
+
+  async function handleSave() {
+    try {
+      const { riskBridge } = await import("./lib/tauri-bridge");
+      await riskBridge.saveConfig(riskConfig);
+      setSaved(true);
+      setTimeout(() => setSaved(false), 2000);
+    } catch {
+      // swallow in local-only mode
+    }
+  }
+
+  return (
+    <div className="w-full max-w-lg space-y-4">
+      <Card>
+        <CardContent className="p-4 space-y-3">
+          <h3 className="text-text-primary font-semibold">Connection</h3>
+          <div className="grid grid-cols-3 gap-2">
+            <div className="flex flex-col gap-1">
+              <label className="text-xs text-text-secondary">Host</label>
+              <Input value={dtcHost} onChange={(e) => setDtcHost(e.target.value)} />
+            </div>
+            <div className="flex flex-col gap-1">
+              <label className="text-xs text-text-secondary">Port</label>
+              <Input type="number" value={dtcPort} onChange={(e) => setDtcPort(Number(e.target.value))} />
+            </div>
+            <div className="flex flex-col gap-1">
+              <label className="text-xs text-text-secondary">Symbol</label>
+              <Input value={symbol} onChange={(e) => setSymbol(e.target.value)} />
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardContent className="p-4 space-y-3">
+          <h3 className="text-text-primary font-semibold">Risk Configuration</h3>
+          <div className="grid grid-cols-2 gap-3">
+            <div className="flex flex-col gap-1">
+              <label className="text-xs text-text-secondary">R-value (points)</label>
+              <Input
+                type="number"
+                value={riskConfig.rValuePoints}
+                onChange={(e) => setRiskConfig({ ...riskConfig, rValuePoints: Number(e.target.value) })}
+              />
+            </div>
+            <div className="flex flex-col gap-1">
+              <label className="text-xs text-text-secondary">R-value (dollars)</label>
+              <Input
+                type="number"
+                value={riskConfig.rValueDollars}
+                onChange={(e) => setRiskConfig({ ...riskConfig, rValueDollars: Number(e.target.value) })}
+              />
+            </div>
+            <div className="flex flex-col gap-1">
+              <label className="text-xs text-text-secondary">Max daily loss (R)</label>
+              <Input
+                type="number"
+                value={riskConfig.maxDailyLossR}
+                onChange={(e) => setRiskConfig({ ...riskConfig, maxDailyLossR: Number(e.target.value) })}
+              />
+            </div>
+            <div className="flex flex-col gap-1">
+              <label className="text-xs text-text-secondary">Max consecutive losses</label>
+              <Input
+                type="number"
+                value={riskConfig.maxConsecutiveLosses}
+                onChange={(e) => setRiskConfig({ ...riskConfig, maxConsecutiveLosses: Number(e.target.value) })}
+              />
+            </div>
+            <div className="flex flex-col gap-1">
+              <label className="text-xs text-text-secondary">Max trades/session</label>
+              <Input
+                type="number"
+                value={riskConfig.maxTradesPerSession ?? ""}
+                onChange={(e) => {
+                  const v = e.target.value ? Number(e.target.value) : null;
+                  setRiskConfig({ ...riskConfig, maxTradesPerSession: v });
+                }}
+              />
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+
+      <Button onClick={handleSave} className="w-full">
+        {saved ? "Saved" : "Save Settings"}
+      </Button>
     </div>
   );
 }

@@ -15,6 +15,30 @@ export interface Setup {
   minDelta?: number;
   requireAboveVwap?: boolean;
   duplicateSuppressionMs?: number;
+  entryLogic?: Record<string, unknown>;
+  stopLogic?: Record<string, unknown>;
+  targets?: Record<string, unknown>[];
+  positionSizing?: Record<string, unknown>;
+  marketContext?: Record<string, unknown>;
+  invalidation?: Record<string, unknown>[];
+  backtestResults?: BacktestResults;
+  contextBacktestResults?: Record<string, unknown>[];
+  discretionaryConditions?: string[];
+  templateSource?: string | null;
+}
+
+export interface BacktestResults {
+  period?: string;
+  samples?: number;
+  winRate?: number;
+  avgWinnerR?: number;
+  avgLoserR?: number;
+  profitFactor?: number;
+  maxConsecutiveLosses?: number;
+  maxDrawdownR?: number;
+  expectancyR?: number;
+  source?: string;
+  importedAt?: number;
 }
 
 export interface SetupAlert {
@@ -33,6 +57,10 @@ export interface MarketState {
   vwap: number;
   vwap1sdUpper: number;
   vwap1sdLower: number;
+  vwap2sdUpper: number;
+  vwap2sdLower: number;
+  vwap3sdUpper: number;
+  vwap3sdLower: number;
   vaHigh: number;
   vaLow: number;
   poc: number;
@@ -44,6 +72,9 @@ export interface MarketState {
   priorDayHigh: number;
   priorDayLow: number;
   priorDayClose: number;
+  priorVaHigh: number;
+  priorVaLow: number;
+  priorPoc: number;
   overnightHigh: number;
   overnightLow: number;
   orHigh: number;
@@ -56,6 +87,7 @@ export interface RiskState {
   dailyPnlR: number;
   tradeCount: number;
   consecutiveLosses: number;
+  consecutiveWins: number;
   drawdownR: number;
   maxDailyLossR: number;
   atLimit: boolean;
@@ -67,8 +99,8 @@ export interface CoachingPrompt {
   setupId: string | null;
   setupName: string;
   message: string;
-  priority: "info" | "alert" | "warning" | "critical";
-  source: "llm" | "raw";
+  priority: "info" | "alert" | "warning" | "critical" | "risk_warning";
+  source: "llm" | "raw" | "replay";
   timestamp: number;
 }
 
@@ -76,6 +108,7 @@ export interface SessionEventInput {
   eventType: string;
   setupId?: string | null;
   data: Record<string, unknown>;
+  sessionId?: string | null;
 }
 
 export interface SessionEventRecord {
@@ -83,6 +116,8 @@ export interface SessionEventRecord {
   eventType: string;
   setupId?: string | null;
   data: Record<string, unknown>;
+  sessionId?: string | null;
+  timestamp?: number | null;
 }
 
 export interface TradeInput {
@@ -92,4 +127,54 @@ export interface TradeInput {
   entryPrice: number;
   exitPrice?: number;
   resultR?: number;
+}
+
+export interface TradeRecord {
+  id: string;
+  sessionId?: string | null;
+  setupId?: string | null;
+  entryTime: number;
+  entryPrice: number;
+  exitTime?: number | null;
+  exitPrice?: number | null;
+  direction: string;
+  size: number;
+  stopPrice?: number | null;
+  targetPrices: number[];
+  resultR?: number | null;
+  planned: boolean;
+  rulesFollowed?: boolean | null;
+  emotionalState?: string | null;
+  notes: string;
+  source: string;
+}
+
+export interface SessionRecord {
+  id: string;
+  date: string;
+  sessionType: string;
+  startTime: number;
+  endTime?: number | null;
+  recordingPath?: string | null;
+  preSessionNote?: string | null;
+}
+
+export interface JournalEntry {
+  id: string;
+  sessionId?: string | null;
+  date: string;
+  content: string;
+  tags: string[];
+  setupReferences: string[];
+  tradeReferences: string[];
+  createdAt: number;
+}
+
+export interface RiskConfigRecord {
+  rValuePoints: number;
+  rValueDollars: number;
+  maxDailyLossR: number;
+  maxConsecutiveLosses: number;
+  maxTradesPerSession?: number | null;
+  noTradeZones: unknown[];
 }

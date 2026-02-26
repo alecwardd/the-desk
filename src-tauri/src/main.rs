@@ -149,8 +149,13 @@ async fn processing_loop(handle: AppHandle, mut rx: broadcast::Receiver<DtcEvent
                     for setup in &setups {
                         if let Some(alert) = rules.evaluate(setup, &market, risk_state.at_limit) {
                             handle.emit("setup-alert", &alert).ok();
+                            if let Ok(alert_json) = serde_json::to_value(&alert) {
+                                let mut recorder = state.recorder.lock().await;
+                                recorder.push_alert(&alert_json);
+                            }
                         }
                     }
+                    rules.update_prev_market(&market);
                 }
 
                 // Throttled risk state emission
@@ -227,8 +232,11 @@ fn main() {
 
     let mut pipelines = PipelineEngine::new();
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-    if let Ok(Some((high, low, close))) = db.load_prior_day(&today) {
+    if let Ok(Some((high, low, close, va_h, va_l, poc))) = db.load_prior_day_full(&today) {
         pipelines.levels.set_prior_day(high, low, close);
+        if let (Some(vh), Some(vl), Some(pc)) = (va_h, va_l, poc) {
+            pipelines.levels.set_prior_profile(vh, vl, pc);
+        }
     }
 
     let state = AppState {
@@ -255,11 +263,26 @@ fn main() {
             commands::dtc_status,
             commands::list_setups,
             commands::create_setup,
+            commands::update_setup,
+            commands::delete_setup,
+            commands::duplicate_setup,
+            commands::toggle_setup,
+            commands::list_templates,
             commands::get_risk_state,
+            commands::get_risk_config,
+            commands::save_risk_config,
             commands::start_session,
             commands::stop_session,
+            commands::list_sessions,
             commands::add_session_event,
             commands::add_trade,
+            commands::create_trade,
+            commands::close_trade,
+            commands::list_trades,
+            commands::get_open_trade,
+            commands::review_trade,
+            commands::save_journal_entry,
+            commands::get_journal,
             commands::call_claude_api,
             commands::load_recording,
             commands::start_replay,
@@ -267,6 +290,7 @@ fn main() {
             commands::seek_replay,
             commands::stop_replay,
             commands::list_session_events,
+            commands::list_recordings,
             commands::start_mock_feed,
             commands::set_prior_day_levels,
         ])

@@ -252,6 +252,9 @@ impl Database {
         if version < 5 {
             self.migrate_v5()?;
         }
+        if version < 6 {
+            self.migrate_v6()?;
+        }
 
         Ok(())
     }
@@ -563,6 +566,51 @@ impl Database {
             ALTER TABLE session_summaries ADD COLUMN balance_state TEXT NOT NULL DEFAULT '';
 
             UPDATE schema_version SET version = 5;
+            ",
+        )?;
+        Ok(())
+    }
+
+    /// V6: add dedup constraints for raw_ticks and market_events.
+    fn migrate_v6(&self) -> Result<(), DbError> {
+        self.conn.execute_batch(
+            "
+            DELETE FROM raw_ticks
+            WHERE id NOT IN (
+              SELECT MIN(id)
+              FROM raw_ticks
+              GROUP BY timestamp_ms, price, volume, bid, ask, is_buy, session_date
+            );
+
+            DELETE FROM market_events
+            WHERE id NOT IN (
+              SELECT MIN(id)
+              FROM market_events
+              GROUP BY
+                session_date,
+                timestamp_ms,
+                event_type,
+                COALESCE(level_name, ''),
+                price,
+                COALESCE(direction, ''),
+                COALESCE(sequence_num, -1)
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_raw_ticks_identity
+              ON raw_ticks(timestamp_ms, price, volume, bid, ask, is_buy, session_date);
+
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_market_events_identity
+              ON market_events(
+                session_date,
+                timestamp_ms,
+                event_type,
+                COALESCE(level_name, ''),
+                price,
+                COALESCE(direction, ''),
+                COALESCE(sequence_num, -1)
+              );
+
+            UPDATE schema_version SET version = 6;
             ",
         )?;
         Ok(())
@@ -1242,7 +1290,7 @@ impl Database {
         session_date: &str,
     ) -> Result<(), DbError> {
         self.conn.execute(
-            "INSERT INTO raw_ticks (timestamp_ms, price, volume, bid, ask, is_buy, session_date)
+            "INSERT OR IGNORE INTO raw_ticks (timestamp_ms, price, volume, bid, ask, is_buy, session_date)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 timestamp_ms,
@@ -1444,7 +1492,7 @@ impl Database {
         let tx = self.conn.unchecked_transaction()?;
         {
             let mut stmt = tx.prepare_cached(
-                "INSERT INTO raw_ticks (timestamp_ms, price, volume, bid, ask, is_buy, session_date)
+                "INSERT OR IGNORE INTO raw_ticks (timestamp_ms, price, volume, bid, ask, is_buy, session_date)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             )?;
             for (ts, price, vol, bid, ask, is_buy, session_date) in ticks {
@@ -1705,6 +1753,36 @@ impl Database {
             |r| r.get(0),
         )?;
         Ok(count > 0)
+    }
+
+    /// Remove backfill-derived research rows for a session before force reprocess.
+    pub fn purge_session_research(&self, session_date: &str) -> Result<(), DbError> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM market_events WHERE session_date = ?1",
+            params![session_date],
+        )?;
+        tx.execute(
+            "DELETE FROM session_summaries WHERE session_date = ?1",
+            params![session_date],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Load recent RTH session volumes for RVOL baseline construction.
+    pub fn recent_rth_session_volumes(&self, limit: usize) -> Result<Vec<f64>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT total_volume
+             FROM session_summaries
+             WHERE session_type = 'RTH' AND total_volume > 0
+             ORDER BY session_date DESC
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |row| row.get::<_, f64>(0))?;
+        let mut volumes: Vec<f64> = rows.filter_map(|r| r.ok()).collect();
+        volumes.reverse();
+        Ok(volumes)
     }
 
     /// List session summaries with optional filters.

@@ -103,6 +103,12 @@ pub struct MarketState {
     pub overnight_high: f64,
     /// Overnight (Globex) session low.
     pub overnight_low: f64,
+    /// Current RTH session high.
+    pub session_high: f64,
+    /// Current RTH session low.
+    pub session_low: f64,
+    /// Last RTH trade price used as session close.
+    pub rth_close_price: f64,
     /// Opening range high (first 30 minutes of RTH).
     pub or_high: f64,
     /// Opening range low (first 30 minutes of RTH).
@@ -257,10 +263,15 @@ impl PipelineEngine {
 
     /// Current session's ending state for archival into prior-day levels.
     pub fn session_end_state(&self) -> SessionEndState {
+        let close = if self.levels.rth_close_price > 0.0 {
+            self.levels.rth_close_price
+        } else {
+            self.levels.last_price
+        };
         SessionEndState {
             high: self.levels.session_high,
             low: self.levels.session_low,
-            close: self.levels.last_price,
+            close,
             va_high: self.tpo.va_high(),
             va_low: self.tpo.va_low(),
             poc: self.tpo.poc(),
@@ -361,6 +372,9 @@ impl PipelineEngine {
             prior_poc: self.levels.prior_poc,
             overnight_high: self.levels.overnight_high,
             overnight_low: self.levels.overnight_low,
+            session_high: self.levels.session_high,
+            session_low: self.levels.session_low,
+            rth_close_price: self.levels.rth_close_price,
             or_high: self.tpo.or_high(),
             or_low: self.tpo.or_low(),
             ib_high: self.tpo.ib_high(),

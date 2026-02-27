@@ -84,6 +84,8 @@ pub struct LevelsPipeline {
     pub session_low: f64,
     /// Most recent trade price seen by this pipeline.
     pub last_price: f64,
+    /// Last trade price observed during RTH only.
+    pub rth_close_price: f64,
     initialized: bool,
     rth_started: bool,
 }
@@ -102,6 +104,7 @@ impl Default for LevelsPipeline {
             session_high: 0.0,
             session_low: 0.0,
             last_price: 0.0,
+            rth_close_price: 0.0,
             initialized: false,
             rth_started: false,
         }
@@ -118,13 +121,18 @@ impl LevelsPipeline {
         if self.rth_started {
             self.prior_day_high = self.session_high;
             self.prior_day_low = self.session_low;
-            self.prior_day_close = self.last_price;
+            self.prior_day_close = if self.rth_close_price > 0.0 {
+                self.rth_close_price
+            } else {
+                self.last_price
+            };
             self.overnight_high = 0.0;
             self.overnight_low = 0.0;
             self.initialized = false;
         }
         self.session_high = 0.0;
         self.session_low = 0.0;
+        self.rth_close_price = 0.0;
         self.rth_started = false;
     }
 
@@ -166,10 +174,12 @@ impl LevelsPipeline {
                 }
                 self.session_high = price;
                 self.session_low = price;
+                self.rth_close_price = price;
                 self.rth_started = true;
             }
             self.session_high = self.session_high.max(price);
             self.session_low = self.session_low.min(price);
+            self.rth_close_price = price;
         }
     }
 

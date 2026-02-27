@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
 
+/// Number of 5-minute buckets in a 6.5-hour RTH session.
+pub const RVOL_RTH_BUCKETS: usize = 78;
+
 /// RVOL classification thresholds (PTT standard).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -55,6 +58,16 @@ impl RvolPipeline {
             })
             .collect();
         self.lookback_days = curves.len();
+    }
+
+    /// Build a simple cumulative 5-minute baseline curve from total session volume.
+    pub fn curve_from_total_volume(total_volume: f64) -> Vec<f64> {
+        if total_volume <= 0.0 {
+            return vec![0.0; RVOL_RTH_BUCKETS];
+        }
+        (1..=RVOL_RTH_BUCKETS)
+            .map(|i| total_volume * (i as f64 / RVOL_RTH_BUCKETS as f64))
+            .collect()
     }
 
     pub fn on_trade(&mut self, volume: f64, minute_of_session: i32) {

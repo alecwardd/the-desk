@@ -12,12 +12,14 @@ use the_desk_backend::backfill;
 use the_desk_backend::db::Database;
 use the_desk_backend::feed::scid_reader::{parse_record_scaled, ScidReader};
 use the_desk_backend::feed::{load_feed_config, load_storage_config, TradeSide};
-use the_desk_backend::pipelines::{EventDetector, PipelineEngine};
+use the_desk_backend::pipelines::{EventDetector, PipelineEngine, RvolPipeline};
 use the_desk_backend::research;
 use the_desk_backend::{
     classify_session, et_minutes_from_timestamp, globex_open_ms, minute_of_session_from_timestamp,
     session_date_from_timestamp_ms, SessionType,
 };
+
+const FRESHNESS_THRESHOLD_MS: f64 = 15_000.0;
 
 #[derive(Clone)]
 pub struct TheDeskMcp {
@@ -37,7 +39,29 @@ fn lock_error() -> McpError {
     McpError::new(ErrorCode::INTERNAL_ERROR, "database lock poisoned", None)
 }
 
-fn text_result(json: serde_json::Value) -> CallToolResult {
+fn freshness_status(age_ms: f64) -> &'static str {
+    if age_ms < 0.0 || !age_ms.is_finite() {
+        "unknown"
+    } else if age_ms <= FRESHNESS_THRESHOLD_MS {
+        "ok"
+    } else {
+        "warning"
+    }
+}
+
+fn text_result(mut json: serde_json::Value) -> CallToolResult {
+    if let Some(obj) = json.as_object_mut() {
+        if let Some(age_ms) = obj.get("dataAgeMs").and_then(|v| v.as_f64()) {
+            obj.insert(
+                "freshnessStatus".to_string(),
+                serde_json::json!(freshness_status(age_ms)),
+            );
+            obj.insert(
+                "freshnessThresholdMs".to_string(),
+                serde_json::json!(FRESHNESS_THRESHOLD_MS),
+            );
+        }
+    }
     CallToolResult::success(vec![Content::text(json.to_string())])
 }
 
@@ -82,6 +106,8 @@ struct BackfillParams {
     /// End date (YYYY-MM-DD). Omit for "through today". Reserved for future use.
     #[allow(dead_code)]
     end_date: Option<String>,
+    /// Reprocess sessions even if summaries already exist.
+    force: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -409,7 +435,46 @@ impl TheDeskMcp {
     }
 
     #[tool(
-        description = "Backfill historical .scid data: process past sessions through all 14 pipelines, detect market events, and persist session summaries. Idempotent -- skips dates already processed. Use to build up the historical research database."
+        description = "Feed health diagnostics: SCID path status, file metadata, latest DB tick timestamp, ingest lag, and freshness/source state."
+    )]
+    async fn get_feed_health(&self) -> Result<CallToolResult, McpError> {
+        let config = load_feed_config();
+        let reader = ScidReader::from_feed_config(&config);
+        let scid_path = reader.path().to_string_lossy().to_string();
+        let meta = std::fs::metadata(reader.path()).ok();
+        let file_exists = meta.is_some();
+        let file_size_bytes = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+        let file_modified_ms = meta
+            .and_then(|m| m.modified().ok())
+            .and_then(|mtime| mtime.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as f64)
+            .unwrap_or(-1.0);
+
+        let db = self.db.lock().map_err(|_| lock_error())?;
+        let tick_count = db.raw_tick_count().unwrap_or(0);
+        let latest_tick_ms = db.latest_tick_timestamp_ms().ok().flatten();
+        let data_age_ms = compute_data_age(&db);
+        let source_state = if !file_exists {
+            "missing"
+        } else {
+            freshness_status(data_age_ms)
+        };
+
+        Ok(text_result(serde_json::json!({
+            "scidPath": scid_path,
+            "fileExists": file_exists,
+            "fileSizeBytes": file_size_bytes,
+            "fileModifiedMs": file_modified_ms,
+            "latestDbTickTimestampMs": latest_tick_ms,
+            "dbTickCount": tick_count,
+            "ingestLagMs": data_age_ms,
+            "sourceState": source_state,
+            "dataAgeMs": data_age_ms
+        })))
+    }
+
+    #[tool(
+        description = "Backfill historical .scid data: process past sessions through all 14 pipelines, detect market events, and persist session summaries. By default it is idempotent and skips dates already processed; set force=true to reprocess existing sessions."
     )]
     async fn backfill_history(
         &self,
@@ -435,7 +500,7 @@ impl TheDeskMcp {
         });
 
         let db = self.db.lock().map_err(|_| lock_error())?;
-        match backfill::run_backfill(&reader, &db, since_ms) {
+        match backfill::run_backfill(&reader, &db, since_ms, params.force.unwrap_or(false)) {
             Ok(result) => Ok(text_result(
                 serde_json::to_value(&result).unwrap_or_default(),
             )),
@@ -539,7 +604,7 @@ impl TheDeskMcp {
     }
 
     #[tool(
-        description = "Query past session summaries with optional filters. Returns structured session data (OHLC, IB range, day type, delta, close vs levels) for historical analysis."
+        description = "Query past session summaries with optional filters. Returns structured session data (OHLC, IB range, day type, delta, close vs levels, POC, VA, DNVA per session) for historical analysis and multi-session value migration."
     )]
     async fn get_session_history(
         &self,
@@ -563,6 +628,11 @@ impl TheDeskMcp {
                             "dayType": s.day_type,
                             "ibRange": s.ib_range,
                             "high": s.high, "low": s.low, "close": s.close,
+                            "poc": s.poc,
+                            "vaHigh": s.vah,
+                            "vaLow": s.val,
+                            "dnvaHigh": s.dnva_high,
+                            "dnvaLow": s.dnva_low,
                             "sessionDelta": s.session_delta,
                             "closeVsIbMid": s.close_vs_ib_mid,
                             "closeVsVwap": s.close_vs_vwap,
@@ -901,31 +971,29 @@ impl TheDeskMcp {
     )]
     async fn validate_data_integrity(&self) -> Result<CallToolResult, McpError> {
         let db = self.db.lock().map_err(|_| lock_error())?;
+        let pipelines = self.pipelines.lock().map_err(|_| {
+            McpError::new(ErrorCode::INTERNAL_ERROR, "pipeline lock poisoned", None)
+        })?;
         let tick_count = db.raw_tick_count().unwrap_or(0);
         let last_ts = db.latest_tick_timestamp_ms().ok().flatten();
         let now_ms = chrono::Utc::now().timestamp_millis() as f64;
         let age_ms = last_ts.map(|v| now_ms - v).unwrap_or(f64::INFINITY);
+        let stream_fresh = age_ms.is_finite() && age_ms <= FRESHNESS_THRESHOLD_MS;
 
         let mut checks = serde_json::json!({
             "rawTicksPresent": tick_count > 0,
-            "streamFresh": age_ms.is_finite() && age_ms <= 15_000.0,
+            "streamFresh": stream_fresh,
+            "freshnessThresholdMs": FRESHNESS_THRESHOLD_MS,
         });
-
-        if let Ok(Some(snapshot)) = db.latest_feature_state() {
-            let poc = snapshot.get("poc").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let va_high = snapshot
-                .get("vaHigh")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.0);
-            let va_low = snapshot
-                .get("vaLow")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.0);
-            let poc_in_va = va_low <= poc && poc <= va_high;
-            checks["pocWithinVa"] = serde_json::json!(poc_in_va);
+        let mut invariants_ok = true;
+        for (name, passed, detail) in pipelines.validate_invariants() {
+            checks[name] = serde_json::json!({
+                "passed": passed,
+                "detail": detail
+            });
+            invariants_ok &= passed;
         }
-
-        let status = if tick_count == 0 || age_ms > 15_000.0 {
+        let status = if tick_count == 0 || !stream_fresh || !invariants_ok {
             "warning"
         } else {
             "ok"
@@ -978,6 +1046,51 @@ fn compute_data_age(db: &Database) -> f64 {
         .flatten()
         .map(|ts| now_ms - ts)
         .unwrap_or(-1.0)
+}
+
+fn persist_integrity_check(db: &Database, pipelines: &PipelineEngine) {
+    let tick_count = db.raw_tick_count().unwrap_or(0);
+    let last_ts = db.latest_tick_timestamp_ms().ok().flatten();
+    let now_ms = chrono::Utc::now().timestamp_millis() as f64;
+    let age_ms = last_ts.map(|v| now_ms - v).unwrap_or(f64::INFINITY);
+    let stream_fresh = age_ms.is_finite() && age_ms <= FRESHNESS_THRESHOLD_MS;
+
+    let mut checks = serde_json::Map::new();
+    checks.insert(
+        "rawTicksPresent".to_string(),
+        serde_json::json!(tick_count > 0),
+    );
+    checks.insert("streamFresh".to_string(), serde_json::json!(stream_fresh));
+    checks.insert(
+        "freshnessThresholdMs".to_string(),
+        serde_json::json!(FRESHNESS_THRESHOLD_MS),
+    );
+    for (name, passed, detail) in pipelines.validate_invariants() {
+        checks.insert(
+            name,
+            serde_json::json!({
+                "passed": passed,
+                "detail": detail
+            }),
+        );
+    }
+
+    let invariants_ok = checks
+        .iter()
+        .filter_map(|(_, v)| v.get("passed").and_then(|p| p.as_bool()))
+        .all(|p| p);
+    let status = if tick_count == 0 || !stream_fresh || !invariants_ok {
+        "warning"
+    } else {
+        "ok"
+    };
+    let result = serde_json::json!({
+        "status": status,
+        "tickCount": tick_count,
+        "lastTickAgeMs": if age_ms.is_finite() { age_ms } else { -1.0 },
+        "checks": checks
+    });
+    let _ = db.insert_validation_run(now_ms, status, &result);
 }
 
 /// Process a single tick through the pipeline engine and event detector.
@@ -1036,116 +1149,157 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db = Database::open(&db_path.to_string_lossy())?;
 
     let mut pipelines = PipelineEngine::new();
+    if let Ok(volumes) = db.recent_rth_session_volumes(20) {
+        let curves: Vec<Vec<f64>> = volumes
+            .into_iter()
+            .map(RvolPipeline::curve_from_total_volume)
+            .collect();
+        pipelines.rvol.load_historical_curve(&curves);
+    }
 
     let config = load_feed_config();
     let reader = ScidReader::from_feed_config(&config);
     let scid_available = reader.path().exists();
 
-    if scid_available {
-        // Backfill from 2 Globex opens ago to capture yesterday's full RTH session
-        let since = globex_open_ms(2);
-        eprintln!(
-            "[the-desk-mcp] Backfilling from {} ...",
-            reader.path().display()
-        );
-        match reader.read_bulk_since(Some(since)) {
-            Ok(ticks) if !ticks.is_empty() => {
-                let mut current_session = SessionType::Unknown;
-                let mut boundary_count = 0u32;
+    // Create the server immediately so stdio is ready before backfill starts.
+    // The startup backfill runs in a background task and populates pipeline
+    // state concurrently with tool serving.
+    let server = TheDeskMcp::new(db, pipelines);
 
-                for tick in &ticks {
-                    // Detect session boundary transitions
-                    if let Some(et_min) = et_minutes_from_timestamp(tick.timestamp_ms) {
-                        let new_session = classify_session(et_min);
-                        if new_session != current_session
-                            && current_session != SessionType::Unknown
-                            && new_session != SessionType::Unknown
-                        {
-                            // RTH → Globex: save prior day levels
-                            if current_session == SessionType::Rth {
-                                let end_state = pipelines.session_end_state();
-                                let date = session_date_from_timestamp_ms(tick.timestamp_ms);
+    if scid_available {
+        // Spawn background startup backfill from 2 Globex opens ago.
+        // Clones the shared Arcs from the server so the backfill can update
+        // pipeline and DB state without blocking the MCP listener.
+        let pipelines_startup = Arc::clone(&server.pipelines);
+        let db_startup = Arc::clone(&server.db);
+        let reader_startup = reader.clone();
+
+        tokio::spawn(async move {
+            let since = globex_open_ms(2);
+            eprintln!(
+                "[the-desk-mcp] Backfilling from {} ...",
+                reader_startup.path().display()
+            );
+            let ticks = match reader_startup.read_bulk_since(Some(since)) {
+                Ok(t) if !t.is_empty() => t,
+                Ok(_) => {
+                    eprintln!("[the-desk-mcp] No ticks since prior Globex open");
+                    return;
+                }
+                Err(e) => {
+                    eprintln!("[the-desk-mcp] Backfill error: {e}");
+                    return;
+                }
+            };
+
+            // Hold pipeline lock only during tick processing. Release pipelines
+            // before acquiring db at boundaries to avoid deadlock and let DB-only
+            // tools (e.g. get_feed_health) run while backfill proceeds.
+            let mut pipelines = match pipelines_startup.lock() {
+                Ok(p) => p,
+                Err(_) => return,
+            };
+
+            let mut current_session = SessionType::Unknown;
+            let mut boundary_count = 0u32;
+
+            for tick in &ticks {
+                if let Some(et_min) = et_minutes_from_timestamp(tick.timestamp_ms) {
+                    let new_session = classify_session(et_min);
+                    if new_session != current_session
+                        && current_session != SessionType::Unknown
+                        && new_session != SessionType::Unknown
+                    {
+                        // Release pipelines before db to avoid deadlock; tools can run now
+                        let end_state = if current_session == SessionType::Rth {
+                            Some(pipelines.session_end_state())
+                        } else {
+                            None
+                        };
+                        let date = session_date_from_timestamp_ms(tick.timestamp_ms);
+                        let today_str = session_date_from_timestamp_ms(tick.timestamp_ms);
+                        drop(pipelines);
+                        if let Some(ref es) = end_state {
+                            if let Ok(db) = db_startup.lock() {
                                 let _ = db.save_prior_day_full(
-                                    &date,
-                                    end_state.high,
-                                    end_state.low,
-                                    end_state.close,
-                                    end_state.va_high,
-                                    end_state.va_low,
-                                    end_state.poc,
+                                    &date, es.high, es.low, es.close, es.va_high, es.va_low, es.poc,
                                 );
                                 eprintln!(
-                                    "[the-desk-mcp] Session boundary: RTH→Globex, saved prior day H={:.2} L={:.2} C={:.2}",
-                                    end_state.high, end_state.low, end_state.close
+                                    "[the-desk-mcp] Session boundary: RTH\u{2192}Globex, saved prior day H={:.2} L={:.2} C={:.2}",
+                                    es.high, es.low, es.close
                                 );
                             }
-                            pipelines.reset_session();
-                            boundary_count += 1;
-
-                            // After reset, load prior day levels for the new session
-                            if new_session == SessionType::Rth || new_session == SessionType::Globex
-                            {
-                                let today_str = session_date_from_timestamp_ms(tick.timestamp_ms);
-                                if let Ok(Some((h, l, c, va_h, va_l, poc))) =
-                                    db.load_prior_day_full(&today_str)
-                                {
-                                    pipelines.levels.set_prior_day(h, l, c);
-                                    if let (Some(vh), Some(vl), Some(pc)) = (va_h, va_l, poc) {
-                                        pipelines.levels.set_prior_profile(vh, vl, pc);
-                                    }
+                        }
+                        let prior = {
+                            if let Ok(db) = db_startup.lock() {
+                                db.load_prior_day_full(&today_str)
+                            } else {
+                                Ok(None)
+                            }
+                        };
+                        pipelines = match pipelines_startup.lock() {
+                            Ok(p) => p,
+                            Err(_) => return,
+                        };
+                        pipelines.reset_session();
+                        if new_session == SessionType::Rth || new_session == SessionType::Globex {
+                            if let Ok(Some((h, l, c, va_h, va_l, poc))) = prior {
+                                pipelines.levels.set_prior_day(h, l, c);
+                                if let (Some(vh), Some(vl), Some(pc)) = (va_h, va_l, poc) {
+                                    pipelines.levels.set_prior_profile(vh, vl, pc);
                                 }
                             }
                         }
-                        if new_session != SessionType::Unknown {
-                            current_session = new_session;
-                        }
+                        boundary_count += 1;
                     }
-
-                    let is_buy = matches!(tick.side, TradeSide::Buy);
-                    let minute = minute_of_session_from_timestamp(tick.timestamp_ms);
-                    pipelines.on_trade_with_timestamp(
-                        tick.price,
-                        tick.volume,
-                        is_buy,
-                        minute,
-                        tick.timestamp_ms,
-                    );
+                    if new_session != SessionType::Unknown {
+                        current_session = new_session;
+                    }
                 }
 
-                let last = ticks.last().unwrap();
-                let bid = if last.bid > 0.0 {
-                    last.bid
-                } else {
-                    last.price - 0.25
-                };
-                let ask = if last.ask > 0.0 {
-                    last.ask
-                } else {
-                    last.price + 0.25
-                };
-                let snapshot = pipelines.snapshot(bid, ask);
+                let is_buy = matches!(tick.side, TradeSide::Buy);
+                let minute = minute_of_session_from_timestamp(tick.timestamp_ms);
+                pipelines.on_trade_with_timestamp(
+                    tick.price,
+                    tick.volume,
+                    is_buy,
+                    minute,
+                    tick.timestamp_ms,
+                );
+            }
+
+            let last = ticks.last().unwrap();
+            let bid = if last.bid > 0.0 {
+                last.bid
+            } else {
+                last.price - 0.25
+            };
+            let ask = if last.ask > 0.0 {
+                last.ask
+            } else {
+                last.price + 0.25
+            };
+            let snapshot = pipelines.snapshot(bid, ask);
+            drop(pipelines);
+            if let Ok(db) = db_startup.lock() {
                 let _ = db.upsert_feature_state(
                     last.timestamp_ms,
                     &serde_json::to_value(&snapshot).unwrap_or_default(),
                 );
-                eprintln!(
-                    "[the-desk-mcp] Backfill complete: {} ticks, {} session boundaries, last price {:.2}",
-                    ticks.len(),
-                    boundary_count,
-                    last.price
-                );
             }
-            Ok(_) => eprintln!("[the-desk-mcp] No ticks since prior Globex open"),
-            Err(e) => eprintln!("[the-desk-mcp] Backfill error: {e}"),
-        }
+            eprintln!(
+                "[the-desk-mcp] Backfill complete: {} ticks, {} session boundaries, last price {:.2}",
+                ticks.len(),
+                boundary_count,
+                last.price
+            );
+        });
     } else {
         eprintln!(
             "[the-desk-mcp] SCID file not found: {}",
             reader.path().display()
         );
     }
-
-    let server = TheDeskMcp::new(db, pipelines);
 
     // Background: poll .scid for new ticks and update pipeline engine + DB
     if scid_available {
@@ -1167,6 +1321,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut persist_counter: u64 = 0;
             let mut event_buffer = Vec::new();
             let mut tick_buffer: Vec<(f64, f64, f64, f64, f64, bool, String)> = Vec::new();
+            let mut last_integrity_check =
+                std::time::Instant::now() - std::time::Duration::from_secs(30);
 
             // Seek to current EOF so we only process NEW ticks
             if let Ok(f) = std::fs::File::open(&reader_path) {
@@ -1175,6 +1331,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             loop {
                 sleep(poll).await;
+                if last_integrity_check.elapsed() >= std::time::Duration::from_secs(15) {
+                    if let (Ok(db), Ok(p)) = (db_bg.lock(), pipelines_bg.lock()) {
+                        persist_integrity_check(&db, &p);
+                    }
+                    last_integrity_check = std::time::Instant::now();
+                }
 
                 let mut file = match std::fs::File::open(&reader_path) {
                     Ok(f) => f,

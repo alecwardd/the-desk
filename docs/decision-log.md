@@ -231,6 +231,32 @@ This is NOT a backtesting engine in the traditional sense — it does not simula
 
 ---
 
+### ADR-012: Embed Dalton AMT and Smashelito frameworks in market-structure-analyst
+
+**Date:** 2026-02-26
+**Status:** Decided
+
+**Context:** The market-structure-analyst subagent was a bare tool list with no embedded domain knowledge, no analytical workflow, and no output format. Compared to stronger agents like `pipeline-verifier.md` (which has "Always do this first" checklists, working methods, and output templates), the market-structure-analyst had no structure to guide its reasoning. Additionally, 5 research MCP tools existed in the Rust binary but lacked JSON descriptor files, making them invisible to the Cursor tool discovery layer.
+
+**Decision:** Rewrite `agents/market-structure-analyst.md` to embed:
+1. **Jim Dalton's Auction Market Theory** — a 6-step decision tree (Timeframe → Balance/Imbalance → Initiative/Responsive → Day Type → Structural References → Profile Shape) applied on every market structure read
+2. **Smashelito's analytical patterns** — three-timeframe state tracking (OTFU/OTFD/BALANCE with duration and invalidation levels), acceptance/rejection framing for conditional scenarios, profile shape reads as positioning (not forecasts), and "unfinished business" tracking
+3. **Structural improvements** — "Always do this first" checklist, explicit `skills/trading-domain/SKILL.md` reference, `dataAgeMs` staleness threshold (30s), working method, output format template, compliance framing rules, and "When uncertain" guidance
+4. **MCP descriptor JSONs** — added 5 missing `.json` files for research tools (`query_event_frequency`, `query_conditional`, `query_distribution`, `get_session_history`, `get_research_summary`) and updated `compare_sessions.json` from "reserved for analytics phase" to its actual functionality
+
+**Alternatives considered:**
+- Keep the agent minimal and rely on the model's implicit knowledge of Market Profile — rejected (inconsistent quality, no guaranteed workflow, no output standardization)
+- Create a separate "Dalton knowledge base" document and reference it — rejected (slower to load, adds indirection; embedding directly in the agent definition is more reliable)
+- Add only structural improvements without domain knowledge — rejected (the analytical framework is the highest-value improvement; structure without substance doesn't improve the read quality)
+
+**Consequences:**
+- Agent file grew from 36 lines to 99 lines — larger context window cost per invocation, but well within limits
+- The agent now has an opinionated analytical framework that may not match all Market Profile practitioners' approaches — mitigated by grounding in Dalton (the foundational source) and using compliance framing that prevents overcommitment
+- Research tools are now discoverable via MCP descriptor files
+- Future: `query_conditional` outcome fields should be expanded to include `profile_shape`, `balance_state`, `poor_high`/`poor_low`, `excess_high`/`excess_low` to fully support the agent's analytical needs
+
+---
+
 ## Pending Decisions
 
 ### ADR-P06: NQ contract rollover handling

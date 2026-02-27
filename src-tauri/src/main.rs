@@ -10,7 +10,7 @@ use the_desk_backend::db::Database;
 use the_desk_backend::dtc::DtcClient;
 use the_desk_backend::feed::scid_reader::ScidReader;
 use the_desk_backend::feed::{load_feed_config, FeedEvent, TradeSide};
-use the_desk_backend::pipelines::{EventDetector, PipelineEngine};
+use the_desk_backend::pipelines::{EventDetector, PipelineEngine, RvolPipeline};
 use the_desk_backend::recording::{RecordingEntry, SessionRecorder};
 use the_desk_backend::risk::{RiskConfig, RiskTracker};
 use the_desk_backend::rules::RulesEngine;
@@ -397,6 +397,13 @@ fn main() {
     }
 
     let mut pipelines = PipelineEngine::new();
+    if let Ok(volumes) = db.recent_rth_session_volumes(20) {
+        let curves: Vec<Vec<f64>> = volumes
+            .into_iter()
+            .map(RvolPipeline::curve_from_total_volume)
+            .collect();
+        pipelines.rvol.load_historical_curve(&curves);
+    }
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     if let Ok(Some((high, low, close, va_h, va_l, poc))) = db.load_prior_day_full(&today) {
         pipelines.levels.set_prior_day(high, low, close);

@@ -1,12 +1,22 @@
 use crate::db::{Database, SessionSummary};
 use crate::feed::scid_reader::ScidReader;
 use crate::feed::TradeSide;
-use crate::pipelines::{EventDetector, MarketState, PipelineEngine};
+use crate::pipelines::{EventDetector, MarketState, PipelineEngine, RvolPipeline};
 use crate::{
     classify_session, et_minutes_from_timestamp, minute_of_session_from_timestamp,
     session_date_from_timestamp_ms, SessionType,
 };
 use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TickGap {
+    pub from_ms: f64,
+    pub to_ms: f64,
+    pub duration_minutes: f64,
+    pub session_date: String,
+    pub session_type: String,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -16,6 +26,7 @@ pub struct BackfillResult {
     pub total_ticks: usize,
     pub total_events: usize,
     pub session_dates: Vec<String>,
+    pub gaps: Vec<TickGap>,
 }
 
 /// Build a SessionSummary from the final MarketState of an RTH session.
@@ -28,6 +39,11 @@ pub fn summary_from_state(
     total_volume: f64,
     signal_count: i64,
 ) -> SessionSummary {
+    let session_close = if state.rth_close_price > 0.0 {
+        state.rth_close_price
+    } else {
+        state.last_price
+    };
     let ib_mid = if state.ib_high > 0.0 && state.ib_low > 0.0 {
         (state.ib_high + state.ib_low) / 2.0
     } else {
@@ -36,9 +52,9 @@ pub fn summary_from_state(
 
     let close_vs_ib_mid = if ib_mid <= 0.0 {
         "n/a".to_string()
-    } else if state.last_price > ib_mid + 0.25 {
+    } else if session_close > ib_mid + 0.25 {
         "above".to_string()
-    } else if state.last_price < ib_mid - 0.25 {
+    } else if session_close < ib_mid - 0.25 {
         "below".to_string()
     } else {
         "at".to_string()
@@ -46,9 +62,9 @@ pub fn summary_from_state(
 
     let close_vs_vwap = if state.vwap <= 0.0 {
         "n/a".to_string()
-    } else if state.last_price > state.vwap + 0.25 {
+    } else if session_close > state.vwap + 0.25 {
         "above".to_string()
-    } else if state.last_price < state.vwap - 0.25 {
+    } else if session_close < state.vwap - 0.25 {
         "below".to_string()
     } else {
         "at".to_string()
@@ -56,9 +72,9 @@ pub fn summary_from_state(
 
     let close_vs_poc = if state.poc <= 0.0 {
         "n/a".to_string()
-    } else if state.last_price > state.poc + 0.25 {
+    } else if session_close > state.poc + 0.25 {
         "above".to_string()
-    } else if state.last_price < state.poc - 0.25 {
+    } else if session_close < state.poc - 0.25 {
         "below".to_string()
     } else {
         "at".to_string()
@@ -68,13 +84,9 @@ pub fn summary_from_state(
         session_date: session_date.to_string(),
         session_type: session_type.to_string(),
         open_price,
-        high: state.last_price.max(state.prior_day_high).max(0.0),
-        low: if state.prior_day_low > 0.0 {
-            state.last_price.min(state.prior_day_low)
-        } else {
-            state.last_price
-        },
-        close: state.last_price,
+        high: state.session_high,
+        low: state.session_low,
+        close: session_close,
         poc: state.poc,
         vah: state.va_high,
         val: state.va_low,
@@ -119,6 +131,7 @@ pub fn run_backfill(
     reader: &ScidReader,
     db: &Database,
     since_ms: Option<f64>,
+    force: bool,
 ) -> Result<BackfillResult, String> {
     let ticks = reader
         .read_bulk_since(since_ms)
@@ -131,11 +144,19 @@ pub fn run_backfill(
             total_ticks: 0,
             total_events: 0,
             session_dates: Vec::new(),
+            gaps: Vec::new(),
         });
     }
 
     let mut pipeline = PipelineEngine::new();
     let mut detector = EventDetector::new();
+    let mut rvol_curves: Vec<Vec<f64>> = db
+        .recent_rth_session_volumes(20)
+        .unwrap_or_default()
+        .into_iter()
+        .map(RvolPipeline::curve_from_total_volume)
+        .collect();
+    pipeline.rvol.load_historical_curve(&rvol_curves);
     let mut current_session = SessionType::Unknown;
     let mut current_date = String::new();
     let mut session_open_price = 0.0_f64;
@@ -146,8 +167,36 @@ pub fn run_backfill(
     let mut sessions_skipped = 0_usize;
     let mut total_events = 0_usize;
     let mut session_dates = Vec::new();
+    let mut gaps: Vec<TickGap> = Vec::new();
+    let mut prev_ts: Option<f64> = None;
+    let mut prev_class = SessionType::Unknown;
 
     for tick in &ticks {
+        let tick_class = et_minutes_from_timestamp(tick.timestamp_ms)
+            .map(classify_session)
+            .unwrap_or(SessionType::Unknown);
+        if let Some(prev) = prev_ts {
+            let gap_ms = tick.timestamp_ms - prev;
+            if gap_ms > 0.0 && tick_class == prev_class {
+                let threshold_ms = match tick_class {
+                    SessionType::Rth => 5.0 * 60_000.0,
+                    SessionType::Globex => 30.0 * 60_000.0,
+                    SessionType::Unknown => f64::INFINITY,
+                };
+                if gap_ms > threshold_ms {
+                    gaps.push(TickGap {
+                        from_ms: prev,
+                        to_ms: tick.timestamp_ms,
+                        duration_minutes: gap_ms / 60_000.0,
+                        session_date: session_date_from_timestamp_ms(tick.timestamp_ms),
+                        session_type: format!("{tick_class:?}"),
+                    });
+                }
+            }
+        }
+        prev_ts = Some(tick.timestamp_ms);
+        prev_class = tick_class;
+
         let date = session_date_from_timestamp_ms(tick.timestamp_ms);
 
         if let Some(et_min) = et_minutes_from_timestamp(tick.timestamp_ms) {
@@ -159,9 +208,13 @@ pub fn run_backfill(
             {
                 // Session boundary: finalize the outgoing session
                 if current_session == SessionType::Rth && !current_date.is_empty() {
-                    let should_process = !db.has_session_summary(&current_date).unwrap_or(true);
+                    let should_process =
+                        force || !db.has_session_summary(&current_date).unwrap_or(true);
 
                     if should_process {
+                        if force {
+                            let _ = db.purge_session_research(&current_date);
+                        }
                         let snapshot = pipeline.snapshot(
                             tick.bid.max(tick.price - 0.25),
                             tick.ask.max(tick.price + 0.25),
@@ -175,16 +228,17 @@ pub fn run_backfill(
                             session_volume,
                             0,
                         );
-                        // Use actual high/low from pipeline
-                        let mut summary = summary;
-                        summary.high = pipeline.levels.session_high;
-                        summary.low = pipeline.levels.session_low;
-
                         let _ = db.upsert_session_summary(&summary);
                         let _ = db.insert_market_events_batch(&event_buffer);
                         total_events += event_buffer.len();
                         session_dates.push(current_date.clone());
                         sessions_processed += 1;
+                        rvol_curves
+                            .push(RvolPipeline::curve_from_total_volume(summary.total_volume));
+                        if rvol_curves.len() > 20 {
+                            let _ = rvol_curves.remove(0);
+                        }
+                        pipeline.rvol.load_historical_curve(&rvol_curves);
                     } else {
                         sessions_skipped += 1;
                     }
@@ -265,8 +319,11 @@ pub fn run_backfill(
     // Finalize the last session if it was RTH
     if current_session == SessionType::Rth
         && !current_date.is_empty()
-        && !db.has_session_summary(&current_date).unwrap_or(true)
+        && (force || !db.has_session_summary(&current_date).unwrap_or(true))
     {
+        if force {
+            let _ = db.purge_session_research(&current_date);
+        }
         let last_tick = ticks.last().unwrap();
         let bid = if last_tick.bid > 0.0 {
             last_tick.bid
@@ -279,7 +336,7 @@ pub fn run_backfill(
             last_tick.price + 0.25
         };
         let snapshot = pipeline.snapshot(bid, ask);
-        let mut summary = summary_from_state(
+        let summary = summary_from_state(
             &snapshot,
             &current_date,
             "RTH",
@@ -288,13 +345,16 @@ pub fn run_backfill(
             session_volume,
             0,
         );
-        summary.high = pipeline.levels.session_high;
-        summary.low = pipeline.levels.session_low;
         let _ = db.upsert_session_summary(&summary);
         let _ = db.insert_market_events_batch(&event_buffer);
         total_events += event_buffer.len();
         session_dates.push(current_date);
         sessions_processed += 1;
+        rvol_curves.push(RvolPipeline::curve_from_total_volume(summary.total_volume));
+        if rvol_curves.len() > 20 {
+            let _ = rvol_curves.remove(0);
+        }
+        pipeline.rvol.load_historical_curve(&rvol_curves);
     }
 
     Ok(BackfillResult {
@@ -303,6 +363,7 @@ pub fn run_backfill(
         total_ticks: ticks.len(),
         total_events,
         session_dates,
+        gaps,
     })
 }
 

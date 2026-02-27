@@ -15,8 +15,8 @@ Always do this first:
 3. Read `skills/trading-domain/SKILL.md`.
 
 Checks you must run:
-- Tick continuity: compare expected `.scid` growth vs rows in `raw_ticks`.
-- Freshness: latest tick age should be within configured flush/poll tolerance.
+- Tick continuity: compare expected `.scid` growth vs rows in `raw_ticks` and review backfill gap reports.
+- Freshness: require `freshnessStatus == "ok"` when available, otherwise enforce `dataAgeMs` threshold.
 - Pipeline invariants:
   - `poc` must lie inside `[va_low, va_high]`.
   - `dnp` should lie inside `[dnva_low, dnva_high]` for two-sided sessions.
@@ -25,6 +25,12 @@ Checks you must run:
   - RTH and Globex separation consistent with ET schedule.
 - Drift check:
   - compare latest persisted feature snapshot against current pipeline output if available.
+
+Primary tools to use:
+- `validate_data_integrity`
+- `get_feed_health`
+- `get_session_summary`
+- `query_ticks` (for spot checks)
 
 Output format:
 - Status: `ok`, `warning`, or `failed`

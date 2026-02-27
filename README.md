@@ -16,9 +16,19 @@ Sierra Chart (.scid files) → Rust Pipeline Engine → SQLite → MCP Server �
 4. **EventDetector** logs ~30 structured market events (level tests, IB extensions, day type changes, etc.)
 5. **SQLite** stores raw ticks, computed state, session summaries, market events, signal outcomes, and playbook signals
 6. **Research query engine** answers frequency, conditional probability, and distribution questions over historical data
-7. **MCP server** exposes 33 tools that any Cursor agent can call for market context and historical research
+7. **MCP server** exposes 34 tools that any Cursor agent can call for market context, feed diagnostics, and historical research
 8. **Specialized subagents** (market structure, order flow, levels, performance) access domain-specific tools and report to the orchestrator
 9. **You chat with agents** in Cursor who reference live (1-5s delayed) market data and historical statistics
+
+## Ingestion Modes
+
+The Desk intentionally runs three ingestion paths:
+
+1. **Startup warm-backfill (MCP/Tauri startup):** reads recent `.scid` history to seed in-memory pipeline state quickly.
+2. **Historical research backfill (`backfill_history`):** processes historical `.scid` data into `session_summaries` + `market_events` (idempotent by default, `force=true` supported for reprocessing).
+3. **Live tail persistence:** polls `.scid` for new records, updates pipelines incrementally, and batch-writes `raw_ticks`.
+
+Use `get_feed_health` and `validate_data_integrity` to confirm feed freshness and integrity before relying on outputs.
 
 ## What It Computes
 
@@ -176,7 +186,7 @@ cd src-tauri && cargo build --release --bin the-desk-mcp
 ## Data Flow & Latency
 
 ```
-Sierra Chart flush:     ~1000ms  (configurable via SC settings)
+Sierra Chart flush:     ~1000ms  (Intraday File Flush Time in SC settings)
 Rust poll + parse:      ~500ms
 Pipeline compute:       ~5ms     (14 pipelines, incremental)
 MCP tool response:      ~50ms

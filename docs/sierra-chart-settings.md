@@ -12,12 +12,13 @@ Settings for Sierra Chart integration with The Desk. These are the recommended/c
 |---------|-------|-------|
 | **Intraday Data Storage Time Unit** | 1 Tick | Required. Gives individual trades with bid/ask volume for delta, footprint, and tape pace pipelines. |
 | **1-Tick Historical Data Days** | 186 days | ~6 months of tick history. Supports RVOL 20-day lookback and backtesting. |
+| **Intraday File Flush Time in Milliseconds** | 1000 (or 0 default) | Primary setting controlling how buffered intraday data is flushed to `.scid` on disk. Lower values reduce latency but increase I/O overhead. |
 
 ## General Settings
 
 | Setting | Value | Notes |
 |---------|-------|-------|
-| **Chart Update Interval (ms)** | 600 | Controls how often SC flushes data to `.scid` files. Combined with The Desk's 1000ms poll interval, gives ~1.6s worst-case data latency. Fine for directional trading (15-min to 1-hr holds). Could lower to 300-400ms for faster updates; below 200ms wastes CPU. |
+| **Chart Update Interval (ms)** | 600 | UI/chart refresh cadence. Helpful for display responsiveness, but disk flush behavior for `.scid` is primarily governed by Intraday File Flush Time. |
 | **Number of Stored Time & Sales Records** | 4000 | SC display setting only — does not affect `.scid` file storage or The Desk. |
 | **Maximum Time & Sales Depth Levels** | 0 | DOM depth recording. Set to 0 (disabled) since The Desk pipelines use tick-level data, not order book depth. Increase to 10 if DOM imbalance analysis is added later. |
 
@@ -53,13 +54,15 @@ price_scale = 100.0           # Rithmic NQ prices are raw * 100
 ## Latency Budget
 
 ```
-Sierra Chart flush:     ~600ms   (Chart Update Interval)
+Sierra Chart flush:     ~600-1000ms (Intraday File Flush Time)
 The Desk poll:          ~1000ms  (flush_poll_ms in config.toml)
 Pipeline compute:       ~5ms     (14 pipelines, incremental)
 ────────────────────────────────────────────────────────
 Data available via MCP: ~1.6s behind reality (worst case)
                         ~0.8s average
 ```
+
+For runtime verification, use MCP tools `get_feed_health` and `validate_data_integrity`.
 
 ---
 

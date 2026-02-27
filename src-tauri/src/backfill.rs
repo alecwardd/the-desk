@@ -89,6 +89,8 @@ pub fn summary_from_state(
         or_high: state.or_high,
         or_low: state.or_low,
         day_type: format!("{:?}", state.day_type),
+        profile_shape: format!("{:?}", state.profile_shape),
+        balance_state: format!("{:?}", state.balance_state),
         total_volume,
         tick_count,
         session_delta: state.session_delta,

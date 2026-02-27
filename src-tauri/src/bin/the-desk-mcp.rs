@@ -1166,6 +1166,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut offset: u64 = 0;
             let mut persist_counter: u64 = 0;
             let mut event_buffer = Vec::new();
+            let mut tick_buffer: Vec<(f64, f64, f64, f64, f64, bool, String)> = Vec::new();
 
             // Seek to current EOF so we only process NEW ticks
             if let Ok(f) = std::fs::File::open(&reader_path) {
@@ -1207,6 +1208,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             tick.ask,
                             &mut event_buffer,
                         );
+
+                        let bid = if tick.bid > 0.0 {
+                            tick.bid
+                        } else {
+                            tick.price - 0.25
+                        };
+                        let ask = if tick.ask > 0.0 {
+                            tick.ask
+                        } else {
+                            tick.price + 0.25
+                        };
+                        let session_date = session_date_from_timestamp_ms(tick.timestamp_ms);
+                        tick_buffer.push((
+                            tick.timestamp_ms,
+                            tick.price,
+                            tick.volume,
+                            bid,
+                            ask,
+                            is_buy,
+                            session_date,
+                        ));
+
+                        if tick_buffer.len() >= 100 {
+                            if let Ok(db) = db_bg.lock() {
+                                let _ = db.insert_raw_ticks_batch(&tick_buffer);
+                            }
+                            tick_buffer.clear();
+                        }
+
                         ticks_this_poll += 1;
                     }
                 }
@@ -1217,6 +1247,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let _ = db.insert_market_events_batch(&event_buffer);
                     }
                     event_buffer.clear();
+                }
+
+                // Flush remaining raw ticks
+                if !tick_buffer.is_empty() {
+                    if let Ok(db) = db_bg.lock() {
+                        let _ = db.insert_raw_ticks_batch(&tick_buffer);
+                    }
+                    tick_buffer.clear();
                 }
 
                 // Persist snapshot periodically (every ~4 polls)

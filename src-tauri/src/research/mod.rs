@@ -108,11 +108,31 @@ pub fn conditional_probability(
         if *count >= min_count {
             condition_met += 1;
             if let Some(summary) = summary_map.get(date) {
-                let field_val = match outcome_field {
+                let owned: String;
+                let field_val: &str = match outcome_field {
                     "close_vs_ib_mid" => &summary.close_vs_ib_mid,
                     "close_vs_vwap" => &summary.close_vs_vwap,
                     "close_vs_poc" => &summary.close_vs_poc,
                     "day_type" => &summary.day_type,
+                    "profile_shape" => &summary.profile_shape,
+                    "balance_state" => &summary.balance_state,
+                    "single_prints_direction" => &summary.single_prints_direction,
+                    "poor_high" => {
+                        owned = summary.poor_high.to_string();
+                        &owned
+                    }
+                    "poor_low" => {
+                        owned = summary.poor_low.to_string();
+                        &owned
+                    }
+                    "excess_high" => {
+                        owned = summary.excess_high.to_string();
+                        &owned
+                    }
+                    "excess_low" => {
+                        owned = summary.excess_low.to_string();
+                        &owned
+                    }
                     _ => continue,
                 };
                 if field_val == outcome_value {

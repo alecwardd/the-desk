@@ -145,6 +145,8 @@ pub struct SessionSummary {
     pub or_high: f64,
     pub or_low: f64,
     pub day_type: String,
+    pub profile_shape: String,
+    pub balance_state: String,
     pub total_volume: f64,
     pub tick_count: i64,
     pub session_delta: f64,
@@ -246,6 +248,9 @@ impl Database {
         }
         if version < 4 {
             self.migrate_v4()?;
+        }
+        if version < 5 {
+            self.migrate_v5()?;
         }
 
         Ok(())
@@ -545,6 +550,19 @@ impl Database {
               ON signal_outcomes(outcome);
 
             UPDATE schema_version SET version = 4;
+            ",
+        )?;
+        Ok(())
+    }
+
+    /// V5: add profile_shape and balance_state columns to session_summaries.
+    fn migrate_v5(&self) -> Result<(), DbError> {
+        self.conn.execute_batch(
+            "
+            ALTER TABLE session_summaries ADD COLUMN profile_shape TEXT NOT NULL DEFAULT '';
+            ALTER TABLE session_summaries ADD COLUMN balance_state TEXT NOT NULL DEFAULT '';
+
+            UPDATE schema_version SET version = 5;
             ",
         )?;
         Ok(())
@@ -1639,19 +1657,21 @@ impl Database {
             "INSERT INTO session_summaries
              (session_date, session_type, open_price, high, low, close,
               poc, vah, val, ib_high, ib_low, ib_range, ib_mid,
-              or_high, or_low, day_type, total_volume, tick_count,
+              or_high, or_low, day_type, profile_shape, balance_state,
+              total_volume, tick_count,
               session_delta, cumulative_delta, dnp, dnva_high, dnva_low,
               vwap_close, signal_count, single_prints_direction,
               excess_high, excess_low, poor_high, poor_low, rvol_ratio,
               close_vs_ib_mid, close_vs_vwap, close_vs_poc, snapshot_json)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35,?36,?37)
              ON CONFLICT(session_date) DO UPDATE SET
                session_type=excluded.session_type, open_price=excluded.open_price,
                high=excluded.high, low=excluded.low, close=excluded.close,
                poc=excluded.poc, vah=excluded.vah, val=excluded.val,
                ib_high=excluded.ib_high, ib_low=excluded.ib_low, ib_range=excluded.ib_range,
                ib_mid=excluded.ib_mid, or_high=excluded.or_high, or_low=excluded.or_low,
-               day_type=excluded.day_type, total_volume=excluded.total_volume,
+               day_type=excluded.day_type, profile_shape=excluded.profile_shape,
+               balance_state=excluded.balance_state, total_volume=excluded.total_volume,
                tick_count=excluded.tick_count, session_delta=excluded.session_delta,
                cumulative_delta=excluded.cumulative_delta, dnp=excluded.dnp,
                dnva_high=excluded.dnva_high, dnva_low=excluded.dnva_low,
@@ -1665,7 +1685,8 @@ impl Database {
             params![
                 s.session_date, s.session_type, s.open_price, s.high, s.low, s.close,
                 s.poc, s.vah, s.val, s.ib_high, s.ib_low, s.ib_range, s.ib_mid,
-                s.or_high, s.or_low, s.day_type, s.total_volume, s.tick_count,
+                s.or_high, s.or_low, s.day_type, s.profile_shape, s.balance_state,
+                s.total_volume, s.tick_count,
                 s.session_delta, s.cumulative_delta, s.dnp, s.dnva_high, s.dnva_low,
                 s.vwap_close, s.signal_count, s.single_prints_direction,
                 i64::from(s.excess_high), i64::from(s.excess_low),
@@ -1719,7 +1740,8 @@ impl Database {
         let sql = format!(
             "SELECT session_date, session_type, open_price, high, low, close,
                     poc, vah, val, ib_high, ib_low, ib_range, ib_mid,
-                    or_high, or_low, day_type, total_volume, tick_count,
+                    or_high, or_low, day_type, profile_shape, balance_state,
+                    total_volume, tick_count,
                     session_delta, cumulative_delta, dnp, dnva_high, dnva_low,
                     vwap_close, signal_count, single_prints_direction,
                     excess_high, excess_low, poor_high, poor_low, rvol_ratio,
@@ -1751,25 +1773,27 @@ impl Database {
                 or_high: row.get(13)?,
                 or_low: row.get(14)?,
                 day_type: row.get::<_, Option<String>>(15)?.unwrap_or_default(),
-                total_volume: row.get(16)?,
-                tick_count: row.get(17)?,
-                session_delta: row.get(18)?,
-                cumulative_delta: row.get(19)?,
-                dnp: row.get(20)?,
-                dnva_high: row.get(21)?,
-                dnva_low: row.get(22)?,
-                vwap_close: row.get(23)?,
-                signal_count: row.get(24)?,
-                single_prints_direction: row.get::<_, Option<String>>(25)?.unwrap_or_default(),
-                excess_high: row.get::<_, i64>(26)? != 0,
-                excess_low: row.get::<_, i64>(27)? != 0,
-                poor_high: row.get::<_, i64>(28)? != 0,
-                poor_low: row.get::<_, i64>(29)? != 0,
-                rvol_ratio: row.get(30)?,
-                close_vs_ib_mid: row.get::<_, Option<String>>(31)?.unwrap_or_default(),
-                close_vs_vwap: row.get::<_, Option<String>>(32)?.unwrap_or_default(),
-                close_vs_poc: row.get::<_, Option<String>>(33)?.unwrap_or_default(),
-                snapshot_json: row.get(34)?,
+                profile_shape: row.get::<_, Option<String>>(16)?.unwrap_or_default(),
+                balance_state: row.get::<_, Option<String>>(17)?.unwrap_or_default(),
+                total_volume: row.get(18)?,
+                tick_count: row.get(19)?,
+                session_delta: row.get(20)?,
+                cumulative_delta: row.get(21)?,
+                dnp: row.get(22)?,
+                dnva_high: row.get(23)?,
+                dnva_low: row.get(24)?,
+                vwap_close: row.get(25)?,
+                signal_count: row.get(26)?,
+                single_prints_direction: row.get::<_, Option<String>>(27)?.unwrap_or_default(),
+                excess_high: row.get::<_, i64>(28)? != 0,
+                excess_low: row.get::<_, i64>(29)? != 0,
+                poor_high: row.get::<_, i64>(30)? != 0,
+                poor_low: row.get::<_, i64>(31)? != 0,
+                rvol_ratio: row.get(32)?,
+                close_vs_ib_mid: row.get::<_, Option<String>>(33)?.unwrap_or_default(),
+                close_vs_vwap: row.get::<_, Option<String>>(34)?.unwrap_or_default(),
+                close_vs_poc: row.get::<_, Option<String>>(35)?.unwrap_or_default(),
+                snapshot_json: row.get(36)?,
             })
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())

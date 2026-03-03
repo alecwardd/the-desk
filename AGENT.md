@@ -132,16 +132,16 @@ The MCP server (`src/bin/the-desk-mcp.rs`) exposes 35 tools. Key categories:
 
 | Category | Tools |
 |----------|-------|
-| **Snapshot** | `get_market_snapshot` |
-| **Structure** | `get_tpo_profile`, `get_delta_profile`, `get_vwap`, `get_key_levels` |
-| **Microstructure** | `get_tape_pace`, `get_footprint`, `get_absorption_events`, `get_trade_size` |
+| **Snapshot** | `get_market_snapshot` (includes VWAP) |
+| **Structure** | `get_tpo_profile`, `get_delta_profile`, `get_key_levels` (includes prior day levels) |
+| **Microstructure** | `get_tape_pace`, `get_footprint`, `get_absorption_events`, `get_trade_size_profile` |
 | **PTT** | `get_or5_status`, `get_rvol`, `get_day_type`, `get_rebid_reoffer_zones`, `get_pinch_events`, `get_session_inventory` |
-| **Rules** | `evaluate_setups`, `get_setup_context`, `check_delta_confirmation` |
+| **Rules** | `evaluate_playbook`, `get_setup_context`, `check_delta_confirmation` |
 | **Risk** | `get_risk_state`, `get_risk_config`, `save_risk_config`, `init_risk_state`, `get_account_state`, `save_account_state`, `get_kelly_position_size`, `get_signal_performance`, `record_trade_result` |
-| **Data** | `query_ticks`, `get_prior_day_levels`, `get_proximity_report` |
+| **Data** | `query_ticks`, `get_proximity_report` |
 | **Integrity** | `validate_data_integrity` |
-| **Research** | `query_event_frequency`, `query_conditional`, `query_distribution`, `compare_sessions`, `get_session_history`, `get_research_summary` |
-| **Backfill** | `backfill_history` |
+| **Research** | `query_event_frequency`, `query_conditional`, `query_distribution`, `query_signal_outcome_distribution`, `query_signal_outcome_conditional`, `compare_sessions`, `get_session_history`, `get_research_summary` |
+| **Backfill** | `backfill_history`, `run_backtest`, `get_backtest_results`, `compare_backtests` |
 | **Storage** | `archive_status` |
 
 ---

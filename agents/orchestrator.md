@@ -40,7 +40,7 @@ Risk output: **Brief footer only** (session state summary).
 ### Setup Check ("Is this a setup?", "Setup check", "Looking at [setup name]")
 
 Call in parallel:
-- `evaluate_setups` (playbook condition status)
+- `evaluate_playbook` (playbook condition status)
 - `get_setup_context` (full context for named setup)
 - `get_proximity_report` (key levels near price)
 - `get_tape_pace` and `get_rvol` (participation quality)

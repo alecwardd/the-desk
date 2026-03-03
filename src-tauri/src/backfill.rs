@@ -1,14 +1,26 @@
-use crate::db::{Database, SessionSummary};
+use crate::db::{Database, SessionSummary, SignalOutcome};
 use crate::feed::scid_reader::ScidReader;
 use crate::feed::TradeSide;
+use crate::outcome_tracker;
 use crate::pipelines::{
     EventDetector, FlowEventEmitter, MarketState, PipelineEngine, RvolPipeline,
 };
+use crate::rules::RulesEngine;
 use crate::{
     classify_session, et_minutes_from_timestamp, minute_of_session_from_timestamp,
     session_date_from_timestamp_ms, SessionType,
 };
 use serde::{Deserialize, Serialize};
+
+/// Configuration for backfill, including optional rules engine replay.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackfillConfig {
+    /// When true, run the rules engine on each tick and track signal outcomes.
+    pub run_rules: bool,
+    /// Optional setup IDs to evaluate. If None, all active setups are used.
+    pub setup_ids: Option<Vec<String>>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -29,6 +41,10 @@ pub struct BackfillResult {
     pub total_events: usize,
     pub session_dates: Vec<String>,
     pub gaps: Vec<TickGap>,
+    /// When run_rules was true: total signals fired during backfill.
+    pub signals_fired: Option<usize>,
+    /// When run_rules was true: backtest run ID if persisted.
+    pub backtest_run_id: Option<String>,
 }
 
 /// Build a SessionSummary from the final MarketState of an RTH session.
@@ -128,12 +144,13 @@ pub fn summary_from_state(
 }
 
 /// Process historical .scid data through all pipelines, detect events,
-/// and persist session summaries.
+/// and persist session summaries. Optionally run rules engine for backtest replay.
 pub fn run_backfill(
     reader: &ScidReader,
     db: &Database,
     since_ms: Option<f64>,
     force: bool,
+    config: Option<BackfillConfig>,
 ) -> Result<BackfillResult, String> {
     let ticks = reader
         .read_bulk_since(since_ms)
@@ -147,8 +164,20 @@ pub fn run_backfill(
             total_events: 0,
             session_dates: Vec::new(),
             gaps: Vec::new(),
+            signals_fired: None,
+            backtest_run_id: None,
         });
     }
+
+    let run_rules = config.as_ref().map(|c| c.run_rules).unwrap_or(false);
+    let setup_ids_filter = config.as_ref().and_then(|c| c.setup_ids.clone());
+    let mut rules = if run_rules {
+        Some(RulesEngine::default())
+    } else {
+        None
+    };
+    let mut signals_fired_this_session = 0_i64;
+    let mut total_signals_fired = 0_usize;
 
     let mut pipeline = PipelineEngine::new();
     let mut detector = EventDetector::new();
@@ -229,7 +258,7 @@ pub fn run_backfill(
                             session_open_price,
                             session_tick_count,
                             session_volume,
-                            0,
+                            signals_fired_this_session,
                         );
                         let _ = db.upsert_session_summary(&summary);
                         let _ = db.insert_market_events_batch(&event_buffer);
@@ -261,10 +290,14 @@ pub fn run_backfill(
                 pipeline.reset_session();
                 detector.reset();
                 flow_emitter.reset();
+                if let Some(ref mut r) = rules {
+                    r.reset();
+                }
                 event_buffer.clear();
                 session_tick_count = 0;
                 session_volume = 0.0;
                 session_open_price = 0.0;
+                signals_fired_this_session = 0;
 
                 // Load prior day levels for the new session
                 if new_session == SessionType::Rth || new_session == SessionType::Globex {
@@ -321,6 +354,50 @@ pub fn run_backfill(
             // Flow events (absorption, pinch, acceleration zones, large trade clusters)
             let flow_events = flow_emitter.detect(&pipeline, tick.timestamp_ms, &current_date);
             event_buffer.extend(flow_events);
+
+            // Rules engine: evaluate setups and track signal outcomes when run_rules is true
+            if let Some(ref mut r) = rules {
+                let setups = db.list_setups().unwrap_or_default();
+                let setups: Vec<_> = if let Some(ref ids) = setup_ids_filter {
+                    setups.into_iter().filter(|s| ids.contains(&s.id)).collect()
+                } else {
+                    setups.into_iter().filter(|s| s.active).collect()
+                };
+                for setup in &setups {
+                    if let Some(alert) = r.evaluate(setup, &snapshot, false) {
+                        let _ = db.insert_playbook_signal(
+                            tick.timestamp_ms,
+                            &alert.setup_id,
+                            &serde_json::to_value(&alert).unwrap_or_else(|_| serde_json::json!({})),
+                        );
+                        let signal_id = format!("{}_{}", alert.setup_id, tick.timestamp_ms as u64);
+                        let outcome = SignalOutcome {
+                            signal_id: signal_id.clone(),
+                            setup_id: alert.setup_id.clone(),
+                            setup_name: Some(alert.setup_name.clone()),
+                            fired_at_ms: tick.timestamp_ms,
+                            fired_price: alert.current_price,
+                            target_price: alert.target_prices.first().copied(),
+                            stop_price: alert.stop_price,
+                            outcome: "pending".to_string(),
+                            outcome_at_ms: None,
+                            max_favorable_excursion: None,
+                            max_adverse_excursion: None,
+                            r_result: None,
+                            time_to_outcome_ms: None,
+                        };
+                        let _ = db.insert_signal_outcome(&outcome);
+                        signals_fired_this_session += 1;
+                        total_signals_fired += 1;
+                    }
+                }
+                r.update_prev_market(&snapshot);
+            }
+
+            // Outcome tracker: update MFE/MAE and resolve signals
+            if run_rules {
+                let _ = outcome_tracker::on_tick(db, tick.price, tick.timestamp_ms, None);
+            }
         }
     }
 
@@ -351,7 +428,7 @@ pub fn run_backfill(
             session_open_price,
             session_tick_count,
             session_volume,
-            0,
+            signals_fired_this_session,
         );
         let _ = db.upsert_session_summary(&summary);
         let _ = db.insert_market_events_batch(&event_buffer);
@@ -365,6 +442,33 @@ pub fn run_backfill(
         pipeline.rvol.load_historical_curve(&rvol_curves);
     }
 
+    let backtest_run_id = if run_rules && total_signals_fired > 0 {
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let now_ms = chrono::Utc::now().timestamp_millis() as f64;
+        let params = serde_json::json!({
+            "runRules": true,
+            "setupIds": setup_ids_filter,
+            "sessionsProcessed": sessions_processed,
+        });
+        let metrics = serde_json::json!({
+            "signalsFired": total_signals_fired,
+            "totalTicks": ticks.len(),
+            "totalEvents": total_events,
+        });
+        let perf = db.signal_performance(None, None, None).unwrap_or_default();
+        let trades = serde_json::json!({ "signalPerformance": perf });
+        if db
+            .insert_backtest_run(&run_id, now_ms, &params, &metrics, &trades)
+            .is_ok()
+        {
+            Some(run_id)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     Ok(BackfillResult {
         sessions_processed,
         sessions_skipped,
@@ -372,6 +476,12 @@ pub fn run_backfill(
         total_events,
         session_dates,
         gaps,
+        signals_fired: if run_rules {
+            Some(total_signals_fired)
+        } else {
+            None
+        },
+        backtest_run_id,
     })
 }
 

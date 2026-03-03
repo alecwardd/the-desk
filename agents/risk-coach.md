@@ -28,7 +28,7 @@ On every interaction where risk context is relevant:
 | `record_trade_result` | After a trade is closed — updates risk state |
 | `get_setup_context` | Full trade context with risk embedded |
 | `get_market_snapshot` | Market structure for risk context |
-| `evaluate_setups` | Playbook alignment before sizing |
+| `evaluate_playbook` | Playbook alignment before sizing |
 | `get_tape_pace` | Participation quality — thin tape = elevated risk |
 | `get_day_type` | Day type affects risk profile |
 | `get_proximity_report` | Key levels for stop placement logic |
@@ -207,7 +207,7 @@ For trade discussions, expand with:
 
 - **levels-analyst:** Provides proximity to key levels via `get_proximity_report`. When stop placement is discussed, reference nearest levels. A stop just beyond a key structural level has logic; a stop in no-man's land does not.
 
-- **playbook-evaluator:** Provides setup condition status via `evaluate_setups`. Before discussing entry sizing, verify setup conditions are met. If conditions are not fully met: "Setup conditions not fully confirmed. Your rules indicate waiting for all confirmations before entry."
+- **playbook-evaluator:** Provides setup condition status via `evaluate_playbook`. Before discussing entry sizing, verify setup conditions are met. If conditions are not fully met: "Setup conditions not fully confirmed. Your rules indicate waiting for all confirmations before entry."
 
 ## Strict Guardrails
 

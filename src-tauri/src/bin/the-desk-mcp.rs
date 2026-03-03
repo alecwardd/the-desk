@@ -10,13 +10,15 @@ use serde::Deserialize;
 use std::sync::{Arc, Mutex};
 use the_desk_backend::backfill;
 use the_desk_backend::db::{
-    AccountStateRecord, Database, OpenPositionRecord, RiskConfigRecord, TradeRecord,
+    AccountStateRecord, Database, OpenPositionRecord, RiskConfigRecord, SignalOutcome, TradeRecord,
 };
 use the_desk_backend::feed::scid_reader::{parse_record_scaled, ScidReader};
 use the_desk_backend::feed::{load_feed_config, load_storage_config, TradeSide};
+use the_desk_backend::outcome_tracker;
 use the_desk_backend::pipelines::{EventDetector, FlowEventEmitter, PipelineEngine, RvolPipeline};
 use the_desk_backend::research;
 use the_desk_backend::risk::{RiskConfig, RiskState, RiskTracker};
+use the_desk_backend::rules::RulesEngine;
 use the_desk_backend::{
     classify_session, et_minutes_from_timestamp, globex_open_ms, minute_of_session_from_timestamp,
     session_date_from_timestamp_ms, SessionType,
@@ -30,6 +32,7 @@ pub struct TheDeskMcp {
     pipelines: Arc<Mutex<PipelineEngine>>,
     detector: Arc<Mutex<EventDetector>>,
     flow_emitter: Arc<Mutex<FlowEventEmitter>>,
+    rules: Arc<Mutex<RulesEngine>>,
     last_bid: Arc<Mutex<f64>>,
     last_ask: Arc<Mutex<f64>>,
     tool_router: ToolRouter<Self>,
@@ -196,6 +199,10 @@ struct BackfillParams {
     end_date: Option<String>,
     /// Reprocess sessions even if summaries already exist.
     force: Option<bool>,
+    /// Run rules engine during backfill to populate signal outcomes (backtest replay).
+    run_rules: Option<bool>,
+    /// Setup IDs to evaluate. Omit for all active setups.
+    setup_ids: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -235,6 +242,30 @@ struct DistributionParams {
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
+struct SignalOutcomeDistributionParams {
+    /// Setup ID to analyze (e.g. "or5-mid-retest").
+    setup_id: String,
+    /// Start date filter (YYYY-MM-DD).
+    start_date: Option<String>,
+    /// End date filter (YYYY-MM-DD).
+    end_date: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+struct SignalOutcomeConditionalParams {
+    /// Setup ID to analyze.
+    setup_id: String,
+    /// Session summary field to filter by (e.g. "day_type", "profile_shape", "balance_state").
+    session_field: String,
+    /// Value to match (e.g. "Trend", "Normal", "above").
+    field_value: String,
+    /// Start date filter (YYYY-MM-DD).
+    start_date: Option<String>,
+    /// End date filter (YYYY-MM-DD).
+    end_date: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 struct SessionHistoryParams {
     /// Start date filter (YYYY-MM-DD).
     start_date: Option<String>,
@@ -247,11 +278,27 @@ struct SessionHistoryParams {
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
+struct CompareBacktestsParams {
+    /// Backtest run IDs to compare.
+    run_ids: Vec<String>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 struct CompareSessionsParams {
     /// Current IB range for similarity matching.
     current_ib_range: Option<f64>,
     /// Current day type for filtering.
     current_day_type: Option<String>,
+    /// Profile shape (e.g. "Normal", "Trend", "DoubleDistribution").
+    profile_shape: Option<String>,
+    /// Balance state (e.g. "Balanced", "Building", "Clearing").
+    balance_state: Option<String>,
+    /// Current RVOL ratio for similarity.
+    rvol_ratio: Option<f64>,
+    /// Session delta sign: "positive", "negative", or "neutral".
+    session_delta_sign: Option<String>,
+    /// Single prints direction for similarity.
+    single_prints_direction: Option<String>,
     /// Max similar sessions to return (default 5).
     max_results: Option<u64>,
 }
@@ -270,6 +317,7 @@ impl TheDeskMcp {
             pipelines: Arc::new(Mutex::new(pipelines)),
             detector: Arc::new(Mutex::new(EventDetector::new())),
             flow_emitter: Arc::new(Mutex::new(FlowEventEmitter::new())),
+            rules: Arc::new(Mutex::new(RulesEngine::default())),
             last_bid: Arc::new(Mutex::new(0.0)),
             last_ask: Arc::new(Mutex::new(0.0)),
             tool_router: Self::tool_router(),
@@ -576,18 +624,67 @@ impl TheDeskMcp {
     }
 
     #[tool(
-        description = "Evaluate all active playbook setups against current market state. Returns which setups have conditions met, approaching, or invalidated. Always frames results as 'your playbook says...' -- never advisory."
+        description = "Evaluate all active playbook setups against current market state. Returns per-setup status (conditionsMet, approaching, notActive) and recent signal count. Always frames results as 'your playbook says...' -- never advisory."
     )]
     async fn evaluate_playbook(&self) -> Result<CallToolResult, McpError> {
-        let db = self.db.lock().map_err(|_| lock_error())?;
-        match db.count_playbook_signals() {
-            Ok(count) => Ok(text_result(serde_json::json!({
-                "recentSignalCount": count,
-                "note": "Use playbook_signals plus current snapshot for full context",
-                "dataAgeMs": compute_data_age(&db)
-            }))),
-            Err(e) => Err(db_error(e)),
+        let (setups, risk_at_limit, fallback_price, count, data_age_ms) = {
+            let db = self.db.lock().map_err(|_| lock_error())?;
+            let setups = db.list_setups().unwrap_or_default();
+            let risk_at_limit = db
+                .load_risk_state()
+                .ok()
+                .flatten()
+                .map(|s| s.at_limit)
+                .unwrap_or(false);
+            let fallback_price = db
+                .latest_feature_state()
+                .ok()
+                .flatten()
+                .and_then(|s| s.get("lastPrice").and_then(|v| v.as_f64()))
+                .unwrap_or(0.0);
+            let count = db.count_playbook_signals().unwrap_or(0);
+            let data_age_ms = compute_data_age(&db);
+            (setups, risk_at_limit, fallback_price, count, data_age_ms)
+        };
+
+        let bid = self.last_bid.lock().map(|g| *g).unwrap_or(0.0);
+        let ask = self.last_ask.lock().map(|g| *g).unwrap_or(0.0);
+        let (bid, ask) = if bid > 0.0 || ask > 0.0 {
+            (
+                if bid > 0.0 { bid } else { ask - 0.25 },
+                if ask > 0.0 { ask } else { bid + 0.25 },
+            )
+        } else {
+            (fallback_price - 0.25, fallback_price + 0.25)
+        };
+
+        let mut setup_statuses: Vec<serde_json::Value> = Vec::new();
+        if let (Ok(pipelines), Ok(mut rules)) = (self.pipelines.lock(), self.rules.lock()) {
+            let market = pipelines.snapshot(bid, ask);
+            for setup in &setups {
+                let _ = rules.evaluate(setup, &market, risk_at_limit);
+                let state = rules.get_state(&setup.id);
+                setup_statuses.push(serde_json::json!({
+                    "setupId": setup.id,
+                    "setupName": setup.name,
+                    "state": format!("{:?}", state),
+                }));
+            }
+        } else {
+            for setup in &setups {
+                setup_statuses.push(serde_json::json!({
+                    "setupId": setup.id,
+                    "setupName": setup.name,
+                    "state": "unknown",
+                }));
+            }
         }
+
+        Ok(text_result(serde_json::json!({
+            "setupStatuses": setup_statuses,
+            "recentSignalCount": count,
+            "dataAgeMs": data_age_ms
+        })))
     }
 
     #[tool(
@@ -834,6 +931,11 @@ impl TheDeskMcp {
         };
         db.insert_trade(&trade).map_err(db_error)?;
 
+        // 1b. Bridge trades -> signal_outcomes: resolve pending signal if setup_id matches
+        if let Some(ref setup_id) = params.setup_id {
+            let _ = db.resolve_pending_signal_by_setup_id(setup_id, params.result_r, now_ms);
+        }
+
         // 2. Load current risk state, apply result via RiskTracker, save
         let risk_state = db.load_risk_state().map_err(db_error)?.unwrap_or_default();
         let config = db.load_risk_config().map_err(db_error)?;
@@ -961,7 +1063,21 @@ impl TheDeskMcp {
         });
 
         let db = self.db.lock().map_err(|_| lock_error())?;
-        match backfill::run_backfill(&reader, &db, since_ms, params.force.unwrap_or(false)) {
+        let config = if params.run_rules.unwrap_or(false) {
+            Some(backfill::BackfillConfig {
+                run_rules: true,
+                setup_ids: params.setup_ids.clone(),
+            })
+        } else {
+            None
+        };
+        match backfill::run_backfill(
+            &reader,
+            &db,
+            since_ms,
+            params.force.unwrap_or(false),
+            config,
+        ) {
             Ok(result) => Ok(text_result(
                 serde_json::to_value(&result).unwrap_or_default(),
             )),
@@ -970,14 +1086,102 @@ impl TheDeskMcp {
     }
 
     #[tool(
-        description = "Compare current session structure against similar historical sessions. Matches by IB range similarity and optionally day type. Returns the most similar past sessions with their outcomes (close vs IB mid, delta, etc.)."
+        description = "Run a backtest: replay the rules engine over historical .scid data. Processes past sessions through all pipelines, evaluates playbook setups, tracks signal outcomes (MFE/MAE, target/stop hit), and persists results to backtest_runs. Use for setup performance analysis and parameter sensitivity."
+    )]
+    async fn run_backtest(
+        &self,
+        Parameters(params): Parameters<BackfillParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let config = load_feed_config();
+        let reader = ScidReader::from_feed_config(&config);
+        if !reader.path().exists() {
+            return Ok(no_data(
+                "SCID file not found. Ensure Sierra Chart data path is configured.",
+            ));
+        }
+        let since_ms = params.start_date.as_deref().map(|d| {
+            chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d")
+                .map(|nd| {
+                    nd.and_hms_opt(0, 0, 0)
+                        .unwrap()
+                        .and_utc()
+                        .timestamp_millis() as f64
+                })
+                .unwrap_or(0.0)
+        });
+        let db = self.db.lock().map_err(|_| lock_error())?;
+        let config = Some(backfill::BackfillConfig {
+            run_rules: true,
+            setup_ids: params.setup_ids.clone(),
+        });
+        match backfill::run_backfill(
+            &reader,
+            &db,
+            since_ms,
+            params.force.unwrap_or(false),
+            config,
+        ) {
+            Ok(result) => Ok(text_result(
+                serde_json::to_value(&result).unwrap_or_default(),
+            )),
+            Err(e) => Err(db_error(e)),
+        }
+    }
+
+    #[tool(
+        description = "Retrieve stored backtest runs. Returns most recent runs with params, metrics, and signal performance. Use to analyze historical backtest results."
+    )]
+    async fn get_backtest_results(
+        &self,
+        Parameters(params): Parameters<LimitParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let db = self.db.lock().map_err(|_| lock_error())?;
+        let limit = params.limit.unwrap_or(10) as usize;
+        match db.list_backtest_runs(limit) {
+            Ok(runs) => Ok(text_result(serde_json::json!({
+                "runs": runs,
+                "count": runs.len(),
+            }))),
+            Err(e) => Err(db_error(e)),
+        }
+    }
+
+    #[tool(
+        description = "Compare two or more backtest runs side-by-side. Pass run IDs to compare params, metrics, and signal performance across parameter variations."
+    )]
+    async fn compare_backtests(
+        &self,
+        Parameters(params): Parameters<CompareBacktestsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let db = self.db.lock().map_err(|_| lock_error())?;
+        let mut runs = Vec::new();
+        for id in &params.run_ids {
+            if let Ok(Some(run)) = db.get_backtest_run(id) {
+                runs.push(run);
+            }
+        }
+        Ok(text_result(serde_json::json!({
+            "runs": runs,
+            "count": runs.len(),
+        })))
+    }
+
+    #[tool(
+        description = "Compare current session structure against similar historical sessions. Uses multi-dimensional similarity: IB range, day type, profile shape, balance state, RVOL ratio, session delta sign, single prints direction. Returns the most similar past sessions with their outcomes (close vs IB mid, delta, etc.)."
     )]
     async fn compare_sessions(
         &self,
         Parameters(params): Parameters<CompareSessionsParams>,
     ) -> Result<CallToolResult, McpError> {
+        let snapshot = self.live_snapshot().or_else(|| {
+            self.db
+                .lock()
+                .ok()
+                .and_then(|d| d.latest_feature_state().ok().flatten())
+        });
         let ib_range = params.current_ib_range.unwrap_or_else(|| {
-            self.live_snapshot()
+            snapshot
+                .as_ref()
                 .and_then(|s| {
                     let h = s.get("ibHigh")?.as_f64()?;
                     let l = s.get("ibLow")?.as_f64()?;
@@ -985,11 +1189,68 @@ impl TheDeskMcp {
                 })
                 .unwrap_or(0.0)
         });
+        let rvol_ratio = params.rvol_ratio.or_else(|| {
+            snapshot
+                .as_ref()
+                .and_then(|s| s.get("rvolRatio").and_then(|v| v.as_f64()))
+        });
+        let session_delta_sign = params.session_delta_sign.or_else(|| {
+            snapshot.as_ref().and_then(|s| {
+                s.get("sessionDelta").and_then(|v| v.as_f64()).map(|d| {
+                    (if d > 0.5 {
+                        "positive"
+                    } else if d < -0.5 {
+                        "negative"
+                    } else {
+                        "neutral"
+                    })
+                    .to_string()
+                })
+            })
+        });
+        let profile_shape = params.profile_shape.or_else(|| {
+            snapshot.as_ref().and_then(|s| {
+                s.get("profileShape")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            })
+        });
+        let balance_state = params.balance_state.or_else(|| {
+            snapshot.as_ref().and_then(|s| {
+                s.get("balanceState")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            })
+        });
+        let single_prints = params.single_prints_direction.or_else(|| {
+            snapshot.as_ref().and_then(|s| {
+                s.get("singlePrintsDirection")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            })
+        });
+
+        let query = research::SessionSimilarityQuery {
+            ib_range: Some(ib_range),
+            day_type: params.current_day_type.clone(),
+            profile_shape,
+            balance_state,
+            rvol_ratio,
+            session_delta_sign,
+            single_prints_direction: single_prints,
+            weights: research::SimilarityWeights::default(),
+        };
         let db = self.db.lock().map_err(|_| lock_error())?;
         let max = params.max_results.unwrap_or(5) as usize;
-        match research::compare_sessions(&db, ib_range, params.current_day_type.as_deref(), max) {
+        match research::compare_sessions_multi(&db, &query, max) {
             Ok(sessions) => Ok(text_result(serde_json::json!({
-                "currentIbRange": ib_range,
+                "queryDimensions": {
+                    "ibRange": ib_range,
+                    "dayType": params.current_day_type,
+                    "profileShape": query.profile_shape,
+                    "balanceState": query.balance_state,
+                    "rvolRatio": query.rvol_ratio,
+                },
                 "similarSessions": sessions,
                 "count": sessions.len(),
             }))),
@@ -1054,6 +1315,50 @@ impl TheDeskMcp {
         match research::metric_distribution(
             &db,
             &params.metric,
+            params.start_date.as_deref(),
+            params.end_date.as_deref(),
+        ) {
+            Ok(result) => Ok(text_result(
+                serde_json::to_value(&result).unwrap_or_default(),
+            )),
+            Err(e) => Err(db_error(e)),
+        }
+    }
+
+    #[tool(
+        description = "Distribution of R-results from signal_outcomes for a setup. Answers: 'When setup X fires, what is the distribution of R-results?' Returns mean, median, stddev, percentiles. Requires signal_outcomes to be populated (run backtest or live tracking)."
+    )]
+    async fn query_signal_outcome_distribution(
+        &self,
+        Parameters(params): Parameters<SignalOutcomeDistributionParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let db = self.db.lock().map_err(|_| lock_error())?;
+        match research::signal_outcome_distribution(
+            &db,
+            &params.setup_id,
+            params.start_date.as_deref(),
+            params.end_date.as_deref(),
+        ) {
+            Ok(result) => Ok(text_result(
+                serde_json::to_value(&result).unwrap_or_default(),
+            )),
+            Err(e) => Err(db_error(e)),
+        }
+    }
+
+    #[tool(
+        description = "Conditional win rate for signal outcomes: when setup X fires and session has field=value (e.g. day_type=Trend), what is the win rate? Joins signal_outcomes with session_summaries. Requires signal_outcomes to be populated."
+    )]
+    async fn query_signal_outcome_conditional(
+        &self,
+        Parameters(params): Parameters<SignalOutcomeConditionalParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let db = self.db.lock().map_err(|_| lock_error())?;
+        match research::signal_outcome_conditional(
+            &db,
+            &params.setup_id,
+            &params.session_field,
+            &params.field_value,
             params.start_date.as_deref(),
             params.end_date.as_deref(),
         ) {
@@ -1680,12 +1985,13 @@ fn persist_integrity_check(db: &Database, pipelines: &PipelineEngine) {
     let _ = db.insert_validation_run(now_ms, status, &result);
 }
 
-/// Process a single tick through the pipeline engine and event detector.
+/// Process a single tick through the pipeline engine, event detector, rules engine, and outcome tracker.
 #[allow(clippy::too_many_arguments)]
 fn process_tick(
     pipelines: &Arc<Mutex<PipelineEngine>>,
     detector: &Arc<Mutex<EventDetector>>,
     flow_emitter: &Arc<Mutex<FlowEventEmitter>>,
+    rules: &Arc<Mutex<RulesEngine>>,
     db: &Arc<Mutex<Database>>,
     last_bid: &Arc<Mutex<f64>>,
     last_ask: &Arc<Mutex<f64>>,
@@ -1698,33 +2004,88 @@ fn process_tick(
     event_buffer: &mut Vec<the_desk_backend::pipelines::MarketEvent>,
 ) {
     let minute = minute_of_session_from_timestamp(timestamp_ms);
-    if let Ok(mut p) = pipelines.lock() {
-        p.on_trade_with_timestamp(price, volume, is_buy, minute, timestamp_ms);
+    let (snapshot, _session_date) = {
+        if let Ok(mut p) = pipelines.lock() {
+            p.on_trade_with_timestamp(price, volume, is_buy, minute, timestamp_ms);
 
-        let cur_bid = if bid > 0.0 { bid } else { price - 0.25 };
-        let cur_ask = if ask > 0.0 { ask } else { price + 0.25 };
-        let snapshot = p.snapshot(cur_bid, cur_ask);
-        let session_date = session_date_from_timestamp_ms(timestamp_ms);
+            let cur_bid = if bid > 0.0 { bid } else { price - 0.25 };
+            let cur_ask = if ask > 0.0 { ask } else { price + 0.25 };
+            let snapshot = p.snapshot(cur_bid, cur_ask);
+            let session_date = session_date_from_timestamp_ms(timestamp_ms);
 
-        // Structural events (level tests, IB extensions, day type changes, etc.)
-        if let Ok(mut det) = detector.lock() {
-            let events = det.detect(&snapshot, timestamp_ms, &session_date, minute);
-            event_buffer.extend(events);
-        }
-
-        // Flow events (absorption, pinch, acceleration zones, large trade clusters)
-        if let Ok(mut fe) = flow_emitter.lock() {
-            let flow_events = fe.detect(&p, timestamp_ms, &session_date);
-            event_buffer.extend(flow_events);
-        }
-
-        // Flush event buffer periodically
-        if event_buffer.len() >= 50 {
-            if let Ok(d) = db.lock() {
-                let _ = d.insert_market_events_batch(event_buffer);
+            // Structural events (level tests, IB extensions, day type changes, etc.)
+            if let Ok(mut det) = detector.lock() {
+                let events = det.detect(&snapshot, timestamp_ms, &session_date, minute);
+                event_buffer.extend(events);
             }
-            event_buffer.clear();
+
+            // Flow events (absorption, pinch, acceleration zones, large trade clusters)
+            if let Ok(mut fe) = flow_emitter.lock() {
+                let flow_events = fe.detect(&p, timestamp_ms, &session_date);
+                event_buffer.extend(flow_events);
+            }
+
+            (snapshot, session_date)
+        } else {
+            return;
         }
+    };
+
+    // Rules engine: evaluate setups and fire alerts (outside pipeline lock to avoid deadlock)
+    let setups = db
+        .lock()
+        .ok()
+        .and_then(|d| d.list_setups().ok())
+        .unwrap_or_default();
+    let risk_at_limit = db
+        .lock()
+        .ok()
+        .and_then(|d| d.load_risk_state().ok().flatten())
+        .map(|s| s.at_limit)
+        .unwrap_or(false);
+    if let Ok(mut r) = rules.lock() {
+        for setup in &setups {
+            if let Some(alert) = r.evaluate(setup, &snapshot, risk_at_limit) {
+                if let Ok(d) = db.lock() {
+                    let _ = d.insert_playbook_signal(
+                        timestamp_ms,
+                        &alert.setup_id,
+                        &serde_json::to_value(&alert).unwrap_or_else(|_| serde_json::json!({})),
+                    );
+                    let signal_id = format!("{}_{}", alert.setup_id, timestamp_ms as u64);
+                    let outcome = SignalOutcome {
+                        signal_id: signal_id.clone(),
+                        setup_id: alert.setup_id.clone(),
+                        setup_name: Some(alert.setup_name.clone()),
+                        fired_at_ms: timestamp_ms,
+                        fired_price: alert.current_price,
+                        target_price: alert.target_prices.first().copied(),
+                        stop_price: alert.stop_price,
+                        outcome: "pending".to_string(),
+                        outcome_at_ms: None,
+                        max_favorable_excursion: None,
+                        max_adverse_excursion: None,
+                        r_result: None,
+                        time_to_outcome_ms: None,
+                    };
+                    let _ = d.insert_signal_outcome(&outcome);
+                }
+            }
+        }
+        r.update_prev_market(&snapshot);
+    }
+
+    // Outcome tracker: update MFE/MAE and resolve signals
+    if let Ok(d) = db.lock() {
+        let _ = outcome_tracker::on_tick(&d, price, timestamp_ms, None);
+    }
+
+    // Flush event buffer periodically
+    if event_buffer.len() >= 50 {
+        if let Ok(d) = db.lock() {
+            let _ = d.insert_market_events_batch(event_buffer);
+        }
+        event_buffer.clear();
     }
     if bid > 0.0 {
         if let Ok(mut b) = last_bid.lock() {
@@ -1907,6 +2268,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let pipelines_bg = Arc::clone(&server.pipelines);
         let detector_bg = Arc::clone(&server.detector);
         let flow_emitter_bg = Arc::clone(&server.flow_emitter);
+        let rules_bg = Arc::clone(&server.rules);
         let last_bid_bg = Arc::clone(&server.last_bid);
         let last_ask_bg = Arc::clone(&server.last_ask);
         let db_bg = Arc::clone(&server.db);
@@ -1962,6 +2324,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             &pipelines_bg,
                             &detector_bg,
                             &flow_emitter_bg,
+                            &rules_bg,
                             &db_bg,
                             &last_bid_bg,
                             &last_ask_bg,

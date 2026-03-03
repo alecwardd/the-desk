@@ -10,6 +10,7 @@ use the_desk_backend::db::Database;
 use the_desk_backend::dtc::DtcClient;
 use the_desk_backend::feed::scid_reader::ScidReader;
 use the_desk_backend::feed::{load_feed_config, FeedEvent, TradeSide};
+use the_desk_backend::outcome_tracker;
 use the_desk_backend::pipelines::{EventDetector, PipelineEngine, RvolPipeline};
 use the_desk_backend::recording::{RecordingEntry, SessionRecorder};
 use the_desk_backend::risk::{RiskConfig, RiskTracker};
@@ -324,6 +325,24 @@ async fn processing_loop(handle: AppHandle, mut rx: broadcast::Receiver<FeedEven
                                 &serde_json::to_value(&alert)
                                     .unwrap_or_else(|_| serde_json::json!({})),
                             );
+                            // Track signal outcome for MFE/MAE and resolution
+                            let signal_id = format!("{}_{}", alert.setup_id, timestamp as u64);
+                            let outcome = the_desk_backend::db::SignalOutcome {
+                                signal_id: signal_id.clone(),
+                                setup_id: alert.setup_id.clone(),
+                                setup_name: Some(alert.setup_name.clone()),
+                                fired_at_ms: timestamp,
+                                fired_price: alert.current_price,
+                                target_price: alert.target_prices.first().copied(),
+                                stop_price: alert.stop_price,
+                                outcome: "pending".to_string(),
+                                outcome_at_ms: None,
+                                max_favorable_excursion: None,
+                                max_adverse_excursion: None,
+                                r_result: None,
+                                time_to_outcome_ms: None,
+                            };
+                            let _ = state.db.lock().await.insert_signal_outcome(&outcome);
                             if let Ok(alert_json) = serde_json::to_value(&alert) {
                                 let mut recorder = state.recorder.lock().await;
                                 recorder.push_alert(&alert_json);
@@ -331,6 +350,12 @@ async fn processing_loop(handle: AppHandle, mut rx: broadcast::Receiver<FeedEven
                         }
                     }
                     rules.update_prev_market(&market);
+                }
+
+                // Outcome tracker: update MFE/MAE and resolve signals that hit target/stop
+                {
+                    let db = state.db.lock().await;
+                    let _ = outcome_tracker::on_tick(&db, price, timestamp, None);
                 }
 
                 // Throttled risk state emission

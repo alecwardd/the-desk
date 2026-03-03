@@ -2117,6 +2117,59 @@ impl Database {
         Ok(())
     }
 
+    /// Resolve the most recent pending signal for a setup_id with a manual trade result.
+    /// Used when record_trade_result is called with setup_id — bridges trades to signal_outcomes.
+    pub fn resolve_pending_signal_by_setup_id(
+        &self,
+        setup_id: &str,
+        result_r: f64,
+        timestamp_ms: f64,
+    ) -> Result<Option<String>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT signal_id, max_favorable_excursion, max_adverse_excursion
+             FROM signal_outcomes
+             WHERE setup_id = ?1 AND outcome = 'pending'
+             ORDER BY fired_at_ms DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query(rusqlite::params![setup_id])?;
+        if let Some(row) = rows.next()? {
+            let signal_id: String = row.get(0)?;
+            let mfe: f64 = row.get(1).unwrap_or(0.0);
+            let mae: f64 = row.get(2).unwrap_or(0.0);
+            let outcome = if result_r > 0.0 {
+                "target_hit"
+            } else {
+                "stop_hit"
+            };
+            self.resolve_signal_outcome(
+                &signal_id,
+                outcome,
+                timestamp_ms,
+                mfe,
+                mae,
+                Some(result_r),
+            )?;
+            Ok(Some(signal_id))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Update MFE/MAE for a pending signal without resolving.
+    pub fn update_signal_outcome_mfe_mae(
+        &self,
+        signal_id: &str,
+        mfe: f64,
+        mae: f64,
+    ) -> Result<(), DbError> {
+        self.conn.execute(
+            "UPDATE signal_outcomes SET max_favorable_excursion=?2, max_adverse_excursion=?3
+             WHERE signal_id=?1 AND outcome='pending'",
+            rusqlite::params![signal_id, mfe, mae],
+        )?;
+        Ok(())
+    }
+
     /// List pending signal outcomes (for the outcome evaluator to track).
     pub fn pending_signal_outcomes(&self) -> Result<Vec<SignalOutcome>, DbError> {
         let mut stmt = self.conn.prepare(
@@ -2143,6 +2196,52 @@ impl Database {
             })
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// List resolved signal outcomes with r_result for research queries.
+    /// Returns (setup_id, session_date, r_result, outcome). Session date derived from fired_at_ms.
+    #[allow(clippy::type_complexity)]
+    pub fn list_signal_outcomes_for_research(
+        &self,
+        setup_id: Option<&str>,
+        start_date: Option<&str>,
+        end_date: Option<&str>,
+    ) -> Result<Vec<(String, String, Option<f64>, String)>, DbError> {
+        use crate::session_date_from_timestamp_ms;
+        let mut stmt = self.conn.prepare(
+            "SELECT setup_id, fired_at_ms, r_result, outcome
+             FROM signal_outcomes WHERE outcome != 'pending'",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, f64>(1)?,
+                row.get::<_, Option<f64>>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut results = Vec::new();
+        for row in rows.filter_map(|r| r.ok()) {
+            let (sid, fired_ms, r_result, outcome) = row;
+            if let Some(filter_id) = setup_id {
+                if sid != filter_id {
+                    continue;
+                }
+            }
+            let session_date = session_date_from_timestamp_ms(fired_ms);
+            if let Some(sd) = start_date {
+                if session_date.as_str() < sd {
+                    continue;
+                }
+            }
+            if let Some(ed) = end_date {
+                if session_date.as_str() > ed {
+                    continue;
+                }
+            }
+            results.push((sid, session_date, r_result, outcome));
+        }
+        Ok(results)
     }
 
     /// Get signal performance stats for a setup.
@@ -2245,6 +2344,81 @@ impl Database {
         Ok(self
             .conn
             .query_row("SELECT COUNT(1) FROM session_summaries", [], |r| r.get(0))?)
+    }
+
+    // ------------------------------------------------------------------
+    // Backtest runs
+    // ------------------------------------------------------------------
+
+    /// Insert a backtest run record.
+    pub fn insert_backtest_run(
+        &self,
+        id: &str,
+        created_at_ms: f64,
+        params: &serde_json::Value,
+        metrics: &serde_json::Value,
+        trades: &serde_json::Value,
+    ) -> Result<(), DbError> {
+        self.conn.execute(
+            "INSERT INTO backtest_runs (id, created_at_ms, params, metrics, trades)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                id,
+                created_at_ms,
+                serde_json::to_string(params).unwrap_or_default(),
+                serde_json::to_string(metrics).unwrap_or_default(),
+                serde_json::to_string(trades).unwrap_or_default(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// List backtest runs, most recent first.
+    pub fn list_backtest_runs(&self, limit: usize) -> Result<Vec<serde_json::Value>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, created_at_ms, params, metrics, trades
+             FROM backtest_runs ORDER BY created_at_ms DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit as i64], |row| {
+            let id: String = row.get(0)?;
+            let created_at_ms: f64 = row.get(1)?;
+            let params_str: String = row.get(2)?;
+            let metrics_str: String = row.get(3)?;
+            let trades_str: String = row.get(4)?;
+            Ok(serde_json::json!({
+                "id": id,
+                "createdAtMs": created_at_ms,
+                "params": serde_json::from_str::<serde_json::Value>(&params_str).unwrap_or_default(),
+                "metrics": serde_json::from_str::<serde_json::Value>(&metrics_str).unwrap_or_default(),
+                "trades": serde_json::from_str::<serde_json::Value>(&trades_str).unwrap_or_default(),
+            }))
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Get a single backtest run by ID.
+    pub fn get_backtest_run(&self, id: &str) -> Result<Option<serde_json::Value>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, created_at_ms, params, metrics, trades
+             FROM backtest_runs WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query(rusqlite::params![id])?;
+        if let Some(row) = rows.next()? {
+            let id: String = row.get(0)?;
+            let created_at_ms: f64 = row.get(1)?;
+            let params_str: String = row.get(2)?;
+            let metrics_str: String = row.get(3)?;
+            let trades_str: String = row.get(4)?;
+            Ok(Some(serde_json::json!({
+                "id": id,
+                "createdAtMs": created_at_ms,
+                "params": serde_json::from_str::<serde_json::Value>(&params_str).unwrap_or_default(),
+                "metrics": serde_json::from_str::<serde_json::Value>(&metrics_str).unwrap_or_default(),
+                "trades": serde_json::from_str::<serde_json::Value>(&trades_str).unwrap_or_default(),
+            })))
+        } else {
+            Ok(None)
+        }
     }
 }
 

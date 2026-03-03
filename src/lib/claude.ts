@@ -19,6 +19,8 @@ export interface BriefingContext {
   setups: Setup[];
   risk: RiskState | null;
   preSessionNote?: string;
+  lastBalance?: number;
+  openPositions?: Array<{ direction: string; size: number; entryPrice: number }>;
 }
 
 /**
@@ -178,6 +180,15 @@ export async function generateBriefingSynthesis(context: BriefingContext): Promi
     if (context.risk) {
       parts.push(
         `Risk state from prior session: ${context.risk.dailyPnlR.toFixed(1)}R P&L.`
+      );
+    }
+
+    if (context.lastBalance != null && context.lastBalance > 0) {
+      parts.push(`Last confirmed balance: $${context.lastBalance.toLocaleString()}.`);
+    }
+    if (context.openPositions && context.openPositions.length > 0) {
+      parts.push(
+        `Open positions not from chat: ${context.openPositions.map((p) => `${p.size} ${p.direction} @ $${p.entryPrice}`).join("; ")}.`
       );
     }
 

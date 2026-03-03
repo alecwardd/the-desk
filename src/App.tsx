@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { PreSessionBriefing } from "./components/briefing/pre-session-briefing";
 import { CoachingFeed } from "./components/coaching/coaching-feed";
 import { MarketSidebar } from "./components/dashboard/market-sidebar";
@@ -11,9 +11,10 @@ import { RiskBar } from "./components/risk/risk-bar";
 import { useCoachingPrompts } from "./hooks/use-coaching-prompts";
 import { useConnection } from "./hooks/use-connection";
 import { useMarketState } from "./hooks/use-market-state";
+import { useRiskConfig } from "./hooks/use-risk-config";
 import { useRiskState } from "./hooks/use-risk-state";
 import { useSetupAlerts } from "./hooks/use-setup-alerts";
-import { generateCoachingPrompt } from "./lib/claude";
+import { generateCoachingPrompt, generateRiskWarning } from "./lib/claude";
 import { sessionBridge, setupBridge, tradeBridge } from "./lib/tauri-bridge";
 import type { CoachingPrompt, SessionEventRecord, Setup, TradeRecord } from "./lib/types";
 import { Button } from "@/components/ui/button";
@@ -26,6 +27,7 @@ export default function App() {
   const connection = useConnection();
   const marketState = useMarketState();
   const riskState = useRiskState();
+  const riskConfig = useRiskConfig();
   const setupAlerts = useSetupAlerts();
   const streamPrompts = useCoachingPrompts();
   const [localPrompts, setLocalPrompts] = useState<CoachingPrompt[]>([]);
@@ -118,6 +120,32 @@ export default function App() {
       })
       .catch(() => {});
   }, [setups, setupAlerts, riskState, quickNote]);
+
+  const lastRiskWarningKey = useRef<string | null>(null);
+  useEffect(() => {
+    if (!riskState) return;
+    let key: string | null = null;
+    if (riskState.atLimit) key = "at_limit";
+    else if (riskState.dailyPnlR <= -0.8 * riskState.maxDailyLossR && riskState.maxDailyLossR > 0)
+      key = "near_limit";
+    else if (riskState.consecutiveLosses >= 3) key = "consecutive_losses";
+    if (!key || key === lastRiskWarningKey.current) return;
+    lastRiskWarningKey.current = key;
+    generateRiskWarning(riskState)
+      .then((prompt) => {
+        setLocalPrompts((existing) => [prompt, ...existing].slice(0, 200));
+      })
+      .catch(() => {});
+  }, [riskState]);
+  useEffect(() => {
+    if (riskState && !riskState.atLimit) {
+      const nearLimit =
+        riskState.dailyPnlR <= -0.8 * riskState.maxDailyLossR && riskState.maxDailyLossR > 0;
+      if (!nearLimit && riskState.consecutiveLosses < 3) {
+        lastRiskWarningKey.current = null;
+      }
+    }
+  }, [riskState]);
 
   async function handlePromptResponse(
     prompt: CoachingPrompt,
@@ -257,7 +285,7 @@ export default function App() {
 
   return (
     <div className="grid grid-rows-[48px_1fr_40px] h-screen">
-      <RiskBar riskState={riskState} connection={connection} />
+      <RiskBar riskState={riskState} riskConfig={riskConfig} connection={connection} />
 
       {showOnboarding ? (
         <div className="flex flex-col overflow-auto">
@@ -334,6 +362,7 @@ export default function App() {
             <MarketSidebar marketState={marketState} setupAlerts={setupAlerts} />
             <CoachingFeed
               prompts={prompts}
+              riskState={riskState}
               onRespond={handlePromptResponse}
               onTookIt={handleTookIt}
             />
@@ -399,6 +428,7 @@ function SettingsPanel() {
     maxConsecutiveLosses: 3,
     maxTradesPerSession: 8 as number | null,
     noTradeZones: [] as unknown[],
+    maxDailyLossDollars: null as number | null,
   });
   const [dtcHost, setDtcHost] = useState("127.0.0.1");
   const [dtcPort, setDtcPort] = useState(11099);
@@ -415,6 +445,7 @@ function SettingsPanel() {
           maxConsecutiveLosses: config.maxConsecutiveLosses,
           maxTradesPerSession: config.maxTradesPerSession ?? null,
           noTradeZones: config.noTradeZones,
+          maxDailyLossDollars: config.maxDailyLossDollars ?? null,
         });
       }).catch(() => {});
     });
@@ -479,6 +510,18 @@ function SettingsPanel() {
                 type="number"
                 value={riskConfig.maxDailyLossR}
                 onChange={(e) => setRiskConfig({ ...riskConfig, maxDailyLossR: Number(e.target.value) })}
+              />
+            </div>
+            <div className="flex flex-col gap-1">
+              <label className="text-xs text-text-secondary">Max daily loss ($) e.g. Lucid 750</label>
+              <Input
+                type="number"
+                value={riskConfig.maxDailyLossDollars ?? ""}
+                placeholder="Optional"
+                onChange={(e) => {
+                  const v = e.target.value ? Number(e.target.value) : null;
+                  setRiskConfig({ ...riskConfig, maxDailyLossDollars: v });
+                }}
               />
             </div>
             <div className="flex flex-col gap-1">

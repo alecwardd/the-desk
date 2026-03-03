@@ -2,7 +2,7 @@ import { useCallback, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
-import type { CoachingPrompt } from "../../lib/types";
+import type { CoachingPrompt, RiskState } from "../../lib/types";
 import { TradeEntryForm } from "./trade-entry-form";
 
 type ResponseType = "took_it" | "watching" | "passed";
@@ -14,6 +14,7 @@ interface ResponseState {
 
 interface Props {
   prompts: CoachingPrompt[];
+  riskState?: RiskState | null;
   onRespond: (prompt: CoachingPrompt, response: ResponseType) => void;
   onTookIt: (
     prompt: CoachingPrompt,
@@ -37,7 +38,7 @@ function promptCardClass(response: ResponseState | undefined): string {
   return "opacity-60";
 }
 
-export function CoachingFeed({ prompts, onRespond, onTookIt }: Props) {
+export function CoachingFeed({ prompts, riskState, onRespond, onTookIt }: Props) {
   const [responses, setResponses] = useState<Record<string, ResponseState>>({});
   const [expandedTrade, setExpandedTrade] = useState<string | null>(null);
   const [expandedPass, setExpandedPass] = useState<string | null>(null);
@@ -107,14 +108,26 @@ export function CoachingFeed({ prompts, onRespond, onTookIt }: Props) {
                 <p className="text-text-secondary mt-1 text-sm">{prompt.message}</p>
 
                 {!response && (
-                  <div className="mt-2 flex gap-2">
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={() => handleRespond(prompt, "took_it")}
-                    >
-                      Took it (1)
-                    </Button>
+                  <div className="mt-2 flex flex-col gap-2">
+                    {riskState?.atLimit && (
+                      <p className="text-warning text-xs">
+                        Your daily loss limit has been reached. Your rules say to stop trading for the day.
+                      </p>
+                    )}
+                    {riskState && !riskState.atLimit && riskState.dailyPnlR <= -0.8 * riskState.maxDailyLossR && (
+                      <p className="text-warning text-xs">
+                        Approaching limit: {riskState.dailyPnlR.toFixed(1)}R of -{riskState.maxDailyLossR}R. Proceed with caution.
+                      </p>
+                    )}
+                    <div className="flex gap-2">
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => handleRespond(prompt, "took_it")}
+                        disabled={riskState?.atLimit === true}
+                      >
+                        Took it (1)
+                      </Button>
                     <Button
                       variant="outline"
                       size="sm"
@@ -122,13 +135,14 @@ export function CoachingFeed({ prompts, onRespond, onTookIt }: Props) {
                     >
                       Watching (2)
                     </Button>
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={() => handleRespond(prompt, "passed")}
-                    >
-                      Passed (3)
-                    </Button>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => handleRespond(prompt, "passed")}
+                      >
+                        Passed (3)
+                      </Button>
+                    </div>
                   </div>
                 )}
 
@@ -142,6 +156,7 @@ export function CoachingFeed({ prompts, onRespond, onTookIt }: Props) {
 
                 {isTradeExpanded && (
                   <TradeEntryForm
+                    riskState={riskState}
                     onSubmit={(dir, sz, px) => handleTradeSubmit(prompt, dir, sz, px)}
                     onCancel={() => setExpandedTrade(null)}
                   />

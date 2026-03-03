@@ -8,10 +8,12 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import type { RiskState } from "../../lib/types";
 
 interface Props {
   defaultDirection?: "long" | "short";
   defaultPrice?: number;
+  riskState?: RiskState | null;
   onSubmit: (direction: "long" | "short", size: number, entryPrice: number) => void;
   onCancel: () => void;
 }
@@ -19,6 +21,7 @@ interface Props {
 export function TradeEntryForm({
   defaultDirection = "long",
   defaultPrice,
+  riskState,
   onSubmit,
   onCancel,
 }: Props) {
@@ -29,8 +32,14 @@ export function TradeEntryForm({
   function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     if (entryPrice <= 0) return;
+    if (riskState?.atLimit) return;
     onSubmit(direction, size, entryPrice);
   }
+
+  const atLimit = riskState?.atLimit === true;
+  const remainingR = riskState
+    ? riskState.maxDailyLossR + riskState.dailyPnlR
+    : null;
 
   return (
     <form
@@ -78,8 +87,14 @@ export function TradeEntryForm({
         />
       </div>
 
+      {atLimit && (
+        <p className="text-warning text-xs">Daily limit reached. Do not log new trades.</p>
+      )}
+      {remainingR != null && remainingR < 0 && !atLimit && (
+        <p className="text-text-muted text-xs">Remaining: {remainingR.toFixed(1)}R</p>
+      )}
       <div className="flex gap-1.5">
-        <Button type="submit" size="sm" disabled={entryPrice <= 0}>
+        <Button type="submit" size="sm" disabled={entryPrice <= 0 || atLimit}>
           Log Trade
         </Button>
         <Button type="button" variant="ghost" size="sm" onClick={onCancel}>

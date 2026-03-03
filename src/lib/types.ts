@@ -177,4 +177,24 @@ export interface RiskConfigRecord {
   maxConsecutiveLosses: number;
   maxTradesPerSession?: number | null;
   noTradeZones: unknown[];
+  maxDailyLossDollars?: number | null;
+}
+
+export interface OpenPosition {
+  direction: string;
+  size: number;
+  entryPrice: number;
+  instrument?: string | null;
+  setupId?: string | null;
+}
+
+export interface AccountStateRecord {
+  lastBalanceDollars: number;
+  lastBalanceUpdatedAtMs: number;
+  openPositions: OpenPosition[];
+  lucidDailyLossDollars?: number | null;
+  lucidAccountSizeDollars?: number | null;
+  profitTargetPerCycle?: number | null;
+  positionSizingMethod: string;
+  kellyFraction: number;
 }

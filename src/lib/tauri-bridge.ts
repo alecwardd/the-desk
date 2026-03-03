@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type {
+  AccountStateRecord,
   CoachingPrompt,
   JournalEntry,
   MarketState,
@@ -55,6 +56,21 @@ export const riskBridge = {
   get: () => invoke<RiskState>("get_risk_state"),
   getConfig: () => invoke<RiskConfigRecord>("get_risk_config"),
   saveConfig: (config: RiskConfigRecord) => invoke<void>("save_risk_config", { config }),
+  initRiskState: () => invoke<RiskState>("init_risk_state"),
+};
+
+export const accountBridge = {
+  get: () => invoke<AccountStateRecord | null>("get_account_state"),
+  save: (input: Partial<{
+    lastBalanceDollars: number;
+    openPositions: Array<{ direction: string; size: number; entryPrice: number; instrument?: string; setupId?: string }>;
+    lucidDailyLossDollars: number;
+    lucidAccountSizeDollars: number;
+    profitTargetPerCycle: number;
+    positionSizingMethod: string;
+    kellyFraction: number;
+  }>) =>
+    invoke<AccountStateRecord>("save_account_state", { input }),
 };
 
 export const sessionBridge = {

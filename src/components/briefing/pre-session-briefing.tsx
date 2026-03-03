@@ -1,10 +1,12 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
 import { Separator } from "@/components/ui/separator";
 import { Textarea } from "@/components/ui/textarea";
-import type { MarketState, RiskState, Setup } from "../../lib/types";
+import type { AccountStateRecord, MarketState, RiskState, Setup } from "../../lib/types";
+import { accountBridge } from "../../lib/tauri-bridge";
 import { generateBriefingSynthesis } from "../../lib/claude";
 
 interface Props {
@@ -18,7 +20,15 @@ export function PreSessionBriefing({ marketState, setups, riskState, onStartSess
   const [focusNote, setFocusNote] = useState("");
   const [briefingNarrative, setBriefingNarrative] = useState<string | null>(null);
   const [loadingBriefing, setLoadingBriefing] = useState(false);
+  const [accountState, setAccountState] = useState<AccountStateRecord | null>(null);
+  const [currentBalance, setCurrentBalance] = useState("");
   const activeSetups = setups.filter((s) => s.active);
+
+  useEffect(() => {
+    accountBridge.get().then((s) => {
+      if (s) setAccountState(s);
+    }).catch(() => {});
+  }, []);
 
   useEffect(() => {
     if (!marketState || briefingNarrative) return;
@@ -28,11 +38,25 @@ export function PreSessionBriefing({ marketState, setups, riskState, onStartSess
       setups,
       risk: riskState ?? null,
       preSessionNote: focusNote || undefined,
+      lastBalance: accountState?.lastBalanceDollars,
+      openPositions: accountState?.openPositions,
     })
       .then(setBriefingNarrative)
       .catch(() => setBriefingNarrative(null))
       .finally(() => setLoadingBriefing(false));
   }, [marketState]);
+
+  const handleStartSession = useCallback(async () => {
+    const balanceNum = currentBalance ? parseFloat(currentBalance) : accountState?.lastBalanceDollars;
+    if (balanceNum != null && balanceNum > 0) {
+      try {
+        await accountBridge.save({ lastBalanceDollars: balanceNum });
+      } catch {
+        // non-Tauri mode or bridge unavailable
+      }
+    }
+    onStartSession(focusNote || undefined);
+  }, [currentBalance, accountState, focusNote, onStartSession]);
 
   return (
     <Card className="w-full max-w-lg">
@@ -48,6 +72,39 @@ export function PreSessionBriefing({ marketState, setups, riskState, onStartSess
         {loadingBriefing && (
           <p className="text-text-muted text-xs">Generating briefing...</p>
         )}
+
+        <div>
+          <h3 className="text-text-primary mb-2 text-sm font-semibold">Account Check</h3>
+          {accountState && accountState.lastBalanceDollars > 0 ? (
+            <p className="text-text-secondary text-sm mb-2">
+              Last balance: ${accountState.lastBalanceDollars.toLocaleString(undefined, { minimumFractionDigits: 2 })}
+              {accountState.lastBalanceUpdatedAtMs > 0 && (
+                <span className="text-text-muted ml-1">
+                  (updated {new Date(accountState.lastBalanceUpdatedAtMs).toLocaleDateString()})
+                </span>
+              )}
+            </p>
+          ) : (
+            <p className="text-text-muted text-sm mb-2">No previous balance recorded.</p>
+          )}
+          <div className="space-y-1">
+            <label className="text-text-secondary text-xs" htmlFor="current-balance">
+              Current account balance ($)
+            </label>
+            <Input
+              id="current-balance"
+              type="number"
+              min={0}
+              step={100}
+              placeholder={accountState?.lastBalanceDollars?.toString() ?? "e.g. 50000"}
+              value={currentBalance}
+              onChange={(e) => setCurrentBalance(e.target.value)}
+              className="h-8"
+            />
+          </div>
+        </div>
+
+        <Separator />
 
         {riskState && (
           <div>
@@ -143,7 +200,7 @@ export function PreSessionBriefing({ marketState, setups, riskState, onStartSess
           />
         </div>
 
-        <Button onClick={() => onStartSession(focusNote || undefined)} className="w-full">
+        <Button onClick={handleStartSession} className="w-full">
           Start Session
         </Button>
       </CardContent>

@@ -599,6 +599,7 @@ mod tests {
             poor_low: false,
             excess_high: false,
             excess_low: false,
+            session_type: "RTH".to_string(),
         }
     }
 

@@ -1,7 +1,9 @@
 use crate::db::{Database, SessionSummary};
 use crate::feed::scid_reader::ScidReader;
 use crate::feed::TradeSide;
-use crate::pipelines::{EventDetector, MarketState, PipelineEngine, RvolPipeline};
+use crate::pipelines::{
+    EventDetector, FlowEventEmitter, MarketState, PipelineEngine, RvolPipeline,
+};
 use crate::{
     classify_session, et_minutes_from_timestamp, minute_of_session_from_timestamp,
     session_date_from_timestamp_ms, SessionType,
@@ -150,6 +152,7 @@ pub fn run_backfill(
 
     let mut pipeline = PipelineEngine::new();
     let mut detector = EventDetector::new();
+    let mut flow_emitter = FlowEventEmitter::new();
     let mut rvol_curves: Vec<Vec<f64>> = db
         .recent_rth_session_volumes(20)
         .unwrap_or_default()
@@ -257,6 +260,7 @@ pub fn run_backfill(
 
                 pipeline.reset_session();
                 detector.reset();
+                flow_emitter.reset();
                 event_buffer.clear();
                 session_tick_count = 0;
                 session_volume = 0.0;
@@ -313,6 +317,10 @@ pub fn run_backfill(
             let snapshot = pipeline.snapshot(bid, ask);
             let events = detector.detect(&snapshot, tick.timestamp_ms, &current_date, minute);
             event_buffer.extend(events);
+
+            // Flow events (absorption, pinch, acceleration zones, large trade clusters)
+            let flow_events = flow_emitter.detect(&pipeline, tick.timestamp_ms, &current_date);
+            event_buffer.extend(flow_events);
         }
     }
 

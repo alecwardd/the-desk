@@ -2,6 +2,7 @@ mod absorption;
 mod day_type;
 mod delta;
 pub mod event_detector;
+pub mod flow_event_emitter;
 mod footprint;
 mod levels;
 mod opening_range_5min;
@@ -18,6 +19,7 @@ pub use absorption::{AbsorptionEvent, AbsorptionPipeline};
 pub use day_type::{BalanceState, DayType, DayTypeClassifier, ProfileShape, SinglePrintsDirection};
 pub use delta::DeltaPipeline;
 pub use event_detector::{EventDetector, MarketEvent};
+pub use flow_event_emitter::FlowEventEmitter;
 pub use footprint::{FootprintLevel, FootprintPipeline};
 pub use levels::{KeyLevel, KeyLevelType, LevelsPipeline, ProximityLevel};
 pub use opening_range_5min::{OpeningRange5MinPipeline, Or5BreakDirection};
@@ -189,6 +191,10 @@ pub struct MarketState {
     pub excess_high: bool,
     /// Excess at bottom of profile.
     pub excess_low: bool,
+
+    /// Current session type from last tick / snapshot time: "RTH", "Globex", or "Unknown".
+    /// During Globex, use overnightHigh/overnightLow as session range; sessionHigh/sessionLow and IB/OR/OR5 are RTH-only.
+    pub session_type: String,
 }
 
 pub struct PipelineEngine {
@@ -343,6 +349,14 @@ impl PipelineEngine {
         let sd = self.vwap.std_dev();
         let vwap = self.vwap.vwap();
         let now_ms = chrono::Utc::now().timestamp_millis() as f64;
+        let session_type = et_minutes_from_timestamp(now_ms)
+            .map(|et_min| match classify_session(et_min) {
+                SessionType::Rth => "RTH",
+                SessionType::Globex => "Globex",
+                SessionType::Unknown => "Unknown",
+            })
+            .unwrap_or("Unknown")
+            .to_string();
         let tape = self.tape_pace.snapshot(now_ms);
         let size = self.trade_size.snapshot();
         MarketState {
@@ -421,6 +435,7 @@ impl PipelineEngine {
                 let (_, bottom) = self.tpo.excess();
                 bottom
             },
+            session_type,
         }
     }
 

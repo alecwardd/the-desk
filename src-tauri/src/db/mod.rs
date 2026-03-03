@@ -110,6 +110,33 @@ pub struct RiskConfigRecord {
     pub max_consecutive_losses: i64,
     pub max_trades_per_session: Option<i64>,
     pub no_trade_zones: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub max_daily_loss_dollars: Option<f64>,
+}
+
+/// Open position not from chat (user-confirmed at session start).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenPositionRecord {
+    pub direction: String,
+    pub size: i64,
+    pub entry_price: f64,
+    pub instrument: Option<String>,
+    pub setup_id: Option<String>,
+}
+
+/// Account state for risk coach: balance, positions, Lucid params, goals.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountStateRecord {
+    pub last_balance_dollars: f64,
+    pub last_balance_updated_at_ms: i64,
+    pub open_positions: Vec<OpenPositionRecord>,
+    pub lucid_daily_loss_dollars: Option<f64>,
+    pub lucid_account_size_dollars: Option<f64>,
+    pub profit_target_per_cycle: Option<f64>,
+    pub position_sizing_method: String,
+    pub kelly_fraction: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -190,12 +217,13 @@ pub struct SignalOutcome {
 impl Default for RiskConfigRecord {
     fn default() -> Self {
         Self {
-            r_value_points: 8.0,
-            r_value_dollars: 40.0,
+            r_value_points: 50.0,
+            r_value_dollars: 250.0,
             max_daily_loss_r: 3.0,
             max_consecutive_losses: 3,
             max_trades_per_session: Some(8),
             no_trade_zones: Vec::new(),
+            max_daily_loss_dollars: Some(750.0),
         }
     }
 }
@@ -254,6 +282,9 @@ impl Database {
         }
         if version < 6 {
             self.migrate_v6()?;
+        }
+        if version < 7 {
+            self.migrate_v7()?;
         }
 
         Ok(())
@@ -611,6 +642,36 @@ impl Database {
               );
 
             UPDATE schema_version SET version = 6;
+            ",
+        )?;
+        Ok(())
+    }
+
+    /// V7: account_state table and risk_config max_daily_loss_dollars.
+    fn migrate_v7(&self) -> Result<(), DbError> {
+        self.conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS account_state (
+              singleton INTEGER PRIMARY KEY DEFAULT 1,
+              last_balance_dollars REAL NOT NULL DEFAULT 0.0,
+              last_balance_updated_at_ms INTEGER NOT NULL DEFAULT 0,
+              open_positions_json TEXT NOT NULL DEFAULT '[]',
+              lucid_daily_loss_dollars REAL NULL,
+              lucid_account_size_dollars REAL NULL,
+              profit_target_per_cycle REAL NULL,
+              position_sizing_method TEXT NOT NULL DEFAULT 'quarter_kelly',
+              kelly_fraction REAL NOT NULL DEFAULT 0.25
+            );
+            INSERT OR IGNORE INTO account_state (singleton) VALUES (1);
+            ",
+        )?;
+        // Add max_daily_loss_dollars to risk_config if not present (SQLite has no IF NOT EXISTS for ADD COLUMN).
+        let _ = self
+            .conn
+            .execute_batch("ALTER TABLE risk_config ADD COLUMN max_daily_loss_dollars REAL NULL");
+        self.conn.execute_batch(
+            "
+            UPDATE schema_version SET version = 7;
             ",
         )?;
         Ok(())
@@ -1030,15 +1091,16 @@ impl Database {
         let zones = serde_json::to_string(&config.no_trade_zones)?;
         self.conn.execute(
             "INSERT INTO risk_config (singleton, r_value_points, r_value_dollars, max_daily_loss_r,
-                max_consecutive_losses, max_trades_per_session, no_trade_zones)
-             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)
+                max_consecutive_losses, max_trades_per_session, no_trade_zones, max_daily_loss_dollars)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(singleton) DO UPDATE SET
                r_value_points=excluded.r_value_points,
                r_value_dollars=excluded.r_value_dollars,
                max_daily_loss_r=excluded.max_daily_loss_r,
                max_consecutive_losses=excluded.max_consecutive_losses,
                max_trades_per_session=excluded.max_trades_per_session,
-               no_trade_zones=excluded.no_trade_zones",
+               no_trade_zones=excluded.no_trade_zones,
+               max_daily_loss_dollars=excluded.max_daily_loss_dollars",
             params![
                 config.r_value_points,
                 config.r_value_dollars,
@@ -1046,6 +1108,7 @@ impl Database {
                 config.max_consecutive_losses,
                 config.max_trades_per_session,
                 zones,
+                config.max_daily_loss_dollars,
             ],
         )?;
         Ok(())
@@ -1054,7 +1117,8 @@ impl Database {
     pub fn load_risk_config(&self) -> Result<RiskConfigRecord, DbError> {
         let mut stmt = self.conn.prepare(
             "SELECT r_value_points, r_value_dollars, max_daily_loss_r,
-                    max_consecutive_losses, max_trades_per_session, no_trade_zones
+                    max_consecutive_losses, max_trades_per_session, no_trade_zones,
+                    max_daily_loss_dollars
              FROM risk_config WHERE singleton = 1",
         )?;
         let mut rows = stmt.query([])?;
@@ -1062,6 +1126,7 @@ impl Database {
             let zones_str: String = row.get::<_, String>(5)?;
             let zones: Vec<serde_json::Value> =
                 serde_json::from_str(&zones_str).unwrap_or_default();
+            let max_daily_loss_dollars: Option<f64> = row.get(6).ok();
             Ok(RiskConfigRecord {
                 r_value_points: row.get(0)?,
                 r_value_dollars: row.get(1)?,
@@ -1069,9 +1134,71 @@ impl Database {
                 max_consecutive_losses: row.get(3)?,
                 max_trades_per_session: row.get(4)?,
                 no_trade_zones: zones,
+                max_daily_loss_dollars,
             })
         } else {
             Ok(RiskConfigRecord::default())
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Account state (risk coach: balance, positions, Lucid params)
+    // ------------------------------------------------------------------
+
+    pub fn save_account_state(&self, state: &AccountStateRecord) -> Result<(), DbError> {
+        let positions_json = serde_json::to_string(&state.open_positions)?;
+        self.conn.execute(
+            "INSERT INTO account_state (singleton, last_balance_dollars, last_balance_updated_at_ms,
+                open_positions_json, lucid_daily_loss_dollars, lucid_account_size_dollars,
+                profit_target_per_cycle, position_sizing_method, kelly_fraction)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(singleton) DO UPDATE SET
+               last_balance_dollars=excluded.last_balance_dollars,
+               last_balance_updated_at_ms=excluded.last_balance_updated_at_ms,
+               open_positions_json=excluded.open_positions_json,
+               lucid_daily_loss_dollars=excluded.lucid_daily_loss_dollars,
+               lucid_account_size_dollars=excluded.lucid_account_size_dollars,
+               profit_target_per_cycle=excluded.profit_target_per_cycle,
+               position_sizing_method=excluded.position_sizing_method,
+               kelly_fraction=excluded.kelly_fraction",
+            params![
+                state.last_balance_dollars,
+                state.last_balance_updated_at_ms,
+                positions_json,
+                state.lucid_daily_loss_dollars,
+                state.lucid_account_size_dollars,
+                state.profit_target_per_cycle,
+                state.position_sizing_method,
+                state.kelly_fraction,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_account_state(&self) -> Result<Option<AccountStateRecord>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT last_balance_dollars, last_balance_updated_at_ms, open_positions_json,
+                    lucid_daily_loss_dollars, lucid_account_size_dollars, profit_target_per_cycle,
+                    position_sizing_method, kelly_fraction
+             FROM account_state WHERE singleton = 1",
+        )?;
+        let mut rows = stmt.query([])?;
+        if let Some(row) = rows.next()? {
+            let pos_str: String = row.get(2)?;
+            let open_positions: Vec<OpenPositionRecord> =
+                serde_json::from_str(&pos_str).unwrap_or_default();
+            Ok(Some(AccountStateRecord {
+                last_balance_dollars: row.get(0)?,
+                last_balance_updated_at_ms: row.get(1)?,
+                open_positions,
+                lucid_daily_loss_dollars: row.get(3)?,
+                lucid_account_size_dollars: row.get(4)?,
+                profit_target_per_cycle: row.get(5)?,
+                position_sizing_method: row.get(6).unwrap_or_else(|_| "quarter_kelly".to_string()),
+                kelly_fraction: row.get(7).unwrap_or(0.25),
+            }))
+        } else {
+            Ok(None)
         }
     }
 
@@ -2048,6 +2175,14 @@ impl Database {
                     "SELECT COALESCE(AVG(r_result), 0) FROM signal_outcomes WHERE setup_id = ?1 AND r_result IS NOT NULL",
                     params![sid], |r| r.get(0),
                 )?;
+                let avg_winner_r: Option<f64> = self.conn.query_row(
+                    "SELECT AVG(r_result) FROM signal_outcomes WHERE setup_id = ?1 AND r_result > 0",
+                    params![sid], |r| r.get(0),
+                ).ok().flatten();
+                let avg_loser_r: Option<f64> = self.conn.query_row(
+                    "SELECT AVG(r_result) FROM signal_outcomes WHERE setup_id = ?1 AND r_result < 0",
+                    params![sid], |r| r.get(0),
+                ).ok().flatten();
                 serde_json::json!({
                     "setupId": sid,
                     "totalSignals": total,
@@ -2056,13 +2191,49 @@ impl Database {
                     "stopHit": stop_hit,
                     "winRate": if resolved > 0 { target_hit as f64 / resolved as f64 } else { 0.0 },
                     "avgR": avg_r,
+                    "avgWinnerR": avg_winner_r,
+                    "avgLoserR": avg_loser_r,
                 })
             }
             None => {
                 let total: i64 =
                     self.conn
                         .query_row("SELECT COUNT(1) FROM signal_outcomes", [], |r| r.get(0))?;
-                serde_json::json!({"totalSignals": total})
+                let resolved: i64 = self.conn.query_row(
+                    "SELECT COUNT(1) FROM signal_outcomes WHERE outcome != 'pending'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                let target_hit: i64 = self.conn.query_row(
+                    "SELECT COUNT(1) FROM signal_outcomes WHERE outcome = 'target_hit'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                let avg_winner_r: Option<f64> = self
+                    .conn
+                    .query_row(
+                        "SELECT AVG(r_result) FROM signal_outcomes WHERE r_result > 0",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .ok()
+                    .flatten();
+                let avg_loser_r: Option<f64> = self
+                    .conn
+                    .query_row(
+                        "SELECT AVG(r_result) FROM signal_outcomes WHERE r_result < 0",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .ok()
+                    .flatten();
+                serde_json::json!({
+                    "totalSignals": total,
+                    "resolved": resolved,
+                    "winRate": if resolved > 0 { target_hit as f64 / resolved as f64 } else { 0.0 },
+                    "avgWinnerR": avg_winner_r,
+                    "avgLoserR": avg_loser_r,
+                })
             }
         };
         let _ = (start_date, end_date); // reserved for future date filtering

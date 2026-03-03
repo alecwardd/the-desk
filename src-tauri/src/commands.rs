@@ -2,8 +2,8 @@ use std::time::Duration;
 
 use tauri::State;
 use the_desk_backend::db::{
-    JournalEntry, RiskConfigRecord, SessionEventInput, SessionEventRecord, SessionRecord,
-    TradeRecord,
+    AccountStateRecord, JournalEntry, OpenPositionRecord, RiskConfigRecord, SessionEventInput,
+    SessionEventRecord, SessionRecord, TradeRecord,
 };
 use the_desk_backend::dtc::{run_mock_dtc_server, TradeSide};
 use the_desk_backend::feed::scid_reader::ScidReader;
@@ -722,6 +722,99 @@ pub async fn save_risk_config(
 ) -> Result<(), String> {
     let db = state.db.lock().await;
     db.save_risk_config(&config).map_err(|e| e.to_string())
+}
+
+/// Initialize or reset risk state for a new session. Creates the initial risk state row
+/// (0 P&L, 0 trades, no streaks) so get_risk_state returns valid data. Call at session start.
+#[tauri::command]
+pub async fn init_risk_state(state: State<'_, AppState>) -> Result<RiskState, String> {
+    let db = state.db.lock().await;
+    let config = db.load_risk_config().map_err(|e| e.to_string())?;
+    let risk_state = RiskState {
+        daily_pnl_r: 0.0,
+        trade_count: 0,
+        consecutive_losses: 0,
+        consecutive_wins: 0,
+        drawdown_r: 0.0,
+        max_daily_loss_r: config.max_daily_loss_r,
+        at_limit: false,
+    };
+    db.save_risk_state(&risk_state).map_err(|e| e.to_string())?;
+    Ok(risk_state)
+}
+
+// ---------------------------------------------------------------------------
+// Account state commands (risk coach: balance, positions, Lucid params)
+// ---------------------------------------------------------------------------
+
+/// Get account state for risk coach: last balance, open positions, Lucid params.
+#[tauri::command]
+pub async fn get_account_state(
+    state: State<'_, AppState>,
+) -> Result<Option<AccountStateRecord>, String> {
+    let db = state.db.lock().await;
+    db.load_account_state().map_err(|e| e.to_string())
+}
+
+/// Save account state. Partial updates: only provided fields are updated.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveAccountStateInput {
+    pub last_balance_dollars: Option<f64>,
+    pub open_positions: Option<Vec<OpenPositionRecord>>,
+    pub lucid_daily_loss_dollars: Option<f64>,
+    pub lucid_account_size_dollars: Option<f64>,
+    pub profit_target_per_cycle: Option<f64>,
+    pub position_sizing_method: Option<String>,
+    pub kelly_fraction: Option<f64>,
+}
+
+#[tauri::command]
+pub async fn save_account_state(
+    state: State<'_, AppState>,
+    input: SaveAccountStateInput,
+) -> Result<AccountStateRecord, String> {
+    let db = state.db.lock().await;
+    let existing = db.load_account_state().map_err(|e| e.to_string())?;
+    let base = existing.unwrap_or(AccountStateRecord {
+        last_balance_dollars: 0.0,
+        last_balance_updated_at_ms: 0,
+        open_positions: Vec::new(),
+        lucid_daily_loss_dollars: None,
+        lucid_account_size_dollars: None,
+        profit_target_per_cycle: None,
+        position_sizing_method: "quarter_kelly".to_string(),
+        kelly_fraction: 0.25,
+    });
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let has_updates = input.last_balance_dollars.is_some() || input.open_positions.is_some();
+    let state_rec = AccountStateRecord {
+        last_balance_dollars: input
+            .last_balance_dollars
+            .unwrap_or(base.last_balance_dollars),
+        last_balance_updated_at_ms: if has_updates {
+            now_ms
+        } else {
+            base.last_balance_updated_at_ms
+        },
+        open_positions: input.open_positions.unwrap_or(base.open_positions),
+        lucid_daily_loss_dollars: input
+            .lucid_daily_loss_dollars
+            .or(base.lucid_daily_loss_dollars),
+        lucid_account_size_dollars: input
+            .lucid_account_size_dollars
+            .or(base.lucid_account_size_dollars),
+        profit_target_per_cycle: input
+            .profit_target_per_cycle
+            .or(base.profit_target_per_cycle),
+        position_sizing_method: input
+            .position_sizing_method
+            .unwrap_or_else(|| base.position_sizing_method.clone()),
+        kelly_fraction: input.kelly_fraction.unwrap_or(base.kelly_fraction),
+    };
+    db.save_account_state(&state_rec)
+        .map_err(|e| e.to_string())?;
+    Ok(state_rec)
 }
 
 // ---------------------------------------------------------------------------

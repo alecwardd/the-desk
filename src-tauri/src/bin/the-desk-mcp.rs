@@ -9,11 +9,14 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use std::sync::{Arc, Mutex};
 use the_desk_backend::backfill;
-use the_desk_backend::db::Database;
+use the_desk_backend::db::{
+    AccountStateRecord, Database, OpenPositionRecord, RiskConfigRecord, TradeRecord,
+};
 use the_desk_backend::feed::scid_reader::{parse_record_scaled, ScidReader};
 use the_desk_backend::feed::{load_feed_config, load_storage_config, TradeSide};
-use the_desk_backend::pipelines::{EventDetector, PipelineEngine, RvolPipeline};
+use the_desk_backend::pipelines::{EventDetector, FlowEventEmitter, PipelineEngine, RvolPipeline};
 use the_desk_backend::research;
+use the_desk_backend::risk::{RiskConfig, RiskState, RiskTracker};
 use the_desk_backend::{
     classify_session, et_minutes_from_timestamp, globex_open_ms, minute_of_session_from_timestamp,
     session_date_from_timestamp_ms, SessionType,
@@ -26,6 +29,7 @@ pub struct TheDeskMcp {
     db: Arc<Mutex<Database>>,
     pipelines: Arc<Mutex<PipelineEngine>>,
     detector: Arc<Mutex<EventDetector>>,
+    flow_emitter: Arc<Mutex<FlowEventEmitter>>,
     last_bid: Arc<Mutex<f64>>,
     last_ask: Arc<Mutex<f64>>,
     tool_router: ToolRouter<Self>,
@@ -85,6 +89,16 @@ struct TickQueryParams {
 struct DeltaConfirmParams {
     /// True for a buy/long setup, false for a sell/short setup.
     is_buy_setup: Option<bool>,
+    /// Optional price level to check delta at. Defaults to current price.
+    price: Option<f64>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+struct DeltaAtPriceParams {
+    /// Price level to query delta at. Omit for current price.
+    price: Option<f64>,
+    /// Number of top prices by absolute delta to return (default 10).
+    top_n: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -97,6 +111,80 @@ struct SetupContextParams {
 struct ProximityParams {
     /// Maximum distance in ticks to include in the report (default 20).
     max_distance_ticks: Option<f64>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+struct SaveAccountStateParams {
+    /// Current account balance in dollars.
+    last_balance_dollars: Option<f64>,
+    /// Open positions not from chat: array of {direction, size, entryPrice, instrument?, setupId?}.
+    open_positions: Option<Vec<OpenPositionInput>>,
+    /// Lucid daily loss limit in dollars (e.g. 750).
+    lucid_daily_loss_dollars: Option<f64>,
+    /// Lucid account size in dollars (e.g. 50000).
+    lucid_account_size_dollars: Option<f64>,
+    /// Profit target per payout cycle (e.g. 2000).
+    profit_target_per_cycle: Option<f64>,
+    /// Position sizing method (default quarter_kelly).
+    position_sizing_method: Option<String>,
+    /// Kelly fraction (default 0.25).
+    kelly_fraction: Option<f64>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+struct OpenPositionInput {
+    direction: String,
+    size: i64,
+    entry_price: f64,
+    instrument: Option<String>,
+    setup_id: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+struct KellyPositionSizeParams {
+    /// Setup ID for setup-specific stats. Omit for aggregate.
+    setup_id: Option<String>,
+    /// Current account balance in dollars (for sizing calc).
+    balance_dollars: Option<f64>,
+    /// Confidence multiplier: 0.5=low, 1.0=normal, 1.5=high.
+    confidence_multiplier: Option<f64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct RecordTradeResultParams {
+    /// Trade direction: "long" or "short".
+    direction: String,
+    /// Number of contracts.
+    size: i64,
+    /// Entry price.
+    entry_price: f64,
+    /// Exit price.
+    exit_price: f64,
+    /// Result in R-units (positive = win, negative = loss).
+    result_r: f64,
+    /// Optional setup ID for performance tracking.
+    setup_id: Option<String>,
+    /// Optional stop price used.
+    stop_price: Option<f64>,
+    /// Optional notes about the trade.
+    notes: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct SaveRiskConfigParams {
+    /// R-value in NQ points (e.g. 50).
+    r_value_points: Option<f64>,
+    /// R-value in dollars (e.g. 250 for MNQ).
+    r_value_dollars: Option<f64>,
+    /// Max daily loss in R-units before session stop (e.g. 3).
+    max_daily_loss_r: Option<f64>,
+    /// Max consecutive losses before circuit breaker (e.g. 3).
+    max_consecutive_losses: Option<i64>,
+    /// Max trades per session (e.g. 8).
+    max_trades_per_session: Option<i64>,
+    /// Max daily loss in dollars (e.g. 750). Used with Lucid params.
+    max_daily_loss_dollars: Option<f64>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -181,6 +269,7 @@ impl TheDeskMcp {
             db: Arc::new(Mutex::new(db)),
             pipelines: Arc::new(Mutex::new(pipelines)),
             detector: Arc::new(Mutex::new(EventDetector::new())),
+            flow_emitter: Arc::new(Mutex::new(FlowEventEmitter::new())),
             last_bid: Arc::new(Mutex::new(0.0)),
             last_ask: Arc::new(Mutex::new(0.0)),
             tool_router: Self::tool_router(),
@@ -264,40 +353,77 @@ impl TheDeskMcp {
     }
 
     #[tool(
-        description = "Key reference levels: prior day high/low/close, prior session value area high/low and POC, overnight (Globex) high/low, initial balance high/low. These are the structural levels that frame current session context."
+        description = "Key reference levels: prior day high/low/close, prior session value area high/low and POC, overnight (Globex) high/low, initial balance high/low. Includes sessionType (RTH vs Globex). For Sunday evening or Globex, use overnightHigh/overnightLow as the session range; sessionHigh/sessionLow and IB/OR/OR5 are RTH-only."
     )]
     async fn get_key_levels(&self) -> Result<CallToolResult, McpError> {
         let db = self.db.lock().map_err(|_| lock_error())?;
         match db.latest_feature_state() {
-            Ok(Some(s)) => Ok(text_result(serde_json::json!({
-                "priorDayHigh": s.get("priorDayHigh"),
-                "priorDayLow": s.get("priorDayLow"),
-                "priorDayClose": s.get("priorDayClose"),
-                "priorVaHigh": s.get("priorVaHigh"),
-                "priorVaLow": s.get("priorVaLow"),
-                "priorPoc": s.get("priorPoc"),
-                "overnightHigh": s.get("overnightHigh"),
-                "overnightLow": s.get("overnightLow"),
-                "ibHigh": s.get("ibHigh"),
-                "ibLow": s.get("ibLow"),
-                "dataAgeMs": compute_data_age(&db)
-            }))),
+            Ok(Some(s)) => {
+                let is_globex = s.get("sessionType").and_then(|v| v.as_str()) == Some("Globex");
+                let mut out = serde_json::json!({
+                    "sessionType": s.get("sessionType"),
+                    "priorDayHigh": s.get("priorDayHigh"),
+                    "priorDayLow": s.get("priorDayLow"),
+                    "priorDayClose": s.get("priorDayClose"),
+                    "priorVaHigh": s.get("priorVaHigh"),
+                    "priorVaLow": s.get("priorVaLow"),
+                    "priorPoc": s.get("priorPoc"),
+                    "overnightHigh": s.get("overnightHigh"),
+                    "overnightLow": s.get("overnightLow"),
+                    "sessionHigh": s.get("sessionHigh"),
+                    "sessionLow": s.get("sessionLow"),
+                    "ibHigh": s.get("ibHigh"),
+                    "ibLow": s.get("ibLow"),
+                    "dataAgeMs": compute_data_age(&db)
+                });
+                if is_globex {
+                    out["sessionScopeNote"] = serde_json::json!("For Globex, use overnightHigh/overnightLow as the session range. sessionHigh, sessionLow, IB, OR, and OR5 are RTH-only and may be zero or from a prior RTH session.");
+                }
+                Ok(text_result(out))
+            }
             Ok(None) => Ok(no_data("No key levels available")),
             Err(e) => Err(db_error(e)),
         }
     }
 
     #[tool(
-        description = "Tape pace analytics: rolling ticks/sec and volume/sec over 5-second, 30-second, and 5-minute windows. Includes tape acceleration (rate of change). Use to gauge market activity intensity."
+        description = "Tape pace analytics: rolling ticks/sec and volume/sec over 5-second, 30-second, and 5-minute windows. Includes tape acceleration (rate of change), pace percentile (current vs session distribution), and dwell time at current price. Use to gauge market activity intensity and participation quality."
     )]
     async fn get_tape_pace(&self) -> Result<CallToolResult, McpError> {
         let db = self.db.lock().map_err(|_| lock_error())?;
+        // Try live pipeline first for full snapshot including volume/sec and dwell
+        if let Ok(pipelines) = self.pipelines.lock() {
+            let now_ms = chrono::Utc::now().timestamp_millis() as f64;
+            let snap = pipelines.tape_pace.snapshot(now_ms);
+            let last_price = pipelines.levels.last_price;
+            let dwell = if last_price > 0.0 {
+                pipelines.tape_pace.dwell_at_price(last_price)
+            } else {
+                0.0
+            };
+            return Ok(text_result(serde_json::json!({
+                "ticksPerSec5s": snap.ticks_per_sec_5s,
+                "ticksPerSec30s": snap.ticks_per_sec_30s,
+                "ticksPerSec5m": snap.ticks_per_sec_5m,
+                "volumePerSec5s": snap.volume_per_sec_5s,
+                "volumePerSec30s": snap.volume_per_sec_30s,
+                "volumePerSec5m": snap.volume_per_sec_5m,
+                "acceleration": snap.acceleration,
+                "pacePercentile": snap.pace_percentile,
+                "dwellAtCurrentPriceMs": dwell,
+                "currentPrice": last_price,
+                "dataAgeMs": compute_data_age(&db)
+            })));
+        }
+        // Fallback to DB
         match db.latest_feature_state() {
             Ok(Some(s)) => Ok(text_result(serde_json::json!({
-                "tapePace5s": s.get("tapePace5s"),
-                "tapePace30s": s.get("tapePace30s"),
-                "tapePace5m": s.get("tapePace5m"),
-                "tapeAcceleration": s.get("tapeAcceleration"),
+                "ticksPerSec5s": s.get("tapePace5s"),
+                "ticksPerSec30s": s.get("tapePace30s"),
+                "ticksPerSec5m": s.get("tapePace5m"),
+                "acceleration": s.get("tapeAcceleration"),
+                "pacePercentile": s.get("pacePercentile"),
+                "note": "Falling back to DB snapshot. Volume/sec and dwell not available.",
                 "dataAgeMs": compute_data_age(&db)
             }))),
             Ok(None) => Ok(no_data("No tape pace data")),
@@ -306,13 +432,43 @@ impl TheDeskMcp {
     }
 
     #[tool(
-        description = "Footprint / volume-at-price data: latest microstructure snapshot including bid/ask volume distribution, imbalance ratios, and stacked imbalance detection."
+        description = "Footprint / volume-at-price data: top price levels by total volume with bid volume, ask volume, delta, and delta-per-volume ratio at each level. Use for identifying where conviction is concentrated."
     )]
     async fn get_footprint(&self) -> Result<CallToolResult, McpError> {
         let db = self.db.lock().map_err(|_| lock_error())?;
+        if let Ok(pipelines) = self.pipelines.lock() {
+            let mut all_levels = pipelines.footprint.levels();
+            // Sort by total volume descending, return top 30
+            all_levels.sort_by(|a, b| {
+                b.1.total()
+                    .partial_cmp(&a.1.total())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let top: Vec<serde_json::Value> = all_levels
+                .iter()
+                .take(30)
+                .map(|(price, lvl)| {
+                    serde_json::json!({
+                        "price": price,
+                        "bidVolume": lvl.bid_volume,
+                        "askVolume": lvl.ask_volume,
+                        "totalVolume": lvl.total(),
+                        "delta": lvl.delta(),
+                        "deltaPerVolume": lvl.delta_per_volume(),
+                        "imbalanceRatio": lvl.imbalance_ratio(),
+                    })
+                })
+                .collect();
+            return Ok(text_result(serde_json::json!({
+                "topLevelsByVolume": top,
+                "totalPriceLevels": all_levels.len(),
+                "dataAgeMs": compute_data_age(&db)
+            })));
+        }
         match db.latest_microstructure_snapshot() {
             Ok(Some(s)) => Ok(text_result(serde_json::json!({
                 "snapshot": s,
+                "note": "Falling back to DB snapshot. Per-level detail not available.",
                 "dataAgeMs": compute_data_age(&db)
             }))),
             Ok(None) => Ok(no_data("No footprint data available")),
@@ -321,13 +477,37 @@ impl TheDeskMcp {
     }
 
     #[tool(
-        description = "Stacked and diagonal imbalance detection from the footprint. Imbalances indicate directional conviction at specific price levels."
+        description = "Stacked and diagonal imbalance detection from the footprint. Stacked: 3+ consecutive levels where one side dominates (>2:1 ratio) -- shows directional conviction. Diagonal: aggressive lifting/hitting across adjacent levels -- shows urgency. Returns prices and direction for each type."
     )]
     async fn get_imbalances(&self) -> Result<CallToolResult, McpError> {
         let db = self.db.lock().map_err(|_| lock_error())?;
+        if let Ok(pipelines) = self.pipelines.lock() {
+            let stacked_prices = pipelines.footprint.stacked_imbalances(2.0, 3);
+            let diagonals = pipelines.footprint.diagonal_imbalances(2.0);
+            let diagonal_data: Vec<serde_json::Value> = diagonals
+                .iter()
+                .map(|(p1, p2, ratio, is_buy)| {
+                    serde_json::json!({
+                        "priceLow": p1,
+                        "priceHigh": p2,
+                        "ratio": ratio,
+                        "direction": if *is_buy { "buy" } else { "sell" },
+                    })
+                })
+                .collect();
+            return Ok(text_result(serde_json::json!({
+                "stackedImbalancePrices": stacked_prices,
+                "stackedCount": stacked_prices.len(),
+                "diagonalImbalances": diagonal_data,
+                "diagonalCount": diagonals.len(),
+                "note": "Stacked: 3+ consecutive levels with >2:1 imbalance ratio. Diagonal: adjacent-level bid/ask imbalances >2:1.",
+                "dataAgeMs": compute_data_age(&db)
+            })));
+        }
         match db.latest_microstructure_snapshot() {
             Ok(Some(s)) => Ok(text_result(serde_json::json!({
                 "snapshot": s,
+                "note": "Falling back to DB snapshot. Stacked/diagonal detail not available.",
                 "dataAgeMs": compute_data_age(&db)
             }))),
             Ok(None) => Ok(no_data("No imbalance data available")),
@@ -355,13 +535,39 @@ impl TheDeskMcp {
     }
 
     #[tool(
-        description = "Trade size distribution: counts of 1-lot, 2-5 lot, 6-20 lot, and 21+ lot trades for the current session. Includes average trade size. Tracks institutional participation."
+        description = "Trade size distribution: counts of 1-lot, 2-5 lot, 6-20 lot, and 21+ lot trades for the current session. Includes average trade size and prices where institutional (21+) lot trades clustered. Use for identifying institutional participation and footprint locations."
     )]
     async fn get_trade_size_profile(&self) -> Result<CallToolResult, McpError> {
         let db = self.db.lock().map_err(|_| lock_error())?;
+        if let Ok(pipelines) = self.pipelines.lock() {
+            let snap = pipelines.trade_size.snapshot();
+            let total_trades = snap.lot_1 + snap.lot_2_5 + snap.lot_6_20 + snap.lot_21_plus;
+            let large_prices = pipelines.trade_size.large_trade_prices();
+            let large_data: Vec<serde_json::Value> = large_prices
+                .iter()
+                .take(20)
+                .map(|(price, count)| {
+                    serde_json::json!({
+                        "price": price,
+                        "largeLotCount": count,
+                    })
+                })
+                .collect();
+            return Ok(text_result(serde_json::json!({
+                "lot1": snap.lot_1,
+                "lot2to5": snap.lot_2_5,
+                "lot6to20": snap.lot_6_20,
+                "lot21plus": snap.lot_21_plus,
+                "totalTrades": total_trades,
+                "avgTradeSize": snap.avg_trade_size,
+                "largeTradePrices": large_data,
+                "dataAgeMs": compute_data_age(&db)
+            })));
+        }
         match db.latest_microstructure_snapshot() {
             Ok(Some(s)) => Ok(text_result(serde_json::json!({
                 "snapshot": s,
+                "note": "Falling back to DB snapshot. Per-price detail not available.",
                 "dataAgeMs": compute_data_age(&db)
             }))),
             Ok(None) => Ok(no_data("No trade size data available")),
@@ -397,6 +603,261 @@ impl TheDeskMcp {
             Ok(None) => Ok(no_data("Risk state not initialized")),
             Err(e) => Err(db_error(e)),
         }
+    }
+
+    #[tool(
+        description = "Account state for risk coach: last known balance, open positions not from chat, Lucid params (daily loss, account size), profit goals. Call at session start to report last balance and ask for confirmation."
+    )]
+    async fn get_account_state(&self) -> Result<CallToolResult, McpError> {
+        let db = self.db.lock().map_err(|_| lock_error())?;
+        match db.load_account_state() {
+            Ok(Some(state)) => Ok(text_result(serde_json::json!({
+                "accountState": state,
+                "dataAgeMs": compute_data_age(&db)
+            }))),
+            Ok(None) => Ok(no_data("Account state not initialized. Ask trader for current balance and save via save_account_state.")),
+            Err(e) => Err(db_error(e)),
+        }
+    }
+
+    #[tool(
+        description = "Save account state: balance, open positions, Lucid params. Call after trader confirms. Partial updates: only provided fields are updated."
+    )]
+    async fn save_account_state(
+        &self,
+        Parameters(params): Parameters<SaveAccountStateParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let db = self.db.lock().map_err(|_| lock_error())?;
+        let existing = db.load_account_state().map_err(db_error)?;
+        let base = existing.unwrap_or(AccountStateRecord {
+            last_balance_dollars: 0.0,
+            last_balance_updated_at_ms: 0,
+            open_positions: Vec::new(),
+            lucid_daily_loss_dollars: None,
+            lucid_account_size_dollars: None,
+            profit_target_per_cycle: None,
+            position_sizing_method: "quarter_kelly".to_string(),
+            kelly_fraction: 0.25,
+        });
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let has_updates = params.last_balance_dollars.is_some() || params.open_positions.is_some();
+        let open_positions: Vec<OpenPositionRecord> = match params.open_positions {
+            Some(positions) => positions
+                .into_iter()
+                .map(|p| OpenPositionRecord {
+                    direction: p.direction,
+                    size: p.size,
+                    entry_price: p.entry_price,
+                    instrument: p.instrument,
+                    setup_id: p.setup_id,
+                })
+                .collect(),
+            None => base.open_positions,
+        };
+        let state = AccountStateRecord {
+            last_balance_dollars: params
+                .last_balance_dollars
+                .unwrap_or(base.last_balance_dollars),
+            last_balance_updated_at_ms: if has_updates {
+                now_ms
+            } else {
+                base.last_balance_updated_at_ms
+            },
+            open_positions,
+            lucid_daily_loss_dollars: params
+                .lucid_daily_loss_dollars
+                .or(base.lucid_daily_loss_dollars),
+            lucid_account_size_dollars: params
+                .lucid_account_size_dollars
+                .or(base.lucid_account_size_dollars),
+            profit_target_per_cycle: params
+                .profit_target_per_cycle
+                .or(base.profit_target_per_cycle),
+            position_sizing_method: params
+                .position_sizing_method
+                .unwrap_or_else(|| base.position_sizing_method.clone()),
+            kelly_fraction: params.kelly_fraction.unwrap_or(base.kelly_fraction),
+        };
+        db.save_account_state(&state).map_err(db_error)?;
+        Ok(text_result(serde_json::json!({
+            "saved": true,
+            "accountState": state,
+        })))
+    }
+
+    #[tool(
+        description = "1/4 Kelly position sizing with optional confidence scaling. Returns suggested R to risk, fractional Kelly, and raw f*. Uses get_signal_performance for win rate and avg winner/loser R. Confidence: 0.5=low (1/8 Kelly), 1.0=normal (1/4 Kelly), 1.5=high (up to 1/2 Kelly)."
+    )]
+    async fn get_kelly_position_size(
+        &self,
+        Parameters(params): Parameters<KellyPositionSizeParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let db = self.db.lock().map_err(|_| lock_error())?;
+        let perf = db
+            .signal_performance(params.setup_id.as_deref(), None, None)
+            .map_err(db_error)?;
+        let win_rate = perf.get("winRate").and_then(|v| v.as_f64()).unwrap_or(0.5);
+        let avg_winner = perf.get("avgWinnerR").and_then(|v| v.as_f64());
+        let avg_loser = perf.get("avgLoserR").and_then(|v| v.as_f64());
+        let (p, q, b) = match (avg_winner, avg_loser) {
+            (Some(aw), Some(al)) if al.abs() > 1e-9 => {
+                let b = aw / al.abs();
+                (win_rate, 1.0 - win_rate, b)
+            }
+            _ => {
+                return Ok(text_result(serde_json::json!({
+                    "note": "Insufficient signal data for Kelly. Need avgWinnerR and avgLoserR from signal_outcomes.",
+                    "suggestedR": 1.0,
+                    "confidenceMultiplier": params.confidence_multiplier.unwrap_or(1.0),
+                })))
+            }
+        };
+        let f_full = if b > 1e-9 { (b * p - q) / b } else { 0.0 };
+        let f_full = f_full.clamp(0.0, 1.0);
+        let conf = params.confidence_multiplier.unwrap_or(1.0);
+        let f_quarter = 0.25_f64 * f_full * conf;
+        let f_quarter = f_quarter.clamp(0.0, 0.5);
+        let balance = params.balance_dollars.unwrap_or(50_000.0);
+        let risk_config = db.load_risk_config().map_err(db_error)?;
+        let r_dollars = risk_config.r_value_dollars;
+        let suggested_r = if r_dollars > 1e-9 {
+            (f_quarter * balance) / r_dollars
+        } else {
+            1.0
+        };
+        Ok(text_result(serde_json::json!({
+            "fullKellyF": f_full,
+            "quarterKellyF": f_quarter,
+            "suggestedR": suggested_r,
+            "confidenceMultiplier": conf,
+            "balanceDollars": balance,
+            "winRate": p,
+            "avgWinnerR": avg_winner,
+            "avgLoserR": avg_loser,
+        })))
+    }
+
+    #[tool(
+        description = "Trader's risk configuration: R-value in points and dollars, max daily loss in R-units and dollars, max consecutive losses, max trades per session, no-trade zones."
+    )]
+    async fn get_risk_config(&self) -> Result<CallToolResult, McpError> {
+        let db = self.db.lock().map_err(|_| lock_error())?;
+        let config = db.load_risk_config().map_err(db_error)?;
+        Ok(text_result(serde_json::json!({
+            "riskConfig": config
+        })))
+    }
+
+    #[tool(
+        description = "Save risk configuration. Partial updates: only provided fields are updated. Call to persist R-value, max daily loss, circuit breaker, and trade limits. Required for full risk tracking when config is not yet in database."
+    )]
+    async fn save_risk_config(
+        &self,
+        Parameters(params): Parameters<SaveRiskConfigParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let db = self.db.lock().map_err(|_| lock_error())?;
+        let base = db.load_risk_config().map_err(db_error)?;
+        let config = RiskConfigRecord {
+            r_value_points: params.r_value_points.unwrap_or(base.r_value_points),
+            r_value_dollars: params.r_value_dollars.unwrap_or(base.r_value_dollars),
+            max_daily_loss_r: params.max_daily_loss_r.unwrap_or(base.max_daily_loss_r),
+            max_consecutive_losses: params
+                .max_consecutive_losses
+                .unwrap_or(base.max_consecutive_losses),
+            max_trades_per_session: params
+                .max_trades_per_session
+                .or(base.max_trades_per_session),
+            no_trade_zones: base.no_trade_zones,
+            max_daily_loss_dollars: params
+                .max_daily_loss_dollars
+                .or(base.max_daily_loss_dollars),
+        };
+        db.save_risk_config(&config).map_err(db_error)?;
+        Ok(text_result(serde_json::json!({
+            "saved": true,
+            "riskConfig": config
+        })))
+    }
+
+    #[tool(
+        description = "Initialize or reset risk state for a new session. Creates the initial risk state row (0 P&L, 0 trades, no streaks) so get_risk_state returns valid data. Call at session start to enable full risk tracking. Uses max_daily_loss_r from risk_config."
+    )]
+    async fn init_risk_state(&self) -> Result<CallToolResult, McpError> {
+        let db = self.db.lock().map_err(|_| lock_error())?;
+        let config = db.load_risk_config().map_err(db_error)?;
+        let state = RiskState {
+            daily_pnl_r: 0.0,
+            trade_count: 0,
+            consecutive_losses: 0,
+            consecutive_wins: 0,
+            drawdown_r: 0.0,
+            max_daily_loss_r: config.max_daily_loss_r,
+            at_limit: false,
+        };
+        db.save_risk_state(&state).map_err(db_error)?;
+        Ok(text_result(serde_json::json!({
+            "initialized": true,
+            "riskState": state
+        })))
+    }
+
+    #[tool(
+        description = "Record a completed trade result. Updates risk state (daily P&L, consecutive wins/losses, drawdown, at_limit). Also creates a trade record for performance tracking. Call after a trade is closed to keep risk state current."
+    )]
+    async fn record_trade_result(
+        &self,
+        Parameters(params): Parameters<RecordTradeResultParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let db = self.db.lock().map_err(|_| lock_error())?;
+
+        // 1. Insert trade record
+        let trade_id = uuid::Uuid::new_v4().to_string();
+        let now_ms = chrono::Utc::now().timestamp_millis() as f64;
+        let trade = TradeRecord {
+            id: trade_id.clone(),
+            session_id: None,
+            setup_id: params.setup_id.clone(),
+            entry_time: now_ms,
+            entry_price: params.entry_price,
+            exit_time: Some(now_ms),
+            exit_price: Some(params.exit_price),
+            direction: params.direction.clone(),
+            size: params.size,
+            stop_price: params.stop_price,
+            target_prices: Vec::new(),
+            result_r: Some(params.result_r),
+            planned: true,
+            rules_followed: None,
+            emotional_state: None,
+            notes: params.notes.unwrap_or_default(),
+            source: "mcp".to_string(),
+        };
+        db.insert_trade(&trade).map_err(db_error)?;
+
+        // 2. Load current risk state, apply result via RiskTracker, save
+        let risk_state = db.load_risk_state().map_err(db_error)?.unwrap_or_default();
+        let config = db.load_risk_config().map_err(db_error)?;
+        let mut tracker = RiskTracker::new(RiskConfig {
+            max_daily_loss_r: config.max_daily_loss_r,
+            max_trades_per_session: config.max_trades_per_session.unwrap_or(8) as usize,
+        });
+        tracker.restore_state(risk_state);
+        tracker.record_trade_result(params.result_r);
+        let new_state = tracker.state();
+        db.save_risk_state(&new_state).map_err(db_error)?;
+
+        Ok(text_result(serde_json::json!({
+            "recorded": true,
+            "tradeId": trade_id,
+            "resultR": params.result_r,
+            "updatedRiskState": new_state,
+            "atLimit": new_state.at_limit,
+            "consecutiveLosses": new_state.consecutive_losses,
+            "consecutiveWins": new_state.consecutive_wins,
+            "dailyPnlR": new_state.daily_pnl_r,
+            "drawdownR": new_state.drawdown_r,
+            "tradeCount": new_state.trade_count,
+        })))
     }
 
     #[tool(
@@ -537,7 +998,7 @@ impl TheDeskMcp {
     }
 
     #[tool(
-        description = "Query how often a market event occurs. Example: 'How often is IB-mid tested per session?' Returns total occurrences, sessions with event, per-session average, and percentage of sessions."
+        description = "Query how often a market event occurs. Returns total occurrences, sessions with event, per-session average, and percentage of sessions. Structural event types: *_test (level tests), ib_extension_hit, ib_formed, or_formed, new_session_high/low, day_type_change, poor_high/low_detected, excess_high/low_detected, or5_mid_retest, dnp_cross, rvol_spike. Flow event types: absorption_detected (metadata.eventSubtype: absorption/exhaustion/delta_divergence), pinch_detected (metadata.timeframe: 1m/5m/15m/30m), acceleration_zone_created, acceleration_zone_held, large_trade_cluster."
     )]
     async fn query_event_frequency(
         &self,
@@ -803,10 +1264,34 @@ impl TheDeskMcp {
     )]
     async fn get_rebid_reoffer_zones(&self) -> Result<CallToolResult, McpError> {
         let db = self.db.lock().map_err(|_| lock_error())?;
+        if let Ok(pipelines) = self.pipelines.lock() {
+            let active: Vec<serde_json::Value> = pipelines
+                .rebid_reoffer
+                .active_zones()
+                .iter()
+                .map(|z| {
+                    serde_json::json!({
+                        "zoneType": z.zone_type,
+                        "status": z.status,
+                        "high": z.high,
+                        "low": z.low,
+                        "mid": z.mid(),
+                        "volume": z.volume,
+                        "delta": z.delta,
+                        "timestampMs": z.timestamp_ms,
+                    })
+                })
+                .collect();
+            return Ok(text_result(serde_json::json!({
+                "activeZones": active,
+                "activeZoneCount": active.len(),
+                "dataAgeMs": compute_data_age(&db)
+            })));
+        }
         match db.latest_feature_state() {
             Ok(Some(s)) => Ok(text_result(serde_json::json!({
                 "activeZoneCount": s.get("activeZoneCount"),
-                "note": "Zone details are computed in-memory. Use get_market_snapshot for full state.",
+                "note": "Falling back to DB snapshot. Zone details not available.",
                 "dataAgeMs": compute_data_age(&db)
             }))),
             Ok(None) => Ok(no_data("No rebid/reoffer data available")),
@@ -815,14 +1300,26 @@ impl TheDeskMcp {
     }
 
     #[tool(
-        description = "Recent delta momentum reversal ('pinch') events: when heavy one-sided delta is suddenly met by fast opposing flow, causing inventory to shift. Each event has timeframe, severity score (0-5), pre/post delta, price displacement. Multi-timeframe: 1m, 5m, 15m, 30m."
+        description = "Recent delta momentum reversal ('pinch') events: when heavy one-sided delta is suddenly met by fast opposing flow, causing inventory to shift. Each event has timeframe (1m/5m/15m/30m), severity score (0-5), pre/post delta, price at pinch, and price displacement."
     )]
     async fn get_pinch_events(&self) -> Result<CallToolResult, McpError> {
         let db = self.db.lock().map_err(|_| lock_error())?;
+        if let Ok(pipelines) = self.pipelines.lock() {
+            let events = pipelines.pinch.recent_events();
+            let event_data: Vec<serde_json::Value> = events
+                .iter()
+                .map(|e| serde_json::to_value(e).unwrap_or_default())
+                .collect();
+            return Ok(text_result(serde_json::json!({
+                "events": event_data,
+                "count": events.len(),
+                "dataAgeMs": compute_data_age(&db)
+            })));
+        }
         match db.latest_feature_state() {
             Ok(Some(s)) => Ok(text_result(serde_json::json!({
                 "pinchEventCount": s.get("pinchEventCount"),
-                "note": "Full pinch event details are computed in-memory by the pipeline engine.",
+                "note": "Falling back to DB snapshot. Event details not available.",
                 "dataAgeMs": compute_data_age(&db)
             }))),
             Ok(None) => Ok(no_data("No pinch data available")),
@@ -831,15 +1328,26 @@ impl TheDeskMcp {
     }
 
     #[tool(
-        description = "Cross-session delta inventory: whether current session is Building (extending prior direction), Clearing (opposing prior direction), or Neutral. Direction: Long/Short/Flat. Includes consecutive sessions with same-direction delta (trend count)."
+        description = "Cross-session delta inventory: whether current session is Building (extending prior direction), Clearing (opposing prior direction), or Neutral. Direction: Long/Short/Flat. Includes consecutive sessions with same-direction delta (trend count) and DNP shift (how much the delta neutral pivot has migrated from prior session)."
     )]
     async fn get_session_inventory(&self) -> Result<CallToolResult, McpError> {
         let db = self.db.lock().map_err(|_| lock_error())?;
+        if let Ok(pipelines) = self.pipelines.lock() {
+            let inv = &pipelines.session_inventory;
+            return Ok(text_result(serde_json::json!({
+                "inventoryState": inv.state(),
+                "inventoryDirection": inv.direction(),
+                "sessionsInTrend": inv.sessions_in_trend(),
+                "dnpShift": inv.dnp_shift(),
+                "dataAgeMs": compute_data_age(&db)
+            })));
+        }
         match db.latest_feature_state() {
             Ok(Some(s)) => Ok(text_result(serde_json::json!({
                 "inventoryState": s.get("inventoryState"),
                 "inventoryDirection": s.get("inventoryDirection"),
                 "sessionsInTrend": s.get("sessionsInTrend"),
+                "note": "Falling back to DB snapshot. DNP shift not available.",
                 "dataAgeMs": compute_data_age(&db)
             }))),
             Ok(None) => Ok(no_data("No session inventory data available")),
@@ -848,29 +1356,103 @@ impl TheDeskMcp {
     }
 
     #[tool(
-        description = "Check delta confirmation at current price level. Returns whether delta supports the direction at the current price (Stowe's 'execution requires delta confirmation'). Use before trade entry."
+        description = "Delta at a specific price level from the delta profile. Returns signed delta at that price, buy/sell confirmation, and the top N prices by absolute delta magnitude (where conviction is concentrated). Omit price to use current price."
+    )]
+    async fn get_delta_at_price(
+        &self,
+        Parameters(params): Parameters<DeltaAtPriceParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let db = self.db.lock().map_err(|_| lock_error())?;
+        if let Ok(pipelines) = self.pipelines.lock() {
+            let price = params.price.unwrap_or(pipelines.levels.last_price);
+            let top_n = params.top_n.unwrap_or(10);
+            let delta = pipelines.delta.delta_at_price(price);
+            let confirms_buy = pipelines.delta.delta_confirmation_at_price(price, true);
+            let confirms_sell = pipelines.delta.delta_confirmation_at_price(price, false);
+
+            // Top N prices by absolute delta
+            let mut profile = pipelines.delta.profile();
+            profile.sort_by(|a, b| {
+                b.1.abs()
+                    .partial_cmp(&a.1.abs())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let top: Vec<serde_json::Value> = profile
+                .iter()
+                .take(top_n)
+                .map(|(p, d)| {
+                    serde_json::json!({
+                        "price": p,
+                        "delta": d,
+                    })
+                })
+                .collect();
+
+            return Ok(text_result(serde_json::json!({
+                "price": price,
+                "deltaAtPrice": delta,
+                "confirmsBuy": confirms_buy,
+                "confirmsSell": confirms_sell,
+                "sessionDelta": pipelines.delta.session_delta(),
+                "topPricesByDelta": top,
+                "dataAgeMs": compute_data_age(&db)
+            })));
+        }
+        Ok(no_data(
+            "Delta at price requires live pipeline. Pipeline not available.",
+        ))
+    }
+
+    #[tool(
+        description = "Check delta confirmation at session level and at a specific price level. Returns whether session delta and price-level delta both support the trade direction. Use before trade entry for Stowe's 'execution requires delta confirmation'."
     )]
     async fn check_delta_confirmation(
         &self,
         Parameters(params): Parameters<DeltaConfirmParams>,
     ) -> Result<CallToolResult, McpError> {
         let db = self.db.lock().map_err(|_| lock_error())?;
+        let is_buy = params.is_buy_setup.unwrap_or(true);
+
+        // Try pipeline for price-level delta
+        if let Ok(pipelines) = self.pipelines.lock() {
+            let session_delta = pipelines.delta.session_delta();
+            let session_confirms = if is_buy {
+                session_delta > 0.0
+            } else {
+                session_delta < 0.0
+            };
+            let price = params.price.unwrap_or(pipelines.levels.last_price);
+            let price_delta = pipelines.delta.delta_at_price(price);
+            let price_confirms = pipelines.delta.delta_confirmation_at_price(price, is_buy);
+            return Ok(text_result(serde_json::json!({
+                "sessionDeltaConfirms": session_confirms,
+                "sessionDelta": session_delta,
+                "priceLevelDeltaConfirms": price_confirms,
+                "deltaAtPrice": price_delta,
+                "price": price,
+                "bothConfirm": session_confirms && price_confirms,
+                "direction": if is_buy { "long" } else { "short" },
+                "dataAgeMs": compute_data_age(&db)
+            })));
+        }
+
+        // Fallback: session-level only
         match db.latest_feature_state() {
             Ok(Some(s)) => {
                 let session_delta = s
                     .get("sessionDelta")
                     .and_then(|v| v.as_f64())
                     .unwrap_or(0.0);
-                let is_buy = params.is_buy_setup.unwrap_or(true);
                 let confirmed = if is_buy {
                     session_delta > 0.0
                 } else {
                     session_delta < 0.0
                 };
                 Ok(text_result(serde_json::json!({
-                    "deltaConfirms": confirmed,
+                    "sessionDeltaConfirms": confirmed,
                     "sessionDelta": session_delta,
                     "direction": if is_buy { "long" } else { "short" },
+                    "note": "Price-level delta not available (pipeline not live).",
                     "dataAgeMs": compute_data_age(&db)
                 })))
             }
@@ -901,7 +1483,7 @@ impl TheDeskMcp {
     }
 
     #[tool(
-        description = "Which key levels is price currently near (within specified tick distance). Returns levels sorted by distance ascending. Includes prior day H/L/C, VA/POC, overnight, IB, OR5 mid, and IB extensions."
+        description = "Which key levels is price currently near (within specified tick distance). Returns levels sorted by distance ascending. Includes prior day H/L/C, VA/POC, overnight (Globex), IB, OR5 mid, and IB extensions. Response includes sessionType (RTH vs Globex); for Globex, weight overnight high/low as the session range."
     )]
     async fn get_proximity_report(
         &self,
@@ -954,7 +1536,12 @@ impl TheDeskMcp {
                     let db_val = b["distanceTicks"].as_f64().unwrap_or(f64::MAX);
                     da.partial_cmp(&db_val).unwrap_or(std::cmp::Ordering::Equal)
                 });
+                let session_type = s
+                    .get("sessionType")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Unknown");
                 Ok(text_result(serde_json::json!({
+                    "sessionType": session_type,
                     "lastPrice": last_price,
                     "maxDistanceTicks": max_ticks,
                     "nearbyLevels": levels,
@@ -1098,6 +1685,7 @@ fn persist_integrity_check(db: &Database, pipelines: &PipelineEngine) {
 fn process_tick(
     pipelines: &Arc<Mutex<PipelineEngine>>,
     detector: &Arc<Mutex<EventDetector>>,
+    flow_emitter: &Arc<Mutex<FlowEventEmitter>>,
     db: &Arc<Mutex<Database>>,
     last_bid: &Arc<Mutex<f64>>,
     last_ask: &Arc<Mutex<f64>>,
@@ -1118,9 +1706,16 @@ fn process_tick(
         let snapshot = p.snapshot(cur_bid, cur_ask);
         let session_date = session_date_from_timestamp_ms(timestamp_ms);
 
+        // Structural events (level tests, IB extensions, day type changes, etc.)
         if let Ok(mut det) = detector.lock() {
             let events = det.detect(&snapshot, timestamp_ms, &session_date, minute);
             event_buffer.extend(events);
+        }
+
+        // Flow events (absorption, pinch, acceleration zones, large trade clusters)
+        if let Ok(mut fe) = flow_emitter.lock() {
+            let flow_events = fe.detect(&p, timestamp_ms, &session_date);
+            event_buffer.extend(flow_events);
         }
 
         // Flush event buffer periodically
@@ -1171,6 +1766,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Clones the shared Arcs from the server so the backfill can update
         // pipeline and DB state without blocking the MCP listener.
         let pipelines_startup = Arc::clone(&server.pipelines);
+        let flow_emitter_startup = Arc::clone(&server.flow_emitter);
         let db_startup = Arc::clone(&server.db);
         let reader_startup = reader.clone();
 
@@ -1280,6 +1876,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 last.price + 0.25
             };
             let snapshot = pipelines.snapshot(bid, ask);
+
+            // Sync flow emitter counts so live polling doesn't emit stale events
+            if let Ok(mut fe) = flow_emitter_startup.lock() {
+                fe.sync_counts(&pipelines);
+            }
             drop(pipelines);
             if let Ok(db) = db_startup.lock() {
                 let _ = db.upsert_feature_state(
@@ -1305,6 +1906,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if scid_available {
         let pipelines_bg = Arc::clone(&server.pipelines);
         let detector_bg = Arc::clone(&server.detector);
+        let flow_emitter_bg = Arc::clone(&server.flow_emitter);
         let last_bid_bg = Arc::clone(&server.last_bid);
         let last_ask_bg = Arc::clone(&server.last_ask);
         let db_bg = Arc::clone(&server.db);
@@ -1359,6 +1961,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         process_tick(
                             &pipelines_bg,
                             &detector_bg,
+                            &flow_emitter_bg,
                             &db_bg,
                             &last_bid_bg,
                             &last_ask_bg,

@@ -39,6 +39,11 @@ When you need specialized help, spawn subagents for these tasks.
 
 > **Path note:** Agent definitions live in `agents/` at the project root. Cursor also discovers them at `.cursor/agents/` (symlinked). Both paths resolve to the same files.
 
+### Orchestrator (Primary Entry Point)
+**When:** The trader interacts with The Desk for any market question, setup evaluation, trade recording, or session management. This is the default agent.
+**How:** Use `orchestrator` (defined in `agents/orchestrator.md`). The orchestrator routes to all specialist agents and ensures risk-coach context is present on every interaction. It calls the same MCP tools the specialists use, with its own synthesis logic and a mandatory risk footer on every response.
+**Definition:** `agents/orchestrator.md`
+
 ### DTC Protocol Research
 **When:** Working on the DTC client or .scid data parsing
 **How:** Delegate to `dtc-protocol-researcher` (defined in `agents/dtc-protocol-researcher.md`)
@@ -74,6 +79,11 @@ When you need specialized help, spawn subagents for these tasks.
 ### Data Integrity Validation
 **When:** After ingestion changes or before analysis
 **How:** Delegate to `data-integrity-validator` (defined in `agents/data-integrity-validator.md`)
+
+### Risk Coach
+**When:** Always — included on every interaction via orchestrator. Also invoked directly for session start, trade recording, position sizing, circuit breakers, and any decision involving risk.
+**How:** Via orchestrator (automatic) or directly as `risk-coach` (defined in `agents/risk-coach.md`).
+**Capabilities:** Session-start balance/position confirmation, dynamic R derivation (compounding), 1/4 Kelly sizing with confidence scaling, consecutive-loss circuit breaker (3 losses = hard stop), drawdown-based size scaling (2R = half size, 3R = stopped), heat tracking (aggregate open exposure), day-type and time-of-day risk awareness, trade result recording via `record_trade_result` MCP tool.
 
 ---
 
@@ -118,7 +128,7 @@ When implementing a feature:
 
 ## MCP Tools Reference
 
-The MCP server (`src/bin/the-desk-mcp.rs`) exposes 33 tools. Key categories:
+The MCP server (`src/bin/the-desk-mcp.rs`) exposes 35 tools. Key categories:
 
 | Category | Tools |
 |----------|-------|
@@ -127,9 +137,10 @@ The MCP server (`src/bin/the-desk-mcp.rs`) exposes 33 tools. Key categories:
 | **Microstructure** | `get_tape_pace`, `get_footprint`, `get_absorption_events`, `get_trade_size` |
 | **PTT** | `get_or5_status`, `get_rvol`, `get_day_type`, `get_rebid_reoffer_zones`, `get_pinch_events`, `get_session_inventory` |
 | **Rules** | `evaluate_setups`, `get_setup_context`, `check_delta_confirmation` |
+| **Risk** | `get_risk_state`, `get_risk_config`, `save_risk_config`, `init_risk_state`, `get_account_state`, `save_account_state`, `get_kelly_position_size`, `get_signal_performance`, `record_trade_result` |
 | **Data** | `query_ticks`, `get_prior_day_levels`, `get_proximity_report` |
 | **Integrity** | `validate_data_integrity` |
-| **Research** | `query_event_frequency`, `query_conditional`, `query_distribution`, `compare_sessions`, `get_session_history`, `get_signal_performance`, `get_research_summary` |
+| **Research** | `query_event_frequency`, `query_conditional`, `query_distribution`, `compare_sessions`, `get_session_history`, `get_research_summary` |
 | **Backfill** | `backfill_history` |
 | **Storage** | `archive_status` |
 

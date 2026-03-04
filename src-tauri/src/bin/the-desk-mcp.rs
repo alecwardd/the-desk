@@ -7,10 +7,13 @@ use rmcp::{
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use the_desk_backend::backfill;
 use the_desk_backend::db::{
-    AccountStateRecord, Database, OpenPositionRecord, RiskConfigRecord, SignalOutcome, TradeRecord,
+    AccountStateRecord, Database, HistoricalJobRun, OpenPositionRecord, RiskConfigRecord,
+    SignalOutcome, TradeRecord,
 };
 use the_desk_backend::feed::scid_reader::{parse_record_scaled, ScidReader};
 use the_desk_backend::feed::{load_feed_config, load_storage_config, TradeSide};
@@ -23,19 +26,40 @@ use the_desk_backend::{
     classify_session, et_minutes_from_timestamp, globex_open_ms, minute_of_session_from_timestamp,
     session_date_from_timestamp_ms, SessionType,
 };
+use tokio::sync::Mutex as AsyncMutex;
+use tokio::time::{sleep, Duration};
 
 const FRESHNESS_THRESHOLD_MS: f64 = 15_000.0;
+const JOB_PROGRESS_PERSIST_INTERVAL_MS: f64 = 1_000.0;
+const JOB_PROGRESS_RECORD_STEP: usize = 50_000;
+const JOB_PROGRESS_RATE_EMA_ALPHA: f64 = 0.25;
 
 #[derive(Clone)]
 pub struct TheDeskMcp {
     db: Arc<Mutex<Database>>,
+    db_path: Arc<String>,
     pipelines: Arc<Mutex<PipelineEngine>>,
     detector: Arc<Mutex<EventDetector>>,
     flow_emitter: Arc<Mutex<FlowEventEmitter>>,
     rules: Arc<Mutex<RulesEngine>>,
     last_bid: Arc<Mutex<f64>>,
     last_ask: Arc<Mutex<f64>>,
+    backfill_manager: Arc<AsyncMutex<BackfillManager>>,
     tool_router: ToolRouter<Self>,
+}
+
+#[derive(Debug)]
+struct InMemoryJobState {
+    run: HistoricalJobRun,
+    request_key: String,
+    cancel_flag: Arc<AtomicBool>,
+}
+
+#[derive(Debug, Default)]
+struct BackfillManager {
+    active_job_id: Option<String>,
+    last_job_id: Option<String>,
+    jobs: HashMap<String, InMemoryJobState>,
 }
 
 fn db_error(e: impl std::fmt::Display) -> McpError {
@@ -74,6 +98,92 @@ fn text_result(mut json: serde_json::Value) -> CallToolResult {
 
 fn no_data(msg: &str) -> CallToolResult {
     CallToolResult::success(vec![Content::text(msg.to_string())])
+}
+
+fn invalid_params_error(msg: impl Into<String>) -> McpError {
+    McpError::new(ErrorCode::INVALID_PARAMS, msg.into(), None)
+}
+
+fn historical_job_response(run: &HistoricalJobRun, already_running: bool) -> serde_json::Value {
+    let mut progress = run.progress.clone();
+    if let Some(progress_obj) = progress.as_object_mut() {
+        let estimated_records = progress_obj
+            .get("estimatedRecords")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let records_scanned = progress_obj
+            .get("recordsScanned")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let remaining_records = estimated_records.saturating_sub(records_scanned);
+        progress_obj.insert(
+            "remainingRecords".to_string(),
+            serde_json::json!(remaining_records),
+        );
+        let eta_rate = progress_obj
+            .get("smoothedRecordsPerSecond")
+            .and_then(|v| v.as_f64())
+            .filter(|rate| *rate > 0.0)
+            .or_else(|| {
+                progress_obj
+                    .get("recordsPerSecond")
+                    .and_then(|v| v.as_f64())
+                    .filter(|rate| *rate > 0.0)
+            });
+        let eta_ms = eta_rate
+            .filter(|_| remaining_records > 0)
+            .map(|rate| remaining_records as f64 / rate * 1000.0);
+        let raw_eta_ms = progress_obj
+            .get("recordsPerSecond")
+            .and_then(|v| v.as_f64())
+            .filter(|rate| *rate > 0.0 && remaining_records > 0)
+            .map(|rate| remaining_records as f64 / rate * 1000.0);
+        progress_obj.insert(
+            "etaMs".to_string(),
+            eta_ms
+                .map(|value| serde_json::json!(value))
+                .unwrap_or(serde_json::Value::Null),
+        );
+        progress_obj.insert(
+            "rawEtaMs".to_string(),
+            raw_eta_ms
+                .map(|value| serde_json::json!(value))
+                .unwrap_or(serde_json::Value::Null),
+        );
+    }
+    serde_json::json!({
+        "jobId": run.id,
+        "jobType": run.job_type,
+        "status": run.status,
+        "alreadyRunning": already_running,
+        "submittedAtMs": run.submitted_at_ms,
+        "startedAtMs": run.started_at_ms,
+        "finishedAtMs": run.finished_at_ms,
+        "params": run.params,
+        "currentPhase": progress.get("currentPhase").cloned().unwrap_or(serde_json::json!(null)),
+        "progress": progress,
+        "warnings": run.warnings,
+        "error": run.error,
+        "result": run.result,
+    })
+}
+
+fn normalized_job_key(
+    job_type: backfill::HistoricalJobType,
+    params: &BackfillParams,
+    force_run_rules: bool,
+) -> String {
+    let mut setup_ids = params.setup_ids.clone().unwrap_or_default();
+    setup_ids.sort();
+    serde_json::json!({
+        "jobType": job_type.as_str(),
+        "startDate": params.start_date,
+        "endDate": params.end_date,
+        "force": params.force.unwrap_or(false),
+        "runRules": force_run_rules || params.run_rules.unwrap_or(false),
+        "setupIds": if setup_ids.is_empty() { serde_json::Value::Null } else { serde_json::json!(setup_ids) },
+    })
+    .to_string()
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -191,18 +301,40 @@ struct SaveRiskConfigParams {
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 struct BackfillParams {
     /// Start date (YYYY-MM-DD). Omit for "all available".
+    #[serde(alias = "start_date")]
     start_date: Option<String>,
-    /// End date (YYYY-MM-DD). Omit for "through today". Reserved for future use.
-    #[allow(dead_code)]
+    /// End date (YYYY-MM-DD). Omit for "through today".
+    #[serde(alias = "end_date")]
     end_date: Option<String>,
     /// Reprocess sessions even if summaries already exist.
+    #[serde(alias = "force")]
     force: Option<bool>,
     /// Run rules engine during backfill to populate signal outcomes (backtest replay).
+    #[serde(alias = "run_rules")]
     run_rules: Option<bool>,
     /// Setup IDs to evaluate. Omit for all active setups.
+    #[serde(alias = "setup_ids")]
     setup_ids: Option<Vec<String>>,
+    /// Wait for the background job to complete before responding.
+    #[serde(alias = "wait_for_completion")]
+    wait_for_completion: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct BackfillStatusParams {
+    #[serde(alias = "job_id")]
+    job_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct CancelBackfillParams {
+    #[serde(alias = "job_id")]
+    job_id: String,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -311,17 +443,336 @@ struct SignalPerformanceParams {
 
 #[tool_router]
 impl TheDeskMcp {
-    fn new(db: Database, pipelines: PipelineEngine) -> Self {
+    fn new(db: Database, pipelines: PipelineEngine, db_path: String) -> Self {
         Self {
             db: Arc::new(Mutex::new(db)),
+            db_path: Arc::new(db_path),
             pipelines: Arc::new(Mutex::new(pipelines)),
             detector: Arc::new(Mutex::new(EventDetector::new())),
             flow_emitter: Arc::new(Mutex::new(FlowEventEmitter::new())),
             rules: Arc::new(Mutex::new(RulesEngine::default())),
             last_bid: Arc::new(Mutex::new(0.0)),
             last_ask: Arc::new(Mutex::new(0.0)),
+            backfill_manager: Arc::new(AsyncMutex::new(BackfillManager::default())),
             tool_router: Self::tool_router(),
         }
+    }
+
+    async fn wait_for_job_terminal(&self, job_id: &str) -> Option<HistoricalJobRun> {
+        loop {
+            let maybe_run = {
+                let manager = self.backfill_manager.lock().await;
+                manager.jobs.get(job_id).map(|state| state.run.clone())
+            };
+            if let Some(run) = maybe_run {
+                if matches!(run.status.as_str(), "completed" | "failed" | "cancelled") {
+                    return Some(run);
+                }
+            } else {
+                return self
+                    .db
+                    .lock()
+                    .ok()
+                    .and_then(|db| db.get_historical_job_run(job_id).ok().flatten());
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    async fn get_job_run(
+        &self,
+        job_id: Option<&str>,
+    ) -> Result<Option<HistoricalJobRun>, McpError> {
+        let manager = self.backfill_manager.lock().await;
+        if let Some(job_id) = job_id {
+            if let Some(state) = manager.jobs.get(job_id) {
+                return Ok(Some(state.run.clone()));
+            }
+        } else if let Some(active_id) = &manager.active_job_id {
+            if let Some(state) = manager.jobs.get(active_id) {
+                return Ok(Some(state.run.clone()));
+            }
+        } else if let Some(last_id) = &manager.last_job_id {
+            if let Some(state) = manager.jobs.get(last_id) {
+                return Ok(Some(state.run.clone()));
+            }
+        }
+        drop(manager);
+
+        let db = self.db.lock().map_err(|_| lock_error())?;
+        if let Some(job_id) = job_id {
+            db.get_historical_job_run(job_id).map_err(db_error)
+        } else {
+            db.latest_historical_job_run().map_err(db_error)
+        }
+    }
+
+    async fn queue_historical_job(
+        &self,
+        params: BackfillParams,
+        job_type: backfill::HistoricalJobType,
+        force_run_rules: bool,
+    ) -> Result<(HistoricalJobRun, bool), McpError> {
+        let (start_ms, end_ms_exclusive) = backfill::parse_backfill_date_range(
+            params.start_date.as_deref(),
+            params.end_date.as_deref(),
+        )
+        .map_err(|e| invalid_params_error(e.to_string()))?;
+        let initial_estimated_records = {
+            let config = load_feed_config();
+            let reader = ScidReader::from_feed_config(&config);
+            reader
+                .estimate_range_records(start_ms, end_ms_exclusive)
+                .unwrap_or(0)
+        };
+
+        let request_key = normalized_job_key(job_type, &params, force_run_rules);
+        let submitted_at_ms = chrono::Utc::now().timestamp_millis() as f64;
+        let run_rules = force_run_rules || params.run_rules.unwrap_or(false);
+        let params_json = serde_json::json!({
+            "startDate": params.start_date,
+            "endDate": params.end_date,
+            "force": params.force.unwrap_or(false),
+            "runRules": run_rules,
+            "setupIds": params.setup_ids,
+        });
+
+        let mut manager = self.backfill_manager.lock().await;
+        if let Some(active_id) = &manager.active_job_id {
+            if let Some(active) = manager.jobs.get(active_id) {
+                if active.request_key == request_key {
+                    return Ok((active.run.clone(), true));
+                }
+                return Err(McpError::new(
+                    ErrorCode::INTERNAL_ERROR,
+                    format!("historical job already running: {}", active.run.id),
+                    None,
+                ));
+            }
+        }
+
+        let job_id = uuid::Uuid::new_v4().to_string();
+        let run = HistoricalJobRun {
+            id: job_id.clone(),
+            job_type: job_type.as_str().to_string(),
+            status: "queued".to_string(),
+            params: params_json.clone(),
+            progress: serde_json::json!({
+                "estimatedRecords": initial_estimated_records,
+                "recordsScanned": 0,
+                "sessionsCompleted": 0,
+                "sessionsSkipped": 0,
+                "currentSessionDate": serde_json::Value::Null,
+                "currentPhase": "queued",
+                "progressPercent": if initial_estimated_records > 0 { serde_json::json!(0.0) } else { serde_json::Value::Null },
+                "elapsedMs": 0.0,
+                "recordsPerSecond": 0.0,
+                "smoothedRecordsPerSecond": 0.0,
+            }),
+            result: None,
+            warnings: Vec::new(),
+            error: None,
+            submitted_at_ms,
+            started_at_ms: None,
+            finished_at_ms: None,
+        };
+        {
+            let db = self.db.lock().map_err(|_| lock_error())?;
+            db.insert_historical_job_run(&run).map_err(db_error)?;
+        }
+
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        manager.active_job_id = Some(job_id.clone());
+        manager.last_job_id = Some(job_id.clone());
+        manager.jobs.insert(
+            job_id.clone(),
+            InMemoryJobState {
+                run: run.clone(),
+                request_key,
+                cancel_flag: Arc::clone(&cancel_flag),
+            },
+        );
+        drop(manager);
+
+        let db_path = Arc::clone(&self.db_path);
+        let manager = Arc::clone(&self.backfill_manager);
+        let worker_params = backfill::BackfillJobParams {
+            job_id: job_id.clone(),
+            job_type,
+            start_date: params.start_date,
+            end_date: params.end_date,
+            force: params.force.unwrap_or(false),
+            run_rules,
+            setup_ids: params.setup_ids,
+        };
+        tokio::task::spawn_blocking(move || {
+            let config = load_feed_config();
+            let reader = ScidReader::from_feed_config(&config);
+            let db = match Database::open(db_path.as_str()) {
+                Ok(db) => db,
+                Err(err) => {
+                    let mut guard = manager.blocking_lock();
+                    if let Some(state) = guard.jobs.get_mut(&job_id) {
+                        state.run.status = "failed".to_string();
+                        state.run.error = Some(err.to_string());
+                        state.run.finished_at_ms =
+                            Some(chrono::Utc::now().timestamp_millis() as f64);
+                        guard.active_job_id = None;
+                    }
+                    return;
+                }
+            };
+
+            let started_at_ms = chrono::Utc::now().timestamp_millis() as f64;
+            {
+                let mut guard = manager.blocking_lock();
+                if let Some(state) = guard.jobs.get_mut(&job_id) {
+                    state.run.status = "running".to_string();
+                    state.run.started_at_ms = Some(started_at_ms);
+                    state.run.progress["currentPhase"] = serde_json::json!("scanning");
+                    let _ = db.update_historical_job_run(
+                        &job_id,
+                        &the_desk_backend::db::HistoricalJobRunUpdate {
+                            status: "running",
+                            progress: &state.run.progress,
+                            result: None,
+                            warnings: &state.run.warnings,
+                            error: None,
+                            started_at_ms: Some(started_at_ms),
+                            finished_at_ms: None,
+                        },
+                    );
+                }
+            }
+
+            eprintln!(
+                "[the-desk-mcp] historical job {} started ({})",
+                job_id,
+                worker_params.job_type.as_str()
+            );
+            let mut last_progress_db_write_ms = started_at_ms;
+            let mut last_persisted_records = 0_usize;
+            let mut last_persisted_sessions_completed = 0_usize;
+            let mut last_persisted_sessions_skipped = 0_usize;
+            let mut last_persisted_phase = String::from("scanning");
+            let mut last_persisted_session_date: Option<String> = None;
+            let mut smoothed_records_per_second = 0.0_f64;
+            let result = backfill::run_backfill_job(
+                &reader,
+                &db,
+                &worker_params,
+                |progress| {
+                    let now_ms = chrono::Utc::now().timestamp_millis() as f64;
+                    let elapsed_ms = (now_ms - started_at_ms).max(0.0);
+                    let records_per_second = if elapsed_ms > 0.0 {
+                        progress.records_scanned as f64 / (elapsed_ms / 1000.0)
+                    } else {
+                        0.0
+                    };
+                    if records_per_second > 0.0 {
+                        smoothed_records_per_second = if smoothed_records_per_second <= 0.0 {
+                            records_per_second
+                        } else {
+                            (JOB_PROGRESS_RATE_EMA_ALPHA * records_per_second)
+                                + ((1.0 - JOB_PROGRESS_RATE_EMA_ALPHA)
+                                    * smoothed_records_per_second)
+                        };
+                    }
+                    let progress_percent = if progress.estimated_records > 0 {
+                        Some(
+                            ((progress.records_scanned as f64 / progress.estimated_records as f64)
+                                * 100.0)
+                                .clamp(0.0, 100.0),
+                        )
+                    } else {
+                        None
+                    };
+                    let mut guard = manager.blocking_lock();
+                    if let Some(state) = guard.jobs.get_mut(&job_id) {
+                        state.run.progress = serde_json::json!({
+                            "estimatedRecords": progress.estimated_records,
+                            "recordsScanned": progress.records_scanned,
+                            "sessionsCompleted": progress.sessions_completed,
+                            "sessionsSkipped": progress.sessions_skipped,
+                            "currentSessionDate": progress.current_session_date,
+                            "currentPhase": progress.current_phase,
+                            "progressPercent": progress_percent,
+                            "elapsedMs": elapsed_ms,
+                            "recordsPerSecond": records_per_second,
+                            "smoothedRecordsPerSecond": smoothed_records_per_second,
+                        });
+                        let should_persist = progress.current_phase != last_persisted_phase
+                            || progress.current_session_date != last_persisted_session_date
+                            || progress.sessions_completed != last_persisted_sessions_completed
+                            || progress.sessions_skipped != last_persisted_sessions_skipped
+                            || progress
+                                .records_scanned
+                                .saturating_sub(last_persisted_records)
+                                >= JOB_PROGRESS_RECORD_STEP
+                            || (now_ms - last_progress_db_write_ms)
+                                >= JOB_PROGRESS_PERSIST_INTERVAL_MS;
+                        if should_persist {
+                            let _ = db.update_historical_job_run(
+                                &job_id,
+                                &the_desk_backend::db::HistoricalJobRunUpdate {
+                                    status: &state.run.status,
+                                    progress: &state.run.progress,
+                                    result: state.run.result.as_ref(),
+                                    warnings: &state.run.warnings,
+                                    error: state.run.error.as_deref(),
+                                    started_at_ms: state.run.started_at_ms,
+                                    finished_at_ms: state.run.finished_at_ms,
+                                },
+                            );
+                            last_progress_db_write_ms = now_ms;
+                            last_persisted_records = progress.records_scanned;
+                            last_persisted_sessions_completed = progress.sessions_completed;
+                            last_persisted_sessions_skipped = progress.sessions_skipped;
+                            last_persisted_phase = progress.current_phase.clone();
+                            last_persisted_session_date = progress.current_session_date.clone();
+                        }
+                    }
+                },
+                cancel_flag.as_ref(),
+            );
+
+            let finished_at_ms = chrono::Utc::now().timestamp_millis() as f64;
+            let mut guard = manager.blocking_lock();
+            if let Some(state) = guard.jobs.get_mut(&job_id) {
+                match result {
+                    Ok(result) => {
+                        state.run.status = "completed".to_string();
+                        state.run.result = Some(serde_json::to_value(&result).unwrap_or_default());
+                        state.run.warnings = result.warnings.clone();
+                        state.run.error = None;
+                    }
+                    Err(backfill::BackfillJobError::Cancelled) => {
+                        state.run.status = "cancelled".to_string();
+                        state.run.error = None;
+                    }
+                    Err(err) => {
+                        state.run.status = "failed".to_string();
+                        state.run.error = Some(err.to_string());
+                    }
+                }
+                state.run.finished_at_ms = Some(finished_at_ms);
+                let _ = db.update_historical_job_run(
+                    &job_id,
+                    &the_desk_backend::db::HistoricalJobRunUpdate {
+                        status: &state.run.status,
+                        progress: &state.run.progress,
+                        result: state.run.result.as_ref(),
+                        warnings: &state.run.warnings,
+                        error: state.run.error.as_deref(),
+                        started_at_ms: state.run.started_at_ms,
+                        finished_at_ms: state.run.finished_at_ms,
+                    },
+                );
+            }
+            guard.active_job_id = None;
+        });
+
+        Ok((run, false))
     }
 
     /// Get a live snapshot from the in-memory pipeline engine.
@@ -1037,7 +1488,7 @@ impl TheDeskMcp {
     }
 
     #[tool(
-        description = "Backfill historical .scid data: process past sessions through all 14 pipelines, detect market events, and persist session summaries. By default it is idempotent and skips dates already processed; set force=true to reprocess existing sessions."
+        description = "Queue a historical backfill job and return a job id. Processes past sessions through all 14 pipelines, detects market events, and persists session summaries without blocking the MCP server."
     )]
     async fn backfill_history(
         &self,
@@ -1050,43 +1501,20 @@ impl TheDeskMcp {
                 "SCID file not found. Ensure Sierra Chart data path is configured.",
             ));
         }
-
-        let since_ms = params.start_date.as_deref().map(|d| {
-            chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d")
-                .map(|nd| {
-                    nd.and_hms_opt(0, 0, 0)
-                        .unwrap()
-                        .and_utc()
-                        .timestamp_millis() as f64
-                })
-                .unwrap_or(0.0)
-        });
-
-        let db = self.db.lock().map_err(|_| lock_error())?;
-        let config = if params.run_rules.unwrap_or(false) {
-            Some(backfill::BackfillConfig {
-                run_rules: true,
-                setup_ids: params.setup_ids.clone(),
-            })
-        } else {
-            None
-        };
-        match backfill::run_backfill(
-            &reader,
-            &db,
-            since_ms,
-            params.force.unwrap_or(false),
-            config,
-        ) {
-            Ok(result) => Ok(text_result(
-                serde_json::to_value(&result).unwrap_or_default(),
-            )),
-            Err(e) => Err(db_error(e)),
+        let wait = params.wait_for_completion.unwrap_or(false);
+        let (run, already_running) = self
+            .queue_historical_job(params, backfill::HistoricalJobType::ResearchBackfill, false)
+            .await?;
+        if wait {
+            if let Some(done) = self.wait_for_job_terminal(&run.id).await {
+                return Ok(text_result(historical_job_response(&done, false)));
+            }
         }
+        Ok(text_result(historical_job_response(&run, already_running)))
     }
 
     #[tool(
-        description = "Run a backtest: replay the rules engine over historical .scid data. Processes past sessions through all pipelines, evaluates playbook setups, tracks signal outcomes (MFE/MAE, target/stop hit), and persists results to backtest_runs. Use for setup performance analysis and parameter sensitivity."
+        description = "Queue a backtest replay job and return a job id. Replays the rules engine over historical .scid data without blocking the MCP server."
     )]
     async fn run_backtest(
         &self,
@@ -1099,33 +1527,59 @@ impl TheDeskMcp {
                 "SCID file not found. Ensure Sierra Chart data path is configured.",
             ));
         }
-        let since_ms = params.start_date.as_deref().map(|d| {
-            chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d")
-                .map(|nd| {
-                    nd.and_hms_opt(0, 0, 0)
-                        .unwrap()
-                        .and_utc()
-                        .timestamp_millis() as f64
-                })
-                .unwrap_or(0.0)
-        });
-        let db = self.db.lock().map_err(|_| lock_error())?;
-        let config = Some(backfill::BackfillConfig {
-            run_rules: true,
-            setup_ids: params.setup_ids.clone(),
-        });
-        match backfill::run_backfill(
-            &reader,
-            &db,
-            since_ms,
-            params.force.unwrap_or(false),
-            config,
-        ) {
-            Ok(result) => Ok(text_result(
-                serde_json::to_value(&result).unwrap_or_default(),
-            )),
-            Err(e) => Err(db_error(e)),
+        let wait = params.wait_for_completion.unwrap_or(false);
+        let (run, already_running) = self
+            .queue_historical_job(params, backfill::HistoricalJobType::Backtest, true)
+            .await?;
+        if wait {
+            if let Some(done) = self.wait_for_job_terminal(&run.id).await {
+                return Ok(text_result(historical_job_response(&done, false)));
+            }
         }
+        Ok(text_result(historical_job_response(&run, already_running)))
+    }
+
+    #[tool(description = "Poll progress for a queued/running historical backfill or backtest job.")]
+    async fn get_backfill_status(
+        &self,
+        Parameters(params): Parameters<BackfillStatusParams>,
+    ) -> Result<CallToolResult, McpError> {
+        match self.get_job_run(params.job_id.as_deref()).await? {
+            Some(run) => Ok(text_result(historical_job_response(&run, false))),
+            None => Ok(no_data("No historical job found")),
+        }
+    }
+
+    #[tool(description = "Cancel an in-flight historical backfill or backtest job.")]
+    async fn cancel_backfill(
+        &self,
+        Parameters(params): Parameters<CancelBackfillParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut manager = self.backfill_manager.lock().await;
+        if let Some(state) = manager.jobs.get_mut(&params.job_id) {
+            state.cancel_flag.store(true, Ordering::Relaxed);
+            state.run.status = "cancelling".to_string();
+            state.run.progress["currentPhase"] = serde_json::json!("cancelling");
+            if let Ok(db) = self.db.lock() {
+                let _ = db.update_historical_job_run(
+                    &params.job_id,
+                    &the_desk_backend::db::HistoricalJobRunUpdate {
+                        status: &state.run.status,
+                        progress: &state.run.progress,
+                        result: state.run.result.as_ref(),
+                        warnings: &state.run.warnings,
+                        error: state.run.error.as_deref(),
+                        started_at_ms: state.run.started_at_ms,
+                        finished_at_ms: state.run.finished_at_ms,
+                    },
+                );
+            }
+            return Ok(text_result(serde_json::json!({
+                "jobId": params.job_id,
+                "status": "cancelling",
+            })));
+        }
+        Ok(no_data("Historical job not found"))
     }
 
     #[tool(
@@ -2015,14 +2469,12 @@ fn process_tick(
 
             // Structural events (level tests, IB extensions, day type changes, etc.)
             if let Ok(mut det) = detector.lock() {
-                let events = det.detect(&snapshot, timestamp_ms, &session_date, minute);
-                event_buffer.extend(events);
+                det.detect_into(&snapshot, timestamp_ms, &session_date, minute, event_buffer);
             }
 
             // Flow events (absorption, pinch, acceleration zones, large trade clusters)
             if let Ok(mut fe) = flow_emitter.lock() {
-                let flow_events = fe.detect(&p, timestamp_ms, &session_date);
-                event_buffer.extend(flow_events);
+                fe.detect_into(&p, timestamp_ms, &session_date, price, event_buffer);
             }
 
             (snapshot, session_date)
@@ -2057,6 +2509,9 @@ fn process_tick(
                         signal_id: signal_id.clone(),
                         setup_id: alert.setup_id.clone(),
                         setup_name: Some(alert.setup_name.clone()),
+                        session_date: session_date_from_timestamp_ms(timestamp_ms),
+                        source: "live".to_string(),
+                        job_id: None,
                         fired_at_ms: timestamp_ms,
                         fired_price: alert.current_price,
                         target_price: alert.target_prices.first().copied(),
@@ -2120,7 +2575,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create the server immediately so stdio is ready before backfill starts.
     // The startup backfill runs in a background task and populates pipeline
     // state concurrently with tool serving.
-    let server = TheDeskMcp::new(db, pipelines);
+    let server = TheDeskMcp::new(db, pipelines, db_path.to_string_lossy().to_string());
 
     if scid_available {
         // Spawn background startup backfill from 2 Globex opens ago.

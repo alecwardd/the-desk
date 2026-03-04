@@ -10,7 +10,7 @@ pub mod risk;
 pub mod rules;
 pub mod templates;
 
-use chrono::{TimeZone, Timelike, Utc};
+use chrono::{Datelike, TimeZone, Timelike, Utc};
 use chrono_tz::US::Eastern;
 
 /// NQ session boundaries in Eastern Time (hour * 60 + minute).
@@ -24,6 +24,15 @@ pub enum SessionType {
     Rth,
     Globex,
     Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TickTimeContext {
+    pub et_minutes: i32,
+    pub minute_of_session: i32,
+    pub session_type: SessionType,
+    pub session_date: String,
+    pub session_date_key: i32,
 }
 
 /// Classify which session a given ET-minute falls into.
@@ -74,6 +83,23 @@ pub fn session_date_from_timestamp_ms(timestamp_ms: f64) -> String {
     } else {
         chrono::Local::now().format("%Y-%m-%d").to_string()
     }
+}
+
+/// Convert a Unix timestamp (milliseconds) to all session-relative ET metadata in one pass.
+pub fn tick_time_context_from_timestamp_ms(timestamp_ms: f64) -> Option<TickTimeContext> {
+    let ts = timestamp_ms as i64;
+    Utc.timestamp_millis_opt(ts).single().map(|utc| {
+        let et = utc.with_timezone(&Eastern);
+        let et_minutes = (et.hour() as i32 * 60) + et.minute() as i32;
+        let session_date_key = et.year() * 10_000 + et.month() as i32 * 100 + et.day() as i32;
+        TickTimeContext {
+            et_minutes,
+            minute_of_session: et_minutes - RTH_OPEN_ET,
+            session_type: classify_session(et_minutes),
+            session_date: et.format("%Y-%m-%d").to_string(),
+            session_date_key,
+        }
+    })
 }
 
 /// Compute a Globex open timestamp (6 PM ET) going `days_back` calendar days.

@@ -188,9 +188,13 @@ async fn processing_loop(handle: AppHandle, mut rx: broadcast::Receiver<FeedEven
                         let snapshot = pipelines.snapshot(bid, ask);
                         let session_date = session_date_from_timestamp_ms(timestamp);
                         let mut detector = state.detector.lock().await;
-                        let events =
-                            detector.detect(&snapshot, timestamp, &session_date, minute_of_session);
-                        event_buffer.extend(events);
+                        detector.detect_into(
+                            &snapshot,
+                            timestamp,
+                            &session_date,
+                            minute_of_session,
+                            &mut event_buffer,
+                        );
 
                         if event_buffer.len() >= 50 {
                             let _ = state
@@ -331,6 +335,11 @@ async fn processing_loop(handle: AppHandle, mut rx: broadcast::Receiver<FeedEven
                                 signal_id: signal_id.clone(),
                                 setup_id: alert.setup_id.clone(),
                                 setup_name: Some(alert.setup_name.clone()),
+                                session_date: the_desk_backend::session_date_from_timestamp_ms(
+                                    timestamp,
+                                ),
+                                source: "live".to_string(),
+                                job_id: None,
                                 fired_at_ms: timestamp,
                                 fired_price: alert.current_price,
                                 target_price: alert.target_prices.first().copied(),

@@ -25,6 +25,17 @@ pub fn on_tick(
     timestamp_ms: f64,
     r_value_points: Option<f64>,
 ) -> Result<Vec<Resolution>, String> {
+    on_tick_filtered(db, price, timestamp_ms, r_value_points, None, None)
+}
+
+pub fn on_tick_filtered(
+    db: &Database,
+    price: f64,
+    timestamp_ms: f64,
+    r_value_points: Option<f64>,
+    source: Option<&str>,
+    job_id: Option<&str>,
+) -> Result<Vec<Resolution>, String> {
     let r_val = r_value_points.unwrap_or_else(|| {
         db.load_risk_config()
             .ok()
@@ -32,7 +43,9 @@ pub fn on_tick(
             .unwrap_or(50.0)
     });
 
-    let pending = db.pending_signal_outcomes().map_err(|e| e.to_string())?;
+    let pending = db
+        .pending_signal_outcomes_filtered(source, job_id)
+        .map_err(|e| e.to_string())?;
     let current_session = session_date_from_timestamp_ms(timestamp_ms);
     let mut resolved = Vec::new();
 

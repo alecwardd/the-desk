@@ -36,7 +36,9 @@ pub use vwap::VwapPipeline;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{classify_session, et_minutes_from_timestamp, SessionType};
+use crate::{
+    classify_session, et_minutes_from_timestamp, tick_time_context_from_timestamp_ms, SessionType,
+};
 
 /// Snapshot of session-ending data for prior-day level archival.
 #[derive(Debug, Clone)]
@@ -302,7 +304,25 @@ impl PipelineEngine {
         let is_overnight = et_minutes_from_timestamp(timestamp_ms)
             .map(|et_min| classify_session(et_min) != SessionType::Rth)
             .unwrap_or(minute_of_session < 0);
+        self.on_trade_with_session_flag(
+            price,
+            volume,
+            is_buy,
+            minute_of_session,
+            timestamp_ms,
+            is_overnight,
+        );
+    }
 
+    pub fn on_trade_with_session_flag(
+        &mut self,
+        price: f64,
+        volume: f64,
+        is_buy: bool,
+        minute_of_session: i32,
+        timestamp_ms: f64,
+        is_overnight: bool,
+    ) {
         self.vwap.add_trade(price, volume);
         self.tpo.add_trade(price, minute_of_session);
         self.delta.add_trade(price, volume, is_buy);
@@ -346,19 +366,65 @@ impl PipelineEngine {
 
     /// Build current market state snapshot.
     pub fn snapshot(&self, bid: f64, ask: f64) -> MarketState {
+        let now_ms = chrono::Utc::now().timestamp_millis() as f64;
+        self.snapshot_at(bid, ask, now_ms)
+    }
+
+    pub fn snapshot_at(&self, bid: f64, ask: f64, timestamp_ms: f64) -> MarketState {
+        self.build_snapshot(bid, ask, timestamp_ms, true)
+    }
+
+    pub fn snapshot_for_detection(&self, bid: f64, ask: f64, timestamp_ms: f64) -> MarketState {
+        self.build_snapshot(bid, ask, timestamp_ms, false)
+    }
+
+    fn build_snapshot(
+        &self,
+        bid: f64,
+        ask: f64,
+        timestamp_ms: f64,
+        include_extended_metrics: bool,
+    ) -> MarketState {
         let sd = self.vwap.std_dev();
         let vwap = self.vwap.vwap();
-        let now_ms = chrono::Utc::now().timestamp_millis() as f64;
-        let session_type = et_minutes_from_timestamp(now_ms)
-            .map(|et_min| match classify_session(et_min) {
+        let session_type = tick_time_context_from_timestamp_ms(timestamp_ms)
+            .map(|ctx| match ctx.session_type {
                 SessionType::Rth => "RTH",
                 SessionType::Globex => "Globex",
                 SessionType::Unknown => "Unknown",
             })
             .unwrap_or("Unknown")
             .to_string();
-        let tape = self.tape_pace.snapshot(now_ms);
-        let size = self.trade_size.snapshot();
+        let tape = if include_extended_metrics {
+            self.tape_pace.snapshot(timestamp_ms)
+        } else {
+            TapePaceSnapshot::default()
+        };
+        let size = if include_extended_metrics {
+            self.trade_size.snapshot()
+        } else {
+            TradeSizeSnapshot::default()
+        };
+        let imbalance_count = if include_extended_metrics {
+            self.footprint.stacked_imbalances(2.0, 3).len()
+        } else {
+            0
+        };
+        let absorption_event_count = if include_extended_metrics {
+            self.absorption.recent_events().len()
+        } else {
+            0
+        };
+        let pinch_event_count = if include_extended_metrics {
+            self.pinch.recent_events().len()
+        } else {
+            0
+        };
+        let active_zone_count = if include_extended_metrics {
+            self.rebid_reoffer.active_zones().len()
+        } else {
+            0
+        };
         MarketState {
             last_price: self.levels.last_price,
             bid,
@@ -398,8 +464,8 @@ impl PipelineEngine {
             tape_pace_5m: tape.ticks_per_sec_5m,
             tape_acceleration: tape.acceleration,
             pace_percentile: tape.pace_percentile,
-            imbalance_count: self.footprint.stacked_imbalances(2.0, 3).len(),
-            absorption_event_count: self.absorption.recent_events().len(),
+            imbalance_count,
+            absorption_event_count,
             avg_trade_size: size.avg_trade_size,
 
             or5_high: self.or5.or5_high(),
@@ -417,13 +483,13 @@ impl PipelineEngine {
             balance_state: self.day_type.balance_state(),
             single_prints_direction: self.day_type.single_prints_direction(),
 
-            pinch_event_count: self.pinch.recent_events().len(),
+            pinch_event_count,
 
             inventory_state: self.session_inventory.state(),
             inventory_direction: self.session_inventory.direction(),
             sessions_in_trend: self.session_inventory.sessions_in_trend(),
 
-            active_zone_count: self.rebid_reoffer.active_zones().len(),
+            active_zone_count,
 
             poor_high: self.tpo.poor_high(),
             poor_low: self.tpo.poor_low(),

@@ -103,6 +103,10 @@ impl TradeSizePipeline {
         self.size_at_price.get(&key).copied().unwrap_or_default()
     }
 
+    pub fn large_trade_count_at_price(&self, price: f64) -> u64 {
+        self.snapshot_at_price(price).lot_21_plus
+    }
+
     /// Prices where large (21+) trades have occurred, sorted by count descending.
     pub fn large_trade_prices(&self) -> Vec<(f64, u64)> {
         let mut out: Vec<(f64, u64)> = self

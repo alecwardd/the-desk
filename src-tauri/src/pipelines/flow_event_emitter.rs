@@ -80,15 +80,37 @@ impl FlowEventEmitter {
         pipelines: &PipelineEngine,
         timestamp_ms: f64,
         session_date: &str,
+        current_price: f64,
     ) -> Vec<MarketEvent> {
         let mut events = Vec::new();
-
-        self.detect_absorption(&mut events, pipelines, timestamp_ms, session_date);
-        self.detect_pinch(&mut events, pipelines, timestamp_ms, session_date);
-        self.detect_zones(&mut events, pipelines, timestamp_ms, session_date);
-        self.detect_large_trade_clusters(&mut events, pipelines, timestamp_ms, session_date);
-
+        self.detect_into(
+            pipelines,
+            timestamp_ms,
+            session_date,
+            current_price,
+            &mut events,
+        );
         events
+    }
+
+    pub fn detect_into(
+        &mut self,
+        pipelines: &PipelineEngine,
+        timestamp_ms: f64,
+        session_date: &str,
+        current_price: f64,
+        events: &mut Vec<MarketEvent>,
+    ) {
+        self.detect_absorption(events, pipelines, timestamp_ms, session_date);
+        self.detect_pinch(events, pipelines, timestamp_ms, session_date);
+        self.detect_zones(events, pipelines, timestamp_ms, session_date);
+        self.detect_large_trade_clusters(
+            events,
+            pipelines,
+            timestamp_ms,
+            session_date,
+            current_price,
+        );
     }
 
     /// Absorption / exhaustion / delta_divergence events.
@@ -229,12 +251,14 @@ impl FlowEventEmitter {
     }
 
     /// Large trade cluster: 3+ new 21+ lot trades at the same price since last check.
+    /// Scans all prices with large trades, not just the current tick price.
     fn detect_large_trade_clusters(
         &mut self,
         events: &mut Vec<MarketEvent>,
         pipelines: &PipelineEngine,
         timestamp_ms: f64,
         session_date: &str,
+        _current_price: f64,
     ) {
         let large_prices = pipelines.trade_size.large_trade_prices();
 
@@ -267,7 +291,7 @@ impl FlowEventEmitter {
             }
         }
 
-        // Update prev counts
+        // Update prev counts from the full set
         self.prev_large_trade_counts.clear();
         for (price, count) in &large_prices {
             self.prev_large_trade_counts
@@ -335,7 +359,7 @@ mod tests {
         assert!(!pipelines.absorption.recent_events().is_empty());
 
         let mut emitter = FlowEventEmitter::new();
-        let events = emitter.detect(&pipelines, 2000.0, "2026-02-26");
+        let events = emitter.detect(&pipelines, 2000.0, "2026-02-26", 21000.0);
         assert!(events.iter().any(|e| e.event_type == "absorption_detected"));
         assert_eq!(
             emitter.prev_absorption_count,
@@ -343,7 +367,7 @@ mod tests {
         );
 
         // Second call should not re-emit the same events
-        let events2 = emitter.detect(&pipelines, 3000.0, "2026-02-26");
+        let events2 = emitter.detect(&pipelines, 3000.0, "2026-02-26", 21000.0);
         assert!(events2
             .iter()
             .all(|e| e.event_type != "absorption_detected"));
@@ -353,7 +377,7 @@ mod tests {
     fn empty_pipelines_emit_nothing() {
         let pipelines = PipelineEngine::new();
         let mut emitter = FlowEventEmitter::new();
-        let events = emitter.detect(&pipelines, 1000.0, "2026-02-26");
+        let events = emitter.detect(&pipelines, 1000.0, "2026-02-26", 21000.0);
         assert!(events.is_empty());
     }
 }

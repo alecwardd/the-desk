@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use super::MarketState;
+use super::{DayType, MarketState};
 #[allow(unused_imports)]
 use crate::pipelines::RvolClassification;
 
@@ -45,7 +45,7 @@ pub struct EventDetector {
     prev_price: f64,
     prev_session_high: f64,
     prev_session_low: f64,
-    prev_day_type: String,
+    prev_day_type: DayType,
     prev_poor_high: bool,
     prev_poor_low: bool,
     prev_excess_high: bool,
@@ -70,7 +70,7 @@ impl EventDetector {
             prev_price: 0.0,
             prev_session_high: 0.0,
             prev_session_low: 0.0,
-            prev_day_type: String::new(),
+            prev_day_type: DayType::default(),
             prev_poor_high: false,
             prev_poor_low: false,
             prev_excess_high: false,
@@ -89,7 +89,7 @@ impl EventDetector {
         self.prev_price = 0.0;
         self.prev_session_high = 0.0;
         self.prev_session_low = 0.0;
-        self.prev_day_type.clear();
+        self.prev_day_type = DayType::default();
         self.prev_poor_high = false;
         self.prev_poor_low = false;
         self.prev_excess_high = false;
@@ -112,17 +112,35 @@ impl EventDetector {
         session_date: &str,
         minute_of_session: i32,
     ) -> Vec<MarketEvent> {
+        let mut events = Vec::new();
+        self.detect_into(
+            state,
+            timestamp_ms,
+            session_date,
+            minute_of_session,
+            &mut events,
+        );
+        events
+    }
+
+    pub fn detect_into(
+        &mut self,
+        state: &MarketState,
+        timestamp_ms: f64,
+        session_date: &str,
+        minute_of_session: i32,
+        events: &mut Vec<MarketEvent>,
+    ) {
         if self.session_date != session_date && !session_date.is_empty() {
             self.session_date = session_date.to_string();
         }
-        let mut events = Vec::new();
         let price = state.last_price;
 
         if self.prev_price <= 0.0 {
             self.prev_price = price;
             self.prev_session_high = price;
             self.prev_session_low = price;
-            self.prev_day_type = format!("{:?}", state.day_type);
+            self.prev_day_type = state.day_type;
             self.prev_poor_high = state.poor_high;
             self.prev_poor_low = state.poor_low;
             self.prev_excess_high = state.excess_high;
@@ -160,11 +178,11 @@ impl EventDetector {
             {
                 self.or_formed = true;
             }
-            return events;
+            return;
         }
 
         // --- Level interaction events ---
-        let levels: Vec<(&str, f64)> = vec![
+        let levels = [
             ("ib_high", state.ib_high),
             ("ib_low", state.ib_low),
             ("ib_mid", ib_mid(state)),
@@ -189,11 +207,11 @@ impl EventDetector {
             ("dnva_low", state.dnva_low),
         ];
 
-        for (name, level) in &levels {
-            if *level <= 0.0 {
+        for (name, level) in levels {
+            if level <= 0.0 {
                 continue;
             }
-            if let Some(direction) = crossed_level(self.prev_price, price, *level) {
+            if let Some(direction) = crossed_level(self.prev_price, price, level) {
                 let event_key = format!("{name}_test");
                 if self.should_emit(&event_key, timestamp_ms) {
                     let seq = self.next_sequence(&event_key);
@@ -215,7 +233,7 @@ impl EventDetector {
         if state.ib_high > 0.0 && state.ib_low > 0.0 {
             let ib_range = state.ib_high - state.ib_low;
             if ib_range > 0.0 {
-                let extensions: Vec<(&str, f64, f64, &str)> = vec![
+                let extensions = [
                     (
                         "ib_ext_0.5x_high",
                         state.ib_high + ib_range * 0.5,
@@ -243,8 +261,8 @@ impl EventDetector {
                         "down",
                     ),
                 ];
-                for (name, ext_level, multiplier, dir) in &extensions {
-                    if let Some(direction) = crossed_level(self.prev_price, price, *ext_level) {
+                for (name, ext_level, multiplier, dir) in extensions {
+                    if let Some(direction) = crossed_level(self.prev_price, price, ext_level) {
                         let event_key = format!("{name}_hit");
                         if self.should_emit(&event_key, timestamp_ms) {
                             events.push(MarketEvent {
@@ -351,8 +369,8 @@ impl EventDetector {
         };
 
         // Day type change
-        let current_day_type = format!("{:?}", state.day_type);
-        if !self.prev_day_type.is_empty() && current_day_type != self.prev_day_type {
+        let current_day_type = state.day_type;
+        if current_day_type != self.prev_day_type {
             events.push(MarketEvent {
                 session_date: session_date.to_string(),
                 timestamp_ms,
@@ -362,8 +380,8 @@ impl EventDetector {
                 direction: None,
                 sequence_num: None,
                 metadata: Some(serde_json::json!({
-                    "from": self.prev_day_type,
-                    "to": current_day_type,
+                    "from": format!("{:?}", self.prev_day_type),
+                    "to": format!("{:?}", current_day_type),
                 })),
             });
         }
@@ -494,7 +512,6 @@ impl EventDetector {
         }
 
         self.prev_price = price;
-        events
     }
 
     /// Check if enough time has passed since the last event of this type.

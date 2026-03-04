@@ -141,7 +141,7 @@ The MCP server (`src/bin/the-desk-mcp.rs`) exposes 35 tools. Key categories:
 | **Data** | `query_ticks`, `get_proximity_report` |
 | **Integrity** | `validate_data_integrity` |
 | **Research** | `query_event_frequency`, `query_conditional`, `query_distribution`, `query_signal_outcome_distribution`, `query_signal_outcome_conditional`, `compare_sessions`, `get_session_history`, `get_research_summary` |
-| **Backfill** | `backfill_history`, `run_backtest`, `get_backtest_results`, `compare_backtests` |
+| **Backfill** | `backfill_history`, `run_backtest`, `get_backfill_status`, `cancel_backfill`, `get_backtest_results`, `compare_backtests` |
 | **Storage** | `archive_status` |
 
 ---

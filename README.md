@@ -25,7 +25,7 @@ Sierra Chart (.scid files) → Rust Pipeline Engine → SQLite → MCP Server �
 The Desk intentionally runs three ingestion paths:
 
 1. **Startup warm-backfill (MCP/Tauri startup):** reads recent `.scid` history to seed in-memory pipeline state quickly.
-2. **Historical research backfill (`backfill_history`):** processes historical `.scid` data into `session_summaries` + `market_events` (idempotent by default, `force=true` supported for reprocessing).
+2. **Historical research backfill (`backfill_history`):** queues a background historical job that streams `.scid` data into `session_summaries` + `market_events` without blocking the MCP server (`get_backfill_status` polls progress, `cancel_backfill` cancels long runs).
 3. **Live tail persistence:** polls `.scid` for new records, updates pipelines incrementally, and batch-writes `raw_ticks`.
 
 Use `get_feed_health` and `validate_data_integrity` to confirm feed freshness and integrity before relying on outputs.
@@ -117,7 +117,7 @@ the-desk/
 │   ├── feed/
 │   │   ├── mod.rs              # FeedEvent, FeedConfig, StorageConfig
 │   │   └── scid_reader.rs      # .scid binary file parser
-│   ├── db/mod.rs               # SQLite schema (V4) + operations
+│   ├── db/mod.rs               # SQLite schema + operations
 │   ├── risk/mod.rs             # Risk state tracking
 │   ├── recording/mod.rs        # Session recording + replay
 │   └── dtc/                    # DTC protocol client (legacy)
@@ -152,15 +152,15 @@ flush_poll_ms = 1000
 
 ### MCP Server
 
-The MCP server is configured in `.cursor/mcp.json`:
+The MCP server is configured in `.cursor/mcp.json`.
+`target_alt` is an alternative build output directory (`CARGO_TARGET_DIR`) to avoid cargo lock conflicts when the MCP server binary is running while a separate `cargo build` is in progress.
 
 ```json
 {
-  "mcpServers": {
-    "the-desk": {
-      "command": "cargo",
-      "args": ["run", "--release", "--bin", "the-desk-mcp"],
-      "cwd": "src-tauri"
+    "mcpServers": {
+      "the-desk": {
+      "command": "c:\\the-desk\\target_alt\\release\\the-desk-mcp.exe",
+      "args": []
     }
   }
 }
@@ -180,8 +180,15 @@ cd src-tauri && cargo check
 # Build MCP server (release)
 cd src-tauri && cargo build --release --bin the-desk-mcp
 
-# Backfill historical data (run via MCP tool `backfill_history`)
+# Queue a historical backfill via MCP, then poll `get_backfill_status`
 ```
+
+Historical jobs are asynchronous:
+
+1. Call `backfill_history` or `run_backtest`
+2. Poll `get_backfill_status(jobId)`
+3. Inspect the final `result` when status is `completed`
+4. Call `cancel_backfill(jobId)` to stop a long-running replay safely
 
 ## Data Flow & Latency
 
@@ -212,7 +219,8 @@ Designed for directional trading with 15-minute to 1-hour holds — not HFT.
 |-------|---------|-------------|
 | `market_events` | ~30 event types with timestamp, price, metadata | Live EventDetector + backfill |
 | `session_summaries` | End-of-session snapshots (35+ fields) | Live processing + backfill |
-| `signal_outcomes` | MFE/MAE/R-result per playbook signal | Rules engine + manual resolution |
+| `signal_outcomes` | MFE/MAE/R-result per playbook signal | Rules engine + manual resolution + replay jobs |
+| `historical_job_runs` | Durable ledger for queued/running/completed historical jobs | `backfill_history` / `run_backtest` |
 
 ## License
 

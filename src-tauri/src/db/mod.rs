@@ -3,6 +3,7 @@ use crate::risk::RiskState;
 use crate::rules::SetupDefinition;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -202,6 +203,11 @@ pub struct SignalOutcome {
     pub signal_id: String,
     pub setup_id: String,
     pub setup_name: Option<String>,
+    pub session_date: String,
+    #[serde(default = "default_signal_source")]
+    pub source: String,
+    #[serde(default)]
+    pub job_id: Option<String>,
     pub fired_at_ms: f64,
     pub fired_price: f64,
     pub target_price: Option<f64>,
@@ -212,6 +218,49 @@ pub struct SignalOutcome {
     pub max_adverse_excursion: Option<f64>,
     pub r_result: Option<f64>,
     pub time_to_outcome_ms: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplaySignalRecord {
+    pub signal_id: String,
+    pub timestamp_ms: f64,
+    pub session_date: String,
+    pub setup_id: String,
+    pub payload: serde_json::Value,
+    pub source: String,
+    pub job_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoricalJobRun {
+    pub id: String,
+    pub job_type: String,
+    pub status: String,
+    pub params: serde_json::Value,
+    pub progress: serde_json::Value,
+    pub result: Option<serde_json::Value>,
+    pub warnings: Vec<String>,
+    pub error: Option<String>,
+    pub submitted_at_ms: f64,
+    pub started_at_ms: Option<f64>,
+    pub finished_at_ms: Option<f64>,
+}
+
+/// Parameters for updating a historical job run (avoids too many function args).
+pub struct HistoricalJobRunUpdate<'a> {
+    pub status: &'a str,
+    pub progress: &'a serde_json::Value,
+    pub result: Option<&'a serde_json::Value>,
+    pub warnings: &'a [String],
+    pub error: Option<&'a str>,
+    pub started_at_ms: Option<f64>,
+    pub finished_at_ms: Option<f64>,
+}
+
+fn default_signal_source() -> String {
+    "live".to_string()
 }
 
 impl Default for RiskConfigRecord {
@@ -239,6 +288,7 @@ pub struct Database {
 impl Database {
     pub fn open(path: &str) -> Result<Self, DbError> {
         let conn = Connection::open(path)?;
+        conn.busy_timeout(Duration::from_secs(5))?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
         let db = Self { conn };
         db.run_migrations()?;
@@ -285,6 +335,9 @@ impl Database {
         }
         if version < 7 {
             self.migrate_v7()?;
+        }
+        if version < 8 {
+            self.migrate_v8()?;
         }
 
         Ok(())
@@ -672,6 +725,93 @@ impl Database {
         self.conn.execute_batch(
             "
             UPDATE schema_version SET version = 7;
+            ",
+        )?;
+        Ok(())
+    }
+
+    /// V8: historical job ledger and replay metadata for backfill/backtests.
+    fn migrate_v8(&self) -> Result<(), DbError> {
+        self.conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS historical_job_runs (
+              id TEXT PRIMARY KEY,
+              job_type TEXT NOT NULL,
+              status TEXT NOT NULL,
+              params_json TEXT NOT NULL,
+              progress_json TEXT NOT NULL DEFAULT '{}',
+              result_json TEXT NULL,
+              warning_json TEXT NULL,
+              error_text TEXT NULL,
+              submitted_at_ms REAL NOT NULL,
+              started_at_ms REAL NULL,
+              finished_at_ms REAL NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_historical_job_runs_status_submitted
+              ON historical_job_runs(status, submitted_at_ms DESC);
+            CREATE INDEX IF NOT EXISTS idx_historical_job_runs_type_submitted
+              ON historical_job_runs(job_type, submitted_at_ms DESC);
+            ",
+        )?;
+
+        let _ = self
+            .conn
+            .execute_batch("ALTER TABLE playbook_signals ADD COLUMN signal_id TEXT NULL");
+        let _ = self
+            .conn
+            .execute_batch("ALTER TABLE playbook_signals ADD COLUMN session_date TEXT NULL");
+        let _ = self.conn.execute_batch(
+            "ALTER TABLE playbook_signals ADD COLUMN source TEXT NOT NULL DEFAULT 'live'",
+        );
+        let _ = self
+            .conn
+            .execute_batch("ALTER TABLE playbook_signals ADD COLUMN job_id TEXT NULL");
+
+        let _ = self
+            .conn
+            .execute_batch("ALTER TABLE signal_outcomes ADD COLUMN session_date TEXT NULL");
+        let _ = self.conn.execute_batch(
+            "ALTER TABLE signal_outcomes ADD COLUMN source TEXT NOT NULL DEFAULT 'live'",
+        );
+        let _ = self
+            .conn
+            .execute_batch("ALTER TABLE signal_outcomes ADD COLUMN job_id TEXT NULL");
+
+        self.conn.execute_batch(
+            "
+            UPDATE playbook_signals
+            SET signal_id = COALESCE(signal_id, setup_id || '_' || CAST(timestamp_ms AS INTEGER))
+            WHERE signal_id IS NULL OR signal_id = '';
+            UPDATE playbook_signals
+            SET session_date = COALESCE(
+              session_date,
+              date((timestamp_ms / 1000.0), 'unixepoch')
+            )
+            WHERE session_date IS NULL OR session_date = '';
+            UPDATE signal_outcomes
+            SET session_date = COALESCE(
+              session_date,
+              date((fired_at_ms / 1000.0), 'unixepoch')
+            )
+            WHERE session_date IS NULL OR session_date = '';
+
+            DELETE FROM playbook_signals
+            WHERE id NOT IN (
+              SELECT MIN(id) FROM playbook_signals GROUP BY signal_id
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_playbook_signals_signal_id
+              ON playbook_signals(signal_id);
+            CREATE INDEX IF NOT EXISTS idx_playbook_signals_session_setup
+              ON playbook_signals(session_date, setup_id);
+            CREATE INDEX IF NOT EXISTS idx_playbook_signals_job_id
+              ON playbook_signals(job_id);
+            CREATE INDEX IF NOT EXISTS idx_signal_outcomes_session_setup
+              ON signal_outcomes(session_date, setup_id);
+            CREATE INDEX IF NOT EXISTS idx_signal_outcomes_job_id
+              ON signal_outcomes(job_id);
+
+            UPDATE schema_version SET version = 8;
             ",
         )?;
         Ok(())
@@ -1466,9 +1606,36 @@ impl Database {
         setup_id: &str,
         payload: &serde_json::Value,
     ) -> Result<(), DbError> {
+        use crate::session_date_from_timestamp_ms;
+        let signal_id = format!("{setup_id}_{}", timestamp_ms as u64);
+        self.insert_playbook_signal_record(&ReplaySignalRecord {
+            signal_id,
+            timestamp_ms,
+            session_date: session_date_from_timestamp_ms(timestamp_ms),
+            setup_id: setup_id.to_string(),
+            payload: payload.clone(),
+            source: "live".to_string(),
+            job_id: None,
+        })
+    }
+
+    pub fn insert_playbook_signal_record(
+        &self,
+        signal: &ReplaySignalRecord,
+    ) -> Result<(), DbError> {
         self.conn.execute(
-            "INSERT INTO playbook_signals (timestamp_ms, setup_id, payload) VALUES (?1, ?2, ?3)",
-            params![timestamp_ms, setup_id, serde_json::to_string(payload)?],
+            "INSERT OR IGNORE INTO playbook_signals
+             (signal_id, timestamp_ms, session_date, setup_id, payload, source, job_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                signal.signal_id,
+                signal.timestamp_ms,
+                signal.session_date,
+                signal.setup_id,
+                serde_json::to_string(&signal.payload)?,
+                signal.source,
+                signal.job_id
+            ],
         )?;
         Ok(())
     }
@@ -1884,6 +2051,17 @@ impl Database {
 
     /// Remove backfill-derived research rows for a session before force reprocess.
     pub fn purge_session_research(&self, session_date: &str) -> Result<(), DbError> {
+        self.purge_historical_session(session_date, &["backfill", "backtest"])
+    }
+
+    /// Remove historical replay artifacts for a session while preserving live rows.
+    /// Uses `unchecked_transaction` which acts as a savepoint when called inside an
+    /// existing transaction (e.g. from `persist_historical_session`).
+    pub fn purge_historical_session(
+        &self,
+        session_date: &str,
+        sources: &[&str],
+    ) -> Result<(), DbError> {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
             "DELETE FROM market_events WHERE session_date = ?1",
@@ -1893,6 +2071,16 @@ impl Database {
             "DELETE FROM session_summaries WHERE session_date = ?1",
             params![session_date],
         )?;
+        for source in sources {
+            tx.execute(
+                "DELETE FROM playbook_signals WHERE session_date = ?1 AND source = ?2",
+                params![session_date, source],
+            )?;
+            tx.execute(
+                "DELETE FROM signal_outcomes WHERE session_date = ?1 AND source = ?2",
+                params![session_date, source],
+            )?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -2064,14 +2252,17 @@ impl Database {
     pub fn insert_signal_outcome(&self, o: &SignalOutcome) -> Result<(), DbError> {
         self.conn.execute(
             "INSERT OR IGNORE INTO signal_outcomes
-             (signal_id, setup_id, setup_name, fired_at_ms, fired_price,
-              target_price, stop_price, outcome, outcome_at_ms,
+             (signal_id, setup_id, setup_name, session_date, source, job_id,
+              fired_at_ms, fired_price, target_price, stop_price, outcome, outcome_at_ms,
               max_favorable_excursion, max_adverse_excursion, r_result, time_to_outcome_ms)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
             params![
                 o.signal_id,
                 o.setup_id,
                 o.setup_name,
+                o.session_date,
+                o.source,
+                o.job_id,
                 o.fired_at_ms,
                 o.fired_price,
                 o.target_price,
@@ -2172,34 +2363,56 @@ impl Database {
 
     /// List pending signal outcomes (for the outcome evaluator to track).
     pub fn pending_signal_outcomes(&self) -> Result<Vec<SignalOutcome>, DbError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT signal_id, setup_id, setup_name, fired_at_ms, fired_price,
-                    target_price, stop_price, outcome, outcome_at_ms,
+        self.pending_signal_outcomes_filtered(None, None)
+    }
+
+    pub fn pending_signal_outcomes_filtered(
+        &self,
+        source: Option<&str>,
+        job_id: Option<&str>,
+    ) -> Result<Vec<SignalOutcome>, DbError> {
+        let mut sql = String::from(
+            "SELECT signal_id, setup_id, setup_name, session_date, source, job_id,
+                    fired_at_ms, fired_price, target_price, stop_price, outcome, outcome_at_ms,
                     max_favorable_excursion, max_adverse_excursion, r_result, time_to_outcome_ms
              FROM signal_outcomes WHERE outcome = 'pending'",
-        )?;
-        let rows = stmt.query_map([], |row| {
+        );
+        let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        if let Some(source) = source {
+            sql.push_str(&format!(" AND source = ?{}", bind_values.len() + 1));
+            bind_values.push(Box::new(source.to_string()));
+        }
+        if let Some(job_id) = job_id {
+            sql.push_str(&format!(" AND job_id = ?{}", bind_values.len() + 1));
+            bind_values.push(Box::new(job_id.to_string()));
+        }
+        let mut stmt = self.conn.prepare(&sql)?;
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+            bind_values.iter().map(|b| b.as_ref()).collect();
+        let rows = stmt.query_map(params_ref.as_slice(), |row| {
             Ok(SignalOutcome {
                 signal_id: row.get(0)?,
                 setup_id: row.get(1)?,
                 setup_name: row.get(2)?,
-                fired_at_ms: row.get(3)?,
-                fired_price: row.get(4)?,
-                target_price: row.get(5)?,
-                stop_price: row.get(6)?,
-                outcome: row.get(7)?,
-                outcome_at_ms: row.get(8)?,
-                max_favorable_excursion: row.get(9)?,
-                max_adverse_excursion: row.get(10)?,
-                r_result: row.get(11)?,
-                time_to_outcome_ms: row.get(12)?,
+                session_date: row.get(3)?,
+                source: row.get(4)?,
+                job_id: row.get(5)?,
+                fired_at_ms: row.get(6)?,
+                fired_price: row.get(7)?,
+                target_price: row.get(8)?,
+                stop_price: row.get(9)?,
+                outcome: row.get(10)?,
+                outcome_at_ms: row.get(11)?,
+                max_favorable_excursion: row.get(12)?,
+                max_adverse_excursion: row.get(13)?,
+                r_result: row.get(14)?,
+                time_to_outcome_ms: row.get(15)?,
             })
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
     /// List resolved signal outcomes with r_result for research queries.
-    /// Returns (setup_id, session_date, r_result, outcome). Session date derived from fired_at_ms.
     #[allow(clippy::type_complexity)]
     pub fn list_signal_outcomes_for_research(
         &self,
@@ -2207,28 +2420,26 @@ impl Database {
         start_date: Option<&str>,
         end_date: Option<&str>,
     ) -> Result<Vec<(String, String, Option<f64>, String)>, DbError> {
-        use crate::session_date_from_timestamp_ms;
         let mut stmt = self.conn.prepare(
-            "SELECT setup_id, fired_at_ms, r_result, outcome
+            "SELECT setup_id, session_date, r_result, outcome
              FROM signal_outcomes WHERE outcome != 'pending'",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
-                row.get::<_, f64>(1)?,
+                row.get::<_, String>(1)?,
                 row.get::<_, Option<f64>>(2)?,
                 row.get::<_, String>(3)?,
             ))
         })?;
         let mut results = Vec::new();
         for row in rows.filter_map(|r| r.ok()) {
-            let (sid, fired_ms, r_result, outcome) = row;
+            let (sid, session_date, r_result, outcome) = row;
             if let Some(filter_id) = setup_id {
                 if sid != filter_id {
                     continue;
                 }
             }
-            let session_date = session_date_from_timestamp_ms(fired_ms);
             if let Some(sd) = start_date {
                 if session_date.as_str() < sd {
                     continue;
@@ -2251,92 +2462,178 @@ impl Database {
         start_date: Option<&str>,
         end_date: Option<&str>,
     ) -> Result<serde_json::Value, DbError> {
-        let base = match setup_id {
-            Some(sid) => {
-                let total: i64 = self.conn.query_row(
-                    "SELECT COUNT(1) FROM signal_outcomes WHERE setup_id = ?1",
-                    params![sid],
-                    |r| r.get(0),
-                )?;
-                let resolved: i64 = self.conn.query_row(
-                    "SELECT COUNT(1) FROM signal_outcomes WHERE setup_id = ?1 AND outcome != 'pending'",
-                    params![sid], |r| r.get(0),
-                )?;
-                let target_hit: i64 = self.conn.query_row(
-                    "SELECT COUNT(1) FROM signal_outcomes WHERE setup_id = ?1 AND outcome = 'target_hit'",
-                    params![sid], |r| r.get(0),
-                )?;
-                let stop_hit: i64 = self.conn.query_row(
-                    "SELECT COUNT(1) FROM signal_outcomes WHERE setup_id = ?1 AND outcome = 'stop_hit'",
-                    params![sid], |r| r.get(0),
-                )?;
-                let avg_r: f64 = self.conn.query_row(
-                    "SELECT COALESCE(AVG(r_result), 0) FROM signal_outcomes WHERE setup_id = ?1 AND r_result IS NOT NULL",
-                    params![sid], |r| r.get(0),
-                )?;
-                let avg_winner_r: Option<f64> = self.conn.query_row(
-                    "SELECT AVG(r_result) FROM signal_outcomes WHERE setup_id = ?1 AND r_result > 0",
-                    params![sid], |r| r.get(0),
-                ).ok().flatten();
-                let avg_loser_r: Option<f64> = self.conn.query_row(
-                    "SELECT AVG(r_result) FROM signal_outcomes WHERE setup_id = ?1 AND r_result < 0",
-                    params![sid], |r| r.get(0),
-                ).ok().flatten();
-                serde_json::json!({
-                    "setupId": sid,
-                    "totalSignals": total,
-                    "resolved": resolved,
-                    "targetHit": target_hit,
-                    "stopHit": stop_hit,
-                    "winRate": if resolved > 0 { target_hit as f64 / resolved as f64 } else { 0.0 },
-                    "avgR": avg_r,
-                    "avgWinnerR": avg_winner_r,
-                    "avgLoserR": avg_loser_r,
-                })
-            }
-            None => {
-                let total: i64 =
-                    self.conn
-                        .query_row("SELECT COUNT(1) FROM signal_outcomes", [], |r| r.get(0))?;
-                let resolved: i64 = self.conn.query_row(
-                    "SELECT COUNT(1) FROM signal_outcomes WHERE outcome != 'pending'",
-                    [],
-                    |r| r.get(0),
-                )?;
-                let target_hit: i64 = self.conn.query_row(
-                    "SELECT COUNT(1) FROM signal_outcomes WHERE outcome = 'target_hit'",
-                    [],
-                    |r| r.get(0),
-                )?;
-                let avg_winner_r: Option<f64> = self
-                    .conn
-                    .query_row(
-                        "SELECT AVG(r_result) FROM signal_outcomes WHERE r_result > 0",
-                        [],
-                        |r| r.get(0),
-                    )
-                    .ok()
-                    .flatten();
-                let avg_loser_r: Option<f64> = self
-                    .conn
-                    .query_row(
-                        "SELECT AVG(r_result) FROM signal_outcomes WHERE r_result < 0",
-                        [],
-                        |r| r.get(0),
-                    )
-                    .ok()
-                    .flatten();
-                serde_json::json!({
-                    "totalSignals": total,
-                    "resolved": resolved,
-                    "winRate": if resolved > 0 { target_hit as f64 / resolved as f64 } else { 0.0 },
-                    "avgWinnerR": avg_winner_r,
-                    "avgLoserR": avg_loser_r,
-                })
-            }
+        self.signal_performance_filtered(setup_id, start_date, end_date, None, None)
+    }
+
+    pub fn signal_performance_filtered(
+        &self,
+        setup_id: Option<&str>,
+        start_date: Option<&str>,
+        end_date: Option<&str>,
+        source: Option<&str>,
+        job_id: Option<&str>,
+    ) -> Result<serde_json::Value, DbError> {
+        let mut conditions = Vec::new();
+        let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        if let Some(setup_id) = setup_id {
+            conditions.push(format!("setup_id = ?{}", bind_values.len() + 1));
+            bind_values.push(Box::new(setup_id.to_string()));
+        }
+        if let Some(start_date) = start_date {
+            conditions.push(format!("session_date >= ?{}", bind_values.len() + 1));
+            bind_values.push(Box::new(start_date.to_string()));
+        }
+        if let Some(end_date) = end_date {
+            conditions.push(format!("session_date <= ?{}", bind_values.len() + 1));
+            bind_values.push(Box::new(end_date.to_string()));
+        }
+        if let Some(source) = source {
+            conditions.push(format!("source = ?{}", bind_values.len() + 1));
+            bind_values.push(Box::new(source.to_string()));
+        }
+        if let Some(job_id) = job_id {
+            conditions.push(format!("job_id = ?{}", bind_values.len() + 1));
+            bind_values.push(Box::new(job_id.to_string()));
+        }
+        let where_clause = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", conditions.join(" AND "))
         };
-        let _ = (start_date, end_date); // reserved for future date filtering
-        Ok(base)
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+            bind_values.iter().map(|b| b.as_ref()).collect();
+
+        let count_sql =
+            |suffix: &str| format!("SELECT COUNT(1) FROM signal_outcomes {where_clause} {suffix}");
+        let avg_sql = |suffix: &str| {
+            format!("SELECT AVG(r_result) FROM signal_outcomes {where_clause} {suffix}")
+        };
+
+        let total: i64 = self
+            .conn
+            .query_row(&count_sql(""), params_ref.as_slice(), |r| r.get(0))?;
+        let resolved: i64 = self.conn.query_row(
+            &count_sql("AND outcome != 'pending'"),
+            params_ref.as_slice(),
+            |r| r.get(0),
+        )?;
+        let target_hit: i64 = self.conn.query_row(
+            &count_sql("AND outcome = 'target_hit'"),
+            params_ref.as_slice(),
+            |r| r.get(0),
+        )?;
+        let stop_hit: i64 = self.conn.query_row(
+            &count_sql("AND outcome = 'stop_hit'"),
+            params_ref.as_slice(),
+            |r| r.get(0),
+        )?;
+        let avg_r: Option<f64> = self.conn.query_row(
+            &avg_sql("AND r_result IS NOT NULL"),
+            params_ref.as_slice(),
+            |r| r.get(0),
+        )?;
+        let avg_winner_r: Option<f64> =
+            self.conn
+                .query_row(&avg_sql("AND r_result > 0"), params_ref.as_slice(), |r| {
+                    r.get(0)
+                })?;
+        let avg_loser_r: Option<f64> =
+            self.conn
+                .query_row(&avg_sql("AND r_result < 0"), params_ref.as_slice(), |r| {
+                    r.get(0)
+                })?;
+
+        let mut result = serde_json::json!({
+            "totalSignals": total,
+            "resolved": resolved,
+            "targetHit": target_hit,
+            "stopHit": stop_hit,
+            "winRate": if resolved > 0 { target_hit as f64 / resolved as f64 } else { 0.0 },
+            "avgR": avg_r.unwrap_or(0.0),
+            "avgWinnerR": avg_winner_r,
+            "avgLoserR": avg_loser_r,
+        });
+        if let Some(setup_id) = setup_id {
+            result["setupId"] = serde_json::json!(setup_id);
+        }
+        if let Some(source) = source {
+            result["source"] = serde_json::json!(source);
+        }
+        if let Some(job_id) = job_id {
+            result["jobId"] = serde_json::json!(job_id);
+        }
+        Ok(result)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn persist_historical_session(
+        &self,
+        session_date: &str,
+        force: bool,
+        purge_sources: &[&str],
+        summary: &SessionSummary,
+        events: &[MarketEvent],
+        replay_signals: &[ReplaySignalRecord],
+        signal_outcomes: &[SignalOutcome],
+        prior_day: (f64, f64, f64, f64, f64, f64),
+    ) -> Result<(), DbError> {
+        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        let result = (|| -> Result<(), DbError> {
+            if force {
+                self.purge_historical_session(session_date, purge_sources)?;
+            }
+            self.upsert_session_summary(summary)?;
+            if !events.is_empty() {
+                let mut stmt = self.conn.prepare_cached(
+                    "INSERT OR IGNORE INTO market_events
+                     (session_date, timestamp_ms, event_type, level_name, price, direction, sequence_num, metadata_json)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                )?;
+                for e in events {
+                    let meta = e
+                        .metadata
+                        .as_ref()
+                        .map(|m| serde_json::to_string(m).unwrap_or_default());
+                    stmt.execute(params![
+                        e.session_date,
+                        e.timestamp_ms,
+                        e.event_type,
+                        e.level_name,
+                        e.price,
+                        e.direction,
+                        e.sequence_num,
+                        meta,
+                    ])?;
+                }
+            }
+            for signal in replay_signals {
+                self.insert_playbook_signal_record(signal)?;
+            }
+            for outcome in signal_outcomes {
+                self.insert_signal_outcome(outcome)?;
+            }
+            self.save_prior_day_full(
+                session_date,
+                prior_day.0,
+                prior_day.1,
+                prior_day.2,
+                prior_day.3,
+                prior_day.4,
+                prior_day.5,
+            )?;
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(err) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(err)
+            }
+        }
     }
 
     /// Count of session summaries in the database.
@@ -2344,6 +2641,102 @@ impl Database {
         Ok(self
             .conn
             .query_row("SELECT COUNT(1) FROM session_summaries", [], |r| r.get(0))?)
+    }
+
+    pub fn insert_historical_job_run(&self, run: &HistoricalJobRun) -> Result<(), DbError> {
+        self.conn.execute(
+            "INSERT INTO historical_job_runs
+             (id, job_type, status, params_json, progress_json, result_json, warning_json, error_text,
+              submitted_at_ms, started_at_ms, finished_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                run.id,
+                run.job_type,
+                run.status,
+                serde_json::to_string(&run.params)?,
+                serde_json::to_string(&run.progress)?,
+                run.result.as_ref().map(serde_json::to_string).transpose()?,
+                serde_json::to_string(&run.warnings)?,
+                run.error,
+                run.submitted_at_ms,
+                run.started_at_ms,
+                run.finished_at_ms
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_historical_job_run(
+        &self,
+        id: &str,
+        update: &HistoricalJobRunUpdate<'_>,
+    ) -> Result<(), DbError> {
+        self.conn.execute(
+            "UPDATE historical_job_runs
+             SET status = ?2,
+                 progress_json = ?3,
+                 result_json = ?4,
+                 warning_json = ?5,
+                 error_text = ?6,
+                 started_at_ms = COALESCE(?7, started_at_ms),
+                 finished_at_ms = ?8
+             WHERE id = ?1",
+            params![
+                id,
+                update.status,
+                serde_json::to_string(update.progress)?,
+                update.result.map(serde_json::to_string).transpose()?,
+                serde_json::to_string(update.warnings)?,
+                update.error,
+                update.started_at_ms,
+                update.finished_at_ms
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_historical_job_run(&self, id: &str) -> Result<Option<HistoricalJobRun>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, job_type, status, params_json, progress_json, result_json, warning_json,
+                    error_text, submitted_at_ms, started_at_ms, finished_at_ms
+             FROM historical_job_runs WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query(params![id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(HistoricalJobRun {
+                id: row.get(0)?,
+                job_type: row.get(1)?,
+                status: row.get(2)?,
+                params: serde_json::from_str(&row.get::<_, String>(3)?).unwrap_or_default(),
+                progress: serde_json::from_str(&row.get::<_, String>(4)?).unwrap_or_default(),
+                result: row
+                    .get::<_, Option<String>>(5)?
+                    .and_then(|s| serde_json::from_str(&s).ok()),
+                warnings: row
+                    .get::<_, Option<String>>(6)?
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_default(),
+                error: row.get(7)?,
+                submitted_at_ms: row.get(8)?,
+                started_at_ms: row.get(9)?,
+                finished_at_ms: row.get(10)?,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn latest_historical_job_run(&self) -> Result<Option<HistoricalJobRun>, DbError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM historical_job_runs ORDER BY submitted_at_ms DESC LIMIT 1")?;
+        let mut rows = stmt.query([])?;
+        if let Some(row) = rows.next()? {
+            let id: String = row.get(0)?;
+            self.get_historical_job_run(&id)
+        } else {
+            Ok(None)
+        }
     }
 
     // ------------------------------------------------------------------
@@ -2602,5 +2995,170 @@ mod tests {
         let entries = db.get_journal_for_session("sess1").expect("get");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].content, "Good session");
+    }
+
+    #[test]
+    fn purge_historical_session_preserves_live_signal_rows() {
+        let db = test_db();
+        db.upsert_session_summary(&SessionSummary {
+            session_date: "2026-03-02".into(),
+            session_type: "RTH".into(),
+            open_price: 21000.0,
+            high: 21010.0,
+            low: 20990.0,
+            close: 21005.0,
+            poc: 21002.0,
+            vah: 21006.0,
+            val: 20998.0,
+            ib_high: 21007.0,
+            ib_low: 20997.0,
+            ib_range: 10.0,
+            ib_mid: 21002.0,
+            or_high: 21004.0,
+            or_low: 20999.0,
+            day_type: "Normal".into(),
+            profile_shape: "DShape".into(),
+            balance_state: "Balanced".into(),
+            total_volume: 1000.0,
+            tick_count: 100,
+            session_delta: 10.0,
+            cumulative_delta: 15.0,
+            dnp: 21001.0,
+            dnva_high: 21003.0,
+            dnva_low: 20999.0,
+            vwap_close: 21002.0,
+            signal_count: 0,
+            single_prints_direction: "None".into(),
+            excess_high: false,
+            excess_low: false,
+            poor_high: false,
+            poor_low: false,
+            rvol_ratio: 1.0,
+            close_vs_ib_mid: "above".into(),
+            close_vs_vwap: "above".into(),
+            close_vs_poc: "above".into(),
+            snapshot_json: None,
+        })
+        .expect("summary");
+        db.insert_market_events_batch(&[MarketEvent {
+            session_date: "2026-03-02".into(),
+            timestamp_ms: 1.0,
+            event_type: "test".into(),
+            level_name: None,
+            price: 21000.0,
+            direction: None,
+            sequence_num: None,
+            metadata: None,
+        }])
+        .expect("event");
+        db.insert_playbook_signal_record(&ReplaySignalRecord {
+            signal_id: "live-1".into(),
+            timestamp_ms: 1.0,
+            session_date: "2026-03-02".into(),
+            setup_id: "setup".into(),
+            payload: serde_json::json!({}),
+            source: "live".into(),
+            job_id: None,
+        })
+        .expect("live signal");
+        db.insert_playbook_signal_record(&ReplaySignalRecord {
+            signal_id: "backfill-1".into(),
+            timestamp_ms: 2.0,
+            session_date: "2026-03-02".into(),
+            setup_id: "setup".into(),
+            payload: serde_json::json!({}),
+            source: "backfill".into(),
+            job_id: Some("job-1".into()),
+        })
+        .expect("backfill signal");
+        db.insert_signal_outcome(&SignalOutcome {
+            signal_id: "live-outcome".into(),
+            setup_id: "setup".into(),
+            setup_name: Some("Setup".into()),
+            session_date: "2026-03-02".into(),
+            source: "live".into(),
+            job_id: None,
+            fired_at_ms: 1.0,
+            fired_price: 21000.0,
+            target_price: Some(21010.0),
+            stop_price: Some(20990.0),
+            outcome: "pending".into(),
+            outcome_at_ms: None,
+            max_favorable_excursion: None,
+            max_adverse_excursion: None,
+            r_result: None,
+            time_to_outcome_ms: None,
+        })
+        .expect("live outcome");
+        db.insert_signal_outcome(&SignalOutcome {
+            signal_id: "backfill-outcome".into(),
+            setup_id: "setup".into(),
+            setup_name: Some("Setup".into()),
+            session_date: "2026-03-02".into(),
+            source: "backfill".into(),
+            job_id: Some("job-1".into()),
+            fired_at_ms: 2.0,
+            fired_price: 21000.0,
+            target_price: Some(21010.0),
+            stop_price: Some(20990.0),
+            outcome: "pending".into(),
+            outcome_at_ms: None,
+            max_favorable_excursion: None,
+            max_adverse_excursion: None,
+            r_result: None,
+            time_to_outcome_ms: None,
+        })
+        .expect("backfill outcome");
+
+        db.purge_historical_session("2026-03-02", &["backfill"])
+            .expect("purge");
+
+        assert_eq!(db.session_summary_count().expect("count"), 0);
+        assert_eq!(db.count_playbook_signals().expect("signal count"), 1);
+        assert_eq!(
+            db.pending_signal_outcomes_filtered(Some("live"), None)
+                .expect("live pending")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn historical_job_run_roundtrip() {
+        let db = test_db();
+        let run = HistoricalJobRun {
+            id: "job-1".into(),
+            job_type: "research_backfill".into(),
+            status: "queued".into(),
+            params: serde_json::json!({"startDate":"2026-03-01"}),
+            progress: serde_json::json!({"currentPhase":"queued"}),
+            result: None,
+            warnings: Vec::new(),
+            error: None,
+            submitted_at_ms: 1.0,
+            started_at_ms: None,
+            finished_at_ms: None,
+        };
+        db.insert_historical_job_run(&run).expect("insert");
+        db.update_historical_job_run(
+            "job-1",
+            &HistoricalJobRunUpdate {
+                status: "completed",
+                progress: &serde_json::json!({"currentPhase":"finalizing"}),
+                result: Some(&serde_json::json!({"sessionsProcessed":1})),
+                warnings: &["warning".into()],
+                error: None,
+                started_at_ms: Some(2.0),
+                finished_at_ms: Some(3.0),
+            },
+        )
+        .expect("update");
+        let loaded = db
+            .get_historical_job_run("job-1")
+            .expect("load")
+            .expect("exists");
+        assert_eq!(loaded.status, "completed");
+        assert_eq!(loaded.warnings.len(), 1);
+        assert_eq!(loaded.result.expect("result")["sessionsProcessed"], 1);
     }
 }

@@ -18,6 +18,8 @@ pub enum ScidError {
     Io(#[from] std::io::Error),
     #[error("invalid scid header: {0}")]
     InvalidHeader(String),
+    #[error("scan callback error: {0}")]
+    Callback(String),
 }
 
 #[derive(Debug, Clone)]
@@ -28,6 +30,18 @@ pub struct ScidTick {
     pub bid: f64,
     pub ask: f64,
     pub side: TradeSide,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanControl {
+    Continue,
+    Stop,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ScanStats {
+    pub estimated_records: usize,
+    pub records_scanned: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -145,35 +159,96 @@ impl ScidReader {
     /// If `since_ms` is provided, uses binary search on the sorted file to skip
     /// directly to the approximate position, avoiding a full sequential scan.
     pub fn read_bulk_since(&self, since_ms: Option<f64>) -> Result<Vec<ScidTick>, ScidError> {
+        let mut out = Vec::new();
+        self.scan_range(since_ms, None, |tick| {
+            out.push(tick);
+            Ok(ScanControl::Continue)
+        })?;
+        Ok(out)
+    }
+
+    /// Scan ticks from the SCID file in order without materializing the full file.
+    ///
+    /// `end_ms_exclusive` stops the scan before the first tick whose timestamp is at
+    /// or after the provided bound.
+    pub fn scan_range<F>(
+        &self,
+        start_ms: Option<f64>,
+        end_ms_exclusive: Option<f64>,
+        mut on_tick: F,
+    ) -> Result<ScanStats, ScidError>
+    where
+        F: FnMut(ScidTick) -> Result<ScanControl, String>,
+    {
         let mut file = File::open(&self.path)?;
         let header = Self::read_header(&mut file)?;
         let data_start = header.header_size as u64;
         let file_len = file.metadata()?.len();
 
         if file_len <= data_start {
-            return Ok(Vec::new());
+            return Ok(ScanStats::default());
         }
 
         let total_records = (file_len - data_start) / SCID_RECORD_SIZE as u64;
-        let start_record = match since_ms {
-            Some(ts) => self.binary_search_record(&mut file, data_start, total_records, ts)?,
-            None => 0,
-        };
+        let (start_record, end_record) = self.range_record_bounds(
+            &mut file,
+            data_start,
+            total_records,
+            start_ms,
+            end_ms_exclusive,
+        )?;
 
         let offset = data_start + start_record * SCID_RECORD_SIZE as u64;
         file.seek(SeekFrom::Start(offset))?;
 
-        let estimated = (total_records - start_record) as usize;
-        let mut out = Vec::with_capacity(estimated);
+        let mut stats = ScanStats {
+            estimated_records: end_record.saturating_sub(start_record) as usize,
+            records_scanned: 0,
+        };
         let mut record = [0_u8; SCID_RECORD_SIZE];
         while file.read_exact(&mut record).is_ok() {
             if let Some(tick) = self.parse_record(&record) {
-                if since_ms.is_none() || tick.timestamp_ms >= since_ms.unwrap_or(0.0) {
-                    out.push(tick);
+                if start_ms.is_some() && tick.timestamp_ms < start_ms.unwrap_or(0.0) {
+                    continue;
+                }
+                if let Some(end_ms) = end_ms_exclusive {
+                    if tick.timestamp_ms >= end_ms {
+                        break;
+                    }
+                }
+                stats.records_scanned += 1;
+                match on_tick(tick).map_err(ScidError::Callback)? {
+                    ScanControl::Continue => {}
+                    ScanControl::Stop => break,
                 }
             }
         }
-        Ok(out)
+
+        Ok(stats)
+    }
+
+    pub fn estimate_range_records(
+        &self,
+        start_ms: Option<f64>,
+        end_ms_exclusive: Option<f64>,
+    ) -> Result<usize, ScidError> {
+        let mut file = File::open(&self.path)?;
+        let header = Self::read_header(&mut file)?;
+        let data_start = header.header_size as u64;
+        let file_len = file.metadata()?.len();
+        if file_len <= data_start {
+            return Ok(0);
+        }
+
+        let total_records = (file_len - data_start) / SCID_RECORD_SIZE as u64;
+        let (start_record, end_record) = self.range_record_bounds(
+            &mut file,
+            data_start,
+            total_records,
+            start_ms,
+            end_ms_exclusive,
+        )?;
+        Ok(end_record.saturating_sub(start_record) as usize)
     }
 
     /// Binary search for the first record at or after `target_ms`.
@@ -205,6 +280,25 @@ impl ScidReader {
             }
         }
         Ok(lo)
+    }
+
+    fn range_record_bounds(
+        &self,
+        file: &mut File,
+        data_start: u64,
+        total_records: u64,
+        start_ms: Option<f64>,
+        end_ms_exclusive: Option<f64>,
+    ) -> Result<(u64, u64), ScidError> {
+        let start_record = match start_ms {
+            Some(ts) => self.binary_search_record(file, data_start, total_records, ts)?,
+            None => 0,
+        };
+        let end_record = match end_ms_exclusive {
+            Some(ts) => self.binary_search_record(file, data_start, total_records, ts)?,
+            None => total_records,
+        };
+        Ok((start_record.min(end_record), end_record))
     }
 
     /// Start a continuous tail loop over a live SCID file.
@@ -395,5 +489,56 @@ mod tests {
         assert_eq!(ticks.len(), 2);
         assert_eq!(ticks[0].price, 21000.0);
         assert!(matches!(ticks[0].side, TradeSide::Buy));
+    }
+
+    #[test]
+    fn scan_range_respects_bounds() {
+        let mut file = NamedTempFile::new().expect("temp");
+        write_scid(&mut file, &[21000.0, 21000.25, 21000.5]);
+        let reader = ScidReader::new(file.path());
+        let all = reader.read_bulk().expect("read");
+        let start = all[1].timestamp_ms;
+        let end = all[2].timestamp_ms;
+        let mut scanned = Vec::new();
+        let stats = reader
+            .scan_range(Some(start), Some(end), |tick| {
+                scanned.push(tick.price);
+                Ok(ScanControl::Continue)
+            })
+            .expect("scan");
+        assert_eq!(scanned, vec![21000.25]);
+        assert_eq!(stats.records_scanned, 1);
+    }
+
+    #[test]
+    fn scan_range_can_stop_early() {
+        let mut file = NamedTempFile::new().expect("temp");
+        write_scid(&mut file, &[21000.0, 21000.25, 21000.5]);
+        let reader = ScidReader::new(file.path());
+        let mut scanned = 0;
+        let stats = reader
+            .scan_range(None, None, |_tick| {
+                scanned += 1;
+                if scanned == 1 {
+                    Ok(ScanControl::Stop)
+                } else {
+                    Ok(ScanControl::Continue)
+                }
+            })
+            .expect("scan");
+        assert_eq!(scanned, 1);
+        assert_eq!(stats.records_scanned, 1);
+    }
+
+    #[test]
+    fn estimate_range_records_respects_end_bound() {
+        let mut file = NamedTempFile::new().expect("temp");
+        write_scid(&mut file, &[21000.0, 21000.25, 21000.5, 21000.75]);
+        let reader = ScidReader::new(file.path());
+        let all = reader.read_bulk().expect("read");
+        let estimate = reader
+            .estimate_range_records(Some(all[1].timestamp_ms), Some(all[3].timestamp_ms))
+            .expect("estimate");
+        assert_eq!(estimate, 2);
     }
 }

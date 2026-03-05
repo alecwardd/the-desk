@@ -293,6 +293,29 @@ This is NOT a backtesting engine in the traditional sense — it does not simula
 
 ---
 
+### ADR-014: MCP tools use try_lock for pipeline access to avoid stalls
+
+**Date:** 2026-03-05
+**Status:** Decided
+
+**Context:** Several MCP tools (`get_tape_pace`, `get_rebid_reoffer_zones`, `get_pinch_events`, `get_rvol`, and others) were stalling and returning "Aborted" when called. Investigation showed that tools that access the pipeline engine use `pipelines.lock()`, which blocks when the lock is held by:
+1. **Startup backfill** — processes millions of ticks from 2 Globex opens ago while holding the lock
+2. **Live poll loop** — processes new .scid ticks in batches; holds lock per tick
+3. **Depth worker** — persists DOM snapshots
+
+When a tool blocks on `lock()`, the MCP server cannot process other requests (stdio transport, single-threaded handler). The client times out and aborts all pending calls.
+
+**Decision:** Tools that have a DB fallback use `try_lock()` instead of `lock()`. If the pipeline is busy, they immediately fall through to the persisted snapshot in the database. Affected tools: `get_tape_pace`, `get_rebid_reoffer_zones`, `get_pinch_events`, `get_footprint`, `get_footprint_window`, `get_tpo_detail`, `get_imbalances`, `get_absorption_events`, `get_trade_size_profile`, `get_session_inventory`, `get_delta_at_price`, `check_delta_confirmation`, `live_snapshot`, `evaluate_playbook`.
+
+**Alternatives considered:**
+- Release pipeline lock more frequently during backfill — rejected (complex, risks inconsistent state)
+- Run tool handlers on a thread pool — rejected (stdio MCP processes requests sequentially; would require transport changes)
+- Increase client timeout — rejected (masks the problem; tools could still block for minutes during heavy backfill)
+
+**Consequences:** When the pipeline is busy, tools return DB-backed data (slightly staler, may lack live-only fields like dwell time, zone details). This is acceptable; the alternative was indefinite stalls. `validate_data_integrity` still uses `lock()` since it requires live pipeline state and is rarely called.
+
+---
+
 ### ADR-P08: Options data provider selection (resolved)
 
 **Impact:** Phase 2 options pipeline (gamma, charm, dealer positioning)

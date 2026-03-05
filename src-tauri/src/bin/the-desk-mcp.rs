@@ -1249,8 +1249,9 @@ impl TheDeskMcp {
     }
 
     /// Get a live snapshot from the in-memory pipeline engine.
+    /// Uses try_lock to avoid blocking when backfill/poll holds the lock.
     fn live_snapshot(&self) -> Option<serde_json::Value> {
-        let pipelines = self.pipelines.lock().ok()?;
+        let pipelines = self.pipelines.try_lock().ok()?;
         let bid = *self.last_bid.lock().ok()?;
         let ask = *self.last_ask.lock().ok()?;
         if bid <= 0.0 && ask <= 0.0 {
@@ -1417,8 +1418,9 @@ impl TheDeskMcp {
     )]
     async fn get_tape_pace(&self) -> Result<CallToolResult, McpError> {
         let db = self.db.lock().map_err(|_| lock_error())?;
-        // Try live pipeline first for full snapshot including volume/sec and dwell
-        if let Ok(pipelines) = self.pipelines.lock() {
+        // Try live pipeline first for full snapshot including volume/sec and dwell.
+        // Use try_lock to avoid blocking when backfill/poll holds the lock.
+        if let Ok(pipelines) = self.pipelines.try_lock() {
             let now_ms = chrono::Utc::now().timestamp_millis() as f64;
             let snap = pipelines.tape_pace.snapshot(now_ms);
             let last_price = pipelines.levels.last_price;
@@ -1465,7 +1467,7 @@ impl TheDeskMcp {
         Parameters(params): Parameters<FootprintParams>,
     ) -> Result<CallToolResult, McpError> {
         let db = self.db.lock().map_err(|_| lock_error())?;
-        if let Ok(pipelines) = self.pipelines.lock() {
+        if let Ok(pipelines) = self.pipelines.try_lock() {
             let mut all_levels = pipelines.footprint.levels();
             // Apply optional price range filter before sorting/truncating.
             if params.price_low.is_some() || params.price_high.is_some() {
@@ -1530,7 +1532,7 @@ impl TheDeskMcp {
         Parameters(params): Parameters<FootprintWindowParams>,
     ) -> Result<CallToolResult, McpError> {
         let db = self.db.lock().map_err(|_| lock_error())?;
-        if let Ok(pipelines) = self.pipelines.lock() {
+        if let Ok(pipelines) = self.pipelines.try_lock() {
             let start = params.start_time_ms.unwrap_or(0.0);
             let end = params.end_time_ms.unwrap_or(f64::MAX);
             let mut levels = pipelines.footprint.levels_in_window(start, end);
@@ -1592,7 +1594,7 @@ impl TheDeskMcp {
         Parameters(params): Parameters<TpoDetailParams>,
     ) -> Result<CallToolResult, McpError> {
         let db = self.db.lock().map_err(|_| lock_error())?;
-        if let Ok(pipelines) = self.pipelines.lock() {
+        if let Ok(pipelines) = self.pipelines.try_lock() {
             let detail = pipelines
                 .tpo
                 .tpo_letter_detail(params.price_low, params.price_high);
@@ -2167,7 +2169,7 @@ impl TheDeskMcp {
     )]
     async fn get_imbalances(&self) -> Result<CallToolResult, McpError> {
         let db = self.db.lock().map_err(|_| lock_error())?;
-        if let Ok(pipelines) = self.pipelines.lock() {
+        if let Ok(pipelines) = self.pipelines.try_lock() {
             let stacked_prices = pipelines.footprint.stacked_imbalances(2.0, 3);
             let diagonals = pipelines.footprint.diagonal_imbalances(2.0);
             let diagonal_data: Vec<serde_json::Value> = diagonals
@@ -2210,8 +2212,8 @@ impl TheDeskMcp {
     ) -> Result<CallToolResult, McpError> {
         let limit = params.limit.unwrap_or(25) as usize;
 
-        // Try live pipeline first
-        if let Ok(pipelines) = self.pipelines.lock() {
+        // Try live pipeline first (try_lock to avoid blocking when backfill/poll holds lock)
+        if let Ok(pipelines) = self.pipelines.try_lock() {
             let live_events = pipelines.absorption.recent_events();
             if !live_events.is_empty() {
                 let events: Vec<serde_json::Value> = live_events
@@ -2255,7 +2257,7 @@ impl TheDeskMcp {
     )]
     async fn get_trade_size_profile(&self) -> Result<CallToolResult, McpError> {
         let db = self.db.lock().map_err(|_| lock_error())?;
-        if let Ok(pipelines) = self.pipelines.lock() {
+        if let Ok(pipelines) = self.pipelines.try_lock() {
             let snap = pipelines.trade_size.snapshot();
             let total_trades = snap.lot_1 + snap.lot_2_5 + snap.lot_6_20 + snap.lot_21_plus;
             let large_prices = pipelines.trade_size.large_trade_prices();
@@ -2327,7 +2329,7 @@ impl TheDeskMcp {
         };
 
         let mut setup_statuses: Vec<serde_json::Value> = Vec::new();
-        if let (Ok(pipelines), Ok(mut rules)) = (self.pipelines.lock(), self.rules.lock()) {
+        if let (Ok(pipelines), Ok(mut rules)) = (self.pipelines.try_lock(), self.rules.lock()) {
             let market = pipelines.snapshot(bid, ask);
             for setup in &setups {
                 let _ = rules.evaluate(setup, &market, risk_at_limit);
@@ -3365,7 +3367,7 @@ impl TheDeskMcp {
     )]
     async fn get_rebid_reoffer_zones(&self) -> Result<CallToolResult, McpError> {
         let db = self.db.lock().map_err(|_| lock_error())?;
-        if let Ok(pipelines) = self.pipelines.lock() {
+        if let Ok(pipelines) = self.pipelines.try_lock() {
             let active: Vec<serde_json::Value> = pipelines
                 .rebid_reoffer
                 .active_zones()
@@ -3405,7 +3407,7 @@ impl TheDeskMcp {
     )]
     async fn get_pinch_events(&self) -> Result<CallToolResult, McpError> {
         let db = self.db.lock().map_err(|_| lock_error())?;
-        if let Ok(pipelines) = self.pipelines.lock() {
+        if let Ok(pipelines) = self.pipelines.try_lock() {
             let events = pipelines.pinch.recent_events();
             let event_data: Vec<serde_json::Value> = events
                 .iter()
@@ -3433,7 +3435,7 @@ impl TheDeskMcp {
     )]
     async fn get_session_inventory(&self) -> Result<CallToolResult, McpError> {
         let db = self.db.lock().map_err(|_| lock_error())?;
-        if let Ok(pipelines) = self.pipelines.lock() {
+        if let Ok(pipelines) = self.pipelines.try_lock() {
             let inv = &pipelines.session_inventory;
             return Ok(text_result(serde_json::json!({
                 "inventoryState": inv.state(),
@@ -3464,7 +3466,7 @@ impl TheDeskMcp {
         Parameters(params): Parameters<DeltaAtPriceParams>,
     ) -> Result<CallToolResult, McpError> {
         let db = self.db.lock().map_err(|_| lock_error())?;
-        if let Ok(pipelines) = self.pipelines.lock() {
+        if let Ok(pipelines) = self.pipelines.try_lock() {
             let price = params.price.unwrap_or(pipelines.levels.last_price);
             let top_n = params.top_n.unwrap_or(10);
             let delta = pipelines.delta.delta_at_price(price);
@@ -3514,8 +3516,8 @@ impl TheDeskMcp {
         let db = self.db.lock().map_err(|_| lock_error())?;
         let is_buy = params.is_buy_setup.unwrap_or(true);
 
-        // Try pipeline for price-level delta
-        if let Ok(pipelines) = self.pipelines.lock() {
+        // Try pipeline for price-level delta (try_lock to avoid blocking)
+        if let Ok(pipelines) = self.pipelines.try_lock() {
             let session_delta = pipelines.delta.session_delta();
             let session_confirms = if is_buy {
                 session_delta > 0.0

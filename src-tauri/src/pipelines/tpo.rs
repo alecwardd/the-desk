@@ -1,6 +1,22 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
+/// Per-price TPO detail: which 30-minute brackets printed at this level.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TpoLevelDetail {
+    /// Price level.
+    pub price: f64,
+    /// Number of distinct 30-minute brackets that printed here.
+    pub bracket_count: usize,
+    /// Raw bracket indices: 0 = first 30 min (OR), 1 = 30-60 min, 2 = 60-90 min, etc.
+    pub brackets: Vec<i32>,
+    /// Corresponding standard TPO letters (A=bracket 0, B=bracket 1, …).
+    pub letters: String,
+    /// True if exactly one bracket printed here — a single print / tail candidate.
+    pub is_single_print: bool,
+}
+
 /// Which session period a single print occurred in.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -28,8 +44,10 @@ pub struct TpoPipeline {
     tpo_letters: HashMap<i64, HashSet<i32>>,
     or_high: f64,
     or_low: f64,
+    or_locked: bool,
     ib_high: f64,
     ib_low: f64,
+    ib_locked: bool,
     initialized: bool,
 }
 
@@ -41,8 +59,10 @@ impl TpoPipeline {
             tpo_letters: HashMap::new(),
             or_high: 0.0,
             or_low: 0.0,
+            or_locked: false,
             ib_high: 0.0,
             ib_low: 0.0,
+            ib_locked: false,
             initialized: false,
         }
     }
@@ -52,8 +72,10 @@ impl TpoPipeline {
         self.tpo_letters.clear();
         self.or_high = 0.0;
         self.or_low = 0.0;
+        self.or_locked = false;
         self.ib_high = 0.0;
         self.ib_low = 0.0;
+        self.ib_locked = false;
         self.initialized = false;
     }
 
@@ -62,13 +84,25 @@ impl TpoPipeline {
     }
 
     /// Add one trade and update profile incrementally.
+    ///
+    /// `minute_of_session` is relative to RTH open (09:30 ET = 0). Negative
+    /// values indicate Globex/overnight and are ignored for OR/IB tracking.
     pub fn add_trade(&mut self, price: f64, minute_of_session: i32) {
-        let bracket = minute_of_session / 30;
-        let price_key = self.discretize(price);
-        self.tpo_letters
-            .entry(price_key)
-            .or_default()
-            .insert(bracket);
+        // Only build TPO letters for non-negative (RTH) minutes.
+        // Globex trades are tracked by the levels pipeline, not TPO.
+        if minute_of_session >= 0 {
+            let bracket = minute_of_session / 30;
+            let price_key = self.discretize(price);
+            self.tpo_letters
+                .entry(price_key)
+                .or_default()
+                .insert(bracket);
+        }
+
+        // OR/IB only track RTH trades (minute_of_session >= 0).
+        if minute_of_session < 0 {
+            return;
+        }
 
         if !self.initialized {
             self.or_high = price;
@@ -77,11 +111,21 @@ impl TpoPipeline {
             self.ib_low = price;
             self.initialized = true;
         }
-        if minute_of_session < 30 {
+
+        // Lock OR permanently once we see a trade at or past minute 30.
+        if minute_of_session >= 30 {
+            self.or_locked = true;
+        }
+        if !self.or_locked {
             self.or_high = self.or_high.max(price);
             self.or_low = self.or_low.min(price);
         }
-        if minute_of_session < 60 {
+
+        // Lock IB permanently once we see a trade at or past minute 60.
+        if minute_of_session >= 60 {
+            self.ib_locked = true;
+        }
+        if !self.ib_locked {
             self.ib_high = self.ib_high.max(price);
             self.ib_low = self.ib_low.min(price);
         }
@@ -152,6 +196,11 @@ impl TpoPipeline {
         self.or_low
     }
 
+    /// Whether the Opening Range is locked (past 30 minutes of RTH).
+    pub fn or_locked(&self) -> bool {
+        self.or_locked
+    }
+
     /// Initial balance high.
     pub fn ib_high(&self) -> f64 {
         self.ib_high
@@ -160,6 +209,11 @@ impl TpoPipeline {
     /// Initial balance low.
     pub fn ib_low(&self) -> f64 {
         self.ib_low
+    }
+
+    /// Whether the Initial Balance is locked (past 60 minutes of RTH).
+    pub fn ib_locked(&self) -> bool {
+        self.ib_locked
     }
 
     /// Price levels that have exactly one TPO letter, tagged by session period.
@@ -235,6 +289,62 @@ impl TpoPipeline {
         letters.len() > 1
     }
 
+    /// Export per-price TPO letter detail, optionally filtered to a price range.
+    ///
+    /// Each entry shows which 30-minute brackets printed at that price, expressed
+    /// as both raw bracket indices and standard TPO letters (A, B, C, …).  Bracket 0
+    /// is the first 30-minute period (Opening Range), bracket 1 completes the Initial
+    /// Balance, and so on.  Levels with exactly one bracket are single prints.
+    pub fn tpo_letter_detail(
+        &self,
+        price_low: Option<f64>,
+        price_high: Option<f64>,
+    ) -> Vec<TpoLevelDetail> {
+        let low_key = price_low.map(|p| self.discretize(p));
+        let high_key = price_high.map(|p| self.discretize(p));
+
+        let mut out: Vec<TpoLevelDetail> = self
+            .tpo_letters
+            .iter()
+            .filter(|(key, _)| {
+                if let Some(lo) = low_key {
+                    if **key < lo {
+                        return false;
+                    }
+                }
+                if let Some(hi) = high_key {
+                    if **key > hi {
+                        return false;
+                    }
+                }
+                true
+            })
+            .map(|(key, letters)| {
+                let mut brackets: Vec<i32> = letters.iter().copied().collect();
+                brackets.sort_unstable();
+                let letter_str: String = brackets
+                    .iter()
+                    .map(|&b| (b'A' + (b as u8).min(25)) as char)
+                    .collect();
+                let is_single = brackets.len() == 1;
+                TpoLevelDetail {
+                    price: *key as f64 * self.tick_size,
+                    bracket_count: brackets.len(),
+                    brackets,
+                    letters: letter_str,
+                    is_single_print: is_single,
+                }
+            })
+            .collect();
+
+        out.sort_by(|a, b| {
+            a.price
+                .partial_cmp(&b.price)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        out
+    }
+
     /// Direction of single prints relative to POC (for day type classifier).
     pub fn single_prints_direction_vs_poc(&self) -> (usize, usize) {
         let poc = self.poc();
@@ -277,5 +387,46 @@ mod tests {
         assert_eq!(pipeline.or_high(), 21005.0);
         assert_eq!(pipeline.or_low(), 21000.0);
         assert_eq!(pipeline.ib_low(), 20995.0);
+    }
+
+    #[test]
+    fn tpo_letter_detail_bracket_counts_and_letters() {
+        let mut p = TpoPipeline::new(0.25);
+        // minute 0 → bracket 0 → letter A
+        p.add_trade(21000.0, 0);
+        // minute 30 → bracket 1 → letter B
+        p.add_trade(21000.0, 30);
+        // minute 0 → bracket 0 → letter A  (different price — single print)
+        p.add_trade(21000.25, 0);
+
+        let detail = p.tpo_letter_detail(None, None);
+        // Should have two price levels.
+        assert_eq!(detail.len(), 2);
+
+        let lvl_21000 = detail.iter().find(|d| d.price == 21000.0).expect("21000");
+        assert_eq!(lvl_21000.bracket_count, 2);
+        assert_eq!(lvl_21000.letters, "AB");
+        assert!(!lvl_21000.is_single_print);
+
+        let lvl_21000_25 = detail
+            .iter()
+            .find(|d| (d.price - 21000.25).abs() < 0.001)
+            .expect("21000.25");
+        assert_eq!(lvl_21000_25.bracket_count, 1);
+        assert_eq!(lvl_21000_25.letters, "A");
+        assert!(lvl_21000_25.is_single_print);
+    }
+
+    #[test]
+    fn tpo_letter_detail_price_filter() {
+        let mut p = TpoPipeline::new(0.25);
+        p.add_trade(21000.0, 0);
+        p.add_trade(21001.0, 0);
+        p.add_trade(21002.0, 0);
+
+        // Only levels in [21000.5, 21001.5].
+        let detail = p.tpo_letter_detail(Some(21000.5), Some(21001.5));
+        assert_eq!(detail.len(), 1);
+        assert_eq!(detail[0].price, 21001.0);
     }
 }

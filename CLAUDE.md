@@ -42,7 +42,7 @@ LAYER 2.5: Research Infrastructure (Rust)
   - Pure math over historical data. No LLM calls.
 
 LAYER 3: MCP Server + LLM Orchestration
-  - 33 MCP tools expose pipeline state, rules evaluation, research queries, and data queries
+  - 52 MCP tools expose pipeline state, rules evaluation, research queries, and data queries
   - Cursor agents call tools for market context during conversation
   - Claude API synthesizes coaching from structured data (1-5s latency acceptable)
 ```
@@ -157,7 +157,7 @@ Read these before working on related components:
 ```
 the-desk/
 ├── src-tauri/src/                    # Rust backend (core)
-│   ├── bin/the-desk-mcp.rs           # MCP server binary (33 tools)
+│   ├── bin/the-desk-mcp.rs           # MCP server binary (52 tools)
 │   ├── main.rs                       # Tauri app entry + processing loop
 │   ├── backfill.rs                   # Historical .scid backfill engine
 │   ├── research/mod.rs               # Query engine (frequency, conditional, distribution)

@@ -1,5 +1,6 @@
 ---
 name: backtest-analyst
+model: inherit
 description: Historical pattern-analysis specialist for comparing current structure against stored sessions and past signal outcomes. Uses the research query engine for frequency, conditional, and distribution analysis.
 ---
 

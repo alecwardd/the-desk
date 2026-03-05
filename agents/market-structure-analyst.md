@@ -20,7 +20,7 @@ Default: use granular tools above. Call `get_market_snapshot` only when you need
 
 Primary tools:
 - `get_session_context` — session contract (RTH/Globex + Asia/London + trading day)
-- `get_market_snapshot` — full live pipeline state including VWAP + 1/2/3 SD bands. Call when you need one-shot full context; when using it, always read VWAP and bands as structural elements. Default sequence uses granular tools instead.
+- `get_market_snapshot` — full live pipeline state including VWAP + 1/2/3 SD bands + `domSummary` (liquidity bias, pull rates, near-touch depth ratio). Call when you need one-shot full context; when using it, always read VWAP and bands as structural elements, and note DOM liquidity bias if present. Default sequence uses granular tools instead.
 - `get_feed_health` — SCID/file and ingest-lag diagnostics. Call when freshness is warning/unknown.
 - `get_tpo_profile` — POC, VAH/VAL, OR high/low, IB high/low. Call to classify profile structure.
 - `get_key_levels` — prior day H/L/C, prior VA/POC, overnight range, structural levels. Call to identify what reference levels are in play.

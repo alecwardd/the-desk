@@ -173,6 +173,30 @@ fn latest_depth_reader() -> Result<Option<DepthReader>, McpError> {
         .map(|path| DepthReader::new(path, config.price_scale)))
 }
 
+/// Shared helper: read `.depth` + `.scid` files to produce a DOM snapshot and feature summary
+/// for a time window.  Used by `get_dom_window`, `get_dom_tape_context_at`, and
+/// `explain_book_reaction` fallback paths.
+fn compute_dom_feature_for_window(
+    start_ms: f64,
+    end_ms: f64,
+    snapshot_at_ms: f64,
+    levels_per_side: usize,
+    price_low: Option<f64>,
+    price_high: Option<f64>,
+) -> Result<(DomFeatureSnapshot, the_desk_backend::depth::DomSnapshot), McpError> {
+    let config = load_feed_config();
+    let reader = depth_reader_for_timestamp(snapshot_at_ms)?;
+    let trades = aggregate_window_trades(&config, start_ms, end_ms)?;
+    let activity = reader
+        .summarize_window(start_ms, end_ms, &trades, price_low, price_high)
+        .map_err(db_error)?;
+    let snapshot = reader
+        .snapshot_at(snapshot_at_ms, levels_per_side)
+        .map_err(db_error)?;
+    let feature = build_dom_feature_snapshot(&snapshot, activity);
+    Ok((feature, snapshot))
+}
+
 fn merge_dom_summary_into_snapshot(
     snapshot: Option<serde_json::Value>,
     dom_summary: &DomSummary,
@@ -1240,16 +1264,19 @@ impl TheDeskMcp {
         description = "Current market snapshot: last price, VWAP with 1/2/3 SD bands, TPO value area (high/low/POC), delta neutral value area (DNVA high/low/DNP), session delta, cumulative delta, key levels (prior day H/L/C, prior VA/POC, overnight range, OR, IB), Globex/London opening ranges, and session context (sessionType, sessionSegment, tradingDay), plus tape pace, imbalance count, absorption event count, and average trade size. Prefers live pipeline state; falls back to last persisted snapshot."
     )]
     async fn get_market_snapshot(&self) -> Result<CallToolResult, McpError> {
+        let db = self.db.lock().map_err(|_| lock_error())?;
+        let dom_feature = db.latest_dom_feature_state().ok().flatten();
         if let Some(snapshot) = self.live_snapshot() {
             return Ok(text_result(serde_json::json!({
                 "snapshot": snapshot,
+                "domSummary": dom_feature.as_ref().and_then(|(_, p)| p.get("domSummary")).cloned(),
                 "source": "live_pipeline"
             })));
         }
-        let db = self.db.lock().map_err(|_| lock_error())?;
         match db.latest_feature_state() {
             Ok(Some(snapshot)) => Ok(text_result(serde_json::json!({
                 "snapshot": snapshot,
+                "domSummary": dom_feature.as_ref().and_then(|(_, p)| p.get("domSummary")).cloned(),
                 "dataAgeMs": compute_data_age(&db),
                 "source": "database"
             }))),
@@ -1614,7 +1641,7 @@ impl TheDeskMcp {
     }
 
     #[tool(
-        description = "Delayed DOM snapshot reconstructed from Sierra `.depth` history at or immediately before a timestamp. Returns best bid/ask, spread, touch imbalance, and the top resting levels on each side. Use this when you want the ladder view, not just executed tape."
+        description = "Delayed DOM snapshot reconstructed from Sierra `.depth` history at or immediately before a timestamp. Returns best bid/ask, spread, touch imbalance, and the top resting levels on each side. Use this when you want the ladder view, not just executed tape. Note: Sierra depth data has ~1 second polling lag, so this is a delayed reconstruction, not real-time."
     )]
     async fn get_dom_snapshot_at(
         &self,
@@ -1717,7 +1744,7 @@ impl TheDeskMcp {
     }
 
     #[tool(
-        description = "Windowed delayed DOM summary using persisted DOM feature snapshots when available. Returns compact DOM summaries across a time range and optionally narrows the reported pull/stack levels to a price band."
+        description = "Windowed delayed DOM summary using persisted DOM feature snapshots when available. Returns compact DOM summaries across a time range and optionally narrows the reported pull/stack levels to a price band. DOM data has ~1s polling lag from Sierra."
     )]
     async fn get_dom_window(
         &self,
@@ -1737,21 +1764,8 @@ impl TheDeskMcp {
                 let price_low = params.price_low;
                 let price_high = params.price_high;
                 let direct = tokio::task::spawn_blocking(move || {
-                    let config = load_feed_config();
-                    let path = DepthReader::find_file_for_timestamp(&config, start)
-                        .map_err(db_error)?
-                        .ok_or_else(|| {
-                            invalid_params_error(format!(
-                                "No Sierra .depth file found for timestamp {start}"
-                            ))
-                        })?;
-                    let depth_reader = DepthReader::new(path, config.price_scale);
-                    let trades = aggregate_window_trades(&config, start, end)?;
-                    let activity = depth_reader
-                        .summarize_window(start, end, &trades, price_low, price_high)
-                        .map_err(db_error)?;
-                    let snapshot = depth_reader.snapshot_at(end, 10).map_err(db_error)?;
-                    let feature = build_dom_feature_snapshot(&snapshot, activity);
+                    let (feature, _) =
+                        compute_dom_feature_for_window(start, end, end, 10, price_low, price_high)?;
                     Ok::<_, McpError>((
                         feature.timestamp_ms,
                         serde_json::to_value(feature).unwrap_or_default(),
@@ -1801,7 +1815,7 @@ impl TheDeskMcp {
     }
 
     #[tool(
-        description = "One-call delayed DOM + tape context at a timestamp. Combines the nearest DOM snapshot, the nearest persisted DOM feature summary, raw-tick footprint over a short window, and derived flow flags."
+        description = "One-call delayed DOM + tape context at a timestamp. Combines the nearest DOM snapshot, the nearest persisted DOM feature summary, raw-tick footprint over a short window, and derived flow flags. DOM data has ~1s polling lag from Sierra."
     )]
     async fn get_dom_tape_context_at(
         &self,
@@ -1839,22 +1853,22 @@ impl TheDeskMcp {
             let price_low = params.price_low;
             let price_high = params.price_high;
             let fallback = tokio::task::spawn_blocking(move || {
-                let config = load_feed_config();
-                let reader = depth_reader_for_timestamp(timestamp_ms)?;
-                let trades = aggregate_window_trades(&config, start_time_ms, end_time_ms)?;
-                let activity = reader
-                    .summarize_window(start_time_ms, end_time_ms, &trades, price_low, price_high)
-                    .map_err(db_error)?;
-                let snapshot = reader.snapshot_at(timestamp_ms, 10).map_err(db_error)?;
-                let feature = build_dom_feature_snapshot(&snapshot, activity);
+                let (feat, snap) = compute_dom_feature_for_window(
+                    start_time_ms,
+                    end_time_ms,
+                    timestamp_ms,
+                    10,
+                    price_low,
+                    price_high,
+                )?;
                 Ok::<_, McpError>((
                     (
-                        snapshot.snapshot_timestamp_ms,
-                        serde_json::to_value(&snapshot).unwrap_or_default(),
+                        snap.snapshot_timestamp_ms,
+                        serde_json::to_value(&snap).unwrap_or_default(),
                     ),
                     (
-                        feature.timestamp_ms,
-                        serde_json::to_value(feature).unwrap_or_default(),
+                        feat.timestamp_ms,
+                        serde_json::to_value(feat).unwrap_or_default(),
                     ),
                 ))
             })
@@ -1922,7 +1936,7 @@ impl TheDeskMcp {
     }
 
     #[tool(
-        description = "Explanation-oriented delayed DOM read around a timestamp or level. Grounds the interpretation in persisted DOM summaries, nearby depth events, and executed tape."
+        description = "Explanation-oriented delayed DOM read around a timestamp or level. Grounds the interpretation in persisted DOM summaries, nearby depth events, and executed tape. DOM data has ~1s polling lag from Sierra."
     )]
     async fn explain_book_reaction(
         &self,
@@ -1968,17 +1982,15 @@ impl TheDeskMcp {
         } else {
             let timestamp_ms = target_time_ms;
             tokio::task::spawn_blocking(move || {
-                let config = load_feed_config();
-                let reader = depth_reader_for_timestamp(timestamp_ms)?;
-                let trades = aggregate_window_trades(&config, start_time_ms, end_time_ms)?;
-                let activity = reader
-                    .summarize_window(start_time_ms, end_time_ms, &trades, price_low, price_high)
-                    .map_err(db_error)?;
-                let snapshot = reader.snapshot_at(timestamp_ms, 10).map_err(db_error)?;
-                Ok::<_, McpError>(
-                    serde_json::to_value(build_dom_feature_snapshot(&snapshot, activity))
-                        .unwrap_or_default(),
-                )
+                let (feat, _) = compute_dom_feature_for_window(
+                    start_time_ms,
+                    end_time_ms,
+                    timestamp_ms,
+                    10,
+                    price_low,
+                    price_high,
+                )?;
+                Ok::<_, McpError>(serde_json::to_value(feat).unwrap_or_default())
             })
             .await
             .map_err(|e| db_error(format!("Explain book reaction task failed: {e}")))??
@@ -2011,17 +2023,126 @@ impl TheDeskMcp {
             })
             .sum();
 
-        let explanation = if pull_stack_bias > 0.0 && net_delta >= 0.0 {
-            "Book stayed supportive: bid-side liquidity held up better than offer-side liquidity while tape stayed neutral-to-positive."
-        } else if pull_stack_bias < 0.0 && net_delta <= 0.0 {
-            "Book reaction leaned defensive: offers held better than bids while tape skewed seller-led."
-        } else if ask_pull_rate > bid_pull_rate {
-            "Offers were pulling faster than bids, which often reads as upward relief unless tape immediately absorbs it."
-        } else if bid_pull_rate > ask_pull_rate {
-            "Bids were pulling faster than offers, which often reads as local fragility unless aggressive buyers step in."
+        let liquidity_bias = dom_summary
+            .get("liquidityBias")
+            .and_then(|v| v.as_str())
+            .unwrap_or("balanced");
+        let total_volume: f64 = ticks.iter().map(|t| t.volume).sum();
+
+        // Extract top pull/stack prices from activity for narrative
+        let top_pull = feature_payload
+            .get("activity")
+            .and_then(|a| a.get("topPullLevels"))
+            .and_then(|v| v.as_array())
+            .and_then(|arr| arr.first())
+            .cloned();
+        let top_stack = feature_payload
+            .get("activity")
+            .and_then(|a| a.get("topStackLevels"))
+            .and_then(|v| v.as_array())
+            .and_then(|arr| arr.first())
+            .cloned();
+
+        // Build magnitude-aware narrative
+        let mut parts = Vec::new();
+
+        // Pull rate comparison with actual numbers
+        let bid_pct = (bid_pull_rate * 100.0).round();
+        let ask_pct = (ask_pull_rate * 100.0).round();
+        if (bid_pull_rate - ask_pull_rate).abs() > 0.1 {
+            if bid_pull_rate > ask_pull_rate {
+                parts.push(format!(
+                    "Bids pulled at {bid_pct:.0}% rate vs asks at {ask_pct:.0}% — bid-side liquidity was being withdrawn faster."
+                ));
+            } else {
+                parts.push(format!(
+                    "Asks pulled at {ask_pct:.0}% rate vs bids at {bid_pct:.0}% — offer-side liquidity was being withdrawn faster."
+                ));
+            }
         } else {
-            "Liquidity stayed relatively balanced, so the reaction looks more tape-driven than book-driven in this window."
+            parts.push(format!(
+                "Pull rates roughly balanced (bids {bid_pct:.0}%, asks {ask_pct:.0}%)."
+            ));
+        }
+
+        // Top pull level with price
+        if let Some(ref pull) = top_pull {
+            let price = pull.get("price").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let qty = pull
+                .get("estimatedPulledQuantity")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            let side = pull
+                .get("side")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            if qty > 0.0 {
+                parts.push(format!(
+                    "Top pull level: {price:.2} ({side} side, {qty:.0} contracts pulled)."
+                ));
+            }
+        }
+
+        // Top stack level with price
+        if let Some(ref stack) = top_stack {
+            let price = stack.get("price").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let qty = stack
+                .get("stackedQuantity")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            let side = stack
+                .get("side")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            if qty > 0.0 {
+                parts.push(format!(
+                    "Top stack level: {price:.2} ({side} side, {qty:.0} contracts stacked)."
+                ));
+            }
+        }
+
+        // Net delta context
+        if net_delta.abs() > 0.0 {
+            let direction = if net_delta > 0.0 {
+                "buyer-led"
+            } else {
+                "seller-led"
+            };
+            parts.push(format!(
+                "Net delta {net_delta:+.0} over {total_volume:.0} volume — tape was {direction}."
+            ));
+        }
+
+        // Depth event density
+        if !depth_events.is_empty() {
+            parts.push(format!(
+                "{} depth events in window — {} book activity.",
+                depth_events.len(),
+                if depth_events.len() > 100 {
+                    "heavy"
+                } else if depth_events.len() > 30 {
+                    "moderate"
+                } else {
+                    "light"
+                }
+            ));
+        }
+
+        // Overall read combining book + tape
+        let overall = if pull_stack_bias > 0.0 && net_delta >= 0.0 {
+            "Book and tape aligned supportive: bid-side liquidity held up while tape stayed neutral-to-positive."
+        } else if pull_stack_bias < 0.0 && net_delta <= 0.0 {
+            "Book and tape aligned defensive: offers held better than bids while tape skewed seller-led."
+        } else if pull_stack_bias > 0.0 && net_delta < 0.0 {
+            "Book was supportive but tape disagreed — bids were stacking while sellers dominated the tape. Potential absorption."
+        } else if pull_stack_bias < 0.0 && net_delta > 0.0 {
+            "Book was fragile but tape was buying — offers were pulling while buyers lifted aggressively. Potential breakout setup."
+        } else {
+            "Liquidity stayed relatively balanced — the reaction looks more tape-driven than book-driven."
         };
+        parts.push(overall.to_string());
+
+        let explanation = parts.join(" ");
 
         Ok(text_result(serde_json::json!({
             "timestampMs": target_time_ms,
@@ -2030,7 +2151,13 @@ impl TheDeskMcp {
             "domFeature": feature_payload,
             "depthEventCount": depth_events.len(),
             "tapeTickCount": ticks.len(),
+            "totalVolume": total_volume,
             "netDelta": net_delta,
+            "pullRates": { "bid": bid_pull_rate, "ask": ask_pull_rate },
+            "pullStackBias": pull_stack_bias,
+            "liquidityBias": liquidity_bias,
+            "topPullLevel": top_pull,
+            "topStackLevel": top_stack,
             "explanation": explanation,
         })))
     }

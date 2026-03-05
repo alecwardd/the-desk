@@ -76,7 +76,7 @@ Arbitration policy (Primary + Secondary):
 ### Market Read ("What's the market doing?", "Give me a read", "What's happening?")
 
 Call in parallel:
-- `get_market_snapshot` (full pipeline state including VWAP)
+- `get_market_snapshot` (full pipeline state including VWAP + DOM summary)
 - `get_tape_pace`
 - `get_rvol`
 - `get_day_type` only when `sessionType == "RTH"`
@@ -85,8 +85,20 @@ Apply the market-structure-analyst framework:
 - Classify: balance vs imbalance, day type, profile shape
 - Report initiative/responsive read
 - Note key levels and proximity
+- Include DOM context from `domSummary` in `get_market_snapshot`: liquidity bias, pull rates, near-touch depth ratio
 
 Risk output: **Brief footer only** (session state summary).
+
+### DOM / Book Questions ("What's the book doing?", "Is liquidity supportive?", "Are bids getting pulled?", "What happened at [level] on the DOM?")
+
+Route to orderflow-analyst DOM toolset:
+- For current DOM state: `get_dom_tape_context_at` (one-call fused view)
+- For level-specific analysis: `get_liquidity_behavior_at_level` with the level price
+- For historical book behavior: `get_dom_window` or `get_pull_stack_activity`
+- For narrative explanation: `explain_book_reaction` around a timestamp or level
+- DOM data is delayed (~1s polling lag from Sierra) — always note this for the trader
+
+Risk output: **Brief footer only.**
 
 ### Globex-Specific Context ("What happened overnight?", "Globex read", "Asia session", "London session")
 
@@ -105,10 +117,11 @@ Risk output: **Brief footer only** unless trade/risk discussion is included.
 
 Call in parallel:
 - `evaluate_playbook` (playbook condition status)
-- `get_setup_context` (full context for named setup)
+- `get_setup_context` (full context for named setup — includes DOM summary and pull/stack activity)
 - `get_proximity_report` (key levels near price)
 - `get_tape_pace` and `get_rvol` (participation quality)
 - `get_delta_profile` (flow confirmation)
+- `get_dom_tape_context_at` (DOM book context — liquidity bias, pull rates, derived flow flags)
 
 If setup conditions are met:
 - Call `get_kelly_position_size` for sizing recommendation
@@ -172,6 +185,7 @@ Full parallel sweep:
 - `get_day_type`
 - `get_key_levels`, `get_proximity_report` (structural levels)
 - `get_session_history(limit=5)` (multi-session context)
+- `get_dom_tape_context_at` (DOM liquidity context)
 
 Execute the risk-coach session-start protocol:
 - Confirm balance and positions

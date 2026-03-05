@@ -32,6 +32,7 @@ On every interaction where risk context is relevant:
 | `get_session_context` | Session classification context (RTH vs Globex, Asia vs London, trading day) |
 | `evaluate_playbook` | Playbook alignment before sizing |
 | `get_tape_pace` | Participation quality — thin tape = elevated risk |
+| `get_dom_tape_context_at` | DOM liquidity context — fragile book (high pull rates, low near-touch depth) compounds thin-tape risk (~1s lag) |
 | `get_day_type` | Day type affects risk profile |
 | `get_proximity_report` | Key levels for stop placement logic |
 | `get_rvol` | Volume context — low RVOL compounds thin-tape risk |
@@ -208,7 +209,7 @@ For trade discussions, expand with:
 
 - **market-structure-analyst:** Provides day type, balance state, profile shape. Risk-coach uses day type for risk adjustment (Non-Trend = tighter expectations). Reference MSA's day-type read when present in context.
 
-- **orderflow-analyst:** Provides participation quality, tape pace, RVOL. Low participation (pace percentile < 20, RVOL Low) = elevated risk environment. Thin tape means wider stops may be needed, or setups may lack participation to work.
+- **orderflow-analyst:** Provides participation quality, tape pace, RVOL. Low participation (pace percentile < 20, RVOL Low) = elevated risk environment. Thin tape means wider stops may be needed, or setups may lack participation to work. DOM context (via `get_dom_tape_context_at`) adds a book-fragility dimension: high bid pull rates + thin tape = especially fragile long-side environment. High ask pull rates + thin tape = fragile short-side resistance.
 
 - **levels-analyst:** Provides proximity to key levels via `get_proximity_report`. When stop placement is discussed, reference nearest levels. A stop just beyond a key structural level has logic; a stop in no-man's land does not.
 

@@ -973,9 +973,21 @@ pub fn build_dom_summary(
     };
     let pull_stack_bias = (activity.bid.stacked_quantity - activity.bid.estimated_pulled_quantity)
         - (activity.ask.stacked_quantity - activity.ask.estimated_pulled_quantity);
-    let liquidity_bias = if pull_stack_bias > 25.0 || near_touch_depth_ratio.unwrap_or(1.0) > 1.2 {
+    let depth_ratio = near_touch_depth_ratio.unwrap_or(1.0);
+    let depth_favors_bid = depth_ratio > 1.2;
+    let depth_favors_ask = depth_ratio < 0.8;
+    let behavior_favors_bid = pull_stack_bias > 25.0;
+    let behavior_favors_ask = pull_stack_bias < -25.0;
+
+    // Both signals must agree, or one must signal while the other is neutral.
+    // If they contradict (depth says bid, behavior says ask), classify as balanced.
+    let liquidity_bias = if (behavior_favors_bid && !depth_favors_ask)
+        || (depth_favors_bid && !behavior_favors_ask)
+    {
         "bid_support".to_string()
-    } else if pull_stack_bias < -25.0 || near_touch_depth_ratio.unwrap_or(1.0) < 0.8 {
+    } else if (behavior_favors_ask && !depth_favors_bid)
+        || (depth_favors_ask && !behavior_favors_bid)
+    {
         "ask_resistance".to_string()
     } else {
         "balanced".to_string()

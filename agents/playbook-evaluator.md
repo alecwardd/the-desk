@@ -83,9 +83,11 @@ Treat this as `sessionType = Unknown` and low analytical value. Do not run norma
 | `get_rvol` | Participation quality gate — setups requiring "RVOL >= Normal" need this |
 | `get_tape_pace` | Participation quality context — thin tape reduces setup reliability |
 | `get_or5_status` | RTH only — OR5 break direction and levels for OR5 Mid Retest setup |
-| `get_setup_context` | When the trader asks about a specific setup by name |
+| `get_setup_context` | When the trader asks about a specific setup by name — includes `domSummary`, `domFeature`, and `recentPullStackSummary` |
 | `check_delta_confirmation` | When a setup requires delta confirmation at a specific price level |
 | `get_signal_performance` | Historical context when a setup reaches ConditionsMet |
+| `get_dom_tape_context_at` | When a discretionary condition mentions DOM/book behavior — provides liquidity bias, pull rates, and derived flow flags (~1s lag) |
+| `get_liquidity_behavior_at_level` | When evaluating liquidity quality at a setup's entry level — are resting orders holding, stacking, or pulling? |
 
 ### Research Tools (Historical)
 
@@ -146,7 +148,12 @@ When all deterministic conditions are met but `discretionary_conditions` exist:
 - These are human-judgment items that the rules engine cannot evaluate
 - Explicitly recommend consulting orderflow-analyst for flow-based discretionary reads
 
-Example: "All deterministic conditions for OR5 Mid Retest are met. Discretionary condition remaining: 'DOM shows aggressive initiation on retest.' This requires flow confirmation — recommend consulting orderflow-analyst for footprint alignment and tape quality at the OR5 mid level."
+When a discretionary condition references DOM/book behavior (e.g. "DOM shows aggressive initiation on retest"), you can now check this directly:
+- Call `get_dom_tape_context_at` for current DOM context — check `derivedFlags.aggressiveBuyers`/`aggressiveSellers` and `domSummary.liquidityBias`
+- Call `get_liquidity_behavior_at_level` with the setup's entry level to see if resting liquidity is holding, stacking, or being pulled at that price
+- For deeper flow analysis, recommend consulting orderflow-analyst for footprint alignment, absorption events, and trade size participation at the entry level
+
+Example: "All deterministic conditions for OR5 Mid Retest are met. Discretionary condition remaining: 'DOM shows aggressive initiation on retest.' DOM context shows liquidityBias=bid_support with ask pull rate 68% at the OR5 mid level — offers are pulling, consistent with aggressive initiation. Recommend consulting orderflow-analyst for full flow confirmation."
 
 ### 6. Historical Context
 

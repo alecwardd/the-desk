@@ -300,14 +300,18 @@ Sierra Chart (DTC Server on Rithmic)
 
 The options/gamma pipeline ingests data from external providers to give traders a view of the derivatives landscape affecting NQ:
 
-**Planned integrations (in priority order):**
+**Preferred integration (ADR-013):**
 
-1. **Unusual Whales API** — Greek exposure endpoints (GEX by strike/expiry, delta, gamma, charm, vanna), options flow alerts, directional flow data. JSON API, well-documented.
-2. **CBOE direct data** — For traders who want to build from source. Raw options chains for SPX/NDX, compute GEX and dealer positioning from first principles.
-3. **OptionData.io** — Real-time WebSocket streaming of options trades with full Greeks ($599/mo, for traders who want tick-level options flow).
-4. **ConvexValue / OmegaMind** — Potential future integrations for specialized gamma modeling.
+1. **Databento** — Raw options chains from OPRA (NDX, SPX, SPY, QQQ) and CME Globex (NQ futures options). We compute all Greeks and GEX ourselves in Rust for a robust, fully controlled model. Official Rust client, strong docs. See `docs/phase-2-options-databento-memo.md`.
 
-The options pipeline is a separate module. Traders who don't use gamma/options data can disable it entirely. Traders who want to go deep can connect multiple sources.
+**Alternatives (in priority order):**
+
+2. **Unusual Whales API** — Pre-computed GEX by strike/expiry, delta, gamma, charm, vanna. Fastest path if we don't build our own model.
+3. **ConvexValue** — Pre-computed gamma, gxoi, gxvolm, charm, vanna. Evaluate if Databento build proves too heavy.
+4. **CBOE direct data** — Raw options chains for SPX/NDX only (no NQ futures options). Compute GEX locally.
+5. **OptionData.io** — Real-time WebSocket streaming of options trades with full Greeks ($599/mo).
+
+The options pipeline is a separate module. Traders who don't use gamma/options data can disable it entirely.
 
 ### Technology Stack
 
@@ -342,7 +346,7 @@ The options pipeline is a separate module. Traders who don't use gamma/options d
               ↕ REST/WebSocket
 ┌─────────────────────────────────────────────────┐
 │  Options Data Providers                         │
-│  (Unusual Whales, CBOE, OptionData.io)          │
+│  (Databento preferred; Unusual Whales, ConvexValue) │
 └─────────────────────────────────────────────────┘
 ```
 

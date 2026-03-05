@@ -524,7 +524,9 @@ Configuration stored at `~/.the-desk/config.toml`.
 
 | Provider | Type | Data | Priority |
 |----------|------|------|----------|
-| Unusual Whales | REST API | GEX, gamma/delta/charm by strike, options flow alerts | P2-first |
+| **Databento** | REST/Historical | Raw OPRA + CME chains; we compute Greeks/GEX | P2-first (preferred, ADR-013) |
+| Unusual Whales | REST API | Pre-computed GEX, gamma/delta/charm by strike | P2-alternative |
+| ConvexValue | API | Pre-computed gamma, gxoi, gxvolm, charm, vanna | P2-alternative |
 | CBOE | Data download | Raw options chains for SPX/NDX, compute GEX locally | P2 |
 | OptionData.io | WebSocket | Real-time options trades with Greeks ($599/mo) | P2-optional |
 

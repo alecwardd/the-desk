@@ -267,12 +267,36 @@ This is NOT a backtesting engine in the traditional sense — it does not simula
 
 ---
 
-### ADR-P08: Options data provider selection
+### ADR-013: Databento as preferred Phase 2 options data provider
+
+**Date:** 2026-03-05
+**Status:** Decided
+**Resolves:** ADR-P08 (Options data provider selection)
+
+**Context:** Phase 2 requires options/gamma data for NQ trading: GEX by strike, dealer positioning, charm/vanna flow. Multiple providers were evaluated (Gexbot, Unusual Whales, CBOE, OptionData.io, ConvexValue).
+
+**Decision:** Databento is the preferred options data provider. We will compute all Greeks (delta, gamma, charm, vanna) and GEX ourselves from raw options chains. Databento provides:
+- **OPRA** for NDX, SPX, SPY, QQQ (1.6M+ equity options)
+- **CME Globex** for NQ futures options (650k+ symbols)
+- Raw tick data, order book, OI, reference data — no pre-computed IV or Greeks
+- Official Rust client library, strong docs, self-service
+- Usage-based historical ($0.04/GB OPRA, $0.50/GB CME) or subscription (~$199/mo unlimited live)
+
+**Alternatives considered:**
+- Unusual Whales — pre-computed GEX; faster path but less control over model
+- CBOE raw — NDX only; no NQ futures options
+- Gexbot — API underdocumented; chart-first; NQ/NDX not clearly primary
+- OptionData.io — real-time WebSocket; higher cost (~$599/mo)
+- ConvexValue — pre-computed gamma, gxoi, gxvolm; evaluate if Databento build proves too heavy
+
+**Consequences:** We build a GEX/Greeks pipeline in Rust (Black-76 or similar for index/futures options). More engineering upfront, but full control over model assumptions and robustness. See `docs/phase-2-options-databento-memo.md` for architecture sketch.
+
+---
+
+### ADR-P08: Options data provider selection (resolved)
 
 **Impact:** Phase 2 options pipeline (gamma, charm, dealer positioning)
-**Owner:** _TBD_
-**Deadline:** Before Phase 2 implementation begins
-**Action needed:** Use `options-api-researcher` subagent to evaluate providers
+**Status:** Resolved by ADR-013
 
 ---
 

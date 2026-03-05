@@ -43,14 +43,16 @@ All of the following must be true before Phase 2 development begins:
 
 #### Provider Evaluation Framework
 
-| Criterion | Weight | Unusual Whales | CBOE Raw | OptionData.io |
-|-----------|--------|---------------|----------|---------------|
-| NQ/NDX coverage depth | 25% | TBD | TBD | TBD |
-| Data freshness / latency | 20% | TBD | TBD | TBD |
-| Greek accuracy (GEX, delta, gamma, charm, vanna) | 20% | TBD | TBD | TBD |
-| API reliability / rate limits | 15% | TBD | TBD | TBD |
-| Cost / licensing | 10% | TBD | TBD | TBD |
-| Integration complexity | 10% | TBD | TBD | TBD |
+| Criterion | Weight | **Databento** (preferred) | Unusual Whales | CBOE Raw | OptionData.io | ConvexValue |
+|-----------|--------|---------------------------|---------------|----------|---------------|-------------|
+| NQ/NDX coverage depth | 25% | ✅ OPRA + CME (NDX + NQ) | TBD | NDX only | TBD | TBD |
+| Data freshness / latency | 20% | ✅ Direct feeds | TBD | TBD | TBD | TBD |
+| Greek accuracy (GEX, delta, gamma, charm, vanna) | 20% | ✅ We compute (own model) | Pre-computed | We compute | Pre-computed | Pre-computed |
+| API reliability / rate limits | 15% | ✅ Strong | TBD | TBD | TBD | TBD |
+| Cost / licensing | 10% | ✅ Usage + subscription | TBD | TBD | TBD | TBD |
+| Integration complexity | 10% | ⚠️ Higher (build GEX pipeline) | Lower | Lower | Lower | TBD |
+
+**Preferred provider:** Databento (see `docs/phase-2-options-databento-memo.md`). Rationale: single source for NDX (OPRA) and NQ (CME) options, raw data so we compute all Greeks ourselves for a robust model, Rust client library, excellent docs. Trade-off: we build the GEX/Greeks pipeline in Rust. Alternatives: Unusual Whales (fastest path, pre-computed), ConvexValue (pre-computed GEX/gamma, gxoi, gxvolm — evaluate if Databento build proves too heavy).
 
 **Decision gate:** Provider selection must be made before any Phase 2 implementation begins. Use the `options-api-researcher` subagent to populate the evaluation matrix.
 
@@ -71,8 +73,8 @@ All of the following must be true before Phase 2 development begins:
 | OPT-11 | Graceful degradation: all features work without options data (feed unavailable or not subscribed) | P0 |
 
 **Open decisions:**
-- [ ] Which provider gives the best signal-to-noise for NQ trading? (Decision gate: before Phase 2 starts)
-- [ ] Build our own GEX model from CBOE raw data or rely on pre-computed from provider?
+- [x] Which provider gives the best signal-to-noise for NQ trading? → **Databento** (preferred; see memo)
+- [x] Build our own GEX model from raw data or rely on pre-computed from provider? → **Build our own** (raw data from Databento; compute Greeks/GEX in Rust for full control and robustness)
 - [ ] What latency tolerance for options data? (30-60 second delay likely acceptable)
 
 ### 3.2 Advanced Order Flow Analysis

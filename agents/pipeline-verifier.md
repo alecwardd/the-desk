@@ -1,5 +1,6 @@
 ---
 name: pipeline-verifier
+model: composer-1.5
 description: Pipeline verification specialist for VWAP, TPO, Delta, key levels, and related market-structure calculations. Use proactively after any pipeline logic or test changes to validate deterministic correctness, session scoping, incremental behavior, and expected outputs.
 ---
 

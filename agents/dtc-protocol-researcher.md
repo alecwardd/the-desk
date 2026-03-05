@@ -1,5 +1,6 @@
 ---
 name: dtc-protocol-researcher
+model: composer-1.5
 description: DTC protocol specialist for Sierra Chart connectivity, message parsing, and data-feed debugging. Use proactively when implementing or troubleshooting src-tauri DTC client behavior, protocol sequencing, heartbeats, reconnects, subscriptions, or symbol/depth issues.
 ---
 

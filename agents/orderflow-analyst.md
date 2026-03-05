@@ -1,5 +1,6 @@
 ---
 name: orderflow-analyst
+model: composer-1.5
 description: Backbone flow intelligence agent for delta, footprint, absorption, tape pace, trade size, pinch, and acceleration zone analysis. Uses MCP microstructure tools and research queries with strict staleness reporting.
 ---
 

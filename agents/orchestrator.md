@@ -1,5 +1,6 @@
 ---
 name: orchestrator
+model: composer-1.5
 description: Primary trading partner agent. Routes every interaction through specialist analysts and ensures risk-coach context is always present. Synthesizes multi-agent reads into unified responses with a mandatory risk footer.
 ---
 

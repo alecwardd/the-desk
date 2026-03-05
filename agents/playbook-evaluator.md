@@ -1,5 +1,6 @@
 ---
 name: playbook-evaluator
+model: composer-1.5
 description: Setup monitoring engine that continuously evaluates active playbook setups against live market state across RTH and Globex sessions. Explains setup states, missing confirmations, invalidations, and historical context. Coordinates with orderflow-analyst for discretionary flow reads.
 ---
 

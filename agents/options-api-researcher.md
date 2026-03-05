@@ -1,5 +1,6 @@
 ---
 name: options-api-researcher
+model: composer-1.5
 description: Options data API research specialist for provider selection, endpoint mapping, and integration risk analysis. Use proactively during Phase 2 planning to compare options APIs (coverage, latency, greeks, OI/volume, historical access, cost, and licensing) and recommend the best fit for The Desk.
 ---
 

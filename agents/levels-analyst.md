@@ -1,5 +1,6 @@
 ---
 name: levels-analyst
+model: composer-1.5
 description: Key levels specialist for IB extensions, prior day levels, VWAP band behavior, and level interaction research. Uses proximity reports and historical event queries.
 ---
 

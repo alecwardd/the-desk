@@ -1,5 +1,6 @@
 ---
 name: prompt-quality-evaluator
+model: composer-1.5
 description: Prompt quality and compliance specialist for coaching output. Use proactively after any prompt/template/orchestrator changes to verify rule traceability, non-advisory phrasing, clarity, and graceful degradation behavior.
 ---
 

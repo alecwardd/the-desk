@@ -36,6 +36,33 @@ pub enum SessionSegment {
     None,
 }
 
+/// Delta-reset segment: Asia and London are separate for segment delta; RTH is its own segment.
+/// Used to reset segment delta at Asia→London (2 AM ET) while keeping combined Globex delta.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeltaSegment {
+    Asia,
+    London,
+    Rth,
+    /// 4 PM–6 PM ET gap between RTH close and Globex open.
+    Unknown,
+}
+
+/// Classify the delta-reset segment for boundary detection.
+/// Asia (6 PM–2 AM ET), London (2 AM–9:30 AM ET), RTH (9:30 AM–4 PM ET), Unknown (4–6 PM gap).
+pub fn classify_delta_segment(et_minutes: i32) -> DeltaSegment {
+    if (RTH_OPEN_ET..RTH_CLOSE_ET).contains(&et_minutes) {
+        DeltaSegment::Rth
+    } else if (RTH_CLOSE_ET..GLOBEX_OPEN_ET).contains(&et_minutes) {
+        DeltaSegment::Unknown
+    } else if !(LONDON_OPEN_ET..GLOBEX_OPEN_ET).contains(&et_minutes) {
+        DeltaSegment::Asia
+    } else if (LONDON_OPEN_ET..RTH_OPEN_ET).contains(&et_minutes) {
+        DeltaSegment::London
+    } else {
+        DeltaSegment::Unknown
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TickTimeContext {
     pub et_minutes: i32,

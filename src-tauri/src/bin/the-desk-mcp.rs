@@ -29,8 +29,9 @@ use the_desk_backend::research;
 use the_desk_backend::risk::{RiskConfig, RiskState, RiskTracker};
 use the_desk_backend::rules::RulesEngine;
 use the_desk_backend::{
-    classify_session, et_minutes_from_timestamp, globex_open_ms, minute_of_session_from_timestamp,
-    session_date_from_timestamp_ms, SessionType, GLOBEX_OPEN_ET, RTH_CLOSE_ET, RTH_OPEN_ET,
+    classify_delta_segment, classify_session, et_minutes_from_timestamp, globex_open_ms,
+    minute_of_session_from_timestamp, session_date_from_timestamp_ms, DeltaSegment, SessionType,
+    GLOBEX_OPEN_ET, RTH_CLOSE_ET, RTH_OPEN_ET,
 };
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::{sleep, Duration};
@@ -1355,17 +1356,19 @@ impl TheDeskMcp {
     }
 
     #[tool(
-        description = "Delta profile: session cumulative delta, delta neutral value area (DNVA high/low), delta neutral pivot (DNP -- midpoint of DNVA). Use for inventory and positioning analysis."
+        description = "Delta profile: segment delta (Asia-only, London-only, or RTH-only), combined Globex delta (Asia+London when in Globex), cumulative delta, DNVA high/low, DNP. Use for inventory and positioning analysis."
     )]
     async fn get_delta_profile(&self) -> Result<CallToolResult, McpError> {
         let db = self.db.lock().map_err(|_| lock_error())?;
         match db.latest_feature_state() {
             Ok(Some(s)) => Ok(text_result(serde_json::json!({
                 "sessionDelta": s.get("sessionDelta"),
+                "globexDelta": s.get("globexDelta"),
                 "cumulativeDelta": s.get("cumulativeDelta"),
                 "dnvaHigh": s.get("dnvaHigh"),
                 "dnvaLow": s.get("dnvaLow"),
                 "dnp": s.get("dnp"),
+                "sessionSegment": s.get("sessionSegment"),
                 "dataAgeMs": compute_data_age(&db)
             }))),
             Ok(None) => Ok(no_data("No delta data available")),
@@ -4192,16 +4195,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             let mut current_session = SessionType::Unknown;
+            let mut current_delta_segment = DeltaSegment::Unknown;
             let mut boundary_count = 0u32;
 
             for tick in &ticks {
                 if let Some(et_min) = et_minutes_from_timestamp(tick.timestamp_ms) {
                     let new_session = classify_session(et_min);
+                    let new_segment = classify_delta_segment(et_min);
+
                     if new_session != current_session
                         && current_session != SessionType::Unknown
                         && new_session != SessionType::Unknown
                     {
-                        // Release pipelines before db to avoid deadlock; tools can run now
                         let end_state = if current_session == SessionType::Rth {
                             Some(pipelines.session_end_state())
                         } else {
@@ -4232,7 +4237,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             Ok(p) => p,
                             Err(_) => return,
                         };
-                        pipelines.reset_session();
+                        pipelines.reset_session_with_type(new_session == SessionType::Globex);
                         if new_session == SessionType::Rth || new_session == SessionType::Globex {
                             if let Ok(Some((h, l, c, va_h, va_l, poc))) = prior {
                                 pipelines.levels.set_prior_day(h, l, c);
@@ -4242,9 +4247,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                         boundary_count += 1;
+                    } else if new_segment != current_delta_segment
+                        && current_delta_segment != DeltaSegment::Unknown
+                        && new_segment != DeltaSegment::Unknown
+                    {
+                        pipelines.reset_segment(new_segment);
+                        boundary_count += 1;
                     }
+
                     if new_session != SessionType::Unknown {
                         current_session = new_session;
+                    }
+                    if new_segment != DeltaSegment::Unknown {
+                        current_delta_segment = new_segment;
                     }
                 }
 
@@ -4321,11 +4336,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut tick_buffer: Vec<(f64, f64, f64, f64, f64, bool, String)> = Vec::new();
             let mut last_integrity_check =
                 std::time::Instant::now() - std::time::Duration::from_secs(30);
-            // Seed current session from the system clock so we can detect boundaries.
-            let mut current_session =
-                et_minutes_from_timestamp(chrono::Utc::now().timestamp_millis() as f64)
-                    .map(classify_session)
-                    .unwrap_or(SessionType::Unknown);
+            // Seed current session and segment from the system clock so we can detect boundaries.
+            let now_et = et_minutes_from_timestamp(chrono::Utc::now().timestamp_millis() as f64);
+            let mut current_session = now_et.map(classify_session).unwrap_or(SessionType::Unknown);
+            let mut current_delta_segment = now_et
+                .map(classify_delta_segment)
+                .unwrap_or(DeltaSegment::Unknown);
 
             // Seek to current EOF so we only process NEW ticks
             if let Ok(f) = std::fs::File::open(&reader_path) {
@@ -4358,9 +4374,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 while file.read_exact(&mut record).is_ok() {
                     offset += 40;
                     if let Some(tick) = parse_record_scaled(&record, price_scale) {
-                        // Detect session boundaries during live polling
+                        // Detect session and segment boundaries during live polling
                         if let Some(et_min) = et_minutes_from_timestamp(tick.timestamp_ms) {
                             let new_session = classify_session(et_min);
+                            let new_segment = classify_delta_segment(et_min);
+
                             if new_session != current_session
                                 && current_session != SessionType::Unknown
                                 && new_session != SessionType::Unknown
@@ -4387,7 +4405,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     } else {
                                         None
                                     };
-                                    p.reset_session();
+                                    p.reset_session_with_type(new_session == SessionType::Globex);
                                     if let Some((h, l, c, va_h, va_l, poc)) = prior {
                                         p.levels.set_prior_day(h, l, c);
                                         if let (Some(vh), Some(vl), Some(pc)) = (va_h, va_l, poc) {
@@ -4405,9 +4423,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 if let Ok(mut fe) = flow_emitter_bg.lock() {
                                     fe.reset();
                                 }
+                            } else if new_segment != current_delta_segment
+                                && current_delta_segment != DeltaSegment::Unknown
+                                && new_segment != DeltaSegment::Unknown
+                            {
+                                if let Ok(mut p) = pipelines_bg.lock() {
+                                    p.reset_segment(new_segment);
+                                    eprintln!(
+                                        "[the-desk-mcp] Segment boundary: {:?} → {:?}",
+                                        current_delta_segment, new_segment
+                                    );
+                                }
                             }
+
                             if new_session != SessionType::Unknown {
                                 current_session = new_session;
+                            }
+                            if new_segment != DeltaSegment::Unknown {
+                                current_delta_segment = new_segment;
                             }
                         }
 

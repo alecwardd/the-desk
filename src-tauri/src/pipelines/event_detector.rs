@@ -800,6 +800,7 @@ mod tests {
             dnva_low: 20995.0,
             dnp: 21000.0,
             session_delta: 100.0,
+            globex_delta: None,
             cumulative_delta: 500.0,
             prior_day_high: 21050.0,
             prior_day_low: 20950.0,

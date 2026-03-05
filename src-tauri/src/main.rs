@@ -16,8 +16,8 @@ use the_desk_backend::recording::{RecordingEntry, SessionRecorder};
 use the_desk_backend::risk::{RiskConfig, RiskTracker};
 use the_desk_backend::rules::RulesEngine;
 use the_desk_backend::{
-    classify_session, et_minutes_from_timestamp, globex_open_ms, minute_of_session_from_timestamp,
-    session_date_from_timestamp_ms, SessionType,
+    classify_delta_segment, classify_session, et_minutes_from_timestamp, globex_open_ms,
+    minute_of_session_from_timestamp, session_date_from_timestamp_ms, DeltaSegment, SessionType,
 };
 use tokio::sync::{broadcast, watch, Mutex};
 
@@ -83,6 +83,7 @@ async fn processing_loop(handle: AppHandle, mut rx: broadcast::Receiver<FeedEven
     let mut last_bid: f64 = 0.0;
     let mut last_ask: f64 = 0.0;
     let mut current_session_type = SessionType::Unknown;
+    let mut current_delta_segment = DeltaSegment::Unknown;
     let mut tick_buffer: Vec<(f64, f64, f64, f64, f64, bool, String)> = Vec::with_capacity(128);
     let mut event_buffer: Vec<the_desk_backend::pipelines::MarketEvent> = Vec::new();
 
@@ -104,9 +105,12 @@ async fn processing_loop(handle: AppHandle, mut rx: broadcast::Receiver<FeedEven
                 let state = handle.state::<AppState>();
                 let is_buy = matches!(side, TradeSide::Buy);
 
-                // --- Session boundary detection ---
+                // --- Session and segment boundary detection ---
                 if let Some(et_min) = et_minutes_from_timestamp(timestamp) {
                     let new_session = classify_session(et_min);
+                    let new_segment = classify_delta_segment(et_min);
+
+                    // Session boundary (RTH↔Globex): full reset, prior-day, volume curve
                     if new_session != current_session_type
                         && current_session_type != SessionType::Unknown
                         && new_session != SessionType::Unknown
@@ -120,7 +124,6 @@ async fn processing_loop(handle: AppHandle, mut rx: broadcast::Receiver<FeedEven
                             } else {
                                 "Globex"
                             };
-                            // Persist the actual per-bucket volume curve before resetting.
                             let curve = pipelines.rvol.current_curve();
                             let _ = state.db.lock().await.save_volume_curve(
                                 &date,
@@ -154,7 +157,6 @@ async fn processing_loop(handle: AppHandle, mut rx: broadcast::Receiver<FeedEven
                         state.detector.lock().await.reset();
                         state.flow_emitter.lock().await.reset();
 
-                        // Flush pending events before session boundary
                         if !event_buffer.is_empty() {
                             let _ = state
                                 .db
@@ -175,8 +177,20 @@ async fn processing_loop(handle: AppHandle, mut rx: broadcast::Receiver<FeedEven
                             )
                             .ok();
                     }
+                    // Segment-only boundary (Asia→London at 2 AM): delta reset, keep Globex range
+                    else if new_segment != current_delta_segment
+                        && current_delta_segment != DeltaSegment::Unknown
+                        && new_segment != DeltaSegment::Unknown
+                    {
+                        let mut pipelines = state.pipelines.lock().await;
+                        pipelines.reset_segment(new_segment);
+                    }
+
                     if new_session != SessionType::Unknown {
                         current_session_type = new_session;
+                    }
+                    if new_segment != DeltaSegment::Unknown {
+                        current_delta_segment = new_segment;
                     }
                     if new_session == SessionType::Unknown {
                         continue;

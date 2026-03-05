@@ -3,7 +3,10 @@ use crate::feed::scid_reader::{ScanControl, ScidReader};
 use crate::feed::TradeSide;
 use crate::pipelines::{EventDetector, FlowEventEmitter, MarketState, PipelineEngine};
 use crate::rules::{RulesEngine, SetupDefinition};
-use crate::{session_date_from_timestamp_ms, tick_time_context_from_timestamp_ms, SessionType};
+use crate::{
+    classify_delta_segment, session_date_from_timestamp_ms, tick_time_context_from_timestamp_ms,
+    DeltaSegment, SessionType,
+};
 use chrono::{Duration, NaiveDate, TimeZone};
 use chrono_tz::US::Eastern;
 use serde::{Deserialize, Serialize};
@@ -353,6 +356,7 @@ where
     on_progress(&state.progress);
 
     let mut current_session = SessionType::Unknown;
+    let mut current_delta_segment = DeltaSegment::Unknown;
     let mut current_date = String::new();
     let mut current_date_key: Option<i32> = None;
     let mut prev_ts: Option<f64> = None;
@@ -408,6 +412,8 @@ where
             state.progress.current_session_date = Some(current_date.clone());
 
             let new_session = tick_ctx.session_type;
+            let new_segment = classify_delta_segment(tick_ctx.et_minutes);
+
             if new_session != current_session
                 && current_session != SessionType::Unknown
                 && new_session != SessionType::Unknown
@@ -448,9 +454,18 @@ where
                         }
                     }
                 }
+            } else if new_segment != current_delta_segment
+                && current_delta_segment != DeltaSegment::Unknown
+                && new_segment != DeltaSegment::Unknown
+            {
+                state.pipeline.reset_segment(new_segment);
             }
+
             if new_session != SessionType::Unknown {
                 current_session = new_session;
+            }
+            if new_segment != DeltaSegment::Unknown {
+                current_delta_segment = new_segment;
             }
             if tick_class == SessionType::Unknown {
                 return Ok(ScanControl::Continue);

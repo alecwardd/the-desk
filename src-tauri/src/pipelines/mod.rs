@@ -38,7 +38,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::depth::DomSummary;
 use crate::{
-    classify_session, et_minutes_from_timestamp, tick_time_context_from_timestamp_ms, SessionType,
+    classify_session, et_minutes_from_timestamp, tick_time_context_from_timestamp_ms, DeltaSegment,
+    SessionType,
 };
 
 /// Snapshot of session-ending data for prior-day level archival.
@@ -119,8 +120,10 @@ pub struct MarketState {
     pub dnva_low: f64,
     /// Delta Neutral Pivot — midpoint of DNVA high and low.
     pub dnp: f64,
-    /// Net buy minus sell volume for the current session.
+    /// Segment delta: Asia-only, London-only, or RTH-only. Resets at Asia→London (2 AM) and RTH↔Globex.
     pub session_delta: f64,
+    /// Combined Globex delta (Asia + London) from 6 PM ET. Only present during Globex; null during RTH.
+    pub globex_delta: Option<f64>,
     /// Running cumulative delta across sessions.
     pub cumulative_delta: f64,
     /// Previous RTH session high.
@@ -271,6 +274,8 @@ pub struct PipelineEngine {
     pub session_inventory: SessionInventoryPipeline,
     last_trade_price: Option<f64>,
     cumulative_delta: f64,
+    /// Combined Globex delta (Asia + London) from 6 PM ET. Only accumulates during Globex; resets at 6 PM and 9:30 AM.
+    globex_delta: f64,
     dom_summary: Option<DomSummary>,
 }
 
@@ -300,6 +305,7 @@ impl PipelineEngine {
             session_inventory: SessionInventoryPipeline::new(),
             last_trade_price: None,
             cumulative_delta: 0.0,
+            globex_delta: 0.0,
             dom_summary: None,
         }
     }
@@ -313,24 +319,44 @@ impl PipelineEngine {
 
     /// Reset all pipelines for a new trading session with explicit session type.
     pub fn reset_session_with_type(&mut self, is_globex: bool) {
-        self.cumulative_delta += self.delta.session_delta();
-        self.levels.reset_session();
-        self.vwap.reset();
-        self.tpo.reset();
-        self.delta.reset();
-        self.tape_pace.reset();
-        self.footprint.reset();
-        self.absorption.reset();
-        self.trade_size.reset();
-        self.or5.reset();
-        self.rvol.reset();
+        self.reset_segment(if is_globex {
+            DeltaSegment::Asia
+        } else {
+            DeltaSegment::Rth
+        });
         self.rvol.start_session(is_globex);
-        self.day_type.reset();
-        self.rebid_reoffer.reset();
-        self.pinch.reset();
-        self.session_inventory.reset();
-        self.last_trade_price = None;
-        self.dom_summary = None;
+    }
+
+    /// Reset at segment boundary. Asia and RTH get full reset; London gets delta-only reset
+    /// (keeps Globex range/levels, resets segment delta for London-only tracking).
+    pub fn reset_segment(&mut self, to_segment: DeltaSegment) {
+        self.cumulative_delta += self.delta.session_delta();
+        self.delta.reset();
+
+        match to_segment {
+            DeltaSegment::Asia | DeltaSegment::Rth => {
+                self.globex_delta = 0.0;
+                self.levels.reset_session();
+                self.vwap.reset();
+                self.tpo.reset();
+                self.tape_pace.reset();
+                self.footprint.reset();
+                self.absorption.reset();
+                self.trade_size.reset();
+                self.or5.reset();
+                self.rvol.reset();
+                self.day_type.reset();
+                self.rebid_reoffer.reset();
+                self.pinch.reset();
+                self.session_inventory.reset();
+                self.last_trade_price = None;
+                self.dom_summary = None;
+            }
+            DeltaSegment::London => {
+                // Delta-only reset: keep levels, VWAP, TPO, etc. for full Globex; only segment delta resets.
+            }
+            DeltaSegment::Unknown => {}
+        }
     }
 
     pub fn set_dom_summary(&mut self, dom_summary: Option<DomSummary>) {
@@ -412,6 +438,10 @@ impl PipelineEngine {
         self.vwap.add_trade(price, volume);
         self.tpo.add_trade(price, minute_of_session);
         self.delta.add_trade(price, volume, is_buy);
+        if is_overnight {
+            let signed = if is_buy { volume } else { -volume };
+            self.globex_delta += signed;
+        }
         self.levels.on_trade(price, is_overnight, et_minutes);
         self.tape_pace.on_trade(timestamp_ms, volume, price);
         self.footprint.on_trade(price, volume, is_buy, timestamp_ms);
@@ -539,6 +569,11 @@ impl PipelineEngine {
             dnva_low: self.delta.dnva_low(),
             dnp: self.delta.dnp(),
             session_delta: self.delta.session_delta(),
+            globex_delta: if session_type == "Globex" {
+                Some(self.globex_delta)
+            } else {
+                None
+            },
             cumulative_delta: self.cumulative_delta + self.delta.session_delta(),
             prior_day_high: self.levels.prior_day_high,
             prior_day_low: self.levels.prior_day_low,

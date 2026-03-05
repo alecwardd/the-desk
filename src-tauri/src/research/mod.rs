@@ -44,6 +44,71 @@ pub struct DistributionResult {
     pub p90: f64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutcomeBreakdown {
+    pub target_hit: i64,
+    pub stop_hit: i64,
+    pub time_exit: i64,
+    pub other: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignalOutcomeExcursionsResult {
+    pub sample_count: usize,
+    pub outcome_breakdown: OutcomeBreakdown,
+    pub mfe_distribution: DistributionResult,
+    pub mae_distribution: DistributionResult,
+    pub time_to_outcome_minutes_distribution: DistributionResult,
+    pub mfe_mae_ratio_distribution: DistributionResult,
+}
+
+fn distribution_from_values(metric: &str, values: &[f64]) -> DistributionResult {
+    if values.is_empty() {
+        return DistributionResult {
+            metric: metric.to_string(),
+            sample_count: 0,
+            mean: 0.0,
+            median: 0.0,
+            stddev: 0.0,
+            min: 0.0,
+            max: 0.0,
+            p10: 0.0,
+            p25: 0.0,
+            p75: 0.0,
+            p90: 0.0,
+        };
+    }
+
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = sorted.len();
+    let sum: f64 = sorted.iter().sum();
+    let mean = sum / n as f64;
+    let variance = sorted.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n as f64;
+    let stddev = variance.sqrt();
+
+    let percentile = |p: f64| -> f64 {
+        let idx = (p / 100.0 * (n - 1) as f64).round() as usize;
+        sorted[idx.min(n - 1)]
+    };
+
+    DistributionResult {
+        metric: metric.to_string(),
+        sample_count: n,
+        mean,
+        median: percentile(50.0),
+        stddev,
+        min: sorted[0],
+        max: sorted[n - 1],
+        p10: percentile(10.0),
+        p25: percentile(25.0),
+        p75: percentile(75.0),
+        p90: percentile(90.0),
+    }
+}
+
 /// "How often does event X happen per session?"
 pub fn event_frequency(
     db: &Database,
@@ -183,49 +248,10 @@ pub fn signal_outcome_distribution(
         .map_err(|e| e.to_string())?;
 
     let values: Vec<f64> = outcomes.into_iter().filter_map(|(_, _, r, _)| r).collect();
-
-    if values.is_empty() {
-        return Ok(DistributionResult {
-            metric: format!("r_result (setup {setup_id})"),
-            sample_count: 0,
-            mean: 0.0,
-            median: 0.0,
-            stddev: 0.0,
-            min: 0.0,
-            max: 0.0,
-            p10: 0.0,
-            p25: 0.0,
-            p75: 0.0,
-            p90: 0.0,
-        });
-    }
-
-    let mut sorted = values.clone();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let n = sorted.len();
-    let sum: f64 = sorted.iter().sum();
-    let mean = sum / n as f64;
-    let variance = sorted.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n as f64;
-    let stddev = variance.sqrt();
-
-    let percentile = |p: f64| -> f64 {
-        let idx = (p / 100.0 * (n - 1) as f64).round() as usize;
-        sorted[idx.min(n - 1)]
-    };
-
-    Ok(DistributionResult {
-        metric: format!("r_result (setup {setup_id})"),
-        sample_count: n,
-        mean,
-        median: percentile(50.0),
-        stddev,
-        min: sorted[0],
-        max: sorted[n - 1],
-        p10: percentile(10.0),
-        p25: percentile(25.0),
-        p75: percentile(75.0),
-        p90: percentile(90.0),
-    })
+    Ok(distribution_from_values(
+        &format!("r_result (setup {setup_id})"),
+        &values,
+    ))
 }
 
 /// Conditional win rate: when setup X fires and session has field=value, what is the win rate?
@@ -303,6 +329,70 @@ pub fn signal_outcome_conditional(
     })
 }
 
+/// Distribution diagnostics for setup outcome excursions (MFE/MAE/time-to-outcome).
+pub fn signal_outcome_excursions(
+    db: &Database,
+    setup_id: Option<&str>,
+    start_date: Option<&str>,
+    end_date: Option<&str>,
+    scope: Option<&SessionScopeFilter>,
+) -> Result<SignalOutcomeExcursionsResult, String> {
+    let rows = db
+        .list_signal_outcomes_for_excursions_filtered(setup_id, start_date, end_date, scope)
+        .map_err(|e| e.to_string())?;
+
+    let mut target_hit = 0_i64;
+    let mut stop_hit = 0_i64;
+    let mut time_exit = 0_i64;
+    let mut other = 0_i64;
+
+    let mut mfe_values = Vec::new();
+    let mut mae_values = Vec::new();
+    let mut time_minutes = Vec::new();
+    let mut mfe_mae_ratio = Vec::new();
+
+    for row in &rows {
+        match row.outcome.as_str() {
+            "target_hit" => target_hit += 1,
+            "stop_hit" => stop_hit += 1,
+            "time_exit" => time_exit += 1,
+            _ => other += 1,
+        }
+
+        if let Some(v) = row.max_favorable_excursion {
+            mfe_values.push(v);
+        }
+        if let Some(v) = row.max_adverse_excursion {
+            mae_values.push(v);
+        }
+        if let Some(ms) = row.time_to_outcome_ms {
+            time_minutes.push(ms / 60_000.0);
+        }
+        if let (Some(mfe), Some(mae)) = (row.max_favorable_excursion, row.max_adverse_excursion) {
+            if mae.abs() > 1e-9 {
+                mfe_mae_ratio.push(mfe / mae.abs());
+            }
+        }
+    }
+
+    Ok(SignalOutcomeExcursionsResult {
+        sample_count: rows.len(),
+        outcome_breakdown: OutcomeBreakdown {
+            target_hit,
+            stop_hit,
+            time_exit,
+            other,
+        },
+        mfe_distribution: distribution_from_values("max_favorable_excursion", &mfe_values),
+        mae_distribution: distribution_from_values("max_adverse_excursion", &mae_values),
+        time_to_outcome_minutes_distribution: distribution_from_values(
+            "time_to_outcome_minutes",
+            &time_minutes,
+        ),
+        mfe_mae_ratio_distribution: distribution_from_values("mfe_mae_ratio", &mfe_mae_ratio),
+    })
+}
+
 /// Distribution of a numeric metric from session_summaries.
 pub fn metric_distribution(
     db: &Database,
@@ -317,7 +407,7 @@ pub fn metric_distribution(
     let summary_end = scope
         .and_then(|s| s.trading_day_end.as_deref())
         .or(end_date);
-    let mut values = db
+    let values = db
         .metric_values(
             metric,
             summary_start,
@@ -325,48 +415,7 @@ pub fn metric_distribution(
             scope.and_then(|s| s.session_type.as_deref()),
         )
         .map_err(|e| e.to_string())?;
-
-    if values.is_empty() {
-        return Ok(DistributionResult {
-            metric: metric.to_string(),
-            sample_count: 0,
-            mean: 0.0,
-            median: 0.0,
-            stddev: 0.0,
-            min: 0.0,
-            max: 0.0,
-            p10: 0.0,
-            p25: 0.0,
-            p75: 0.0,
-            p90: 0.0,
-        });
-    }
-
-    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let n = values.len();
-    let sum: f64 = values.iter().sum();
-    let mean = sum / n as f64;
-    let variance = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n as f64;
-    let stddev = variance.sqrt();
-
-    let percentile = |p: f64| -> f64 {
-        let idx = (p / 100.0 * (n - 1) as f64).round() as usize;
-        values[idx.min(n - 1)]
-    };
-
-    Ok(DistributionResult {
-        metric: metric.to_string(),
-        sample_count: n,
-        mean,
-        median: percentile(50.0),
-        stddev,
-        min: values[0],
-        max: values[n - 1],
-        p10: percentile(10.0),
-        p25: percentile(25.0),
-        p75: percentile(75.0),
-        p90: percentile(90.0),
-    })
+    Ok(distribution_from_values(metric, &values))
 }
 
 /// User-configurable weights for multi-dimensional session similarity.
@@ -560,6 +609,7 @@ pub fn compare_sessions_multi(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::SignalOutcome;
 
     #[test]
     fn distribution_handles_empty() {
@@ -567,5 +617,58 @@ mod tests {
         let db = Database::open(file.path().to_string_lossy().as_ref()).unwrap();
         let result = metric_distribution(&db, "ib_range", None, None, None).unwrap();
         assert_eq!(result.sample_count, 0);
+    }
+
+    #[test]
+    fn excursions_query_computes_breakdown_and_distributions() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = Database::open(file.path().to_string_lossy().as_ref()).unwrap();
+        db.insert_signal_outcome(&SignalOutcome {
+            signal_id: "e1".into(),
+            setup_id: "s1".into(),
+            setup_name: Some("Setup 1".into()),
+            session_date: "2026-03-04".into(),
+            source: "live".into(),
+            job_id: None,
+            fired_at_ms: 1_000.0,
+            fired_price: 21000.0,
+            target_price: Some(21010.0),
+            stop_price: Some(20990.0),
+            outcome: "target_hit".into(),
+            outcome_at_ms: Some(2_000.0),
+            max_favorable_excursion: Some(15.0),
+            max_adverse_excursion: Some(5.0),
+            r_result: Some(1.0),
+            time_to_outcome_ms: Some(60_000.0),
+        })
+        .unwrap();
+        db.insert_signal_outcome(&SignalOutcome {
+            signal_id: "e2".into(),
+            setup_id: "s1".into(),
+            setup_name: Some("Setup 1".into()),
+            session_date: "2026-03-04".into(),
+            source: "live".into(),
+            job_id: None,
+            fired_at_ms: 3_000.0,
+            fired_price: 21000.0,
+            target_price: Some(21010.0),
+            stop_price: Some(20990.0),
+            outcome: "time_exit".into(),
+            outcome_at_ms: Some(4_000.0),
+            max_favorable_excursion: Some(6.0),
+            max_adverse_excursion: Some(3.0),
+            r_result: Some(0.2),
+            time_to_outcome_ms: Some(120_000.0),
+        })
+        .unwrap();
+
+        let result = signal_outcome_excursions(&db, Some("s1"), None, None, None).unwrap();
+        assert_eq!(result.sample_count, 2);
+        assert_eq!(result.outcome_breakdown.target_hit, 1);
+        assert_eq!(result.outcome_breakdown.time_exit, 1);
+        assert_eq!(result.mfe_distribution.sample_count, 2);
+        assert_eq!(result.mae_distribution.sample_count, 2);
+        assert_eq!(result.time_to_outcome_minutes_distribution.sample_count, 2);
+        assert_eq!(result.mfe_mae_ratio_distribution.sample_count, 2);
     }
 }

@@ -116,11 +116,15 @@ Risk output: **Full session-start protocol.**
 ### Performance Review ("How am I doing?", "What's my win rate?", "Performance")
 
 Call:
-- `get_signal_performance` (aggregate and per-setup)
+- `get_setup_performance_matrix` (breadth scan across setups)
+- `get_signal_performance` (aggregate and setup drill-down)
+- `query_signal_outcome_distribution` (R-result profile for focus setups)
+- `query_signal_outcome_conditional` (regime-conditioned performance)
+- `query_signal_outcome_excursions` (MFE/MAE/time-to-outcome diagnostics)
 - `get_session_history(limit=20)` (recent sessions)
 - `get_account_state` (balance progression)
 
-Report: win rate, average R, Kelly sizing implications, compounding progress, cycle status.
+Report: setup leaderboard, win rate, average R, regime sensitivity, execution-quality diagnostics, Kelly sizing implications, compounding progress, cycle status.
 
 Risk output: **Full compounding report.**
 

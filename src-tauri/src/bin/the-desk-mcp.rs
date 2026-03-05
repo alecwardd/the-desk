@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use the_desk_backend::backfill;
 use the_desk_backend::db::{
     AccountStateRecord, Database, HistoricalJobRun, OpenPositionRecord, RiskConfigRecord,
-    SessionScopeFilter, SignalOutcome, TradeRecord,
+    SessionScopeFilter, SetupPerformanceSortBy, SignalOutcome, TradeRecord,
 };
 use the_desk_backend::feed::scid_reader::{parse_record_scaled, ScidReader};
 use the_desk_backend::feed::{load_feed_config, load_storage_config, TradeSide};
@@ -246,6 +246,26 @@ fn build_session_scope_filter(
     }
 }
 
+fn parse_setup_perf_sort(sort_by: Option<&str>) -> Result<SetupPerformanceSortBy, McpError> {
+    match sort_by.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("resolved") => Ok(SetupPerformanceSortBy::Resolved),
+        Some("winrate") => Ok(SetupPerformanceSortBy::WinRate),
+        Some("avgr") => Ok(SetupPerformanceSortBy::AvgR),
+        Some("totalsignals") => Ok(SetupPerformanceSortBy::TotalSignals),
+        Some(other) => Err(invalid_params_error(format!(
+            "sortBy must be one of winRate|avgR|resolved|totalSignals, got: {other}"
+        ))),
+    }
+}
+
+fn normalize_signal_source(raw: &str) -> Option<&'static str> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "live" => Some("live"),
+        "backtest" => Some("backtest"),
+        _ => None,
+    }
+}
+
 fn historical_job_response(run: &HistoricalJobRun, already_running: bool) -> serde_json::Value {
     let mut progress = run.progress.clone();
     if let Some(progress_obj) = progress.as_object_mut() {
@@ -336,8 +356,55 @@ struct LimitParams {
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 struct TickQueryParams {
-    /// Maximum number of ticks to return, most recent first (default 500).
+    /// Maximum number of ticks to return (default 200, max 2000). When a time range is set,
+    /// results are returned in ascending chronological order; otherwise most-recent first.
     limit: Option<u64>,
+    /// Start of time range as Unix epoch milliseconds (e.g. 1740092400000.0).
+    /// Use get_market_snapshot to find the current timestamp, then subtract to target earlier times.
+    start_time_ms: Option<f64>,
+    /// End of time range as Unix epoch milliseconds.
+    end_time_ms: Option<f64>,
+    /// Filter to ticks at or above this price.
+    price_low: Option<f64>,
+    /// Filter to ticks at or below this price.
+    price_high: Option<f64>,
+    /// Filter to a specific trading session date in YYYY-MM-DD format (e.g. "2026-03-04").
+    session_date: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+struct FootprintWindowParams {
+    /// Start of time window as Unix epoch milliseconds. Required for meaningful output.
+    start_time_ms: Option<f64>,
+    /// End of time window as Unix epoch milliseconds. Required for meaningful output.
+    end_time_ms: Option<f64>,
+    /// Optional: only return levels at or above this price.
+    price_low: Option<f64>,
+    /// Optional: only return levels at or below this price.
+    price_high: Option<f64>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+struct FootprintParams {
+    /// Optional: only return levels at or above this price. Filtering happens before the top-30 volume sort.
+    price_low: Option<f64>,
+    /// Optional: only return levels at or below this price. Filtering happens before the top-30 volume sort.
+    price_high: Option<f64>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+struct TpoDetailParams {
+    /// Optional: only return levels at or above this price.
+    price_low: Option<f64>,
+    /// Optional: only return levels at or below this price.
+    price_high: Option<f64>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+struct SnapshotAtParams {
+    /// Target time as Unix epoch milliseconds. Returns the stored pipeline snapshot
+    /// closest to this timestamp. Snapshots are stored every ~30 seconds.
+    timestamp_ms: Option<f64>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -555,6 +622,23 @@ struct SignalOutcomeConditionalParams {
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct SignalOutcomeExcursionsParams {
+    /// Setup ID to analyze. Omit for combined outcomes across setups.
+    #[serde(alias = "setup_id")]
+    setup_id: Option<String>,
+    /// Start date filter (YYYY-MM-DD).
+    #[serde(alias = "start_date")]
+    start_date: Option<String>,
+    /// End date filter (YYYY-MM-DD).
+    #[serde(alias = "end_date")]
+    end_date: Option<String>,
+    /// Optional session/trading-day scope filter.
+    #[serde(flatten)]
+    session_scope: SessionScopeParams,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 struct SessionHistoryParams {
     /// Start date filter (YYYY-MM-DD).
     start_date: Option<String>,
@@ -563,6 +647,28 @@ struct SessionHistoryParams {
     /// Filter by day type (e.g. "Trend", "Normal").
     day_type: Option<String>,
     /// Maximum number of sessions to return (default 20).
+    limit: Option<u64>,
+    /// Optional session/trading-day scope filter.
+    #[serde(flatten)]
+    session_scope: SessionScopeParams,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct SetupPerformanceMatrixParams {
+    /// Start date filter (YYYY-MM-DD).
+    #[serde(alias = "start_date")]
+    start_date: Option<String>,
+    /// End date filter (YYYY-MM-DD).
+    #[serde(alias = "end_date")]
+    end_date: Option<String>,
+    /// Minimum resolved outcomes required for inclusion (default 0).
+    #[serde(alias = "min_resolved")]
+    min_resolved: Option<i64>,
+    /// Sort key: winRate | avgR | resolved | totalSignals (default resolved).
+    #[serde(alias = "sort_by")]
+    sort_by: Option<String>,
+    /// Maximum number of setup rows to return (default 50).
     limit: Option<u64>,
     /// Optional session/trading-day scope filter.
     #[serde(flatten)]
@@ -603,6 +709,11 @@ struct SignalPerformanceParams {
     start_date: Option<String>,
     /// End date filter (YYYY-MM-DD).
     end_date: Option<String>,
+    /// Optional source filter: "live" or "backtest".
+    source: Option<String>,
+    /// Optional backtest job ID filter.
+    #[serde(alias = "job_id", alias = "jobId")]
+    job_id: Option<String>,
     /// Optional session/trading-day scope filter.
     #[serde(flatten)]
     session_scope: SessionScopeParams,
@@ -1149,13 +1260,32 @@ impl TheDeskMcp {
     }
 
     #[tool(
-        description = "Footprint / volume-at-price data: top price levels by total volume with bid volume, ask volume, delta, and delta-per-volume ratio at each level. Use for identifying where conviction is concentrated."
+        description = "Footprint / volume-at-price data for the current session: top price levels by total volume with bid volume, ask volume, delta, and delta-per-volume ratio. Use price_low/price_high to focus on a specific price zone (e.g. near a key level). For a time-windowed footprint showing what happened at a specific time, use get_footprint_window instead."
     )]
-    async fn get_footprint(&self) -> Result<CallToolResult, McpError> {
+    async fn get_footprint(
+        &self,
+        Parameters(params): Parameters<FootprintParams>,
+    ) -> Result<CallToolResult, McpError> {
         let db = self.db.lock().map_err(|_| lock_error())?;
         if let Ok(pipelines) = self.pipelines.lock() {
             let mut all_levels = pipelines.footprint.levels();
-            // Sort by total volume descending, return top 30
+            // Apply optional price range filter before sorting/truncating.
+            if params.price_low.is_some() || params.price_high.is_some() {
+                all_levels.retain(|(price, _)| {
+                    if let Some(lo) = params.price_low {
+                        if *price < lo {
+                            return false;
+                        }
+                    }
+                    if let Some(hi) = params.price_high {
+                        if *price > hi {
+                            return false;
+                        }
+                    }
+                    true
+                });
+            }
+            // Sort by total volume descending, return top 30.
             all_levels.sort_by(|a, b| {
                 b.1.total()
                     .partial_cmp(&a.1.total())
@@ -1179,6 +1309,7 @@ impl TheDeskMcp {
             return Ok(text_result(serde_json::json!({
                 "topLevelsByVolume": top,
                 "totalPriceLevels": all_levels.len(),
+                "priceFilter": { "low": params.price_low, "high": params.price_high },
                 "dataAgeMs": compute_data_age(&db)
             })));
         }
@@ -1189,6 +1320,124 @@ impl TheDeskMcp {
                 "dataAgeMs": compute_data_age(&db)
             }))),
             Ok(None) => Ok(no_data("No footprint data available")),
+            Err(e) => Err(db_error(e)),
+        }
+    }
+
+    #[tool(
+        description = "Time-windowed footprint: bid/ask volume at each price level traded between start_time_ms and end_time_ms. Ideal for reconstructing what happened at a specific price during a specific time window — e.g. 'show me the footprint at the overnight low between 20:00 and 20:10'. Results are sorted by price ascending. Use get_market_snapshot to find current timestamp_ms, then subtract milliseconds to target earlier windows. Optionally narrow the price range with price_low/price_high."
+    )]
+    async fn get_footprint_window(
+        &self,
+        Parameters(params): Parameters<FootprintWindowParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let db = self.db.lock().map_err(|_| lock_error())?;
+        if let Ok(pipelines) = self.pipelines.lock() {
+            let start = params.start_time_ms.unwrap_or(0.0);
+            let end = params.end_time_ms.unwrap_or(f64::MAX);
+            let mut levels = pipelines.footprint.levels_in_window(start, end);
+            // Apply optional price range filter.
+            if params.price_low.is_some() || params.price_high.is_some() {
+                levels.retain(|(price, _)| {
+                    if let Some(lo) = params.price_low {
+                        if *price < lo {
+                            return false;
+                        }
+                    }
+                    if let Some(hi) = params.price_high {
+                        if *price > hi {
+                            return false;
+                        }
+                    }
+                    true
+                });
+            }
+            let total_volume: f64 = levels.iter().map(|(_, l)| l.total()).sum();
+            let net_delta: f64 = levels.iter().map(|(_, l)| l.delta()).sum();
+            let level_count = levels.len();
+            let level_data: Vec<serde_json::Value> = levels
+                .iter()
+                .map(|(price, lvl)| {
+                    serde_json::json!({
+                        "price": price,
+                        "bidVolume": lvl.bid_volume,
+                        "askVolume": lvl.ask_volume,
+                        "totalVolume": lvl.total(),
+                        "delta": lvl.delta(),
+                        "deltaPerVolume": lvl.delta_per_volume(),
+                        "imbalanceRatio": lvl.imbalance_ratio(),
+                    })
+                })
+                .collect();
+            return Ok(text_result(serde_json::json!({
+                "levels": level_data,
+                "levelCount": level_count,
+                "windowStartMs": start,
+                "windowEndMs": if end == f64::MAX { serde_json::Value::Null } else { serde_json::json!(end) },
+                "priceFilter": { "low": params.price_low, "high": params.price_high },
+                "summary": {
+                    "totalVolume": total_volume,
+                    "netDelta": net_delta,
+                },
+                "note": "In-memory current session only. For historical sessions, use query_ticks with time and price filters.",
+                "dataAgeMs": compute_data_age(&db)
+            })));
+        }
+        Err(McpError::internal_error("Pipeline lock unavailable", None))
+    }
+
+    #[tool(
+        description = "Per-price TPO letter detail for the current session: shows which 30-minute brackets (A, B, C, …) printed at each price level. Bracket A = first 30 min (Opening Range), B = 30-60 min (completes IB), C onwards = regular session. Single-print levels (is_single_print: true) are tail/excess candidates. Use price_low/price_high to focus on a specific price zone."
+    )]
+    async fn get_tpo_detail(
+        &self,
+        Parameters(params): Parameters<TpoDetailParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let db = self.db.lock().map_err(|_| lock_error())?;
+        if let Ok(pipelines) = self.pipelines.lock() {
+            let detail = pipelines
+                .tpo
+                .tpo_letter_detail(params.price_low, params.price_high);
+            let single_print_prices: Vec<f64> = detail
+                .iter()
+                .filter(|d| d.is_single_print)
+                .map(|d| d.price)
+                .collect();
+            let level_count = detail.len();
+            let single_count = single_print_prices.len();
+            return Ok(text_result(serde_json::json!({
+                "levels": detail,
+                "levelCount": level_count,
+                "singlePrintCount": single_count,
+                "singlePrintPrices": single_print_prices,
+                "priceFilter": { "low": params.price_low, "high": params.price_high },
+                "note": "In-memory current session only. Brackets: A=0 (OR), B=1 (completes IB), C=2, D=3, ...",
+                "dataAgeMs": compute_data_age(&db)
+            })));
+        }
+        Err(McpError::internal_error("Pipeline lock unavailable", None))
+    }
+
+    #[tool(
+        description = "Historical pipeline snapshot nearest to a given timestamp. Pipeline state (VWAP, POC, VA, delta, day type, etc.) is stored every ~30 seconds. Use this to answer 'what was the market structure at 20:00?' — pass that time as epoch milliseconds. The response includes the actual snapshot timestamp so you can see how close the match is. Use get_market_snapshot to get the current timestamp_ms and work backward."
+    )]
+    async fn get_snapshot_at(
+        &self,
+        Parameters(params): Parameters<SnapshotAtParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let db = self.db.lock().map_err(|_| lock_error())?;
+        let target_ms = params
+            .timestamp_ms
+            .unwrap_or_else(|| db.latest_tick_timestamp_ms().ok().flatten().unwrap_or(0.0));
+        match db.get_snapshot_near(target_ms) {
+            Ok(Some((snapshot_ts, payload))) => Ok(text_result(serde_json::json!({
+                "snapshot": payload,
+                "snapshotTimestampMs": snapshot_ts,
+                "requestedTimestampMs": target_ms,
+                "offsetMs": snapshot_ts - target_ms,
+                "dataAgeMs": compute_data_age(&db)
+            }))),
+            Ok(None) => Ok(no_data("No pipeline snapshots found. Snapshots are stored every ~30s once data is flowing.")),
             Err(e) => Err(db_error(e)),
         }
     }
@@ -1240,11 +1489,41 @@ impl TheDeskMcp {
         Parameters(params): Parameters<LimitParams>,
     ) -> Result<CallToolResult, McpError> {
         let limit = params.limit.unwrap_or(25) as usize;
+
+        // Try live pipeline first
+        if let Ok(pipelines) = self.pipelines.lock() {
+            let live_events = pipelines.absorption.recent_events();
+            if !live_events.is_empty() {
+                let events: Vec<serde_json::Value> = live_events
+                    .iter()
+                    .rev()
+                    .take(limit)
+                    .map(|evt| {
+                        serde_json::json!({
+                            "timestampMs": evt.timestamp_ms,
+                            "eventType": evt.event_type,
+                            "price": evt.price,
+                            "severity": evt.severity,
+                        })
+                    })
+                    .collect();
+                let db = self.db.lock().map_err(|_| lock_error())?;
+                return Ok(text_result(serde_json::json!({
+                    "events": events,
+                    "count": events.len(),
+                    "source": "live_pipeline",
+                    "dataAgeMs": compute_data_age(&db)
+                })));
+            }
+        }
+
+        // Fall back to market_events table (where FlowEventEmitter writes absorption_detected events)
         let db = self.db.lock().map_err(|_| lock_error())?;
-        match db.list_recent_absorption_events(limit) {
+        match db.list_market_events_by_type("absorption_detected", limit) {
             Ok(events) => Ok(text_result(serde_json::json!({
                 "events": events,
                 "count": events.len(),
+                "source": "market_events_db",
                 "dataAgeMs": compute_data_age(&db)
             }))),
             Err(e) => Err(db_error(e)),
@@ -1632,21 +1911,53 @@ impl TheDeskMcp {
     }
 
     #[tool(
-        description = "Query recent raw tick data. Returns individual trades with price, volume, bid, ask, and aggressor side. Ordered most recent first."
+        description = "Query raw tick data. Without filters, returns the most recent ticks (most-recent first). With start_time_ms/end_time_ms, returns ticks in that time window in chronological order (ASC) — ideal for reconstructing the tape at a specific moment. With price_low/price_high, limits to trades in that price range. With session_date (YYYY-MM-DD), limits to that trading day. All filters can be combined. Use get_market_snapshot to get the current timestamp_ms and work backward from there."
     )]
     async fn query_ticks(
         &self,
         Parameters(params): Parameters<TickQueryParams>,
     ) -> Result<CallToolResult, McpError> {
-        let limit = params.limit.unwrap_or(500) as usize;
+        let limit = params.limit.unwrap_or(200).min(2000) as usize;
         let db = self.db.lock().map_err(|_| lock_error())?;
-        match db.list_recent_ticks(limit) {
-            Ok(ticks) => Ok(text_result(serde_json::json!({
-                "ticks": ticks,
-                "count": ticks.len(),
-                "dataAgeMs": compute_data_age(&db)
-            }))),
-            Err(e) => Err(db_error(e)),
+        let has_filters = params.start_time_ms.is_some()
+            || params.end_time_ms.is_some()
+            || params.price_low.is_some()
+            || params.price_high.is_some()
+            || params.session_date.is_some();
+        if has_filters {
+            match db.query_ticks_filtered(
+                params.start_time_ms,
+                params.end_time_ms,
+                params.price_low,
+                params.price_high,
+                params.session_date.as_deref(),
+                limit,
+            ) {
+                Ok(ticks) => Ok(text_result(serde_json::json!({
+                    "ticks": ticks,
+                    "count": ticks.len(),
+                    "order": if params.start_time_ms.is_some() || params.end_time_ms.is_some() { "chronological" } else { "mostRecentFirst" },
+                    "filters": {
+                        "startTimeMs": params.start_time_ms,
+                        "endTimeMs": params.end_time_ms,
+                        "priceLow": params.price_low,
+                        "priceHigh": params.price_high,
+                        "sessionDate": params.session_date,
+                    },
+                    "dataAgeMs": compute_data_age(&db)
+                }))),
+                Err(e) => Err(db_error(e)),
+            }
+        } else {
+            match db.list_recent_ticks(limit) {
+                Ok(ticks) => Ok(text_result(serde_json::json!({
+                    "ticks": ticks,
+                    "count": ticks.len(),
+                    "order": "mostRecentFirst",
+                    "dataAgeMs": compute_data_age(&db)
+                }))),
+                Err(e) => Err(db_error(e)),
+            }
         }
     }
 
@@ -2052,6 +2363,29 @@ impl TheDeskMcp {
     }
 
     #[tool(
+        description = "Outcome excursion diagnostics for signal outcomes. Returns distributions for max favorable excursion (MFE), max adverse excursion (MAE), time-to-outcome (minutes), and MFE/MAE ratio, plus resolved outcome breakdown. Use to evaluate execution quality and target/stop behavior."
+    )]
+    async fn query_signal_outcome_excursions(
+        &self,
+        Parameters(params): Parameters<SignalOutcomeExcursionsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let scope = build_session_scope_filter(&params.session_scope)?;
+        let db = self.db.lock().map_err(|_| lock_error())?;
+        match research::signal_outcome_excursions(
+            &db,
+            params.setup_id.as_deref(),
+            params.start_date.as_deref(),
+            params.end_date.as_deref(),
+            scope.as_ref(),
+        ) {
+            Ok(result) => Ok(text_result(
+                serde_json::to_value(&result).unwrap_or_default(),
+            )),
+            Err(e) => Err(db_error(e)),
+        }
+    }
+
+    #[tool(
         description = "Query past session summaries with optional filters. Returns structured session data (OHLC, IB range, day type, delta, close vs levels, POC, VA, DNVA per session) for historical analysis and multi-session value migration."
     )]
     async fn get_session_history(
@@ -2112,23 +2446,64 @@ impl TheDeskMcp {
     }
 
     #[tool(
-        description = "Signal/setup performance statistics. Returns win rate, average R, total signals, target hit vs stop hit counts. Filter by setup_id to see performance of a specific setup."
+        description = "Signal/setup performance statistics. Returns win rate, average R, total signals, resolved/pending counts, target hit vs stop hit vs time-exit counts. Filter by setup_id to see performance of a specific setup. Optional source filter: live|backtest."
     )]
     async fn get_signal_performance(
         &self,
         Parameters(params): Parameters<SignalPerformanceParams>,
     ) -> Result<CallToolResult, McpError> {
         let scope = build_session_scope_filter(&params.session_scope)?;
+        let source = params
+            .source
+            .as_deref()
+            .map(|raw| {
+                normalize_signal_source(raw).ok_or_else(|| {
+                    invalid_params_error(format!("source must be one of live|backtest, got: {raw}"))
+                })
+            })
+            .transpose()?;
         let db = self.db.lock().map_err(|_| lock_error())?;
         match db.signal_performance_filtered(
             params.setup_id.as_deref(),
             params.start_date.as_deref(),
             params.end_date.as_deref(),
-            None,
-            None,
+            source,
+            params.job_id.as_deref(),
             scope.as_ref(),
         ) {
             Ok(result) => Ok(text_result(result)),
+            Err(e) => Err(db_error(e)),
+        }
+    }
+
+    #[tool(
+        description = "Per-setup performance matrix in one call. Returns aggregated setup metrics: total/resolved/pending counts, target/stop/time-exit breakdown, win rate, avg R, avg winner/loser R. Supports date + session scope filters, minimum resolved threshold, sorting, and limit."
+    )]
+    async fn get_setup_performance_matrix(
+        &self,
+        Parameters(params): Parameters<SetupPerformanceMatrixParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let scope = build_session_scope_filter(&params.session_scope)?;
+        let sort_by = parse_setup_perf_sort(params.sort_by.as_deref())?;
+        let min_resolved = params.min_resolved.unwrap_or(0).max(0);
+        let limit = params.limit.unwrap_or(50).max(1) as usize;
+        let db = self.db.lock().map_err(|_| lock_error())?;
+        match db.setup_performance_matrix_filtered(
+            params.start_date.as_deref(),
+            params.end_date.as_deref(),
+            None,
+            None,
+            scope.as_ref(),
+            min_resolved,
+            sort_by,
+            limit,
+        ) {
+            Ok(rows) => Ok(text_result(serde_json::json!({
+                "rows": rows,
+                "count": rows.len(),
+                "sortBy": params.sort_by.unwrap_or_else(|| "resolved".to_string()),
+                "minResolved": min_resolved,
+            }))),
             Err(e) => Err(db_error(e)),
         }
     }
@@ -3009,6 +3384,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut tick_buffer: Vec<(f64, f64, f64, f64, f64, bool, String)> = Vec::new();
             let mut last_integrity_check =
                 std::time::Instant::now() - std::time::Duration::from_secs(30);
+            // Seed current session from the system clock so we can detect boundaries.
+            let mut current_session =
+                et_minutes_from_timestamp(chrono::Utc::now().timestamp_millis() as f64)
+                    .map(classify_session)
+                    .unwrap_or(SessionType::Unknown);
 
             // Seek to current EOF so we only process NEW ticks
             if let Ok(f) = std::fs::File::open(&reader_path) {
@@ -3041,6 +3421,59 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 while file.read_exact(&mut record).is_ok() {
                     offset += 40;
                     if let Some(tick) = parse_record_scaled(&record, price_scale) {
+                        // Detect session boundaries during live polling
+                        if let Some(et_min) = et_minutes_from_timestamp(tick.timestamp_ms) {
+                            let new_session = classify_session(et_min);
+                            if new_session != current_session
+                                && current_session != SessionType::Unknown
+                                && new_session != SessionType::Unknown
+                            {
+                                if let Ok(mut p) = pipelines_bg.lock() {
+                                    let end_state = if current_session == SessionType::Rth {
+                                        Some(p.session_end_state())
+                                    } else {
+                                        None
+                                    };
+                                    let date = session_date_from_timestamp_ms(tick.timestamp_ms);
+                                    if let Some(ref es) = end_state {
+                                        if let Ok(db) = db_bg.lock() {
+                                            let _ = db.save_prior_day_full(
+                                                &date, es.high, es.low, es.close, es.va_high,
+                                                es.va_low, es.poc,
+                                            );
+                                        }
+                                    }
+                                    let today_str =
+                                        session_date_from_timestamp_ms(tick.timestamp_ms);
+                                    let prior = if let Ok(db) = db_bg.lock() {
+                                        db.load_prior_day_full(&today_str).ok().flatten()
+                                    } else {
+                                        None
+                                    };
+                                    p.reset_session();
+                                    if let Some((h, l, c, va_h, va_l, poc)) = prior {
+                                        p.levels.set_prior_day(h, l, c);
+                                        if let (Some(vh), Some(vl), Some(pc)) = (va_h, va_l, poc) {
+                                            p.levels.set_prior_profile(vh, vl, pc);
+                                        }
+                                    }
+                                    eprintln!(
+                                        "[the-desk-mcp] Live boundary: {:?} → {:?}",
+                                        current_session, new_session
+                                    );
+                                }
+                                if let Ok(mut det) = detector_bg.lock() {
+                                    det.reset();
+                                }
+                                if let Ok(mut fe) = flow_emitter_bg.lock() {
+                                    fe.reset();
+                                }
+                            }
+                            if new_session != SessionType::Unknown {
+                                current_session = new_session;
+                            }
+                        }
+
                         let is_buy = matches!(tick.side, TradeSide::Buy);
                         process_tick(
                             &pipelines_bg,
@@ -3137,4 +3570,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let service = server.serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_setup_perf_sort_validates_values() {
+        assert_eq!(
+            parse_setup_perf_sort(None).expect("default"),
+            SetupPerformanceSortBy::Resolved
+        );
+        assert_eq!(
+            parse_setup_perf_sort(Some("winRate")).expect("winRate"),
+            SetupPerformanceSortBy::WinRate
+        );
+        assert!(parse_setup_perf_sort(Some("bogus")).is_err());
+    }
+
+    #[test]
+    fn build_session_scope_filter_validates_and_infers_segment() {
+        let invalid = SessionScopeParams {
+            session_type: Some("RTH".into()),
+            session_segment: Some("Asia".into()),
+            ..Default::default()
+        };
+        assert!(build_session_scope_filter(&invalid).is_err());
+
+        let inferred = SessionScopeParams {
+            session_segment: Some("London".into()),
+            ..Default::default()
+        };
+        let scope = build_session_scope_filter(&inferred)
+            .expect("scope")
+            .expect("some");
+        assert_eq!(scope.session_type.as_deref(), Some("Globex"));
+        assert_eq!(scope.session_segment.as_deref(), Some("London"));
+    }
+
+    #[test]
+    fn normalize_signal_source_validates_values() {
+        assert_eq!(normalize_signal_source("live"), Some("live"));
+        assert_eq!(normalize_signal_source("backtest"), Some("backtest"));
+        assert_eq!(normalize_signal_source("paper"), None);
+    }
 }

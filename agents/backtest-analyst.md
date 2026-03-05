@@ -44,6 +44,7 @@ Responsibilities:
 - Flag regime sensitivity (does setup X work differently in trend vs balance days?)
 - Answer "what if" questions by filtering backtest results by market conditions
 - Feed signal_performance data to risk-coach for Kelly sizing
+- Ensure `signal_outcomes` coverage is sufficient before performance-analyst deep dives (distribution/conditional/excursion reads)
 - Summarize historical analogs and regime similarity
 - Keep outputs descriptive and process-oriented
 

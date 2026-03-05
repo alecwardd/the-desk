@@ -128,21 +128,64 @@ When implementing a feature:
 
 ## MCP Tools Reference
 
-The MCP server (`src/bin/the-desk-mcp.rs`) exposes 35 tools. Key categories:
+The MCP server (`src/bin/the-desk-mcp.rs`) exposes 54 tools across 11 categories:
 
-| Category | Tools |
-|----------|-------|
-| **Snapshot** | `get_market_snapshot` (includes VWAP) |
-| **Structure** | `get_tpo_profile`, `get_delta_profile`, `get_key_levels` (includes prior day levels) |
-| **Microstructure** | `get_tape_pace`, `get_footprint`, `get_absorption_events`, `get_trade_size_profile` |
-| **PTT** | `get_or5_status`, `get_rvol`, `get_day_type`, `get_rebid_reoffer_zones`, `get_pinch_events`, `get_session_inventory` |
-| **Rules** | `evaluate_playbook`, `get_setup_context`, `check_delta_confirmation` |
-| **Risk** | `get_risk_state`, `get_risk_config`, `save_risk_config`, `init_risk_state`, `get_account_state`, `save_account_state`, `get_kelly_position_size`, `get_signal_performance`, `record_trade_result` |
-| **Data** | `query_ticks`, `get_proximity_report` |
-| **Integrity** | `validate_data_integrity` |
-| **Research** | `query_event_frequency`, `query_conditional`, `query_distribution`, `query_signal_outcome_distribution`, `query_signal_outcome_conditional`, `compare_sessions`, `get_session_history`, `get_research_summary` |
-| **Backfill** | `backfill_history`, `run_backtest`, `get_backfill_status`, `cancel_backfill`, `get_backtest_results`, `compare_backtests` |
-| **Storage** | `archive_status` |
+| Category | Tools | Description |
+|----------|-------|-------------|
+| **Snapshot** | `get_market_snapshot` | Current price, VWAP, session state |
+| | `get_session_context` | Session type (RTH/Globex), segment (Asia/London), trading day, data freshness |
+| | `get_session_summary` | Total tick count, latest tick timestamp, latest pipeline snapshot (health check) |
+| | `get_feed_health` | SCID path status, file metadata, ingest lag, freshness diagnostics |
+| | `get_snapshot_at` | Historical pipeline snapshot nearest to a given timestamp |
+| **Structure** | `get_tpo_profile` | POC, value area, opening range, initial balance |
+| | `get_tpo_detail` | Per-price TPO letter detail (which brackets printed where, single prints) |
+| | `get_delta_profile` | Session delta, DNVA, DNP |
+| | `get_delta_at_price` | Delta at a specific price level + top N prices by absolute delta |
+| | `get_key_levels` | Prior day H/L/C, prior VA/POC, overnight H/L, Globex OR30, London OR60, IB |
+| **Microstructure** | `get_tape_pace` | Rolling ticks/sec, volume/sec, acceleration, pace percentile, dwell time |
+| | `get_footprint` | Volume-at-price for current session (bid/ask/delta per level) |
+| | `get_footprint_window` | Time-windowed footprint for a specific time range |
+| | `get_imbalances` | Stacked and diagonal imbalance detection from footprint |
+| | `get_absorption_events` | Absorption/exhaustion events with severity scores |
+| | `get_trade_size_profile` | Trade size distribution (1-lot, 2-5, 6-20, 21+), institutional clustering |
+| **PTT Indicators** | `get_or5_status` | 5-min Opening Range: levels, break direction, mid retest, extension targets |
+| | `get_rvol` | Relative volume vs N-day average at same time-of-day |
+| | `get_day_type` | Day type (Normal/Trend/etc.), profile shape, balance state, single prints |
+| | `get_rebid_reoffer_zones` | Active acceleration zones with status (Fresh/Retested/Held/Failed) |
+| | `get_pinch_events` | Delta momentum reversals across 1m/5m/15m/30m timeframes |
+| | `get_session_inventory` | Cross-session delta inventory (Building/Clearing/Neutral), trend count |
+| **Rules** | `evaluate_playbook` | All active setups vs current market state (met/approaching/notActive) |
+| | `get_setup_context` | Full context for a named setup (OR5, delta, RVOL, day type, zones, risk) |
+| | `check_delta_confirmation` | Session + price-level delta confirmation for a trade direction |
+| **Risk** | `get_risk_state` | Daily P&L in R, trade count, streaks, drawdown, at-limit status |
+| | `get_risk_config` | R-value, max daily loss, circuit breaker, trade limits |
+| | `save_risk_config` | Persist risk configuration (partial updates supported) |
+| | `init_risk_state` | Initialize/reset risk state for new session |
+| | `get_account_state` | Last balance, open positions, Lucid params, profit goals |
+| | `save_account_state` | Persist account state (partial updates supported) |
+| | `get_kelly_position_size` | 1/4 Kelly sizing with confidence scaling |
+| | `get_signal_performance` | Win rate, avg R, resolved/pending, target/stop/time-exit counts |
+| | `record_trade_result` | Record closed trade, update risk state |
+| **Data** | `query_ticks` | Raw tick data queries |
+| | `get_proximity_report` | Which key levels is price near (sorted by distance) |
+| **Integrity** | `validate_data_integrity` | Tick count, freshness, pipeline consistency invariants |
+| **Research** | `query_event_frequency` | How often does event X occur across sessions? |
+| | `query_conditional` | When X happens N+ times, how often does Y occur? |
+| | `query_distribution` | Distribution stats for a numeric metric (mean, median, percentiles) |
+| | `get_setup_performance_matrix` | Per-setup performance table (win rate, avg R, counts) |
+| | `query_signal_outcome_distribution` | R-result distribution for a setup's signal outcomes |
+| | `query_signal_outcome_conditional` | Conditional win rate for signals filtered by session attributes |
+| | `query_signal_outcome_excursions` | MFE/MAE/time-to-outcome diagnostics for signal outcomes |
+| | `compare_sessions` | Multi-dimensional similarity matching against historical sessions |
+| | `get_session_history` | Query past session summaries with optional filters |
+| | `get_research_summary` | Pre-session statistical briefing (session count, IB dist, day types) |
+| **Backfill** | `backfill_history` | Queue historical backfill job (all 14 pipelines + event detection) |
+| | `run_backtest` | Queue backtest replay job (rules engine over historical data) |
+| | `get_backfill_status` | Poll progress for backfill/backtest jobs |
+| | `cancel_backfill` | Cancel in-flight backfill/backtest job |
+| | `get_backtest_results` | Retrieve stored backtest runs with metrics |
+| | `compare_backtests` | Compare two or more backtest runs side-by-side |
+| **Storage** | `archive_status` | Hot/warm/cold tier sizes, session count, last archive date |
 
 ---
 

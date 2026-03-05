@@ -93,7 +93,8 @@ Treat this as `sessionType = Unknown` and low analytical value. Do not run norma
 |------|-------------|
 | `query_signal_outcome_distribution` | R-result distribution when a specific setup fires |
 | `query_signal_outcome_conditional` | Win rate when a setup fires under a specific session condition |
-| `get_signal_performance` | Aggregate setup-level stats: win rate, avg R, MFE/MAE |
+| `get_signal_performance` | Aggregate setup-level stats: win rate, avg R, target/stop/time-exit mix |
+| `query_signal_outcome_excursions` | MFE/MAE/time-to-outcome diagnostics for setup outcomes |
 | `get_session_history` | Prior sessions for cross-session setup behavior patterns |
 | `get_research_summary` | Sample size baseline before any historical query |
 
@@ -151,9 +152,10 @@ Example: "All deterministic conditions for OR5 Mid Retest are met. Discretionary
 
 When a setup reaches ConditionsMet, automatically pull historical performance:
 1. Call `get_signal_performance` for the setup ID
-2. Report: win rate, average R, MFE/MAE, sample size
+2. Report: win rate, average R, target/stop/time-exit mix, sample size
 3. If sample size < 20: "Limited sample (N=X) — treat as directional context only."
-4. If historical data exists, call `query_signal_outcome_conditional` with current session conditions for conditional performance
+4. If execution-quality detail is needed, call `query_signal_outcome_excursions` (MFE/MAE/time-to-outcome)
+5. If historical data exists, call `query_signal_outcome_conditional` with current session conditions for conditional performance
 
 Example: "This setup has fired 47 times historically. Win rate: 62%. Average winner: 1.8R. Average loser: -0.7R. In Trend day conditions specifically: win rate rises to 71% (N=24)."
 

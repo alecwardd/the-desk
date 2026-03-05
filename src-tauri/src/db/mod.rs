@@ -222,6 +222,26 @@ pub struct SignalOutcome {
     pub time_to_outcome_ms: Option<f64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignalOutcomeExcursionRow {
+    pub setup_id: String,
+    pub setup_name: Option<String>,
+    pub outcome: String,
+    pub max_favorable_excursion: Option<f64>,
+    pub max_adverse_excursion: Option<f64>,
+    pub time_to_outcome_ms: Option<f64>,
+    pub fired_at_ms: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetupPerformanceSortBy {
+    WinRate,
+    AvgR,
+    Resolved,
+    TotalSignals,
+}
+
 /// Optional session/trading-day scope filter used by research-style queries.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -450,6 +470,23 @@ fn trading_day_if_scope_match(
     }
 
     Some(ctx.trading_day)
+}
+
+fn analysis_day_for_scope(
+    session_date: &str,
+    timestamp_ms: f64,
+    scope: Option<&SessionScopeFilter>,
+) -> Option<String> {
+    match trading_day_if_scope_match(timestamp_ms, scope) {
+        Some(day) => Some(day),
+        None => {
+            if scope.map(|s| !s.is_empty()).unwrap_or(false) {
+                None
+            } else {
+                Some(session_date.to_string())
+            }
+        }
+    }
 }
 
 impl Default for RiskConfigRecord {
@@ -1991,6 +2028,135 @@ impl Database {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// Query ticks with optional filters for time range, price range, and session date.
+    ///
+    /// When a time range is provided, results are returned in ascending chronological order
+    /// (oldest first) so the caller can read the auction from left to right. Without time
+    /// filters the results are ordered most-recent first (same as `list_recent_ticks`).
+    pub fn query_ticks_filtered(
+        &self,
+        start_ms: Option<f64>,
+        end_ms: Option<f64>,
+        price_low: Option<f64>,
+        price_high: Option<f64>,
+        session_date: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<RawTickRecord>, DbError> {
+        use rusqlite::types::Value;
+
+        let mut conditions = Vec::<String>::new();
+        let mut p: Vec<Value> = Vec::new();
+
+        if let Some(v) = start_ms {
+            p.push(Value::Real(v));
+            conditions.push(format!("timestamp_ms >= ?{}", p.len()));
+        }
+        if let Some(v) = end_ms {
+            p.push(Value::Real(v));
+            conditions.push(format!("timestamp_ms <= ?{}", p.len()));
+        }
+        if let Some(v) = price_low {
+            p.push(Value::Real(v));
+            conditions.push(format!("price >= ?{}", p.len()));
+        }
+        if let Some(v) = price_high {
+            p.push(Value::Real(v));
+            conditions.push(format!("price <= ?{}", p.len()));
+        }
+        if let Some(v) = session_date {
+            p.push(Value::Text(v.to_string()));
+            conditions.push(format!("session_date = ?{}", p.len()));
+        }
+        p.push(Value::Integer(limit as i64));
+        let limit_idx = p.len();
+
+        let where_clause = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", conditions.join(" AND "))
+        };
+
+        // Use ASC when a time window is given (chronological read), DESC otherwise.
+        let order = if start_ms.is_some() || end_ms.is_some() {
+            "ASC"
+        } else {
+            "DESC"
+        };
+
+        let sql = format!(
+            "SELECT id, timestamp_ms, price, volume, bid, ask, is_buy, session_date \
+             FROM raw_ticks {where_clause} ORDER BY timestamp_ms {order} LIMIT ?{limit_idx}"
+        );
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(p), |row| {
+            Ok(RawTickRecord {
+                id: row.get(0)?,
+                timestamp_ms: row.get(1)?,
+                price: row.get(2)?,
+                volume: row.get(3)?,
+                bid: row.get(4)?,
+                ask: row.get(5)?,
+                is_buy: row.get::<_, i64>(6)? == 1,
+                session_date: row.get(7)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Return the pipeline snapshot stored closest in time to `timestamp_ms`.
+    /// Also returns the actual snapshot timestamp so callers can see how close the match was.
+    pub fn get_snapshot_near(
+        &self,
+        timestamp_ms: f64,
+    ) -> Result<Option<(f64, serde_json::Value)>, DbError> {
+        // Use two index-friendly lookups (before and after) and pick the nearer row.
+        let before = {
+            let mut stmt = self.conn.prepare(
+                "SELECT timestamp_ms, payload FROM pipeline_snapshots \
+                 WHERE timestamp_ms <= ?1 ORDER BY timestamp_ms DESC LIMIT 1",
+            )?;
+            let mut rows = stmt.query(params![timestamp_ms])?;
+            if let Some(row) = rows.next()? {
+                let ts: f64 = row.get(0)?;
+                let payload: String = row.get(1)?;
+                serde_json::from_str::<serde_json::Value>(&payload)
+                    .ok()
+                    .map(|v| (ts, v))
+            } else {
+                None
+            }
+        };
+        let after = {
+            let mut stmt = self.conn.prepare(
+                "SELECT timestamp_ms, payload FROM pipeline_snapshots \
+                 WHERE timestamp_ms >= ?1 ORDER BY timestamp_ms ASC LIMIT 1",
+            )?;
+            let mut rows = stmt.query(params![timestamp_ms])?;
+            if let Some(row) = rows.next()? {
+                let ts: f64 = row.get(0)?;
+                let payload: String = row.get(1)?;
+                serde_json::from_str::<serde_json::Value>(&payload)
+                    .ok()
+                    .map(|v| (ts, v))
+            } else {
+                None
+            }
+        };
+        Ok(match (before, after) {
+            (Some(b), Some(a)) => {
+                if (b.0 - timestamp_ms).abs() <= (a.0 - timestamp_ms).abs() {
+                    Some(b)
+                } else {
+                    Some(a)
+                }
+            }
+            (Some(b), None) => Some(b),
+            (None, Some(a)) => Some(a),
+            (None, None) => None,
+        })
+    }
+
     pub fn raw_tick_count(&self) -> Result<i64, DbError> {
         Ok(self
             .conn
@@ -2028,6 +2194,37 @@ impl Database {
                 "price": row.get::<_, f64>(2)?,
                 "severity": row.get::<_, f64>(3)?,
                 "payload": payload
+            }))
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn list_market_events_by_type(
+        &self,
+        event_type: &str,
+        limit: usize,
+    ) -> Result<Vec<serde_json::Value>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT timestamp_ms, event_type, price, direction, metadata_json,
+                    session_date, session_type, session_segment, trading_day
+             FROM market_events WHERE event_type = ?1
+             ORDER BY timestamp_ms DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![event_type, limit as i64], |row| {
+            let metadata_str: Option<String> = row.get(4)?;
+            let metadata: serde_json::Value = metadata_str
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_else(|| serde_json::json!({}));
+            Ok(serde_json::json!({
+                "timestampMs": row.get::<_, f64>(0)?,
+                "eventType": row.get::<_, String>(1)?,
+                "price": row.get::<_, f64>(2)?,
+                "direction": row.get::<_, Option<String>>(3)?,
+                "metadata": metadata,
+                "sessionDate": row.get::<_, String>(5)?,
+                "sessionType": row.get::<_, Option<String>>(6)?,
+                "sessionSegment": row.get::<_, Option<String>>(7)?,
+                "tradingDay": row.get::<_, Option<String>>(8)?,
             }))
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -2858,8 +3055,10 @@ impl Database {
                     continue;
                 }
             }
-            let analysis_day =
-                trading_day_if_scope_match(fired_at_ms, scope).unwrap_or(session_date.clone());
+            let Some(analysis_day) = analysis_day_for_scope(&session_date, fired_at_ms, scope)
+            else {
+                continue;
+            };
             if let Some(sd) = start_date {
                 if analysis_day.as_str() < sd {
                     continue;
@@ -2871,6 +3070,68 @@ impl Database {
                 }
             }
             results.push((sid, analysis_day, r_result, outcome));
+        }
+        Ok(results)
+    }
+
+    /// List resolved signal outcomes with excursion fields for performance diagnostics.
+    pub fn list_signal_outcomes_for_excursions_filtered(
+        &self,
+        setup_id: Option<&str>,
+        start_date: Option<&str>,
+        end_date: Option<&str>,
+        scope: Option<&SessionScopeFilter>,
+    ) -> Result<Vec<SignalOutcomeExcursionRow>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT setup_id, setup_name, session_date, fired_at_ms, outcome,
+                    max_favorable_excursion, max_adverse_excursion, time_to_outcome_ms
+             FROM signal_outcomes
+             WHERE outcome != 'pending'",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, f64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<f64>>(5)?,
+                row.get::<_, Option<f64>>(6)?,
+                row.get::<_, Option<f64>>(7)?,
+            ))
+        })?;
+
+        let mut results = Vec::new();
+        for row in rows.filter_map(|r| r.ok()) {
+            let (sid, setup_name, session_date, fired_at_ms, outcome, mfe, mae, tto_ms) = row;
+            if let Some(filter_id) = setup_id {
+                if sid != filter_id {
+                    continue;
+                }
+            }
+            let Some(analysis_day) = analysis_day_for_scope(&session_date, fired_at_ms, scope)
+            else {
+                continue;
+            };
+            if let Some(sd) = start_date {
+                if analysis_day.as_str() < sd {
+                    continue;
+                }
+            }
+            if let Some(ed) = end_date {
+                if analysis_day.as_str() > ed {
+                    continue;
+                }
+            }
+            results.push(SignalOutcomeExcursionRow {
+                setup_id: sid,
+                setup_name,
+                outcome,
+                max_favorable_excursion: mfe,
+                max_adverse_excursion: mae,
+                time_to_outcome_ms: tto_ms,
+                fired_at_ms,
+            });
         }
         Ok(results)
     }
@@ -2931,8 +3192,10 @@ impl Database {
 
         let mut total = 0_i64;
         let mut resolved = 0_i64;
+        let mut pending = 0_i64;
         let mut target_hit = 0_i64;
         let mut stop_hit = 0_i64;
+        let mut time_exit = 0_i64;
         let mut r_sum = 0.0_f64;
         let mut r_count = 0_i64;
         let mut winner_sum = 0.0_f64;
@@ -2942,8 +3205,10 @@ impl Database {
 
         for row in rows.filter_map(|r| r.ok()) {
             let (session_date, fired_at_ms, outcome, r_result) = row;
-            let analysis_day =
-                trading_day_if_scope_match(fired_at_ms, scope).unwrap_or(session_date.clone());
+            let Some(analysis_day) = analysis_day_for_scope(&session_date, fired_at_ms, scope)
+            else {
+                continue;
+            };
             if let Some(sd) = start_date {
                 if analysis_day.as_str() < sd {
                     continue;
@@ -2957,11 +3222,15 @@ impl Database {
             total += 1;
             if outcome != "pending" {
                 resolved += 1;
+            } else {
+                pending += 1;
             }
             if outcome == "target_hit" {
                 target_hit += 1;
             } else if outcome == "stop_hit" {
                 stop_hit += 1;
+            } else if outcome == "time_exit" {
+                time_exit += 1;
             }
             if let Some(r) = r_result {
                 r_sum += r;
@@ -2995,8 +3264,10 @@ impl Database {
         let mut result = serde_json::json!({
             "totalSignals": total,
             "resolved": resolved,
+            "pending": pending,
             "targetHit": target_hit,
             "stopHit": stop_hit,
+            "timeExit": time_exit,
             "winRate": if resolved > 0 { target_hit as f64 / resolved as f64 } else { 0.0 },
             "avgR": avg_r,
             "avgWinnerR": avg_winner_r,
@@ -3012,6 +3283,189 @@ impl Database {
             result["jobId"] = serde_json::json!(job_id);
         }
         Ok(result)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn setup_performance_matrix_filtered(
+        &self,
+        start_date: Option<&str>,
+        end_date: Option<&str>,
+        source: Option<&str>,
+        job_id: Option<&str>,
+        scope: Option<&SessionScopeFilter>,
+        min_resolved: i64,
+        sort_by: SetupPerformanceSortBy,
+        limit: usize,
+    ) -> Result<Vec<serde_json::Value>, DbError> {
+        #[derive(Default)]
+        struct SetupPerfAgg {
+            setup_name: Option<String>,
+            total: i64,
+            resolved: i64,
+            pending: i64,
+            target_hit: i64,
+            stop_hit: i64,
+            time_exit: i64,
+            r_sum: f64,
+            r_count: i64,
+            winner_sum: f64,
+            winner_count: i64,
+            loser_sum: f64,
+            loser_count: i64,
+        }
+
+        let mut sql = String::from(
+            "SELECT setup_id, setup_name, session_date, fired_at_ms, outcome, r_result
+             FROM signal_outcomes WHERE 1=1",
+        );
+        let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        if let Some(source) = source {
+            sql.push_str(&format!(" AND source = ?{}", bind_values.len() + 1));
+            bind_values.push(Box::new(source.to_string()));
+        }
+        if let Some(job_id) = job_id {
+            sql.push_str(&format!(" AND job_id = ?{}", bind_values.len() + 1));
+            bind_values.push(Box::new(job_id.to_string()));
+        }
+        let mut stmt = self.conn.prepare(&sql)?;
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+            bind_values.iter().map(|b| b.as_ref()).collect();
+        let rows = stmt.query_map(params_ref.as_slice(), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, f64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<f64>>(5)?,
+            ))
+        })?;
+
+        let mut grouped: BTreeMap<String, SetupPerfAgg> = BTreeMap::new();
+        for row in rows.filter_map(|r| r.ok()) {
+            let (setup_id, setup_name, session_date, fired_at_ms, outcome, r_result) = row;
+            let Some(analysis_day) = analysis_day_for_scope(&session_date, fired_at_ms, scope)
+            else {
+                continue;
+            };
+            if let Some(sd) = start_date {
+                if analysis_day.as_str() < sd {
+                    continue;
+                }
+            }
+            if let Some(ed) = end_date {
+                if analysis_day.as_str() > ed {
+                    continue;
+                }
+            }
+
+            let agg = grouped.entry(setup_id).or_default();
+            if agg.setup_name.is_none() {
+                agg.setup_name = setup_name;
+            }
+            agg.total += 1;
+            if outcome == "pending" {
+                agg.pending += 1;
+            } else {
+                agg.resolved += 1;
+            }
+            if outcome == "target_hit" {
+                agg.target_hit += 1;
+            } else if outcome == "stop_hit" {
+                agg.stop_hit += 1;
+            } else if outcome == "time_exit" {
+                agg.time_exit += 1;
+            }
+            if let Some(r) = r_result {
+                agg.r_sum += r;
+                agg.r_count += 1;
+                if r > 0.0 {
+                    agg.winner_sum += r;
+                    agg.winner_count += 1;
+                } else if r < 0.0 {
+                    agg.loser_sum += r;
+                    agg.loser_count += 1;
+                }
+            }
+        }
+
+        let mut rows: Vec<serde_json::Value> = grouped
+            .into_iter()
+            .filter_map(|(setup_id, agg)| {
+                if agg.resolved < min_resolved {
+                    return None;
+                }
+                let win_rate = if agg.resolved > 0 {
+                    agg.target_hit as f64 / agg.resolved as f64
+                } else {
+                    0.0
+                };
+                let avg_r = if agg.r_count > 0 {
+                    agg.r_sum / agg.r_count as f64
+                } else {
+                    0.0
+                };
+                let avg_winner_r = if agg.winner_count > 0 {
+                    Some(agg.winner_sum / agg.winner_count as f64)
+                } else {
+                    None
+                };
+                let avg_loser_r = if agg.loser_count > 0 {
+                    Some(agg.loser_sum / agg.loser_count as f64)
+                } else {
+                    None
+                };
+                Some(serde_json::json!({
+                    "setupId": setup_id,
+                    "setupName": agg.setup_name,
+                    "totalSignals": agg.total,
+                    "resolved": agg.resolved,
+                    "pending": agg.pending,
+                    "targetHit": agg.target_hit,
+                    "stopHit": agg.stop_hit,
+                    "timeExit": agg.time_exit,
+                    "winRate": win_rate,
+                    "avgR": avg_r,
+                    "avgWinnerR": avg_winner_r,
+                    "avgLoserR": avg_loser_r,
+                }))
+            })
+            .collect();
+
+        rows.sort_by(|a, b| {
+            let ord = match sort_by {
+                SetupPerformanceSortBy::WinRate => b
+                    .get("winRate")
+                    .and_then(|v| v.as_f64())
+                    .partial_cmp(&a.get("winRate").and_then(|v| v.as_f64()))
+                    .unwrap_or(std::cmp::Ordering::Equal),
+                SetupPerformanceSortBy::AvgR => b
+                    .get("avgR")
+                    .and_then(|v| v.as_f64())
+                    .partial_cmp(&a.get("avgR").and_then(|v| v.as_f64()))
+                    .unwrap_or(std::cmp::Ordering::Equal),
+                SetupPerformanceSortBy::Resolved => b
+                    .get("resolved")
+                    .and_then(|v| v.as_i64())
+                    .cmp(&a.get("resolved").and_then(|v| v.as_i64())),
+                SetupPerformanceSortBy::TotalSignals => b
+                    .get("totalSignals")
+                    .and_then(|v| v.as_i64())
+                    .cmp(&a.get("totalSignals").and_then(|v| v.as_i64())),
+            };
+            if ord == std::cmp::Ordering::Equal {
+                a.get("setupId")
+                    .and_then(|v| v.as_str())
+                    .cmp(&b.get("setupId").and_then(|v| v.as_str()))
+            } else {
+                ord
+            }
+        });
+
+        if rows.len() > limit {
+            rows.truncate(limit);
+        }
+        Ok(rows)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3652,6 +4106,117 @@ mod tests {
     }
 
     #[test]
+    fn query_ticks_filtered_by_time_range() {
+        let db = test_db();
+        // Insert ticks spread across two time windows.
+        db.insert_raw_tick(
+            1_000.0,
+            21000.0,
+            10.0,
+            20999.75,
+            21000.25,
+            true,
+            "2026-03-04",
+        )
+        .expect("insert t1");
+        db.insert_raw_tick(
+            2_000.0,
+            21001.0,
+            5.0,
+            21000.75,
+            21001.25,
+            false,
+            "2026-03-04",
+        )
+        .expect("insert t2");
+        db.insert_raw_tick(
+            3_000.0,
+            21002.0,
+            8.0,
+            21001.75,
+            21002.25,
+            true,
+            "2026-03-04",
+        )
+        .expect("insert t3");
+        db.insert_raw_tick(
+            4_000.0,
+            21003.0,
+            12.0,
+            21002.75,
+            21003.25,
+            false,
+            "2026-03-04",
+        )
+        .expect("insert t4");
+
+        // Time-range filter: only t2 and t3.
+        let ticks = db
+            .query_ticks_filtered(Some(1_500.0), Some(3_500.0), None, None, None, 100)
+            .expect("query");
+        assert_eq!(ticks.len(), 2);
+        // Chronological order when time range given.
+        assert_eq!(ticks[0].timestamp_ms, 2_000.0);
+        assert_eq!(ticks[1].timestamp_ms, 3_000.0);
+
+        // Price-range filter: only t1 (21000) and t2 (21001).
+        let ticks = db
+            .query_ticks_filtered(None, None, Some(20999.0), Some(21001.5), None, 100)
+            .expect("query price");
+        assert_eq!(ticks.len(), 2);
+
+        // Session-date filter returns all ticks for that day.
+        let ticks = db
+            .query_ticks_filtered(None, None, None, None, Some("2026-03-04"), 100)
+            .expect("query session");
+        assert_eq!(ticks.len(), 4);
+
+        // Combined time + price: only t3 (ts=3000, price=21002).
+        let ticks = db
+            .query_ticks_filtered(
+                Some(2_500.0),
+                Some(3_500.0),
+                Some(21001.5),
+                Some(21002.5),
+                None,
+                100,
+            )
+            .expect("query combined");
+        assert_eq!(ticks.len(), 1);
+        assert_eq!(ticks[0].price, 21002.0);
+    }
+
+    #[test]
+    fn get_snapshot_near_returns_closest() {
+        let db = test_db();
+        // Insert three snapshots at t=1000, 5000, 9000.
+        let snap_a = serde_json::json!({"label": "a"});
+        let snap_b = serde_json::json!({"label": "b"});
+        let snap_c = serde_json::json!({"label": "c"});
+        db.insert_pipeline_snapshot(1_000.0, &snap_a).expect("a");
+        db.insert_pipeline_snapshot(5_000.0, &snap_b).expect("b");
+        db.insert_pipeline_snapshot(9_000.0, &snap_c).expect("c");
+
+        // Query at t=3500 → closer to b (5000, diff=1500) than a (1000, diff=2500).
+        let (ts, payload) = db.get_snapshot_near(3_500.0).expect("query").expect("some");
+        assert_eq!(ts, 5_000.0);
+        assert_eq!(payload["label"], "b");
+
+        // Query at t=1100 → closer to a (1000, diff=100).
+        let (ts, _) = db.get_snapshot_near(1_100.0).expect("q2").expect("some");
+        assert_eq!(ts, 1_000.0);
+
+        // Query exactly at t=9000 → c.
+        let (ts, payload) = db.get_snapshot_near(9_000.0).expect("q3").expect("some");
+        assert_eq!(ts, 9_000.0);
+        assert_eq!(payload["label"], "c");
+
+        // Query past the end → c (last snapshot).
+        let (ts, _) = db.get_snapshot_near(99_000.0).expect("q4").expect("some");
+        assert_eq!(ts, 9_000.0);
+    }
+
+    #[test]
     fn market_event_scope_falls_back_to_timestamp_when_context_missing() {
         let db = test_db();
         let ts = Eastern
@@ -3681,5 +4246,226 @@ mod tests {
         assert_eq!(total, 1);
         assert_eq!(sessions_with, 1);
         assert_eq!(total_sessions, 1);
+    }
+
+    #[test]
+    fn signal_performance_includes_pending_and_time_exit_and_source_filters() {
+        let db = test_db();
+        db.insert_signal_outcome(&SignalOutcome {
+            signal_id: "p1".into(),
+            setup_id: "s1".into(),
+            setup_name: Some("Setup 1".into()),
+            session_date: "2026-03-04".into(),
+            source: "live".into(),
+            job_id: None,
+            fired_at_ms: 1_000.0,
+            fired_price: 21000.0,
+            target_price: Some(21010.0),
+            stop_price: Some(20990.0),
+            outcome: "pending".into(),
+            outcome_at_ms: None,
+            max_favorable_excursion: Some(8.0),
+            max_adverse_excursion: Some(2.0),
+            r_result: None,
+            time_to_outcome_ms: None,
+        })
+        .expect("insert pending");
+        db.insert_signal_outcome(&SignalOutcome {
+            signal_id: "p2".into(),
+            setup_id: "s1".into(),
+            setup_name: Some("Setup 1".into()),
+            session_date: "2026-03-04".into(),
+            source: "live".into(),
+            job_id: None,
+            fired_at_ms: 2_000.0,
+            fired_price: 21000.0,
+            target_price: Some(21010.0),
+            stop_price: Some(20990.0),
+            outcome: "target_hit".into(),
+            outcome_at_ms: Some(2_500.0),
+            max_favorable_excursion: Some(12.0),
+            max_adverse_excursion: Some(3.0),
+            r_result: Some(1.2),
+            time_to_outcome_ms: Some(500.0),
+        })
+        .expect("insert winner");
+        db.insert_signal_outcome(&SignalOutcome {
+            signal_id: "p3".into(),
+            setup_id: "s1".into(),
+            setup_name: Some("Setup 1".into()),
+            session_date: "2026-03-04".into(),
+            source: "backtest".into(),
+            job_id: Some("job-1".into()),
+            fired_at_ms: 3_000.0,
+            fired_price: 21000.0,
+            target_price: Some(21010.0),
+            stop_price: Some(20990.0),
+            outcome: "time_exit".into(),
+            outcome_at_ms: Some(3_900.0),
+            max_favorable_excursion: Some(6.0),
+            max_adverse_excursion: Some(7.0),
+            r_result: Some(-0.3),
+            time_to_outcome_ms: Some(900.0),
+        })
+        .expect("insert time exit");
+
+        let overall = db
+            .signal_performance_filtered(None, None, None, None, None, None)
+            .expect("overall");
+        assert_eq!(overall["totalSignals"].as_i64(), Some(3));
+        assert_eq!(overall["resolved"].as_i64(), Some(2));
+        assert_eq!(overall["pending"].as_i64(), Some(1));
+        assert_eq!(overall["targetHit"].as_i64(), Some(1));
+        assert_eq!(overall["timeExit"].as_i64(), Some(1));
+        assert_eq!(overall["stopHit"].as_i64(), Some(0));
+        assert_eq!(overall["winRate"].as_f64(), Some(0.5));
+
+        let live_only = db
+            .signal_performance_filtered(None, None, None, Some("live"), None, None)
+            .expect("live only");
+        assert_eq!(live_only["totalSignals"].as_i64(), Some(2));
+        assert_eq!(live_only["timeExit"].as_i64(), Some(0));
+
+        let backtest_job = db
+            .signal_performance_filtered(None, None, None, Some("backtest"), Some("job-1"), None)
+            .expect("backtest job");
+        assert_eq!(backtest_job["totalSignals"].as_i64(), Some(1));
+        assert_eq!(backtest_job["timeExit"].as_i64(), Some(1));
+    }
+
+    #[test]
+    fn setup_performance_matrix_sorts_and_applies_min_resolved() {
+        let db = test_db();
+        let insert = |db: &Database,
+                      signal_id: &str,
+                      setup_id: &str,
+                      outcome: &str,
+                      r: Option<f64>,
+                      fired_at_ms: f64| {
+            db.insert_signal_outcome(&SignalOutcome {
+                signal_id: signal_id.into(),
+                setup_id: setup_id.into(),
+                setup_name: Some(setup_id.into()),
+                session_date: "2026-03-04".into(),
+                source: "live".into(),
+                job_id: None,
+                fired_at_ms,
+                fired_price: 21000.0,
+                target_price: Some(21010.0),
+                stop_price: Some(20990.0),
+                outcome: outcome.into(),
+                outcome_at_ms: None,
+                max_favorable_excursion: None,
+                max_adverse_excursion: None,
+                r_result: r,
+                time_to_outcome_ms: None,
+            })
+            .expect("insert");
+        };
+
+        insert(&db, "a1", "setup-a", "target_hit", Some(1.0), 1_000.0);
+        insert(&db, "a2", "setup-a", "stop_hit", Some(-1.0), 2_000.0);
+        insert(&db, "a3", "setup-a", "time_exit", Some(0.2), 3_000.0);
+        insert(&db, "a4", "setup-a", "pending", None, 4_000.0);
+        insert(&db, "b1", "setup-b", "target_hit", Some(1.5), 5_000.0);
+
+        let matrix = db
+            .setup_performance_matrix_filtered(
+                None,
+                None,
+                None,
+                None,
+                None,
+                2,
+                SetupPerformanceSortBy::WinRate,
+                25,
+            )
+            .expect("matrix");
+        assert_eq!(matrix.len(), 1);
+        assert_eq!(matrix[0]["setupId"].as_str(), Some("setup-a"));
+        assert_eq!(matrix[0]["resolved"].as_i64(), Some(3));
+        assert_eq!(matrix[0]["pending"].as_i64(), Some(1));
+        assert_eq!(matrix[0]["timeExit"].as_i64(), Some(1));
+
+        let limited = db
+            .setup_performance_matrix_filtered(
+                None,
+                None,
+                None,
+                None,
+                None,
+                0,
+                SetupPerformanceSortBy::TotalSignals,
+                1,
+            )
+            .expect("limited");
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0]["setupId"].as_str(), Some("setup-a"));
+    }
+
+    #[test]
+    fn excursion_rows_respect_scope_filters() {
+        let db = test_db();
+        let asia_ts = Eastern
+            .with_ymd_and_hms(2026, 3, 2, 19, 0, 0)
+            .single()
+            .expect("asia ts")
+            .timestamp_millis() as f64;
+        let rth_ts = Eastern
+            .with_ymd_and_hms(2026, 3, 3, 10, 0, 0)
+            .single()
+            .expect("rth ts")
+            .timestamp_millis() as f64;
+
+        db.insert_signal_outcome(&SignalOutcome {
+            signal_id: "asia-row".into(),
+            setup_id: "s-asia".into(),
+            setup_name: Some("Asia Setup".into()),
+            session_date: "2026-03-03".into(),
+            source: "live".into(),
+            job_id: None,
+            fired_at_ms: asia_ts,
+            fired_price: 21000.0,
+            target_price: Some(21010.0),
+            stop_price: Some(20990.0),
+            outcome: "target_hit".into(),
+            outcome_at_ms: Some(asia_ts + 120_000.0),
+            max_favorable_excursion: Some(10.0),
+            max_adverse_excursion: Some(2.0),
+            r_result: Some(1.0),
+            time_to_outcome_ms: Some(120_000.0),
+        })
+        .expect("insert asia");
+        db.insert_signal_outcome(&SignalOutcome {
+            signal_id: "rth-row".into(),
+            setup_id: "s-rth".into(),
+            setup_name: Some("RTH Setup".into()),
+            session_date: "2026-03-03".into(),
+            source: "live".into(),
+            job_id: None,
+            fired_at_ms: rth_ts,
+            fired_price: 21000.0,
+            target_price: Some(21010.0),
+            stop_price: Some(20990.0),
+            outcome: "stop_hit".into(),
+            outcome_at_ms: Some(rth_ts + 180_000.0),
+            max_favorable_excursion: Some(3.0),
+            max_adverse_excursion: Some(9.0),
+            r_result: Some(-1.0),
+            time_to_outcome_ms: Some(180_000.0),
+        })
+        .expect("insert rth");
+
+        let asia_scope = SessionScopeFilter {
+            session_type: Some("Globex".into()),
+            session_segment: Some("Asia".into()),
+            trading_day_start: None,
+            trading_day_end: None,
+        };
+        let rows = db
+            .list_signal_outcomes_for_excursions_filtered(None, None, None, Some(&asia_scope))
+            .expect("rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].setup_id, "s-asia");
     }
 }

@@ -14,6 +14,7 @@ Always do this first:
 2. Read `AGENT.md` for repository workflow requirements.
 3. Read `skills/trading-domain/SKILL.md` before validating any pipeline result.
 4. Read `commands/pipeline-test.md` for the expected verification flow and reporting format.
+5. Call `get_session_context` and verify the expected session classification for the tested window (`sessionType`, `sessionSegment`, `tradingDay`).
 
 Scope you own:
 - Rust pipeline unit/integration verification (VWAP, TPO/Market Profile, Delta, levels, session boundaries).

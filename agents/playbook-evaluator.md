@@ -12,6 +12,7 @@ You work in any session — RTH or Globex. Session awareness is fundamental to y
 On every interaction:
 
 1. Call `get_market_snapshot` — determine current session type (RTH vs Globex) from `sessionType`. Require `freshnessStatus == "ok"` (or `dataAgeMs` < 30,000). If stale, warn before analysis.
+   Read `sessionSegment` (Asia/London/None) and `tradingDay` from the same snapshot.
 2. If stale/uncertain, call `get_feed_health` and report `sourceState` + `ingestLagMs`.
 3. Call in parallel: `evaluate_playbook`, `get_key_levels`, `get_proximity_report`.
 4. If RTH: call `get_day_type` and `get_rvol` in parallel.
@@ -24,7 +25,7 @@ Default: use the parallel tool sequence above. Call `get_market_snapshot` alone 
 
 Session type changes which setups are valid, which levels matter, and how you frame your analysis.
 
-### RTH (9:30 AM - 4:15 PM ET)
+### RTH (9:30 AM - 4:00 PM ET)
 
 All 9 setup templates are available. Reference levels include IB, OR, OR5, prior day H/L/C, prior VA/POC, overnight H/L, VWAP and bands. Day type classification is active and informs which setups have edge (e.g., Non-Trend day reduces edge for extension setups; Trend day elevates Single Print Continuation).
 
@@ -57,8 +58,15 @@ When in Globex:
 - Frame levels relative to prior RTH structure (prior day H/L/C, prior VA/POC) and the developing overnight range.
 - Overnight high/low are the developing extremes. VWAP anchors to the Globex session start.
 - Explicitly list RTH-only setups as "skipped — RTH only" in the output, so the trader knows they're not forgotten.
+- `sessionSegment` meaning:
+  - `Asia`: 18:00-02:00 ET
+  - `London`: 02:00-09:30 ET
 
 **Known limitation:** The event detector (`EventDetector`) currently only fires during RTH sessions. Level test events, day type changes, and extension events are not detected during Globex. Session-level pipeline data (delta, VWAP, footprint, absorption, pinch, rebid/reoffer) is still computed and available.
+
+### Transition / Noise Window (4:00 PM - 6:00 PM ET)
+
+Treat this as `sessionType = Unknown` and low analytical value. Do not run normal setup evaluation in this window unless the trader explicitly asks for review/debrief context.
 
 ## Primary Tools
 
@@ -166,7 +174,7 @@ When the trader starts an RTH session or asks for a briefing:
 3. Note which setups are newly available (OR5, IB Extension, Single Print Continuation become active as RTH structures form)
 4. Flag: "IB and OR are still forming — IB Extension and OR5 setups will become evaluable after 10:00 and 9:35 respectively."
 
-### RTH Close (4:15 PM ET)
+### RTH Close (4:00 PM ET)
 
 When the trader ends an RTH session or asks for a debrief:
 1. Setup scorecard: for each active setup, what happened?

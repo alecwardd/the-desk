@@ -445,6 +445,9 @@ where
             if new_session != SessionType::Unknown {
                 current_session = new_session;
             }
+            if tick_class == SessionType::Unknown {
+                return Ok(ScanControl::Continue);
+            }
 
             let is_buy = matches!(tick.side, TradeSide::Buy);
             let minute = tick_ctx.minute_of_session;
@@ -461,6 +464,7 @@ where
                 minute,
                 tick.timestamp_ms,
                 current_session != SessionType::Rth,
+                tick_ctx.et_minutes,
             );
 
             let bid = if tick.bid > 0.0 {
@@ -904,12 +908,14 @@ mod tests {
 
     #[test]
     fn summary_computes_close_vs_levels() {
-        let mut state = MarketState::default();
-        state.last_price = 21010.0;
-        state.ib_high = 21020.0;
-        state.ib_low = 20980.0;
-        state.vwap = 21000.0;
-        state.poc = 21005.0;
+        let state = MarketState {
+            last_price: 21010.0,
+            ib_high: 21020.0,
+            ib_low: 20980.0,
+            vwap: 21000.0,
+            poc: 21005.0,
+            ..Default::default()
+        };
 
         let summary = summary_from_state(&state, "2026-02-26", "RTH", 21000.0, 1000, 5000.0, 0);
         assert_eq!(summary.ib_mid, 21000.0);

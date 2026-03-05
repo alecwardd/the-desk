@@ -15,8 +15,9 @@ use chrono_tz::US::Eastern;
 
 /// NQ session boundaries in Eastern Time (hour * 60 + minute).
 pub const RTH_OPEN_ET: i32 = 9 * 60 + 30; // 09:30
-pub const RTH_CLOSE_ET: i32 = 16 * 60 + 15; // 16:15
+pub const RTH_CLOSE_ET: i32 = 16 * 60; // 16:00
 pub const GLOBEX_OPEN_ET: i32 = 18 * 60; // 18:00
+pub const LONDON_OPEN_ET: i32 = 2 * 60; // 02:00
 
 /// Session type for NQ futures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,13 +27,24 @@ pub enum SessionType {
     Unknown,
 }
 
+/// Session segment classification for Globex windows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionSegment {
+    Asia,
+    London,
+    None,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TickTimeContext {
     pub et_minutes: i32,
     pub minute_of_session: i32,
     pub session_type: SessionType,
+    pub session_segment: SessionSegment,
     pub session_date: String,
     pub session_date_key: i32,
+    pub trading_day: String,
+    pub trading_day_key: i32,
 }
 
 /// Classify which session a given ET-minute falls into.
@@ -43,6 +55,20 @@ pub fn classify_session(et_minutes: i32) -> SessionType {
         SessionType::Globex
     } else {
         SessionType::Unknown
+    }
+}
+
+/// Classify Globex sub-session segment for a given ET-minute and session type.
+pub fn classify_session_segment(et_minutes: i32, session_type: SessionType) -> SessionSegment {
+    if session_type != SessionType::Globex {
+        return SessionSegment::None;
+    }
+    if !(LONDON_OPEN_ET..GLOBEX_OPEN_ET).contains(&et_minutes) {
+        SessionSegment::Asia
+    } else if (LONDON_OPEN_ET..RTH_OPEN_ET).contains(&et_minutes) {
+        SessionSegment::London
+    } else {
+        SessionSegment::None
     }
 }
 
@@ -85,19 +111,48 @@ pub fn session_date_from_timestamp_ms(timestamp_ms: f64) -> String {
     }
 }
 
+/// Trading day label (YYYY-MM-DD) with a 6:00 PM ET roll.
+/// At/after 18:00 ET, ticks are assigned to the next RTH trading day.
+pub fn trading_day_from_timestamp_ms(timestamp_ms: f64) -> String {
+    let ts = timestamp_ms as i64;
+    if let Some(dt) = Utc.timestamp_millis_opt(ts).single() {
+        let et = dt.with_timezone(&Eastern);
+        let date = if (et.hour() as i32 * 60) + et.minute() as i32 >= GLOBEX_OPEN_ET {
+            et.date_naive() + chrono::Duration::days(1)
+        } else {
+            et.date_naive()
+        };
+        return date.format("%Y-%m-%d").to_string();
+    }
+    chrono::Local::now().format("%Y-%m-%d").to_string()
+}
+
 /// Convert a Unix timestamp (milliseconds) to all session-relative ET metadata in one pass.
 pub fn tick_time_context_from_timestamp_ms(timestamp_ms: f64) -> Option<TickTimeContext> {
     let ts = timestamp_ms as i64;
     Utc.timestamp_millis_opt(ts).single().map(|utc| {
         let et = utc.with_timezone(&Eastern);
         let et_minutes = (et.hour() as i32 * 60) + et.minute() as i32;
+        let session_type = classify_session(et_minutes);
+        let session_segment = classify_session_segment(et_minutes, session_type);
         let session_date_key = et.year() * 10_000 + et.month() as i32 * 100 + et.day() as i32;
+        let trading_date = if et_minutes >= GLOBEX_OPEN_ET {
+            et.date_naive() + chrono::Duration::days(1)
+        } else {
+            et.date_naive()
+        };
+        let trading_day_key = trading_date.year() * 10_000
+            + trading_date.month() as i32 * 100
+            + trading_date.day() as i32;
         TickTimeContext {
             et_minutes,
             minute_of_session: et_minutes - RTH_OPEN_ET,
-            session_type: classify_session(et_minutes),
+            session_type,
+            session_segment,
             session_date: et.format("%Y-%m-%d").to_string(),
             session_date_key,
+            trading_day: trading_date.format("%Y-%m-%d").to_string(),
+            trading_day_key,
         }
     })
 }

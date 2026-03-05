@@ -108,6 +108,7 @@ async fn processing_loop(handle: AppHandle, mut rx: broadcast::Receiver<FeedEven
                     let new_session = classify_session(et_min);
                     if new_session != current_session_type
                         && current_session_type != SessionType::Unknown
+                        && new_session != SessionType::Unknown
                     {
                         let mut pipelines = state.pipelines.lock().await;
                         let end_state = pipelines.session_end_state();
@@ -157,7 +158,12 @@ async fn processing_loop(handle: AppHandle, mut rx: broadcast::Receiver<FeedEven
                             )
                             .ok();
                     }
-                    current_session_type = new_session;
+                    if new_session != SessionType::Unknown {
+                        current_session_type = new_session;
+                    }
+                    if new_session == SessionType::Unknown {
+                        continue;
+                    }
                 }
 
                 let minute_of_session = minute_of_session_from_timestamp(timestamp);

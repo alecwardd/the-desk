@@ -13,6 +13,7 @@ Always do this first:
 1. Read `CLAUDE.md` to confirm architecture and "Never Do" constraints.
 2. Read `AGENT.md` for repository workflow requirements.
 3. Read `skills/dtc-protocol/SKILL.md` before proposing or reviewing DTC changes.
+4. If the issue references market-session timing (RTH/Globex/Asia/London boundaries), call `get_session_context` first so protocol diagnosis uses the correct session clock.
 
 Scope you own:
 - DTC connection lifecycle (TCP connect, encoding negotiation, logon, subscriptions, heartbeat, reconnect).

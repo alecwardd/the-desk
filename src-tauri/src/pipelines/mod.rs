@@ -113,6 +113,14 @@ pub struct MarketState {
     pub session_low: f64,
     /// Last RTH trade price used as session close.
     pub rth_close_price: f64,
+    /// Globex OR30 high (18:00-18:30 ET).
+    pub globex_or30_high: f64,
+    /// Globex OR30 low (18:00-18:30 ET).
+    pub globex_or30_low: f64,
+    /// London OR60 high (02:00-03:00 ET).
+    pub london_or60_high: f64,
+    /// London OR60 low (02:00-03:00 ET).
+    pub london_or60_low: f64,
     /// Opening range high (first 30 minutes of RTH).
     pub or_high: f64,
     /// Opening range low (first 30 minutes of RTH).
@@ -197,6 +205,10 @@ pub struct MarketState {
     /// Current session type from last tick / snapshot time: "RTH", "Globex", or "Unknown".
     /// During Globex, use overnightHigh/overnightLow as session range; sessionHigh/sessionLow and IB/OR/OR5 are RTH-only.
     pub session_type: String,
+    /// Globex sub-session segment: "Asia", "London", or "None".
+    pub session_segment: String,
+    /// Trading day (YYYY-MM-DD) with a 6:00 PM ET roll.
+    pub trading_day: String,
 }
 
 pub struct PipelineEngine {
@@ -301,9 +313,24 @@ impl PipelineEngine {
         minute_of_session: i32,
         timestamp_ms: f64,
     ) {
-        let is_overnight = et_minutes_from_timestamp(timestamp_ms)
-            .map(|et_min| classify_session(et_min) != SessionType::Rth)
-            .unwrap_or(minute_of_session < 0);
+        let (et_minutes, session_type) = et_minutes_from_timestamp(timestamp_ms)
+            .map(|et_min| (et_min, classify_session(et_min)))
+            .unwrap_or_else(|| {
+                let fallback = minute_of_session + crate::RTH_OPEN_ET;
+                (
+                    fallback,
+                    if minute_of_session < 0 {
+                        SessionType::Globex
+                    } else {
+                        SessionType::Rth
+                    },
+                )
+            });
+        // Ignore 16:00-18:00 ET transition/noise window.
+        if session_type == SessionType::Unknown {
+            return;
+        }
+        let is_overnight = session_type == SessionType::Globex;
         self.on_trade_with_session_flag(
             price,
             volume,
@@ -311,9 +338,11 @@ impl PipelineEngine {
             minute_of_session,
             timestamp_ms,
             is_overnight,
+            et_minutes,
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn on_trade_with_session_flag(
         &mut self,
         price: f64,
@@ -322,11 +351,12 @@ impl PipelineEngine {
         minute_of_session: i32,
         timestamp_ms: f64,
         is_overnight: bool,
+        et_minutes: i32,
     ) {
         self.vwap.add_trade(price, volume);
         self.tpo.add_trade(price, minute_of_session);
         self.delta.add_trade(price, volume, is_buy);
-        self.levels.on_trade(price, is_overnight);
+        self.levels.on_trade(price, is_overnight, et_minutes);
         self.tape_pace.on_trade(timestamp_ms, volume, price);
         self.footprint.on_trade(price, volume, is_buy, timestamp_ms);
         let move_ticks = if let Some(prev) = self.last_trade_price {
@@ -387,14 +417,24 @@ impl PipelineEngine {
     ) -> MarketState {
         let sd = self.vwap.std_dev();
         let vwap = self.vwap.vwap();
-        let session_type = tick_time_context_from_timestamp_ms(timestamp_ms)
-            .map(|ctx| match ctx.session_type {
-                SessionType::Rth => "RTH",
-                SessionType::Globex => "Globex",
-                SessionType::Unknown => "Unknown",
-            })
-            .unwrap_or("Unknown")
-            .to_string();
+        let (session_type, session_segment, trading_day) =
+            if let Some(ctx) = tick_time_context_from_timestamp_ms(timestamp_ms) {
+                let st = match ctx.session_type {
+                    SessionType::Rth => "RTH",
+                    SessionType::Globex => "Globex",
+                    SessionType::Unknown => "Unknown",
+                }
+                .to_string();
+                let ss = match ctx.session_segment {
+                    crate::SessionSegment::Asia => "Asia",
+                    crate::SessionSegment::London => "London",
+                    crate::SessionSegment::None => "None",
+                }
+                .to_string();
+                (st, ss, ctx.trading_day)
+            } else {
+                ("Unknown".to_string(), "None".to_string(), String::new())
+            };
         let tape = if include_extended_metrics {
             self.tape_pace.snapshot(timestamp_ms)
         } else {
@@ -455,6 +495,10 @@ impl PipelineEngine {
             session_high: self.levels.session_high,
             session_low: self.levels.session_low,
             rth_close_price: self.levels.rth_close_price,
+            globex_or30_high: self.levels.globex_or30_high,
+            globex_or30_low: self.levels.globex_or30_low,
+            london_or60_high: self.levels.london_or60_high,
+            london_or60_low: self.levels.london_or60_low,
             or_high: self.tpo.or_high(),
             or_low: self.tpo.or_low(),
             ib_high: self.tpo.ib_high(),
@@ -502,6 +546,8 @@ impl PipelineEngine {
                 bottom
             },
             session_type,
+            session_segment,
+            trading_day,
         }
     }
 

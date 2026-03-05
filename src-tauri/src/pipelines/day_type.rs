@@ -237,7 +237,7 @@ mod tests {
         let tpo: Vec<(f64, usize)> = (0..20)
             .map(|i| {
                 let price = 21000.0 + i as f64 * 0.25;
-                let count = if i >= 3 && i <= 16 { 5 } else { 1 };
+                let count = if (3..=16).contains(&i) { 5 } else { 1 };
                 (price, count)
             })
             .collect();

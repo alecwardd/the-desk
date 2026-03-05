@@ -86,8 +86,18 @@ pub struct LevelsPipeline {
     pub last_price: f64,
     /// Last trade price observed during RTH only.
     pub rth_close_price: f64,
+    /// Globex OR30 high (18:00-18:30 ET).
+    pub globex_or30_high: f64,
+    /// Globex OR30 low (18:00-18:30 ET).
+    pub globex_or30_low: f64,
+    /// London OR60 high (02:00-03:00 ET).
+    pub london_or60_high: f64,
+    /// London OR60 low (02:00-03:00 ET).
+    pub london_or60_low: f64,
     initialized: bool,
     rth_started: bool,
+    globex_or30_initialized: bool,
+    london_or60_initialized: bool,
 }
 
 impl Default for LevelsPipeline {
@@ -105,8 +115,14 @@ impl Default for LevelsPipeline {
             session_low: 0.0,
             last_price: 0.0,
             rth_close_price: 0.0,
+            globex_or30_high: 0.0,
+            globex_or30_low: 0.0,
+            london_or60_high: 0.0,
+            london_or60_low: 0.0,
             initialized: false,
             rth_started: false,
+            globex_or30_initialized: false,
+            london_or60_initialized: false,
         }
     }
 }
@@ -128,7 +144,13 @@ impl LevelsPipeline {
             };
             self.overnight_high = 0.0;
             self.overnight_low = 0.0;
+            self.globex_or30_high = 0.0;
+            self.globex_or30_low = 0.0;
+            self.london_or60_high = 0.0;
+            self.london_or60_low = 0.0;
             self.initialized = false;
+            self.globex_or30_initialized = false;
+            self.london_or60_initialized = false;
         }
         self.session_high = 0.0;
         self.session_low = 0.0;
@@ -153,7 +175,7 @@ impl LevelsPipeline {
     /// Apply one trade update and maintain key levels.
     /// `is_overnight` should be true for Globex/overnight ticks (6 PM - 9:30 AM ET),
     /// false for RTH ticks (9:30 AM - 4:15 PM ET).
-    pub fn on_trade(&mut self, price: f64, is_overnight: bool) {
+    pub fn on_trade(&mut self, price: f64, is_overnight: bool, et_minutes: i32) {
         self.last_price = price;
 
         if !self.initialized {
@@ -165,6 +187,28 @@ impl LevelsPipeline {
         if is_overnight {
             self.overnight_high = self.overnight_high.max(price);
             self.overnight_low = self.overnight_low.min(price);
+            // Globex OR30: 18:00-18:30 ET.
+            if (18 * 60..18 * 60 + 30).contains(&et_minutes) {
+                if !self.globex_or30_initialized {
+                    self.globex_or30_high = price;
+                    self.globex_or30_low = price;
+                    self.globex_or30_initialized = true;
+                } else {
+                    self.globex_or30_high = self.globex_or30_high.max(price);
+                    self.globex_or30_low = self.globex_or30_low.min(price);
+                }
+            }
+            // London OR60: 02:00-03:00 ET.
+            if (2 * 60..3 * 60).contains(&et_minutes) {
+                if !self.london_or60_initialized {
+                    self.london_or60_high = price;
+                    self.london_or60_low = price;
+                    self.london_or60_initialized = true;
+                } else {
+                    self.london_or60_high = self.london_or60_high.max(price);
+                    self.london_or60_low = self.london_or60_low.min(price);
+                }
+            }
         } else {
             if !self.rth_started {
                 if self.prior_day_high <= 0.0 {
@@ -319,9 +363,9 @@ mod tests {
     #[test]
     fn tracks_overnight_range() {
         let mut pipeline = LevelsPipeline::default();
-        pipeline.on_trade(21000.0, true);
-        pipeline.on_trade(21050.0, true);
-        pipeline.on_trade(20980.0, true);
+        pipeline.on_trade(21000.0, true, 18 * 60);
+        pipeline.on_trade(21050.0, true, 18 * 60 + 1);
+        pipeline.on_trade(20980.0, true, 18 * 60 + 2);
         assert_eq!(pipeline.overnight_high, 21050.0);
         assert_eq!(pipeline.overnight_low, 20980.0);
     }
@@ -329,11 +373,11 @@ mod tests {
     #[test]
     fn tracks_session_range_separately() {
         let mut pipeline = LevelsPipeline::default();
-        pipeline.on_trade(21000.0, true);
-        pipeline.on_trade(21050.0, true);
-        pipeline.on_trade(21020.0, false);
-        pipeline.on_trade(21040.0, false);
-        pipeline.on_trade(21010.0, false);
+        pipeline.on_trade(21000.0, true, 18 * 60);
+        pipeline.on_trade(21050.0, true, 18 * 60 + 1);
+        pipeline.on_trade(21020.0, false, 9 * 60 + 30);
+        pipeline.on_trade(21040.0, false, 9 * 60 + 31);
+        pipeline.on_trade(21010.0, false, 9 * 60 + 32);
         assert_eq!(pipeline.overnight_high, 21050.0);
         assert_eq!(pipeline.overnight_low, 21000.0);
         assert_eq!(pipeline.session_high, 21040.0);
@@ -344,7 +388,7 @@ mod tests {
     fn prior_day_levels_appear_in_key_levels() {
         let mut pipeline = LevelsPipeline::default();
         pipeline.set_prior_day(21100.0, 20900.0, 21050.0);
-        pipeline.on_trade(21000.0, false);
+        pipeline.on_trade(21000.0, false, 9 * 60 + 30);
         let levels = pipeline.key_levels();
         assert!(levels
             .iter()
@@ -357,10 +401,10 @@ mod tests {
     #[test]
     fn reset_session_rolls_levels() {
         let mut pipeline = LevelsPipeline::default();
-        pipeline.on_trade(21000.0, true);
-        pipeline.on_trade(21020.0, false);
-        pipeline.on_trade(21050.0, false);
-        pipeline.on_trade(21010.0, false);
+        pipeline.on_trade(21000.0, true, 18 * 60);
+        pipeline.on_trade(21020.0, false, 9 * 60 + 30);
+        pipeline.on_trade(21050.0, false, 9 * 60 + 31);
+        pipeline.on_trade(21010.0, false, 9 * 60 + 32);
         assert_eq!(pipeline.session_high, 21050.0);
         assert_eq!(pipeline.session_low, 21010.0);
 
@@ -378,9 +422,9 @@ mod tests {
         pipeline.set_prior_day(21100.0, 20900.0, 21050.0);
 
         // Globex session builds overnight range
-        pipeline.on_trade(21020.0, true);
-        pipeline.on_trade(21080.0, true);
-        pipeline.on_trade(20950.0, true);
+        pipeline.on_trade(21020.0, true, 18 * 60);
+        pipeline.on_trade(21080.0, true, 18 * 60 + 1);
+        pipeline.on_trade(20950.0, true, 18 * 60 + 2);
         assert_eq!(pipeline.overnight_high, 21080.0);
         assert_eq!(pipeline.overnight_low, 20950.0);
 
@@ -390,11 +434,27 @@ mod tests {
         assert_eq!(pipeline.overnight_low, 20950.0);
 
         // RTH ticks should not overwrite overnight range
-        pipeline.on_trade(21000.0, false);
-        pipeline.on_trade(21040.0, false);
+        pipeline.on_trade(21000.0, false, 9 * 60 + 30);
+        pipeline.on_trade(21040.0, false, 9 * 60 + 31);
         assert_eq!(pipeline.overnight_high, 21080.0);
         assert_eq!(pipeline.overnight_low, 20950.0);
         assert_eq!(pipeline.session_high, 21040.0);
         assert_eq!(pipeline.session_low, 21000.0);
+    }
+
+    #[test]
+    fn tracks_globex_and_london_opening_ranges() {
+        let mut pipeline = LevelsPipeline::default();
+        pipeline.on_trade(21010.0, true, 18 * 60);
+        pipeline.on_trade(21020.0, true, 18 * 60 + 10);
+        pipeline.on_trade(21005.0, true, 18 * 60 + 20);
+        assert_eq!(pipeline.globex_or30_high, 21020.0);
+        assert_eq!(pipeline.globex_or30_low, 21005.0);
+
+        pipeline.on_trade(20990.0, true, 2 * 60);
+        pipeline.on_trade(21000.0, true, 2 * 60 + 20);
+        pipeline.on_trade(20980.0, true, 2 * 60 + 40);
+        assert_eq!(pipeline.london_or60_high, 21000.0);
+        assert_eq!(pipeline.london_or60_low, 20980.0);
     }
 }

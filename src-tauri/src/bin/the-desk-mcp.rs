@@ -24,7 +24,7 @@ use the_desk_backend::risk::{RiskConfig, RiskState, RiskTracker};
 use the_desk_backend::rules::RulesEngine;
 use the_desk_backend::{
     classify_session, et_minutes_from_timestamp, globex_open_ms, minute_of_session_from_timestamp,
-    session_date_from_timestamp_ms, SessionType,
+    session_date_from_timestamp_ms, SessionType, GLOBEX_OPEN_ET, RTH_CLOSE_ET, RTH_OPEN_ET,
 };
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::{sleep, Duration};
@@ -77,6 +77,18 @@ fn freshness_status(age_ms: f64) -> &'static str {
         "ok"
     } else {
         "warning"
+    }
+}
+
+fn transition_hint(et_minutes: i32) -> Option<(&'static str, &'static str, &'static str)> {
+    if (RTH_CLOSE_ET..GLOBEX_OPEN_ET).contains(&et_minutes) {
+        Some(("RTH", "Globex", "rth_close_to_globex_open"))
+    } else if (GLOBEX_OPEN_ET..GLOBEX_OPEN_ET + 5).contains(&et_minutes) {
+        Some(("RTH", "Globex", "globex_open"))
+    } else if (RTH_OPEN_ET..RTH_OPEN_ET + 5).contains(&et_minutes) {
+        Some(("Globex", "RTH", "rth_open"))
+    } else {
+        None
     }
 }
 
@@ -788,7 +800,7 @@ impl TheDeskMcp {
     }
 
     #[tool(
-        description = "Current market snapshot: last price, VWAP with 1/2/3 SD bands, TPO value area (high/low/POC), delta neutral value area (DNVA high/low/DNP), session delta, cumulative delta, key levels (prior day H/L/C, prior VA/POC, overnight range, OR, IB), tape pace, imbalance count, absorption event count, and average trade size. Prefers live pipeline state; falls back to last persisted snapshot."
+        description = "Current market snapshot: last price, VWAP with 1/2/3 SD bands, TPO value area (high/low/POC), delta neutral value area (DNVA high/low/DNP), session delta, cumulative delta, key levels (prior day H/L/C, prior VA/POC, overnight range, OR, IB), Globex/London opening ranges, and session context (sessionType, sessionSegment, tradingDay), plus tape pace, imbalance count, absorption event count, and average trade size. Prefers live pipeline state; falls back to last persisted snapshot."
     )]
     async fn get_market_snapshot(&self) -> Result<CallToolResult, McpError> {
         if let Some(snapshot) = self.live_snapshot() {
@@ -807,6 +819,51 @@ impl TheDeskMcp {
             Ok(None) => Ok(no_data(
                 "No market snapshot available yet. Ensure Sierra Chart is running and .scid data is being ingested.",
             )),
+            Err(e) => Err(db_error(e)),
+        }
+    }
+
+    #[tool(
+        description = "Current session context: sessionType (RTH/Globex/Unknown), sessionSegment (Asia/London/None), tradingDay (6 PM ET roll), and data freshness."
+    )]
+    async fn get_session_context(&self) -> Result<CallToolResult, McpError> {
+        let db = self.db.lock().map_err(|_| lock_error())?;
+        let now_ms = chrono::Utc::now().timestamp_millis() as f64;
+        let context_ts = db
+            .latest_tick_timestamp_ms()
+            .ok()
+            .flatten()
+            .unwrap_or(now_ms);
+        let et_minutes = et_minutes_from_timestamp(context_ts).unwrap_or(-1);
+        let (is_transition, transition_from, transition_to, transition_phase) =
+            if let Some((from, to, phase)) = transition_hint(et_minutes) {
+                (
+                    true,
+                    serde_json::json!(from),
+                    serde_json::json!(to),
+                    serde_json::json!(phase),
+                )
+            } else {
+                (
+                    false,
+                    serde_json::Value::Null,
+                    serde_json::Value::Null,
+                    serde_json::Value::Null,
+                )
+            };
+        match db.latest_feature_state() {
+            Ok(Some(s)) => Ok(text_result(serde_json::json!({
+                "sessionType": s.get("sessionType"),
+                "sessionSegment": s.get("sessionSegment"),
+                "tradingDay": s.get("tradingDay"),
+                "isTransition": is_transition,
+                "transitionFrom": transition_from,
+                "transitionTo": transition_to,
+                "transitionPhase": transition_phase,
+                "etMinutes": et_minutes,
+                "dataAgeMs": compute_data_age(&db)
+            }))),
+            Ok(None) => Ok(no_data("No session context available")),
             Err(e) => Err(db_error(e)),
         }
     }
@@ -852,7 +909,7 @@ impl TheDeskMcp {
     }
 
     #[tool(
-        description = "Key reference levels: prior day high/low/close, prior session value area high/low and POC, overnight (Globex) high/low, initial balance high/low. Includes sessionType (RTH vs Globex). For Sunday evening or Globex, use overnightHigh/overnightLow as the session range; sessionHigh/sessionLow and IB/OR/OR5 are RTH-only."
+        description = "Key reference levels: prior day high/low/close, prior session value area high/low and POC, overnight (Globex) high/low, Globex OR30 and London OR60, and initial balance high/low. Includes sessionType (RTH vs Globex), sessionSegment (Asia/London/None), and tradingDay."
     )]
     async fn get_key_levels(&self) -> Result<CallToolResult, McpError> {
         let db = self.db.lock().map_err(|_| lock_error())?;
@@ -861,6 +918,8 @@ impl TheDeskMcp {
                 let is_globex = s.get("sessionType").and_then(|v| v.as_str()) == Some("Globex");
                 let mut out = serde_json::json!({
                     "sessionType": s.get("sessionType"),
+                    "sessionSegment": s.get("sessionSegment"),
+                    "tradingDay": s.get("tradingDay"),
                     "priorDayHigh": s.get("priorDayHigh"),
                     "priorDayLow": s.get("priorDayLow"),
                     "priorDayClose": s.get("priorDayClose"),
@@ -869,6 +928,10 @@ impl TheDeskMcp {
                     "priorPoc": s.get("priorPoc"),
                     "overnightHigh": s.get("overnightHigh"),
                     "overnightLow": s.get("overnightLow"),
+                    "globexOr30High": s.get("globexOr30High"),
+                    "globexOr30Low": s.get("globexOr30Low"),
+                    "londonOr60High": s.get("londonOr60High"),
+                    "londonOr60Low": s.get("londonOr60Low"),
                     "sessionHigh": s.get("sessionHigh"),
                     "sessionLow": s.get("sessionLow"),
                     "ibHigh": s.get("ibHigh"),
@@ -1845,6 +1908,7 @@ impl TheDeskMcp {
                     .map(|s| {
                         serde_json::json!({
                             "sessionDate": s.session_date,
+                            "sessionType": s.session_type,
                             "dayType": s.day_type,
                             "ibRange": s.ib_range,
                             "high": s.high, "low": s.low, "close": s.close,
@@ -2242,7 +2306,7 @@ impl TheDeskMcp {
     }
 
     #[tool(
-        description = "Which key levels is price currently near (within specified tick distance). Returns levels sorted by distance ascending. Includes prior day H/L/C, VA/POC, overnight (Globex), IB, OR5 mid, and IB extensions. Response includes sessionType (RTH vs Globex); for Globex, weight overnight high/low as the session range."
+        description = "Which key levels is price currently near (within specified tick distance). Returns levels sorted by distance ascending. Includes prior day H/L/C, VA/POC, overnight (Globex), Globex OR30, London OR60, IB, OR5 mid, and IB extensions. Response includes sessionType/sessionSegment/tradingDay."
     )]
     async fn get_proximity_report(
         &self,
@@ -2264,6 +2328,10 @@ impl TheDeskMcp {
                     ("priorPoc", "PriorPoc"),
                     ("overnightHigh", "OvernightHigh"),
                     ("overnightLow", "OvernightLow"),
+                    ("globexOr30High", "GlobexOr30High"),
+                    ("globexOr30Low", "GlobexOr30Low"),
+                    ("londonOr60High", "LondonOr60High"),
+                    ("londonOr60Low", "LondonOr60Low"),
                     ("ibHigh", "IbHigh"),
                     ("ibLow", "IbLow"),
                     ("orHigh", "OrHigh"),
@@ -2299,8 +2367,14 @@ impl TheDeskMcp {
                     .get("sessionType")
                     .and_then(|v| v.as_str())
                     .unwrap_or("Unknown");
+                let session_segment = s
+                    .get("sessionSegment")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("None");
                 Ok(text_result(serde_json::json!({
                     "sessionType": session_type,
+                    "sessionSegment": session_segment,
+                    "tradingDay": s.get("tradingDay"),
                     "lastPrice": last_price,
                     "maxDistanceTicks": max_ticks,
                     "nearbyLevels": levels,
@@ -2457,6 +2531,16 @@ fn process_tick(
     ask: f64,
     event_buffer: &mut Vec<the_desk_backend::pipelines::MarketEvent>,
 ) {
+    let session_type = et_minutes_from_timestamp(timestamp_ms)
+        .map(classify_session)
+        .unwrap_or(if minute_of_session_from_timestamp(timestamp_ms) < 0 {
+            SessionType::Globex
+        } else {
+            SessionType::Rth
+        });
+    if session_type == SessionType::Unknown {
+        return;
+    }
     let minute = minute_of_session_from_timestamp(timestamp_ms);
     let (snapshot, _session_date) = {
         if let Ok(mut p) = pipelines.lock() {

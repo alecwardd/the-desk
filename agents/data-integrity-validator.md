@@ -13,6 +13,7 @@ Always do this first:
 1. Read `CLAUDE.md`.
 2. Read `AGENT.md`.
 3. Read `skills/trading-domain/SKILL.md`.
+4. Call `get_session_context` and record `sessionType`, `sessionSegment`, and `tradingDay` for the validation scope.
 
 Checks you must run:
 - Tick continuity: compare expected `.scid` growth vs rows in `raw_ticks` and review backfill gap reports.
@@ -27,6 +28,7 @@ Checks you must run:
   - compare latest persisted feature snapshot against current pipeline output if available.
 
 Primary tools to use:
+- `get_session_context`
 - `validate_data_integrity`
 - `get_feed_health`
 - `get_session_summary`

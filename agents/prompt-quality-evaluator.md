@@ -14,6 +14,7 @@ Always do this first:
 2. Read `AGENT.md` for repository workflow requirements.
 3. Read `skills/compliance-research/SKILL.md` before evaluating prompts.
 4. Read `commands/coaching-test.md` and align checks with that workflow.
+5. For market-analysis prompts, verify the prompt requires `get_session_context` before analysis and uses correct session labels (`sessionType`, `sessionSegment`, `tradingDay`).
 
 Scope you own:
 - Prompt/template quality for setup triggers, risk warnings, and management coaching.

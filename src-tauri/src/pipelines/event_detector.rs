@@ -583,6 +583,10 @@ mod tests {
             session_high: 21025.0,
             session_low: 20975.0,
             rth_close_price: 21000.0,
+            globex_or30_high: 21010.0,
+            globex_or30_low: 20990.0,
+            london_or60_high: 21005.0,
+            london_or60_low: 20995.0,
             or_high: 21015.0,
             or_low: 20985.0,
             ib_high: 21020.0,
@@ -617,6 +621,8 @@ mod tests {
             excess_high: false,
             excess_low: false,
             session_type: "RTH".to_string(),
+            session_segment: "None".to_string(),
+            trading_day: "2026-02-26".to_string(),
         }
     }
 

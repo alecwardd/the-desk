@@ -11,7 +11,7 @@ use the_desk_backend::dtc::DtcClient;
 use the_desk_backend::feed::scid_reader::ScidReader;
 use the_desk_backend::feed::{load_feed_config, FeedEvent, TradeSide};
 use the_desk_backend::outcome_tracker;
-use the_desk_backend::pipelines::{EventDetector, FlowEventEmitter, PipelineEngine, RvolPipeline};
+use the_desk_backend::pipelines::{EventDetector, FlowEventEmitter, PipelineEngine};
 use the_desk_backend::recording::{RecordingEntry, SessionRecorder};
 use the_desk_backend::risk::{RiskConfig, RiskTracker};
 use the_desk_backend::rules::RulesEngine;
@@ -113,6 +113,21 @@ async fn processing_loop(handle: AppHandle, mut rx: broadcast::Receiver<FeedEven
                     {
                         let mut pipelines = state.pipelines.lock().await;
                         let end_state = pipelines.session_end_state();
+                        {
+                            let date = session_date_from_timestamp_ms(timestamp);
+                            let session_label = if current_session_type == SessionType::Rth {
+                                "RTH"
+                            } else {
+                                "Globex"
+                            };
+                            // Persist the actual per-bucket volume curve before resetting.
+                            let curve = pipelines.rvol.current_curve();
+                            let _ = state.db.lock().await.save_volume_curve(
+                                &date,
+                                session_label,
+                                &curve,
+                            );
+                        }
                         if current_session_type == SessionType::Rth {
                             let date = session_date_from_timestamp_ms(timestamp);
                             let _ = state.db.lock().await.save_prior_day_full(
@@ -135,7 +150,7 @@ async fn processing_loop(handle: AppHandle, mut rx: broadcast::Receiver<FeedEven
                                 end_state.poc,
                             );
                         }
-                        pipelines.reset_session();
+                        pipelines.reset_session_with_type(new_session == SessionType::Globex);
                         state.detector.lock().await.reset();
                         state.flow_emitter.lock().await.reset();
 
@@ -366,6 +381,8 @@ async fn processing_loop(handle: AppHandle, mut rx: broadcast::Receiver<FeedEven
                                 max_adverse_excursion: None,
                                 r_result: None,
                                 time_to_outcome_ms: None,
+                                rvol_at_fire: Some(market.rvol_ratio),
+                                rvol_bucket_at_fire: Some(market.rvol_bucket_index as i32),
                             };
                             let _ = state.db.lock().await.insert_signal_outcome(&outcome);
                             if let Ok(alert_json) = serde_json::to_value(&alert) {
@@ -447,12 +464,11 @@ fn main() {
     }
 
     let mut pipelines = PipelineEngine::new();
-    if let Ok(volumes) = db.recent_rth_session_volumes(20) {
-        let curves: Vec<Vec<f64>> = volumes
-            .into_iter()
-            .map(RvolPipeline::curve_from_total_volume)
-            .collect();
+    if let Ok(curves) = db.recent_session_volume_curves("RTH", 20) {
         pipelines.rvol.load_historical_curve(&curves);
+    }
+    if let Ok(curves) = db.recent_session_volume_curves("Globex", 20) {
+        pipelines.rvol.load_globex_historical_curve(&curves);
     }
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     if let Ok(Some((high, low, close, va_h, va_l, poc))) = db.load_prior_day_full(&today) {

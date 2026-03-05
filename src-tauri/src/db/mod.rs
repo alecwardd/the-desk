@@ -238,6 +238,10 @@ pub struct SignalOutcome {
     pub max_adverse_excursion: Option<f64>,
     pub r_result: Option<f64>,
     pub time_to_outcome_ms: Option<f64>,
+    #[serde(default)]
+    pub rvol_at_fire: Option<f64>,
+    #[serde(default)]
+    pub rvol_bucket_at_fire: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -588,6 +592,9 @@ impl Database {
         }
         if version < 10 {
             self.migrate_v10()?;
+        }
+        if version < 11 {
+            self.migrate_v11()?;
         }
 
         Ok(())
@@ -1221,6 +1228,33 @@ impl Database {
             UPDATE schema_version SET version = 10;
             ",
         )?;
+        Ok(())
+    }
+
+    /// V11: RVOL volume curves table + signal outcome RVOL context columns.
+    fn migrate_v11(&self) -> Result<(), DbError> {
+        self.conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS session_volume_curves (
+              session_date TEXT NOT NULL,
+              session_type TEXT NOT NULL,
+              bucket_index INTEGER NOT NULL,
+              cumulative_volume REAL NOT NULL,
+              PRIMARY KEY (session_date, session_type, bucket_index)
+            );
+            CREATE INDEX IF NOT EXISTS idx_svc_type_date
+              ON session_volume_curves(session_type, session_date);
+
+            UPDATE schema_version SET version = 11;
+            ",
+        )?;
+        // Add RVOL columns to signal_outcomes (ignore if already present).
+        let _ = self
+            .conn
+            .execute_batch("ALTER TABLE signal_outcomes ADD COLUMN rvol_at_fire REAL;");
+        let _ = self
+            .conn
+            .execute_batch("ALTER TABLE signal_outcomes ADD COLUMN rvol_bucket_at_fire INTEGER;");
         Ok(())
     }
 
@@ -3005,6 +3039,10 @@ impl Database {
             "DELETE FROM session_summaries WHERE session_date = ?1",
             params![session_date],
         )?;
+        tx.execute(
+            "DELETE FROM session_volume_curves WHERE session_date = ?1",
+            params![session_date],
+        )?;
         for source in sources {
             tx.execute(
                 "DELETE FROM playbook_signals WHERE session_date = ?1 AND source = ?2",
@@ -3032,6 +3070,91 @@ impl Database {
         let mut volumes: Vec<f64> = rows.filter_map(|r| r.ok()).collect();
         volumes.reverse();
         Ok(volumes)
+    }
+
+    /// Save a per-bucket cumulative volume curve for a session.
+    pub fn save_volume_curve(
+        &self,
+        session_date: &str,
+        session_type: &str,
+        curve: &[f64],
+    ) -> Result<(), DbError> {
+        let tx = self.conn.unchecked_transaction()?;
+        // Clear any existing curve for this session/type.
+        tx.execute(
+            "DELETE FROM session_volume_curves WHERE session_date = ?1 AND session_type = ?2",
+            params![session_date, session_type],
+        )?;
+        for (i, &vol) in curve.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO session_volume_curves (session_date, session_type, bucket_index, cumulative_volume)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![session_date, session_type, i as i64, vol],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Load recent session volume curves from the session_volume_curves table.
+    /// Returns actual per-bucket cumulative volumes for up to `limit` sessions.
+    /// Falls back to `recent_rth_session_volumes` + linear interpolation if no curves stored.
+    pub fn recent_session_volume_curves(
+        &self,
+        session_type: &str,
+        limit: usize,
+    ) -> Result<Vec<Vec<f64>>, DbError> {
+        // Get distinct session dates with stored curves.
+        let mut date_stmt = self.conn.prepare(
+            "SELECT DISTINCT session_date FROM session_volume_curves
+             WHERE session_type = ?1
+             ORDER BY session_date DESC
+             LIMIT ?2",
+        )?;
+        let dates: Vec<String> = date_stmt
+            .query_map(params![session_type, limit as i64], |row| {
+                row.get::<_, String>(0)
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        if dates.is_empty() {
+            // Fallback: build curves from total session volumes.
+            use crate::pipelines::RvolPipeline;
+            let volumes = self.recent_rth_session_volumes(limit)?;
+            return Ok(volumes
+                .into_iter()
+                .map(RvolPipeline::curve_from_total_volume)
+                .collect());
+        }
+
+        let mut curves = Vec::with_capacity(dates.len());
+        let mut bucket_stmt = self.conn.prepare(
+            "SELECT bucket_index, cumulative_volume FROM session_volume_curves
+             WHERE session_date = ?1 AND session_type = ?2
+             ORDER BY bucket_index ASC",
+        )?;
+        for date in dates.iter().rev() {
+            let buckets: Vec<(usize, f64)> = bucket_stmt
+                .query_map(params![date, session_type], |row| {
+                    Ok((row.get::<_, i64>(0)? as usize, row.get::<_, f64>(1)?))
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
+            if buckets.is_empty() {
+                continue;
+            }
+            let max_idx = buckets.iter().map(|(i, _)| *i).max().unwrap_or(0);
+            let mut curve = vec![0.0; max_idx + 1];
+            for (i, vol) in buckets {
+                if i < curve.len() {
+                    curve[i] = vol;
+                }
+            }
+            curves.push(curve);
+        }
+
+        Ok(curves)
     }
 
     /// List session summaries with optional filters.
@@ -3202,8 +3325,9 @@ impl Database {
             "INSERT OR IGNORE INTO signal_outcomes
              (signal_id, setup_id, setup_name, session_date, source, job_id,
               fired_at_ms, fired_price, target_price, stop_price, outcome, outcome_at_ms,
-              max_favorable_excursion, max_adverse_excursion, r_result, time_to_outcome_ms)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+              max_favorable_excursion, max_adverse_excursion, r_result, time_to_outcome_ms,
+              rvol_at_fire, rvol_bucket_at_fire)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
             params![
                 o.signal_id,
                 o.setup_id,
@@ -3221,6 +3345,8 @@ impl Database {
                 o.max_adverse_excursion,
                 o.r_result,
                 o.time_to_outcome_ms,
+                o.rvol_at_fire,
+                o.rvol_bucket_at_fire,
             ],
         )?;
         Ok(())
@@ -3322,7 +3448,8 @@ impl Database {
         let mut sql = String::from(
             "SELECT signal_id, setup_id, setup_name, session_date, source, job_id,
                     fired_at_ms, fired_price, target_price, stop_price, outcome, outcome_at_ms,
-                    max_favorable_excursion, max_adverse_excursion, r_result, time_to_outcome_ms
+                    max_favorable_excursion, max_adverse_excursion, r_result, time_to_outcome_ms,
+                    rvol_at_fire, rvol_bucket_at_fire
              FROM signal_outcomes WHERE outcome = 'pending'",
         );
         let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -3355,6 +3482,8 @@ impl Database {
                 max_adverse_excursion: row.get(13)?,
                 r_result: row.get(14)?,
                 time_to_outcome_ms: row.get(15)?,
+                rvol_at_fire: row.get(16)?,
+                rvol_bucket_at_fire: row.get(17)?,
             })
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
@@ -3405,6 +3534,58 @@ impl Database {
                 }
             }
             results.push((sid, analysis_day, r_result, outcome));
+        }
+        Ok(results)
+    }
+
+    /// List resolved signal outcomes with RVOL-at-fire context for regime analysis.
+    /// Returns `(rvol_at_fire, r_result, outcome)` tuples, filtering to rows where
+    /// `rvol_at_fire` is populated.
+    pub fn list_signal_outcomes_with_rvol(
+        &self,
+        setup_id: Option<&str>,
+        start_date: Option<&str>,
+        end_date: Option<&str>,
+        scope: Option<&SessionScopeFilter>,
+    ) -> Result<Vec<(f64, Option<f64>, String)>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT setup_id, session_date, r_result, outcome, fired_at_ms, rvol_at_fire
+             FROM signal_outcomes
+             WHERE outcome != 'pending' AND rvol_at_fire IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<f64>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, f64>(4)?,
+                row.get::<_, f64>(5)?,
+            ))
+        })?;
+        let mut results = Vec::new();
+        for row in rows.filter_map(|r| r.ok()) {
+            let (sid, session_date, r_result, outcome, fired_at_ms, rvol) = row;
+            if let Some(filter_id) = setup_id {
+                if sid != filter_id {
+                    continue;
+                }
+            }
+            let Some(analysis_day) = analysis_day_for_scope(&session_date, fired_at_ms, scope)
+            else {
+                continue;
+            };
+            if let Some(sd) = start_date {
+                if analysis_day.as_str() < sd {
+                    continue;
+                }
+            }
+            if let Some(ed) = end_date {
+                if analysis_day.as_str() > ed {
+                    continue;
+                }
+            }
+            results.push((rvol, r_result, outcome));
         }
         Ok(results)
     }
@@ -4335,6 +4516,8 @@ mod tests {
             max_adverse_excursion: None,
             r_result: None,
             time_to_outcome_ms: None,
+            rvol_at_fire: None,
+            rvol_bucket_at_fire: None,
         })
         .expect("live outcome");
         db.insert_signal_outcome(&SignalOutcome {
@@ -4354,6 +4537,8 @@ mod tests {
             max_adverse_excursion: None,
             r_result: None,
             time_to_outcome_ms: None,
+            rvol_at_fire: None,
+            rvol_bucket_at_fire: None,
         })
         .expect("backfill outcome");
 
@@ -4657,6 +4842,8 @@ mod tests {
             max_adverse_excursion: Some(2.0),
             r_result: None,
             time_to_outcome_ms: None,
+            rvol_at_fire: None,
+            rvol_bucket_at_fire: None,
         })
         .expect("insert pending");
         db.insert_signal_outcome(&SignalOutcome {
@@ -4676,6 +4863,8 @@ mod tests {
             max_adverse_excursion: Some(3.0),
             r_result: Some(1.2),
             time_to_outcome_ms: Some(500.0),
+            rvol_at_fire: None,
+            rvol_bucket_at_fire: None,
         })
         .expect("insert winner");
         db.insert_signal_outcome(&SignalOutcome {
@@ -4695,6 +4884,8 @@ mod tests {
             max_adverse_excursion: Some(7.0),
             r_result: Some(-0.3),
             time_to_outcome_ms: Some(900.0),
+            rvol_at_fire: None,
+            rvol_bucket_at_fire: None,
         })
         .expect("insert time exit");
 
@@ -4748,6 +4939,8 @@ mod tests {
                 max_adverse_excursion: None,
                 r_result: r,
                 time_to_outcome_ms: None,
+                rvol_at_fire: None,
+                rvol_bucket_at_fire: None,
             })
             .expect("insert");
         };
@@ -4823,6 +5016,8 @@ mod tests {
             max_adverse_excursion: Some(2.0),
             r_result: Some(1.0),
             time_to_outcome_ms: Some(120_000.0),
+            rvol_at_fire: None,
+            rvol_bucket_at_fire: None,
         })
         .expect("insert asia");
         db.insert_signal_outcome(&SignalOutcome {
@@ -4842,6 +5037,8 @@ mod tests {
             max_adverse_excursion: Some(9.0),
             r_result: Some(-1.0),
             time_to_outcome_ms: Some(180_000.0),
+            rvol_at_fire: None,
+            rvol_bucket_at_fire: None,
         })
         .expect("insert rth");
 

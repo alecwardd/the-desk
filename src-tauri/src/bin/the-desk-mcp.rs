@@ -3325,14 +3325,44 @@ impl TheDeskMcp {
     }
 
     #[tool(
-        description = "Relative Volume: ratio of current session's cumulative volume vs the N-day average at the same time-of-day. Classification: Low (<85%%), Normal (85-100%%), Elevated (100-115%%), High (>115%%). Use to calibrate expectations."
+        description = "Relative Volume: ratio of current session's cumulative volume vs the N-day average at the same time-of-day. Returns classification (Low/Normal/Elevated/High), percentile rank (0-100 vs history at same time), velocity (rate of change per 5-min bucket), acceleration (second derivative), bucket progress, actual vs expected volume, and lookback days. Use to calibrate participation quality and regime context."
     )]
     async fn get_rvol(&self) -> Result<CallToolResult, McpError> {
         let db = self.db.lock().map_err(|_| lock_error())?;
+        // Try live pipeline first for full snapshot.
+        if let Ok(pipelines) = self.pipelines.try_lock() {
+            let rvol = &pipelines.rvol;
+            let actual = rvol.session_volume();
+            let expected = rvol.expected_volume_at_bucket();
+            let total = rvol.total_buckets();
+            let bucket = rvol.bucket_index();
+            let session_pct = if total > 0 {
+                format!("{:.1}%", bucket as f64 / total as f64 * 100.0)
+            } else {
+                "0.0%".to_string()
+            };
+            return Ok(text_result(serde_json::json!({
+                "rvolRatio": rvol.rvol_ratio(),
+                "rvolClassification": format!("{:?}", rvol.classification()),
+                "rvolPercentile": rvol.rvol_percentile(),
+                "currentBucket": bucket,
+                "totalBuckets": total,
+                "sessionProgress": session_pct,
+                "actualVolume": actual,
+                "expectedVolume": expected,
+                "volumeDelta": actual - expected,
+                "velocity": rvol.rvol_velocity(),
+                "acceleration": rvol.rvol_acceleration(),
+                "lookbackDays": rvol.lookback_days(),
+                "dataAgeMs": compute_data_age(&db),
+            })));
+        }
+        // Fallback to DB snapshot when pipeline lock is unavailable.
         match db.latest_feature_state() {
             Ok(Some(s)) => Ok(text_result(serde_json::json!({
                 "rvolRatio": s.get("rvolRatio"),
                 "rvolClassification": s.get("rvolClassification"),
+                "note": "Falling back to DB snapshot. Percentile, velocity, and bucket details not available.",
                 "dataAgeMs": compute_data_age(&db)
             }))),
             Ok(None) => Ok(no_data("No RVOL data available")),
@@ -3939,6 +3969,8 @@ fn process_tick(
                         max_adverse_excursion: None,
                         r_result: None,
                         time_to_outcome_ms: None,
+                        rvol_at_fire: Some(snapshot.rvol_ratio),
+                        rvol_bucket_at_fire: Some(snapshot.rvol_bucket_index as i32),
                     };
                     let _ = d.insert_signal_outcome(&outcome);
                 }

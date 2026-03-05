@@ -197,6 +197,14 @@ pub struct MarketState {
     pub rvol_ratio: f64,
     /// RVOL classification.
     pub rvol_classification: RvolClassification,
+    /// RVOL velocity: rate of change of ratio per 5-min bucket.
+    pub rvol_velocity: f64,
+    /// RVOL acceleration: second derivative of ratio.
+    pub rvol_acceleration: f64,
+    /// RVOL percentile rank vs historical days at same time-of-day (0-100).
+    pub rvol_percentile: f64,
+    /// Current 5-minute bucket index.
+    pub rvol_bucket_index: usize,
 
     // --- Day Type ---
     /// Current day type classification.
@@ -298,8 +306,13 @@ impl PipelineEngine {
 
     /// Reset all pipelines for a new trading session.
     /// Accumulates outgoing session delta into the cross-session cumulative total
-    /// before clearing.
+    /// before clearing. Defaults to RTH session type for RVOL.
     pub fn reset_session(&mut self) {
+        self.reset_session_with_type(false);
+    }
+
+    /// Reset all pipelines for a new trading session with explicit session type.
+    pub fn reset_session_with_type(&mut self, is_globex: bool) {
         self.cumulative_delta += self.delta.session_delta();
         self.levels.reset_session();
         self.vwap.reset();
@@ -311,6 +324,7 @@ impl PipelineEngine {
         self.trade_size.reset();
         self.or5.reset();
         self.rvol.reset();
+        self.rvol.start_session(is_globex);
         self.day_type.reset();
         self.rebid_reoffer.reset();
         self.pinch.reset();
@@ -563,6 +577,10 @@ impl PipelineEngine {
 
             rvol_ratio: self.rvol.rvol_ratio(),
             rvol_classification: self.rvol.classification(),
+            rvol_velocity: self.rvol.rvol_velocity(),
+            rvol_acceleration: self.rvol.rvol_acceleration(),
+            rvol_percentile: self.rvol.rvol_percentile(),
+            rvol_bucket_index: self.rvol.bucket_index(),
 
             day_type: self.day_type.day_type(),
             profile_shape: self.day_type.profile_shape(),

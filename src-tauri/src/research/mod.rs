@@ -393,6 +393,70 @@ pub fn signal_outcome_excursions(
     })
 }
 
+/// Win-rate breakdown for a setup grouped by RVOL regime at signal fire time.
+///
+/// Buckets: Low (<0.85), Normal (0.85–1.0), Elevated (1.0–1.15), High (>1.15).
+/// Returns a `ConditionalResult` for each regime that has at least one observation.
+pub fn signal_outcome_by_rvol_regime(
+    db: &Database,
+    setup_id: Option<&str>,
+    start_date: Option<&str>,
+    end_date: Option<&str>,
+    scope: Option<&SessionScopeFilter>,
+) -> Result<Vec<(String, ConditionalResult)>, String> {
+    let regimes: &[(&str, f64, f64)] = &[
+        ("Low", 0.0, 0.85),
+        ("Normal", 0.85, 1.0),
+        ("Elevated", 1.0, 1.15),
+        ("High", 1.15, f64::INFINITY),
+    ];
+
+    let outcomes = db
+        .list_signal_outcomes_with_rvol(setup_id, start_date, end_date, scope)
+        .map_err(|e| e.to_string())?;
+
+    let mut results = Vec::new();
+    for (label, lo, hi) in regimes {
+        let in_regime: Vec<_> = outcomes
+            .iter()
+            .filter(|(rvol, _r, _)| *rvol >= *lo && *rvol < *hi)
+            .collect();
+        if in_regime.is_empty() {
+            continue;
+        }
+        let total = in_regime.len() as i64;
+        let wins = in_regime
+            .iter()
+            .filter(|(_, r, _)| r.map(|v| v > 0.0).unwrap_or(false))
+            .count() as i64;
+        let probability = if total > 0 {
+            wins as f64 / total as f64
+        } else {
+            0.0
+        };
+        results.push((
+            label.to_string(),
+            ConditionalResult {
+                condition_description: format!(
+                    "setup fires with RVOL in {label} regime ({lo:.2}–{hi_label})",
+                    hi_label = if hi.is_infinite() {
+                        "∞".to_string()
+                    } else {
+                        format!("{hi:.2}")
+                    }
+                ),
+                outcome_description: "r_result > 0 (win)".to_string(),
+                probability,
+                sample_size: total,
+                condition_met_count: total,
+                outcome_met_count: wins,
+                total_sessions: outcomes.len() as i64,
+            },
+        ));
+    }
+    Ok(results)
+}
+
 /// Distribution of a numeric metric from session_summaries.
 pub fn metric_distribution(
     db: &Database,
@@ -640,6 +704,8 @@ mod tests {
             max_adverse_excursion: Some(5.0),
             r_result: Some(1.0),
             time_to_outcome_ms: Some(60_000.0),
+            rvol_at_fire: None,
+            rvol_bucket_at_fire: None,
         })
         .unwrap();
         db.insert_signal_outcome(&SignalOutcome {
@@ -659,6 +725,8 @@ mod tests {
             max_adverse_excursion: Some(3.0),
             r_result: Some(0.2),
             time_to_outcome_ms: Some(120_000.0),
+            rvol_at_fire: None,
+            rvol_bucket_at_fire: None,
         })
         .unwrap();
 

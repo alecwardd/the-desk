@@ -1,9 +1,7 @@
 use crate::db::{Database, ReplaySignalRecord, SessionSummary, SignalOutcome};
 use crate::feed::scid_reader::{ScanControl, ScidReader};
 use crate::feed::TradeSide;
-use crate::pipelines::{
-    EventDetector, FlowEventEmitter, MarketState, PipelineEngine, RvolPipeline,
-};
+use crate::pipelines::{EventDetector, FlowEventEmitter, MarketState, PipelineEngine};
 use crate::rules::{RulesEngine, SetupDefinition};
 use crate::{session_date_from_timestamp_ms, tick_time_context_from_timestamp_ms, SessionType};
 use chrono::{Duration, NaiveDate, TimeZone};
@@ -134,6 +132,7 @@ impl Default for SessionBuffers {
 struct BackfillRunState {
     pipeline: PipelineEngine,
     rvol_curves: Vec<Vec<f64>>,
+    globex_rvol_curves: Vec<Vec<f64>>,
     progress: BackfillProgress,
     warnings: Vec<String>,
     sessions_processed: usize,
@@ -302,14 +301,17 @@ where
         .map(|cfg| cfg.r_value_points)
         .unwrap_or(50.0);
 
+    let rvol_curves = db
+        .recent_session_volume_curves("RTH", 20)
+        .unwrap_or_default();
+    let globex_rvol_curves = db
+        .recent_session_volume_curves("Globex", 20)
+        .unwrap_or_default();
+
     let mut state = BackfillRunState {
         pipeline: PipelineEngine::new(),
-        rvol_curves: db
-            .recent_rth_session_volumes(20)
-            .unwrap_or_default()
-            .into_iter()
-            .map(RvolPipeline::curve_from_total_volume)
-            .collect(),
+        rvol_curves,
+        globex_rvol_curves,
         progress: BackfillProgress {
             current_phase: "scanning".to_string(),
             ..Default::default()
@@ -326,6 +328,10 @@ where
         .pipeline
         .rvol
         .load_historical_curve(&state.rvol_curves);
+    state
+        .pipeline
+        .rvol
+        .load_globex_historical_curve(&state.globex_rvol_curves);
 
     let mut detector = EventDetector::new();
     let mut flow_emitter = FlowEventEmitter::new();
@@ -420,7 +426,9 @@ where
                 )
                 .map_err(|e| e.to_string())?;
 
-                state.pipeline.reset_session();
+                state
+                    .pipeline
+                    .reset_session_with_type(new_session == SessionType::Globex);
                 detector.reset();
                 flow_emitter.reset();
                 if let Some(ref mut rules) = rules {
@@ -539,6 +547,10 @@ where
                                 max_adverse_excursion: None,
                                 r_result: None,
                                 time_to_outcome_ms: None,
+                                rvol_at_fire: Some(state.pipeline.rvol.rvol_ratio()),
+                                rvol_bucket_at_fire: Some(
+                                    state.pipeline.rvol.bucket_index() as i32,
+                                ),
                             });
                         }
                     }
@@ -696,6 +708,19 @@ where
                 .warnings
                 .push(format!("session {current_date} produced zero events"));
         }
+
+        // Persist the actual per-bucket Globex volume curve and update rolling baseline.
+        let curve = state.pipeline.rvol.current_curve();
+        let _ = db.save_volume_curve(current_date, "Globex", &curve);
+        state.globex_rvol_curves.push(curve);
+        if state.globex_rvol_curves.len() > 20 {
+            state.globex_rvol_curves.remove(0);
+        }
+        state
+            .pipeline
+            .rvol
+            .load_globex_historical_curve(&state.globex_rvol_curves);
+
         return Ok(());
     }
 
@@ -763,11 +788,12 @@ where
                 .push(format!("session {current_date} produced zero events"));
         }
 
-        state
-            .rvol_curves
-            .push(RvolPipeline::curve_from_total_volume(summary.total_volume));
+        // Persist the actual per-bucket RTH volume curve and update rolling baseline.
+        let curve = state.pipeline.rvol.current_curve();
+        let _ = db.save_volume_curve(current_date, "RTH", &curve);
+        state.rvol_curves.push(curve);
         if state.rvol_curves.len() > 20 {
-            let _ = state.rvol_curves.remove(0);
+            state.rvol_curves.remove(0);
         }
         state
             .pipeline

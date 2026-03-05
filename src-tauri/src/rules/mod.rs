@@ -78,6 +78,10 @@ pub enum ConditionField {
 
     // --- Volume Context ---
     RvolClassification,
+    /// Percentile rank of RVOL vs historical days at same time-of-day (0–100).
+    RvolPercentile,
+    /// Rate of change of RVOL ratio per 5-minute bucket (positive = accelerating).
+    RvolVelocity,
 
     // --- 5-Min OR (Leo's setup) ---
     PriceVsOr5High,
@@ -529,6 +533,34 @@ fn evaluate_typed_condition(
             if let ConditionValue::Text(expected) = &cond.value {
                 let actual = format!("{:?}", market.rvol_classification);
                 return actual.to_lowercase() == expected.to_lowercase();
+            }
+            return false;
+        }
+        ConditionField::RvolPercentile => {
+            if let ConditionValue::Number(threshold) = &cond.value {
+                return match &cond.operator {
+                    ConditionOperator::GreaterThan | ConditionOperator::Above => {
+                        market.rvol_percentile > *threshold
+                    }
+                    ConditionOperator::LessThan | ConditionOperator::Below => {
+                        market.rvol_percentile < *threshold
+                    }
+                    _ => false,
+                };
+            }
+            return false;
+        }
+        ConditionField::RvolVelocity => {
+            if let ConditionValue::Number(threshold) = &cond.value {
+                return match &cond.operator {
+                    ConditionOperator::GreaterThan | ConditionOperator::Above => {
+                        market.rvol_velocity > *threshold
+                    }
+                    ConditionOperator::LessThan | ConditionOperator::Below => {
+                        market.rvol_velocity < *threshold
+                    }
+                    _ => false,
+                };
             }
             return false;
         }

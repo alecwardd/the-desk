@@ -698,6 +698,39 @@ impl EventDetector {
                         sequence_num: None,
                         metadata: Some(serde_json::json!({
                             "rvolRatio": state.rvol_ratio,
+                            "rvolVelocity": state.rvol_velocity,
+                        })),
+                        session_type: String::new(),
+                        session_segment: String::new(),
+                        trading_day: String::new(),
+                    },
+                );
+            }
+        }
+
+        // RVOL snapshot at IB close (bucket 12 = minute 60, end of Initial Balance period).
+        // Fires once per session to record the RVOL regime context at the IB close.
+        if state.rvol_bucket_index == 12 {
+            let event_key = "rvol_at_ib_close";
+            if self.should_emit(event_key, timestamp_ms) {
+                self.push_event_with_context(
+                    state,
+                    session_date,
+                    events,
+                    MarketEvent {
+                        session_date: session_date.to_string(),
+                        timestamp_ms,
+                        event_type: event_key.to_string(),
+                        level_name: None,
+                        price,
+                        direction: None,
+                        sequence_num: None,
+                        metadata: Some(serde_json::json!({
+                            "rvolRatio": state.rvol_ratio,
+                            "rvolClassification": format!("{:?}", state.rvol_classification),
+                            "rvolPercentile": state.rvol_percentile,
+                            "rvolVelocity": state.rvol_velocity,
+                            "bucket": state.rvol_bucket_index,
                         })),
                         session_type: String::new(),
                         session_segment: String::new(),
@@ -803,6 +836,10 @@ mod tests {
             or5_mid_retested: false,
             rvol_ratio: 1.0,
             rvol_classification: RvolClassification::Normal,
+            rvol_velocity: 0.0,
+            rvol_acceleration: 0.0,
+            rvol_percentile: 50.0,
+            rvol_bucket_index: 0,
             day_type: DayType::Normal,
             profile_shape: ProfileShape::Gaussian,
             balance_state: BalanceState::Balanced,

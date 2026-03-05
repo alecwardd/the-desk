@@ -406,20 +406,19 @@ where
                 && current_session != SessionType::Unknown
                 && new_session != SessionType::Unknown
             {
-                if current_session == SessionType::Rth {
-                    finalize_rth_session(
-                        db,
-                        params,
-                        &mut state,
-                        &current_date,
-                        last_tick_meta,
-                        source,
-                        r_value_points,
-                        cancel_flag,
-                        &mut on_progress,
-                    )
-                    .map_err(|e| e.to_string())?;
-                }
+                finalize_session_period(
+                    db,
+                    params,
+                    &mut state,
+                    current_session,
+                    &current_date,
+                    last_tick_meta,
+                    source,
+                    r_value_points,
+                    cancel_flag,
+                    &mut on_progress,
+                )
+                .map_err(|e| e.to_string())?;
 
                 state.pipeline.reset_session();
                 detector.reset();
@@ -479,33 +478,33 @@ where
             };
             last_tick_meta = Some((bid, ask, tick.price, tick.timestamp_ms));
 
+            let snapshot = if params.run_rules && current_session == SessionType::Rth {
+                state.pipeline.snapshot_at(bid, ask, tick.timestamp_ms)
+            } else {
+                state
+                    .pipeline
+                    .snapshot_for_detection(bid, ask, tick.timestamp_ms)
+            };
+            state.progress.current_phase = "processing_session".to_string();
+
+            tick_events.clear();
+            detector.detect_into(
+                &snapshot,
+                tick.timestamp_ms,
+                &current_date,
+                minute,
+                &mut tick_events,
+            );
+            flow_emitter.detect_into(
+                &state.pipeline,
+                tick.timestamp_ms,
+                &current_date,
+                tick.price,
+                &mut tick_events,
+            );
+            state.buffers.event_buffer.append(&mut tick_events);
+
             if current_session == SessionType::Rth {
-                let snapshot = if params.run_rules {
-                    state.pipeline.snapshot_at(bid, ask, tick.timestamp_ms)
-                } else {
-                    state
-                        .pipeline
-                        .snapshot_for_detection(bid, ask, tick.timestamp_ms)
-                };
-                state.progress.current_phase = "processing_session".to_string();
-
-                tick_events.clear();
-                detector.detect_into(
-                    &snapshot,
-                    tick.timestamp_ms,
-                    &current_date,
-                    minute,
-                    &mut tick_events,
-                );
-                flow_emitter.detect_into(
-                    &state.pipeline,
-                    tick.timestamp_ms,
-                    &current_date,
-                    tick.price,
-                    &mut tick_events,
-                );
-                state.buffers.event_buffer.append(&mut tick_events);
-
                 if let Some(ref mut rules) = rules {
                     for setup in &setups {
                         if let Some(alert) = rules.evaluate(setup, &snapshot, false) {
@@ -575,11 +574,12 @@ where
 
     state.progress.current_phase = "finalizing".to_string();
     on_progress(&state.progress);
-    if current_session == SessionType::Rth {
-        finalize_rth_session(
+    if current_session != SessionType::Unknown {
+        finalize_session_period(
             db,
             params,
             &mut state,
+            current_session,
             &current_date,
             last_tick_meta,
             source,
@@ -656,10 +656,11 @@ fn prepare_backfill_setups(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn finalize_rth_session<F>(
+fn finalize_session_period<F>(
     db: &Database,
     params: &BackfillJobParams,
     state: &mut BackfillRunState,
+    session_type: SessionType,
     current_date: &str,
     last_tick_meta: Option<(f64, f64, f64, f64)>,
     source: &str,
@@ -676,7 +677,25 @@ where
     if cancel_flag.load(Ordering::Relaxed) {
         return Err(BackfillJobError::Cancelled);
     }
-    if last_tick_meta.is_none() {
+    if last_tick_meta.is_none() || session_type == SessionType::Unknown {
+        return Ok(());
+    }
+
+    if session_type == SessionType::Globex {
+        state.progress.current_phase = "persisting_session".to_string();
+        state.progress.current_session_date = Some(current_date.to_string());
+        on_progress(&state.progress);
+        db.insert_market_events_batch(&state.buffers.event_buffer)
+            .map_err(runtime_err)?;
+        state.total_events += state.buffers.event_buffer.len();
+        state.sessions_processed += 1;
+        state.progress.sessions_completed = state.sessions_processed;
+        state.session_dates.push(current_date.to_string());
+        if state.buffers.event_buffer.is_empty() {
+            state
+                .warnings
+                .push(format!("session {current_date} produced zero events"));
+        }
         return Ok(());
     }
 

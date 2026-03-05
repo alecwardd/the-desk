@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use super::event_detector::MarketEvent;
 use super::PipelineEngine;
+use crate::tick_time_context_from_timestamp_ms;
 
 /// Emits flow events from pipeline ring buffers into the MarketEvent stream.
 ///
@@ -113,6 +114,31 @@ impl FlowEventEmitter {
         );
     }
 
+    fn event_context(timestamp_ms: f64, session_date: &str) -> (String, String, String) {
+        if let Some(ctx) = tick_time_context_from_timestamp_ms(timestamp_ms) {
+            let session_type = match ctx.session_type {
+                crate::SessionType::Rth => "RTH".to_string(),
+                crate::SessionType::Globex => "Globex".to_string(),
+                crate::SessionType::Unknown => "Unknown".to_string(),
+            };
+            let session_segment = if session_type == "Globex" {
+                match ctx.session_segment {
+                    crate::SessionSegment::Asia => "Asia".to_string(),
+                    crate::SessionSegment::London => "London".to_string(),
+                    crate::SessionSegment::None => "None".to_string(),
+                }
+            } else {
+                "None".to_string()
+            };
+            return (session_type, session_segment, ctx.trading_day);
+        }
+        (
+            "Unknown".to_string(),
+            "None".to_string(),
+            session_date.to_string(),
+        )
+    }
+
     /// Absorption / exhaustion / delta_divergence events.
     fn detect_absorption(
         &mut self,
@@ -121,6 +147,8 @@ impl FlowEventEmitter {
         timestamp_ms: f64,
         session_date: &str,
     ) {
+        let (session_type, session_segment, trading_day) =
+            Self::event_context(timestamp_ms, session_date);
         let current = pipelines.absorption.recent_events();
         let count = current.len();
         if count > self.prev_absorption_count {
@@ -139,6 +167,9 @@ impl FlowEventEmitter {
                             "eventSubtype": evt.event_type,
                             "severity": evt.severity,
                         })),
+                        session_type: session_type.clone(),
+                        session_segment: session_segment.clone(),
+                        trading_day: trading_day.clone(),
                     });
                 }
             }
@@ -154,6 +185,8 @@ impl FlowEventEmitter {
         timestamp_ms: f64,
         session_date: &str,
     ) {
+        let (session_type, session_segment, trading_day) =
+            Self::event_context(timestamp_ms, session_date);
         let current = pipelines.pinch.recent_events();
         let count = current.len();
         if count > self.prev_pinch_count {
@@ -176,6 +209,9 @@ impl FlowEventEmitter {
                             "priceAtPinch": evt.price_at_pinch,
                             "priceDisplacement": evt.price_displacement,
                         })),
+                        session_type: session_type.clone(),
+                        session_segment: session_segment.clone(),
+                        trading_day: trading_day.clone(),
                     });
                 }
             }
@@ -191,6 +227,8 @@ impl FlowEventEmitter {
         timestamp_ms: f64,
         session_date: &str,
     ) {
+        let (session_type, session_segment, trading_day) =
+            Self::event_context(timestamp_ms, session_date);
         let all_zones = pipelines.rebid_reoffer.all_zones();
         let count = all_zones.len();
 
@@ -218,6 +256,9 @@ impl FlowEventEmitter {
                             "volume": zone.volume,
                             "delta": zone.delta,
                         })),
+                        session_type: session_type.clone(),
+                        session_segment: session_segment.clone(),
+                        trading_day: trading_day.clone(),
                     });
                 }
             }
@@ -244,6 +285,9 @@ impl FlowEventEmitter {
                             "low": zone.low,
                             "mid": zone.mid(),
                         })),
+                        session_type: session_type.clone(),
+                        session_segment: session_segment.clone(),
+                        trading_day: trading_day.clone(),
                     });
                 }
             }
@@ -260,6 +304,8 @@ impl FlowEventEmitter {
         session_date: &str,
         _current_price: f64,
     ) {
+        let (session_type, session_segment, trading_day) =
+            Self::event_context(timestamp_ms, session_date);
         let large_prices = pipelines.trade_size.large_trade_prices();
 
         for (price, count) in &large_prices {
@@ -286,6 +332,9 @@ impl FlowEventEmitter {
                             "count": count,
                             "newTrades": new_trades,
                         })),
+                        session_type: session_type.clone(),
+                        session_segment: session_segment.clone(),
+                        trading_day: trading_day.clone(),
                     });
                 }
             }

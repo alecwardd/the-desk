@@ -304,6 +304,104 @@ fn normalize_session_segment_filter(value: &str) -> Option<&'static str> {
     }
 }
 
+fn normalize_session_type_value(value: &str) -> Option<&'static str> {
+    normalize_session_type_filter(value)
+}
+
+fn normalize_session_segment_value(value: &str, session_type: &str) -> Option<&'static str> {
+    if session_type != "Globex" {
+        return Some("None");
+    }
+    normalize_session_segment_filter(value).or(Some("None"))
+}
+
+fn resolved_event_row_context(
+    timestamp_ms: f64,
+    session_type: Option<&str>,
+    session_segment: Option<&str>,
+    trading_day: Option<&str>,
+    session_date_fallback: Option<&str>,
+) -> Option<(String, String, String)> {
+    let stored_type = session_type
+        .filter(|v| !v.trim().is_empty())
+        .and_then(normalize_session_type_value);
+    let stored_day = trading_day.filter(|v| !v.trim().is_empty());
+    let stored_segment = session_segment.filter(|v| !v.trim().is_empty());
+
+    if let (Some(st), Some(td)) = (stored_type, stored_day) {
+        let seg = normalize_session_segment_value(stored_segment.unwrap_or("None"), st)?;
+        return Some((st.to_string(), seg.to_string(), td.to_string()));
+    }
+
+    if let Some(ctx) = tick_time_context_from_timestamp_ms(timestamp_ms) {
+        let st = match ctx.session_type {
+            crate::SessionType::Rth => "RTH",
+            crate::SessionType::Globex => "Globex",
+            crate::SessionType::Unknown => "Unknown",
+        };
+        let seg = if st == "Globex" {
+            match ctx.session_segment {
+                crate::SessionSegment::Asia => "Asia",
+                crate::SessionSegment::London => "London",
+                crate::SessionSegment::None => "None",
+            }
+        } else {
+            "None"
+        };
+        return Some((st.to_string(), seg.to_string(), ctx.trading_day));
+    }
+
+    session_date_fallback.map(|d| ("Unknown".to_string(), "None".to_string(), d.to_string()))
+}
+
+fn trading_day_if_scope_match_for_event_row(
+    timestamp_ms: f64,
+    session_type: Option<&str>,
+    session_segment: Option<&str>,
+    trading_day: Option<&str>,
+    session_date_fallback: Option<&str>,
+    scope: Option<&SessionScopeFilter>,
+) -> Option<String> {
+    let (row_session_type, row_session_segment, row_trading_day) = resolved_event_row_context(
+        timestamp_ms,
+        session_type,
+        session_segment,
+        trading_day,
+        session_date_fallback,
+    )?;
+
+    let Some(scope) = scope else {
+        return Some(row_trading_day);
+    };
+    if scope.is_empty() {
+        return Some(row_trading_day);
+    }
+    if let Some(filter_type) = scope.session_type.as_deref() {
+        let normalized = normalize_session_type_filter(filter_type)?;
+        if row_session_type != normalized {
+            return None;
+        }
+    }
+    if let Some(filter_segment) = scope.session_segment.as_deref() {
+        let normalized = normalize_session_segment_filter(filter_segment)?;
+        if row_session_segment != normalized {
+            return None;
+        }
+    }
+    if let Some(start) = scope.trading_day_start.as_deref() {
+        if row_trading_day.as_str() < start {
+            return None;
+        }
+    }
+    if let Some(end) = scope.trading_day_end.as_deref() {
+        if row_trading_day.as_str() > end {
+            return None;
+        }
+    }
+
+    Some(row_trading_day)
+}
+
 fn trading_day_if_scope_match(
     timestamp_ms: f64,
     scope: Option<&SessionScopeFilter>,
@@ -429,6 +527,9 @@ impl Database {
         }
         if version < 8 {
             self.migrate_v8()?;
+        }
+        if version < 9 {
+            self.migrate_v9()?;
         }
 
         Ok(())
@@ -905,6 +1006,111 @@ impl Database {
             UPDATE schema_version SET version = 8;
             ",
         )?;
+        Ok(())
+    }
+
+    /// V9: persisted market-event session context (type/segment/trading day).
+    fn migrate_v9(&self) -> Result<(), DbError> {
+        let _ = self
+            .conn
+            .execute_batch("ALTER TABLE market_events ADD COLUMN session_type TEXT NULL");
+        let _ = self
+            .conn
+            .execute_batch("ALTER TABLE market_events ADD COLUMN session_segment TEXT NULL");
+        let _ = self
+            .conn
+            .execute_batch("ALTER TABLE market_events ADD COLUMN trading_day TEXT NULL");
+
+        self.conn.execute_batch(
+            "
+            CREATE INDEX IF NOT EXISTS idx_market_events_event_trading_day
+              ON market_events(event_type, trading_day);
+            CREATE INDEX IF NOT EXISTS idx_market_events_day_session_segment
+              ON market_events(trading_day, session_type, session_segment);
+            ",
+        )?;
+
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, timestamp_ms, session_date,
+                        COALESCE(session_type, ''), COALESCE(session_segment, ''), COALESCE(trading_day, '')
+                 FROM market_events",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, f64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            })?;
+            let mut updates: Vec<(i64, String, String, String)> = Vec::new();
+            for row in rows.filter_map(|r| r.ok()) {
+                let (id, ts, session_date, stored_type, stored_segment, stored_day) = row;
+                let has_type = !stored_type.trim().is_empty();
+                let has_segment = !stored_segment.trim().is_empty();
+                let has_day = !stored_day.trim().is_empty();
+                if has_type && has_segment && has_day {
+                    continue;
+                }
+                if let Some(ctx) = tick_time_context_from_timestamp_ms(ts) {
+                    let session_type = match ctx.session_type {
+                        crate::SessionType::Rth => "RTH".to_string(),
+                        crate::SessionType::Globex => "Globex".to_string(),
+                        crate::SessionType::Unknown => "Unknown".to_string(),
+                    };
+                    let session_segment = if session_type == "Globex" {
+                        match ctx.session_segment {
+                            crate::SessionSegment::Asia => "Asia".to_string(),
+                            crate::SessionSegment::London => "London".to_string(),
+                            crate::SessionSegment::None => "None".to_string(),
+                        }
+                    } else {
+                        "None".to_string()
+                    };
+                    updates.push((id, session_type, session_segment, ctx.trading_day));
+                } else {
+                    updates.push((id, "Unknown".to_string(), "None".to_string(), session_date));
+                }
+            }
+            drop(stmt);
+
+            if !updates.is_empty() {
+                let tx = self.conn.unchecked_transaction()?;
+                {
+                    let mut update_stmt = tx.prepare(
+                        "UPDATE market_events
+                         SET session_type = ?2, session_segment = ?3, trading_day = ?4
+                         WHERE id = ?1",
+                    )?;
+                    for (id, session_type, session_segment, trading_day) in &updates {
+                        update_stmt.execute(params![
+                            id,
+                            session_type,
+                            session_segment,
+                            trading_day
+                        ])?;
+                    }
+                }
+                tx.commit()?;
+            }
+        }
+
+        self.conn
+            .execute("UPDATE market_events SET session_type='Unknown' WHERE session_type IS NULL OR session_type=''", [])?;
+        self.conn
+            .execute("UPDATE market_events SET session_segment='None' WHERE session_segment IS NULL OR session_segment=''", [])?;
+        self.conn.execute(
+            "UPDATE market_events
+             SET trading_day = session_date
+             WHERE trading_day IS NULL OR trading_day = ''",
+            [],
+        )?;
+
+        self.conn
+            .execute_batch("UPDATE schema_version SET version = 9;")?;
         Ok(())
     }
 
@@ -1971,8 +2177,9 @@ impl Database {
         {
             let mut stmt = tx.prepare_cached(
                 "INSERT OR IGNORE INTO market_events
-                 (session_date, timestamp_ms, event_type, level_name, price, direction, sequence_num, metadata_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                 (session_date, timestamp_ms, event_type, level_name, price, direction, sequence_num, metadata_json,
+                  session_type, session_segment, trading_day)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             )?;
             for e in events {
                 let meta = e
@@ -1988,6 +2195,9 @@ impl Database {
                     e.direction,
                     e.sequence_num,
                     meta,
+                    &e.session_type,
+                    &e.session_segment,
+                    &e.trading_day,
                 ])?;
             }
         }
@@ -2015,19 +2225,35 @@ impl Database {
             event_bind_values.push(Box::new(ed.to_string()));
         }
         let event_sql = format!(
-            "SELECT timestamp_ms FROM market_events WHERE {}",
+            "SELECT timestamp_ms, session_date, session_type, session_segment, trading_day
+             FROM market_events WHERE {}",
             event_conditions.join(" AND ")
         );
         let mut event_stmt = self.conn.prepare(&event_sql)?;
         let event_params_ref: Vec<&dyn rusqlite::types::ToSql> =
             event_bind_values.iter().map(|b| b.as_ref()).collect();
-        let event_rows =
-            event_stmt.query_map(event_params_ref.as_slice(), |row| row.get::<_, f64>(0))?;
+        let event_rows = event_stmt.query_map(event_params_ref.as_slice(), |row| {
+            Ok((
+                row.get::<_, f64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        })?;
 
         let mut total_events = 0_i64;
         let mut sessions_with_event = BTreeSet::new();
-        for ts in event_rows.filter_map(|r| r.ok()) {
-            if let Some(trading_day) = trading_day_if_scope_match(ts, scope) {
+        for row in event_rows.filter_map(|r| r.ok()) {
+            let (ts, session_date, st, seg, td) = row;
+            if let Some(trading_day) = trading_day_if_scope_match_for_event_row(
+                ts,
+                st.as_deref(),
+                seg.as_deref(),
+                td.as_deref(),
+                Some(session_date.as_str()),
+                scope,
+            ) {
                 total_events += 1;
                 sessions_with_event.insert(trading_day);
             }
@@ -2054,15 +2280,34 @@ impl Database {
         } else {
             format!("WHERE {}", all_session_conditions.join(" AND "))
         };
-        let all_sql = format!("SELECT timestamp_ms FROM market_events {all_where_clause}");
+        let all_sql = format!(
+            "SELECT timestamp_ms, session_date, session_type, session_segment, trading_day
+             FROM market_events {all_where_clause}"
+        );
         let mut all_stmt = self.conn.prepare(&all_sql)?;
         let all_params_ref: Vec<&dyn rusqlite::types::ToSql> =
             all_session_bind_values.iter().map(|b| b.as_ref()).collect();
-        let all_rows = all_stmt.query_map(all_params_ref.as_slice(), |row| row.get::<_, f64>(0))?;
+        let all_rows = all_stmt.query_map(all_params_ref.as_slice(), |row| {
+            Ok((
+                row.get::<_, f64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        })?;
 
         let mut total_sessions = BTreeSet::new();
-        for ts in all_rows.filter_map(|r| r.ok()) {
-            if let Some(trading_day) = trading_day_if_scope_match(ts, scope) {
+        for row in all_rows.filter_map(|r| r.ok()) {
+            let (ts, session_date, st, seg, td) = row;
+            if let Some(trading_day) = trading_day_if_scope_match_for_event_row(
+                ts,
+                st.as_deref(),
+                seg.as_deref(),
+                td.as_deref(),
+                Some(session_date.as_str()),
+                scope,
+            ) {
                 total_sessions.insert(trading_day);
             }
         }
@@ -2112,17 +2357,34 @@ impl Database {
             bind_values.push(Box::new(ed.to_string()));
         }
         let sql = format!(
-            "SELECT timestamp_ms FROM market_events WHERE {}",
+            "SELECT timestamp_ms, session_date, session_type, session_segment, trading_day
+             FROM market_events WHERE {}",
             conditions.join(" AND ")
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let params_ref: Vec<&dyn rusqlite::types::ToSql> =
             bind_values.iter().map(|b| b.as_ref()).collect();
-        let rows = stmt.query_map(params_ref.as_slice(), |row| row.get::<_, f64>(0))?;
+        let rows = stmt.query_map(params_ref.as_slice(), |row| {
+            Ok((
+                row.get::<_, f64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        })?;
 
         let mut by_day: BTreeMap<String, i64> = BTreeMap::new();
-        for ts in rows.filter_map(|r| r.ok()) {
-            if let Some(trading_day) = trading_day_if_scope_match(ts, scope) {
+        for row in rows.filter_map(|r| r.ok()) {
+            let (ts, session_date, st, seg, td) = row;
+            if let Some(trading_day) = trading_day_if_scope_match_for_event_row(
+                ts,
+                st.as_deref(),
+                seg.as_deref(),
+                td.as_deref(),
+                Some(session_date.as_str()),
+                scope,
+            ) {
                 *by_day.entry(trading_day).or_insert(0) += 1;
             }
         }
@@ -2773,8 +3035,9 @@ impl Database {
             if !events.is_empty() {
                 let mut stmt = self.conn.prepare_cached(
                     "INSERT OR IGNORE INTO market_events
-                     (session_date, timestamp_ms, event_type, level_name, price, direction, sequence_num, metadata_json)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                     (session_date, timestamp_ms, event_type, level_name, price, direction, sequence_num, metadata_json,
+                      session_type, session_segment, trading_day)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 )?;
                 for e in events {
                     let meta = e
@@ -2790,6 +3053,9 @@ impl Database {
                         e.direction,
                         e.sequence_num,
                         meta,
+                        &e.session_type,
+                        &e.session_segment,
+                        &e.trading_day,
                     ])?;
                 }
             }
@@ -3005,6 +3271,8 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
+    use chrono_tz::US::Eastern;
     use tempfile::NamedTempFile;
 
     fn test_db() -> Database {
@@ -3236,6 +3504,9 @@ mod tests {
             direction: None,
             sequence_num: None,
             metadata: None,
+            session_type: "RTH".into(),
+            session_segment: "None".into(),
+            trading_day: "2026-03-02".into(),
         }])
         .expect("event");
         db.insert_playbook_signal_record(&ReplaySignalRecord {
@@ -3347,5 +3618,68 @@ mod tests {
         assert_eq!(loaded.status, "completed");
         assert_eq!(loaded.warnings.len(), 1);
         assert_eq!(loaded.result.expect("result")["sessionsProcessed"], 1);
+    }
+
+    #[test]
+    fn market_event_rows_store_session_context() {
+        let db = test_db();
+        db.insert_market_events_batch(&[MarketEvent {
+            session_date: "2026-03-03".into(),
+            timestamp_ms: 1.0,
+            event_type: "context_test".into(),
+            level_name: None,
+            price: 21000.0,
+            direction: None,
+            sequence_num: None,
+            metadata: None,
+            session_type: "Globex".into(),
+            session_segment: "Asia".into(),
+            trading_day: "2026-03-04".into(),
+        }])
+        .expect("insert");
+        let row: (String, String, String) = db
+            .conn
+            .query_row(
+                "SELECT session_type, session_segment, trading_day
+                 FROM market_events WHERE event_type = 'context_test' LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .expect("row");
+        assert_eq!(row.0, "Globex");
+        assert_eq!(row.1, "Asia");
+        assert_eq!(row.2, "2026-03-04");
+    }
+
+    #[test]
+    fn market_event_scope_falls_back_to_timestamp_when_context_missing() {
+        let db = test_db();
+        let ts = Eastern
+            .with_ymd_and_hms(2026, 3, 2, 19, 0, 0)
+            .single()
+            .expect("ts")
+            .timestamp_millis() as f64;
+        db.conn
+            .execute(
+                "INSERT INTO market_events
+                 (session_date, timestamp_ms, event_type, level_name, price, direction, sequence_num, metadata_json,
+                  session_type, session_segment, trading_day)
+                 VALUES (?1, ?2, ?3, NULL, ?4, NULL, NULL, NULL, NULL, NULL, NULL)",
+                params!["2026-03-02", ts, "legacy_scope_test", 21000.0],
+            )
+            .expect("insert");
+
+        let scope = SessionScopeFilter {
+            session_type: Some("Globex".into()),
+            session_segment: Some("Asia".into()),
+            trading_day_start: None,
+            trading_day_end: None,
+        };
+        let (total, sessions_with, total_sessions) = db
+            .count_events_by_type("legacy_scope_test", None, None, Some(&scope))
+            .expect("counts");
+        assert_eq!(total, 1);
+        assert_eq!(sessions_with, 1);
+        assert_eq!(total_sessions, 1);
     }
 }

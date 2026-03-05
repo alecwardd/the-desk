@@ -62,7 +62,9 @@ When in Globex:
   - `Asia`: 18:00-02:00 ET
   - `London`: 02:00-09:30 ET
 
-**Known limitation:** The event detector (`EventDetector`) currently only fires during RTH sessions. Level test events, day type changes, and extension events are not detected during Globex. Session-level pipeline data (delta, VWAP, footprint, absorption, pinch, rebid/reoffer) is still computed and available.
+Event parity note: market events are available in Globex as well as RTH. Keep interpretation session-aware:
+- RTH-only structural events (`ib_formed`, `or_formed`, `or5_mid_retest`, `ib_extension_hit`, `day_type_change`) are intentionally suppressed during Globex.
+- Session-agnostic structural and flow events remain valid during Globex and should be included in overnight reads.
 
 ### Transition / Noise Window (4:00 PM - 6:00 PM ET)
 

@@ -21,6 +21,10 @@ On every interaction, regardless of topic:
 
 Then route to specialist tool sets based on the question type.
 
+Session parity expectation:
+- Treat overnight event statistics as first-class research context. Globex/Asia/London event data is valid and should be segmented explicitly when relevant.
+- Keep RTH-only structural semantics separate from Globex reads (do not apply RTH-only event interpretations overnight).
+
 ## Question Routing
 
 ### Market Read ("What's the market doing?", "Give me a read", "What's happening?")

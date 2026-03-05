@@ -22,6 +22,9 @@ pub struct MarketEvent {
     pub direction: Option<String>,
     pub sequence_num: Option<i32>,
     pub metadata: Option<serde_json::Value>,
+    pub session_type: String,
+    pub session_segment: String,
+    pub trading_day: String,
 }
 
 fn crossed_level(prev_price: f64, cur_price: f64, level: f64) -> Option<String> {
@@ -35,6 +38,53 @@ fn crossed_level(prev_price: f64, cur_price: f64, level: f64) -> Option<String> 
     } else {
         None
     }
+}
+
+fn normalize_session_type(value: &str) -> String {
+    if value.eq_ignore_ascii_case("rth") {
+        "RTH".to_string()
+    } else if value.eq_ignore_ascii_case("globex") {
+        "Globex".to_string()
+    } else {
+        "Unknown".to_string()
+    }
+}
+
+fn normalize_session_segment(value: &str, session_type: &str) -> String {
+    if session_type != "Globex" {
+        return "None".to_string();
+    }
+    if value.eq_ignore_ascii_case("asia") {
+        "Asia".to_string()
+    } else if value.eq_ignore_ascii_case("london") {
+        "London".to_string()
+    } else {
+        "None".to_string()
+    }
+}
+
+fn event_allowed_in_session(
+    event_type: &str,
+    level_name: Option<&str>,
+    session_type: &str,
+) -> bool {
+    if session_type == "RTH" {
+        return true;
+    }
+    match event_type {
+        "ib_formed" | "or_formed" | "or5_mid_retest" | "ib_extension_hit" | "day_type_change" => {
+            return false;
+        }
+        _ => {}
+    }
+    if event_type.ends_with("_test")
+        && level_name
+            .map(|name| name.starts_with("ib_"))
+            .unwrap_or(false)
+    {
+        return false;
+    }
+    true
 }
 
 /// Detects structured events by comparing consecutive MarketState snapshots.
@@ -82,6 +132,32 @@ impl EventDetector {
             sequence_counts: HashMap::new(),
             session_date: String::new(),
         }
+    }
+
+    fn push_event_with_context(
+        &self,
+        state: &MarketState,
+        session_date: &str,
+        events: &mut Vec<MarketEvent>,
+        mut event: MarketEvent,
+    ) {
+        let session_type = normalize_session_type(&state.session_type);
+        let session_segment = normalize_session_segment(&state.session_segment, &session_type);
+        if !event_allowed_in_session(
+            &event.event_type,
+            event.level_name.as_deref(),
+            &session_type,
+        ) {
+            return;
+        }
+        event.session_type = session_type;
+        event.session_segment = session_segment;
+        event.trading_day = if state.trading_day.is_empty() {
+            session_date.to_string()
+        } else {
+            state.trading_day.clone()
+        };
+        events.push(event);
     }
 
     /// Reset for a new trading session.
@@ -155,21 +231,29 @@ impl EventDetector {
             {
                 self.ib_formed = true;
                 let ib_range = state.ib_high - state.ib_low;
-                events.push(MarketEvent {
-                    session_date: session_date.to_string(),
-                    timestamp_ms,
-                    event_type: "ib_formed".to_string(),
-                    level_name: None,
-                    price,
-                    direction: None,
-                    sequence_num: None,
-                    metadata: Some(serde_json::json!({
-                        "ibHigh": state.ib_high,
-                        "ibLow": state.ib_low,
-                        "ibRange": ib_range,
-                        "ibMid": ib_mid(state),
-                    })),
-                });
+                self.push_event_with_context(
+                    state,
+                    session_date,
+                    events,
+                    MarketEvent {
+                        session_date: session_date.to_string(),
+                        timestamp_ms,
+                        event_type: "ib_formed".to_string(),
+                        level_name: None,
+                        price,
+                        direction: None,
+                        sequence_num: None,
+                        metadata: Some(serde_json::json!({
+                            "ibHigh": state.ib_high,
+                            "ibLow": state.ib_low,
+                            "ibRange": ib_range,
+                            "ibMid": ib_mid(state),
+                        })),
+                        session_type: String::new(),
+                        session_segment: String::new(),
+                        trading_day: String::new(),
+                    },
+                );
             }
             if !self.or_formed
                 && minute_of_session >= 30
@@ -215,16 +299,24 @@ impl EventDetector {
                 let event_key = format!("{name}_test");
                 if self.should_emit(&event_key, timestamp_ms) {
                     let seq = self.next_sequence(&event_key);
-                    events.push(MarketEvent {
-                        session_date: session_date.to_string(),
-                        timestamp_ms,
-                        event_type: event_key,
-                        level_name: Some(name.to_string()),
-                        price,
-                        direction: Some(direction),
-                        sequence_num: Some(seq),
-                        metadata: Some(serde_json::json!({"levelPrice": level})),
-                    });
+                    self.push_event_with_context(
+                        state,
+                        session_date,
+                        events,
+                        MarketEvent {
+                            session_date: session_date.to_string(),
+                            timestamp_ms,
+                            event_type: event_key,
+                            level_name: Some(name.to_string()),
+                            price,
+                            direction: Some(direction),
+                            sequence_num: Some(seq),
+                            metadata: Some(serde_json::json!({"levelPrice": level})),
+                            session_type: String::new(),
+                            session_segment: String::new(),
+                            trading_day: String::new(),
+                        },
+                    );
                 }
             }
         }
@@ -265,21 +357,29 @@ impl EventDetector {
                     if let Some(direction) = crossed_level(self.prev_price, price, ext_level) {
                         let event_key = format!("{name}_hit");
                         if self.should_emit(&event_key, timestamp_ms) {
-                            events.push(MarketEvent {
-                                session_date: session_date.to_string(),
-                                timestamp_ms,
-                                event_type: "ib_extension_hit".to_string(),
-                                level_name: Some(name.to_string()),
-                                price,
-                                direction: Some(direction),
-                                sequence_num: None,
-                                metadata: Some(serde_json::json!({
-                                    "multiplier": multiplier,
-                                    "extensionDirection": dir,
-                                    "extensionPrice": ext_level,
-                                    "ibRange": ib_range,
-                                })),
-                            });
+                            self.push_event_with_context(
+                                state,
+                                session_date,
+                                events,
+                                MarketEvent {
+                                    session_date: session_date.to_string(),
+                                    timestamp_ms,
+                                    event_type: "ib_extension_hit".to_string(),
+                                    level_name: Some(name.to_string()),
+                                    price,
+                                    direction: Some(direction),
+                                    sequence_num: None,
+                                    metadata: Some(serde_json::json!({
+                                        "multiplier": multiplier,
+                                        "extensionDirection": dir,
+                                        "extensionPrice": ext_level,
+                                        "ibRange": ib_range,
+                                    })),
+                                    session_type: String::new(),
+                                    session_segment: String::new(),
+                                    trading_day: String::new(),
+                                },
+                            );
                         }
                     }
                 }
@@ -292,40 +392,56 @@ impl EventDetector {
         if !self.ib_formed && minute_of_session >= 60 && state.ib_high > 0.0 && state.ib_low > 0.0 {
             self.ib_formed = true;
             let ib_range = state.ib_high - state.ib_low;
-            events.push(MarketEvent {
-                session_date: session_date.to_string(),
-                timestamp_ms,
-                event_type: "ib_formed".to_string(),
-                level_name: None,
-                price,
-                direction: None,
-                sequence_num: None,
-                metadata: Some(serde_json::json!({
-                    "ibHigh": state.ib_high,
-                    "ibLow": state.ib_low,
-                    "ibRange": ib_range,
-                    "ibMid": ib_mid(state),
-                })),
-            });
+            self.push_event_with_context(
+                state,
+                session_date,
+                events,
+                MarketEvent {
+                    session_date: session_date.to_string(),
+                    timestamp_ms,
+                    event_type: "ib_formed".to_string(),
+                    level_name: None,
+                    price,
+                    direction: None,
+                    sequence_num: None,
+                    metadata: Some(serde_json::json!({
+                        "ibHigh": state.ib_high,
+                        "ibLow": state.ib_low,
+                        "ibRange": ib_range,
+                        "ibMid": ib_mid(state),
+                    })),
+                    session_type: String::new(),
+                    session_segment: String::new(),
+                    trading_day: String::new(),
+                },
+            );
         }
 
         // OR formed (minute 30 of RTH, fire once)
         if !self.or_formed && minute_of_session >= 30 && state.or_high > 0.0 && state.or_low > 0.0 {
             self.or_formed = true;
-            events.push(MarketEvent {
-                session_date: session_date.to_string(),
-                timestamp_ms,
-                event_type: "or_formed".to_string(),
-                level_name: None,
-                price,
-                direction: None,
-                sequence_num: None,
-                metadata: Some(serde_json::json!({
-                    "orHigh": state.or_high,
-                    "orLow": state.or_low,
-                    "orRange": state.or_high - state.or_low,
-                })),
-            });
+            self.push_event_with_context(
+                state,
+                session_date,
+                events,
+                MarketEvent {
+                    session_date: session_date.to_string(),
+                    timestamp_ms,
+                    event_type: "or_formed".to_string(),
+                    level_name: None,
+                    price,
+                    direction: None,
+                    sequence_num: None,
+                    metadata: Some(serde_json::json!({
+                        "orHigh": state.or_high,
+                        "orLow": state.or_low,
+                        "orRange": state.or_high - state.or_low,
+                    })),
+                    session_type: String::new(),
+                    session_segment: String::new(),
+                    trading_day: String::new(),
+                },
+            );
         }
 
         // New session high/low
@@ -333,32 +449,48 @@ impl EventDetector {
             let event_key = "new_session_high";
             if self.should_emit(event_key, timestamp_ms) {
                 let seq = self.next_sequence(event_key);
-                events.push(MarketEvent {
-                    session_date: session_date.to_string(),
-                    timestamp_ms,
-                    event_type: event_key.to_string(),
-                    level_name: None,
-                    price,
-                    direction: Some("up".to_string()),
-                    sequence_num: Some(seq),
-                    metadata: Some(serde_json::json!({"prevHigh": self.prev_session_high})),
-                });
+                self.push_event_with_context(
+                    state,
+                    session_date,
+                    events,
+                    MarketEvent {
+                        session_date: session_date.to_string(),
+                        timestamp_ms,
+                        event_type: event_key.to_string(),
+                        level_name: None,
+                        price,
+                        direction: Some("up".to_string()),
+                        sequence_num: Some(seq),
+                        metadata: Some(serde_json::json!({"prevHigh": self.prev_session_high})),
+                        session_type: String::new(),
+                        session_segment: String::new(),
+                        trading_day: String::new(),
+                    },
+                );
             }
         }
         if price < self.prev_session_low && self.prev_session_low > 0.0 {
             let event_key = "new_session_low";
             if self.should_emit(event_key, timestamp_ms) {
                 let seq = self.next_sequence(event_key);
-                events.push(MarketEvent {
-                    session_date: session_date.to_string(),
-                    timestamp_ms,
-                    event_type: event_key.to_string(),
-                    level_name: None,
-                    price,
-                    direction: Some("down".to_string()),
-                    sequence_num: Some(seq),
-                    metadata: Some(serde_json::json!({"prevLow": self.prev_session_low})),
-                });
+                self.push_event_with_context(
+                    state,
+                    session_date,
+                    events,
+                    MarketEvent {
+                        session_date: session_date.to_string(),
+                        timestamp_ms,
+                        event_type: event_key.to_string(),
+                        level_name: None,
+                        price,
+                        direction: Some("down".to_string()),
+                        sequence_num: Some(seq),
+                        metadata: Some(serde_json::json!({"prevLow": self.prev_session_low})),
+                        session_type: String::new(),
+                        session_segment: String::new(),
+                        trading_day: String::new(),
+                    },
+                );
             }
         }
         self.prev_session_high = self.prev_session_high.max(price);
@@ -371,96 +503,144 @@ impl EventDetector {
         // Day type change
         let current_day_type = state.day_type;
         if current_day_type != self.prev_day_type {
-            events.push(MarketEvent {
-                session_date: session_date.to_string(),
-                timestamp_ms,
-                event_type: "day_type_change".to_string(),
-                level_name: None,
-                price,
-                direction: None,
-                sequence_num: None,
-                metadata: Some(serde_json::json!({
-                    "from": format!("{:?}", self.prev_day_type),
-                    "to": format!("{:?}", current_day_type),
-                })),
-            });
+            self.push_event_with_context(
+                state,
+                session_date,
+                events,
+                MarketEvent {
+                    session_date: session_date.to_string(),
+                    timestamp_ms,
+                    event_type: "day_type_change".to_string(),
+                    level_name: None,
+                    price,
+                    direction: None,
+                    sequence_num: None,
+                    metadata: Some(serde_json::json!({
+                        "from": format!("{:?}", self.prev_day_type),
+                        "to": format!("{:?}", current_day_type),
+                    })),
+                    session_type: String::new(),
+                    session_segment: String::new(),
+                    trading_day: String::new(),
+                },
+            );
         }
         self.prev_day_type = current_day_type;
 
         // Poor high/low detected
         if state.poor_high && !self.prev_poor_high {
-            events.push(MarketEvent {
-                session_date: session_date.to_string(),
-                timestamp_ms,
-                event_type: "poor_high_detected".to_string(),
-                level_name: None,
-                price,
-                direction: None,
-                sequence_num: None,
-                metadata: None,
-            });
+            self.push_event_with_context(
+                state,
+                session_date,
+                events,
+                MarketEvent {
+                    session_date: session_date.to_string(),
+                    timestamp_ms,
+                    event_type: "poor_high_detected".to_string(),
+                    level_name: None,
+                    price,
+                    direction: None,
+                    sequence_num: None,
+                    metadata: None,
+                    session_type: String::new(),
+                    session_segment: String::new(),
+                    trading_day: String::new(),
+                },
+            );
         }
         self.prev_poor_high = state.poor_high;
 
         if state.poor_low && !self.prev_poor_low {
-            events.push(MarketEvent {
-                session_date: session_date.to_string(),
-                timestamp_ms,
-                event_type: "poor_low_detected".to_string(),
-                level_name: None,
-                price,
-                direction: None,
-                sequence_num: None,
-                metadata: None,
-            });
+            self.push_event_with_context(
+                state,
+                session_date,
+                events,
+                MarketEvent {
+                    session_date: session_date.to_string(),
+                    timestamp_ms,
+                    event_type: "poor_low_detected".to_string(),
+                    level_name: None,
+                    price,
+                    direction: None,
+                    sequence_num: None,
+                    metadata: None,
+                    session_type: String::new(),
+                    session_segment: String::new(),
+                    trading_day: String::new(),
+                },
+            );
         }
         self.prev_poor_low = state.poor_low;
 
         // Excess detected
         if state.excess_high && !self.prev_excess_high {
-            events.push(MarketEvent {
-                session_date: session_date.to_string(),
-                timestamp_ms,
-                event_type: "excess_high_detected".to_string(),
-                level_name: None,
-                price,
-                direction: Some("up".to_string()),
-                sequence_num: None,
-                metadata: None,
-            });
+            self.push_event_with_context(
+                state,
+                session_date,
+                events,
+                MarketEvent {
+                    session_date: session_date.to_string(),
+                    timestamp_ms,
+                    event_type: "excess_high_detected".to_string(),
+                    level_name: None,
+                    price,
+                    direction: Some("up".to_string()),
+                    sequence_num: None,
+                    metadata: None,
+                    session_type: String::new(),
+                    session_segment: String::new(),
+                    trading_day: String::new(),
+                },
+            );
         }
         self.prev_excess_high = state.excess_high;
 
         if state.excess_low && !self.prev_excess_low {
-            events.push(MarketEvent {
-                session_date: session_date.to_string(),
-                timestamp_ms,
-                event_type: "excess_low_detected".to_string(),
-                level_name: None,
-                price,
-                direction: Some("down".to_string()),
-                sequence_num: None,
-                metadata: None,
-            });
+            self.push_event_with_context(
+                state,
+                session_date,
+                events,
+                MarketEvent {
+                    session_date: session_date.to_string(),
+                    timestamp_ms,
+                    event_type: "excess_low_detected".to_string(),
+                    level_name: None,
+                    price,
+                    direction: Some("down".to_string()),
+                    sequence_num: None,
+                    metadata: None,
+                    session_type: String::new(),
+                    session_segment: String::new(),
+                    trading_day: String::new(),
+                },
+            );
         }
         self.prev_excess_low = state.excess_low;
 
         // OR5 mid retest
         if state.or5_mid_retested && !self.prev_or5_mid_retested {
-            events.push(MarketEvent {
-                session_date: session_date.to_string(),
-                timestamp_ms,
-                event_type: "or5_mid_retest".to_string(),
-                level_name: Some("or5_mid".to_string()),
-                price,
-                direction: Some(format!("{:?}", state.or5_break_direction)),
-                sequence_num: None,
-                metadata: Some(serde_json::json!({
-                    "or5High": state.or5_high,
-                    "or5Low": state.or5_low,
-                    "or5Mid": state.or5_mid,
-                })),
-            });
+            self.push_event_with_context(
+                state,
+                session_date,
+                events,
+                MarketEvent {
+                    session_date: session_date.to_string(),
+                    timestamp_ms,
+                    event_type: "or5_mid_retest".to_string(),
+                    level_name: Some("or5_mid".to_string()),
+                    price,
+                    direction: Some(format!("{:?}", state.or5_break_direction)),
+                    sequence_num: None,
+                    metadata: Some(serde_json::json!({
+                        "or5High": state.or5_high,
+                        "or5Low": state.or5_low,
+                        "or5Mid": state.or5_mid,
+                    })),
+                    session_type: String::new(),
+                    session_segment: String::new(),
+                    trading_day: String::new(),
+                },
+            );
         }
         self.prev_or5_mid_retested = state.or5_mid_retested;
 
@@ -471,19 +651,27 @@ impl EventDetector {
             if let Some(direction) = crossed_level(self.prev_price, price, state.dnp) {
                 let event_key = "dnp_cross";
                 if self.should_emit(event_key, timestamp_ms) {
-                    events.push(MarketEvent {
-                        session_date: session_date.to_string(),
-                        timestamp_ms,
-                        event_type: event_key.to_string(),
-                        level_name: Some("dnp".to_string()),
-                        price,
-                        direction: Some(direction),
-                        sequence_num: None,
-                        metadata: Some(serde_json::json!({
-                            "dnp": state.dnp,
-                            "sessionDelta": state.session_delta,
-                        })),
-                    });
+                    self.push_event_with_context(
+                        state,
+                        session_date,
+                        events,
+                        MarketEvent {
+                            session_date: session_date.to_string(),
+                            timestamp_ms,
+                            event_type: event_key.to_string(),
+                            level_name: Some("dnp".to_string()),
+                            price,
+                            direction: Some(direction),
+                            sequence_num: None,
+                            metadata: Some(serde_json::json!({
+                                "dnp": state.dnp,
+                                "sessionDelta": state.session_delta,
+                            })),
+                            session_type: String::new(),
+                            session_segment: String::new(),
+                            trading_day: String::new(),
+                        },
+                    );
                 }
             }
         }
@@ -496,18 +684,26 @@ impl EventDetector {
         {
             let event_key = "rvol_spike";
             if self.should_emit(event_key, timestamp_ms) {
-                events.push(MarketEvent {
-                    session_date: session_date.to_string(),
-                    timestamp_ms,
-                    event_type: event_key.to_string(),
-                    level_name: None,
-                    price,
-                    direction: None,
-                    sequence_num: None,
-                    metadata: Some(serde_json::json!({
-                        "rvolRatio": state.rvol_ratio,
-                    })),
-                });
+                self.push_event_with_context(
+                    state,
+                    session_date,
+                    events,
+                    MarketEvent {
+                        session_date: session_date.to_string(),
+                        timestamp_ms,
+                        event_type: event_key.to_string(),
+                        level_name: None,
+                        price,
+                        direction: None,
+                        sequence_num: None,
+                        metadata: Some(serde_json::json!({
+                            "rvolRatio": state.rvol_ratio,
+                        })),
+                        session_type: String::new(),
+                        session_segment: String::new(),
+                        trading_day: String::new(),
+                    },
+                );
             }
         }
 
@@ -743,6 +939,46 @@ mod tests {
         s2.poor_high = true;
         let events = detector.detect(&s2, 2000.0, date, 60);
         assert!(events.iter().any(|e| e.event_type == "poor_high_detected"));
+    }
+
+    #[test]
+    fn globex_suppresses_rth_only_events() {
+        let mut detector = EventDetector::new();
+        let date = "2026-02-27";
+
+        let mut s = base_state();
+        s.session_type = "Globex".to_string();
+        s.session_segment = "Asia".to_string();
+        s.trading_day = "2026-02-27".to_string();
+        let events = detector.detect(&s, 1000.0, date, 60);
+        assert!(
+            !events.iter().any(|e| e.event_type == "ib_formed"),
+            "IB-formed must remain RTH-only"
+        );
+    }
+
+    #[test]
+    fn globex_keeps_session_agnostic_events_with_context() {
+        let mut detector = EventDetector::new();
+        let date = "2026-02-27";
+
+        let mut s1 = base_state();
+        s1.session_type = "Globex".to_string();
+        s1.session_segment = "London".to_string();
+        s1.trading_day = "2026-02-27".to_string();
+        s1.last_price = 20999.0;
+        detector.detect(&s1, 1000.0, date, -30);
+
+        let mut s2 = s1.clone();
+        s2.last_price = 21001.0;
+        let events = detector.detect(&s2, 2000.0, date, -29);
+        let evt = events
+            .into_iter()
+            .find(|e| e.event_type == "dnp_cross")
+            .expect("expected dnp_cross in globex");
+        assert_eq!(evt.session_type, "Globex");
+        assert_eq!(evt.session_segment, "London");
+        assert_eq!(evt.trading_day, "2026-02-27");
     }
 
     #[test]

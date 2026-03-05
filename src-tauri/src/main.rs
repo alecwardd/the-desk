@@ -11,7 +11,7 @@ use the_desk_backend::dtc::DtcClient;
 use the_desk_backend::feed::scid_reader::ScidReader;
 use the_desk_backend::feed::{load_feed_config, FeedEvent, TradeSide};
 use the_desk_backend::outcome_tracker;
-use the_desk_backend::pipelines::{EventDetector, PipelineEngine, RvolPipeline};
+use the_desk_backend::pipelines::{EventDetector, FlowEventEmitter, PipelineEngine, RvolPipeline};
 use the_desk_backend::recording::{RecordingEntry, SessionRecorder};
 use the_desk_backend::risk::{RiskConfig, RiskTracker};
 use the_desk_backend::rules::RulesEngine;
@@ -49,6 +49,7 @@ pub(crate) struct AppState {
     pub dtc: Mutex<DtcClient>,
     pub pipelines: Mutex<PipelineEngine>,
     pub detector: Mutex<EventDetector>,
+    pub flow_emitter: Mutex<FlowEventEmitter>,
     pub rules: Mutex<RulesEngine>,
     pub risk: Mutex<RiskTracker>,
     pub db: Mutex<Database>,
@@ -136,6 +137,7 @@ async fn processing_loop(handle: AppHandle, mut rx: broadcast::Receiver<FeedEven
                         }
                         pipelines.reset_session();
                         state.detector.lock().await.reset();
+                        state.flow_emitter.lock().await.reset();
 
                         // Flush pending events before session boundary
                         if !event_buffer.is_empty() {
@@ -179,37 +181,45 @@ async fn processing_loop(handle: AppHandle, mut rx: broadcast::Receiver<FeedEven
                         timestamp,
                     );
 
-                    // Detect market events (RTH only)
-                    if current_session_type == SessionType::Rth {
-                        let bid = if last_bid > 0.0 {
-                            last_bid
-                        } else {
-                            price - 0.25
-                        };
-                        let ask = if last_ask > 0.0 {
-                            last_ask
-                        } else {
-                            price + 0.25
-                        };
-                        let snapshot = pipelines.snapshot(bid, ask);
-                        let session_date = session_date_from_timestamp_ms(timestamp);
-                        let mut detector = state.detector.lock().await;
-                        detector.detect_into(
-                            &snapshot,
-                            timestamp,
-                            &session_date,
-                            minute_of_session,
-                            &mut event_buffer,
-                        );
+                    // Detect and buffer market events in both RTH and Globex.
+                    let bid = if last_bid > 0.0 {
+                        last_bid
+                    } else {
+                        price - 0.25
+                    };
+                    let ask = if last_ask > 0.0 {
+                        last_ask
+                    } else {
+                        price + 0.25
+                    };
+                    let snapshot = pipelines.snapshot(bid, ask);
+                    let session_date = session_date_from_timestamp_ms(timestamp);
+                    let mut detector = state.detector.lock().await;
+                    detector.detect_into(
+                        &snapshot,
+                        timestamp,
+                        &session_date,
+                        minute_of_session,
+                        &mut event_buffer,
+                    );
+                    drop(detector);
+                    let mut flow_emitter = state.flow_emitter.lock().await;
+                    flow_emitter.detect_into(
+                        &pipelines,
+                        timestamp,
+                        &session_date,
+                        price,
+                        &mut event_buffer,
+                    );
+                    drop(flow_emitter);
 
-                        if event_buffer.len() >= 50 {
-                            let _ = state
-                                .db
-                                .lock()
-                                .await
-                                .insert_market_events_batch(&event_buffer);
-                            event_buffer.clear();
-                        }
+                    if event_buffer.len() >= 50 {
+                        let _ = state
+                            .db
+                            .lock()
+                            .await
+                            .insert_market_events_batch(&event_buffer);
+                        event_buffer.clear();
                     }
 
                     if last_market_emit.elapsed() >= market_interval {
@@ -456,6 +466,7 @@ fn main() {
         dtc: Mutex::new(DtcClient::new(tx.clone())),
         pipelines: Mutex::new(pipelines),
         detector: Mutex::new(EventDetector::new()),
+        flow_emitter: Mutex::new(FlowEventEmitter::new()),
         rules: Mutex::new(RulesEngine::default()),
         risk: Mutex::new(risk),
         db: Mutex::new(db),

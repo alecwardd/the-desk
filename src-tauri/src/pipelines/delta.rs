@@ -60,28 +60,10 @@ impl DeltaPipeline {
         out
     }
 
-    /// Delta-neutral pivot where cumulative profile crosses zero.
+    /// Delta Neutral Pivot — midpoint of the DNVA high and low.
     pub fn dnp(&self) -> f64 {
-        if self.delta_by_price.is_empty() {
-            return 0.0;
-        }
-        let mut keys: Vec<i64> = self.delta_by_price.keys().copied().collect();
-        keys.sort();
-        let mut running = 0.0;
-        let mut closest_key = keys[0];
-        let mut closest_abs = f64::MAX;
-        for key in keys {
-            running += self.delta_by_price.get(&key).copied().unwrap_or(0.0);
-            let distance = running.abs();
-            if distance < closest_abs {
-                closest_abs = distance;
-                closest_key = key;
-            }
-            if running == 0.0 {
-                return key as f64 * self.tick_size;
-            }
-        }
-        closest_key as f64 * self.tick_size
+        let (high, low) = self.dnva_bounds();
+        (high + low) / 2.0
     }
 
     fn dnva_bounds(&self) -> (f64, f64) {

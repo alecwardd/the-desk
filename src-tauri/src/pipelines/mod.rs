@@ -85,7 +85,7 @@ pub struct MarketState {
     pub dnva_high: f64,
     /// Delta neutral value area low (70% of absolute delta).
     pub dnva_low: f64,
-    /// Delta neutral pivot — where cumulative delta crosses zero.
+    /// Delta Neutral Pivot — midpoint of DNVA high and low.
     pub dnp: f64,
     /// Net buy minus sell volume for the current session.
     pub session_delta: f64,

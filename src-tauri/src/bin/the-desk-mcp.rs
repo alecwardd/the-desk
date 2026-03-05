@@ -1156,7 +1156,7 @@ impl TheDeskMcp {
     }
 
     #[tool(
-        description = "Delta profile: session cumulative delta, delta neutral value area (DNVA high/low), delta neutral pivot (DNP -- where cumulative delta crosses zero). Use for inventory and positioning analysis."
+        description = "Delta profile: session cumulative delta, delta neutral value area (DNVA high/low), delta neutral pivot (DNP -- midpoint of DNVA). Use for inventory and positioning analysis."
     )]
     async fn get_delta_profile(&self) -> Result<CallToolResult, McpError> {
         let db = self.db.lock().map_err(|_| lock_error())?;

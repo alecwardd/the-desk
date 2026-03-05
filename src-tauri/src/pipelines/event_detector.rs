@@ -646,7 +646,7 @@ impl EventDetector {
 
         // --- Delta/flow events ---
 
-        // DNP cross (price crosses delta neutral pivot)
+        // DNP cross (price crosses delta neutral pivot — midpoint of DNVA)
         if state.dnp > 0.0 {
             if let Some(direction) = crossed_level(self.prev_price, price, state.dnp) {
                 let event_key = "dnp_cross";

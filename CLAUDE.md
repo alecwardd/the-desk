@@ -82,7 +82,7 @@ These terms have precise meanings. Using them incorrectly will produce a broken 
 | **Value Area** | 70% of TPOs (or volume), calculated outward from POC | Calculating as "middle 70% of range" |
 | **POC** | Point of Control — highest TPO (or volume) price level | N/A |
 | **DNVA** | Delta Neutral Value Area — 70% of absolute delta | Calculating from raw (signed) delta |
-| **DNP** | Delta Neutral Pivot — where cumulative delta crosses zero | Confusing with POC |
+| **DNP** | Delta Neutral Pivot — midpoint of DNVA high and low | Confusing with POC or delta zero-crossing |
 | **Delta** | Buy volume minus sell volume at a price level | Forgetting to classify trade direction |
 | **Single Prints** | TPO levels with exactly one letter — initiative activity | Confusing with low-volume levels |
 | **IB** | Initial Balance — first 60 minutes of RTH range | Confusing with Opening Range (30 min) |

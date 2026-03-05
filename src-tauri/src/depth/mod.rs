@@ -21,6 +21,8 @@ pub enum DepthError {
     Io(#[from] std::io::Error),
     #[error("invalid depth header: {0}")]
     InvalidHeader(String),
+    #[error("scan callback error: {0}")]
+    Callback(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -147,6 +149,47 @@ pub struct PullStackActivitySummary {
     pub top_stack_levels: Vec<PriceActivitySummary>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct DomSummary {
+    pub source_file: String,
+    pub timestamp_ms: f64,
+    pub best_bid: Option<f64>,
+    pub best_ask: Option<f64>,
+    pub spread_ticks: Option<i32>,
+    pub touch_imbalance_ratio: Option<f64>,
+    pub near_touch_bid_depth: f64,
+    pub near_touch_ask_depth: f64,
+    pub near_touch_depth_ratio: Option<f64>,
+    pub bid_pull_rate: f64,
+    pub ask_pull_rate: f64,
+    pub stack_bias: f64,
+    pub pull_stack_bias: f64,
+    pub liquidity_bias: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DomFeatureSnapshot {
+    pub source_file: String,
+    pub timestamp_ms: f64,
+    pub session_date: String,
+    pub dom_summary: DomSummary,
+    pub activity: PullStackActivitySummary,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanControl {
+    Continue,
+    Stop,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ScanStats {
+    pub estimated_records: usize,
+    pub records_scanned: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct DepthReader {
     path: PathBuf,
@@ -154,7 +197,7 @@ pub struct DepthReader {
 }
 
 #[derive(Debug, Clone, Default)]
-struct DepthBook {
+pub struct DepthBook {
     bids: BTreeMap<i64, LevelState>,
     asks: BTreeMap<i64, LevelState>,
 }
@@ -187,6 +230,31 @@ impl DepthReader {
     /// Path to the depth file.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Offset to the first record after the fixed depth header.
+    pub fn data_start_offset(&self) -> u64 {
+        DEPTH_HEADER_SIZE as u64
+    }
+
+    /// Current file length for tail-loop callers.
+    pub fn file_len(&self) -> Result<u64, DepthError> {
+        Ok(std::fs::metadata(&self.path)?.len())
+    }
+
+    /// Read all depth records in the file.
+    pub fn read_bulk(&self) -> Result<Vec<DepthRecord>, DepthError> {
+        self.read_bulk_since(None)
+    }
+
+    /// Read depth records from the file starting at an optional minimum timestamp.
+    pub fn read_bulk_since(&self, since_ms: Option<f64>) -> Result<Vec<DepthRecord>, DepthError> {
+        let mut out = Vec::new();
+        self.scan_range(since_ms, None, |record| {
+            out.push(record);
+            Ok(ScanControl::Continue)
+        })?;
+        Ok(out)
     }
 
     /// Discover `.depth` files in Sierra's `MarketDepthData` directory for the configured symbol.
@@ -260,6 +328,132 @@ impl DepthReader {
         let first = self.read_record_at(&mut file, data_start, 0)?;
         let last = self.read_record_at(&mut file, data_start, total_records.saturating_sub(1))?;
         Ok((first.timestamp_ms, last.timestamp_ms))
+    }
+
+    /// Scan depth records in time order without materializing the entire file.
+    pub fn scan_range<F>(
+        &self,
+        start_ms: Option<f64>,
+        end_ms_exclusive: Option<f64>,
+        mut on_record: F,
+    ) -> Result<ScanStats, DepthError>
+    where
+        F: FnMut(DepthRecord) -> Result<ScanControl, String>,
+    {
+        let mut file = File::open(&self.path)?;
+        let header = Self::read_header(&mut file)?;
+        let data_start = header.header_size as u64;
+        let file_len = file.metadata()?.len();
+        if file_len <= data_start {
+            return Ok(ScanStats::default());
+        }
+
+        let total_records = (file_len - data_start) / DEPTH_RECORD_SIZE as u64;
+        let start_record = if let Some(start_ms) = start_ms {
+            self.binary_search_record(&mut file, data_start, total_records, start_ms)?
+        } else {
+            0
+        };
+        let end_record = if let Some(end_ms) = end_ms_exclusive {
+            self.binary_search_record(&mut file, data_start, total_records, end_ms)?
+        } else {
+            total_records
+        };
+
+        let mut stats = ScanStats {
+            estimated_records: end_record.saturating_sub(start_record) as usize,
+            records_scanned: 0,
+        };
+        file.seek(SeekFrom::Start(
+            data_start + start_record * DEPTH_RECORD_SIZE as u64,
+        ))?;
+        let mut buf = [0_u8; DEPTH_RECORD_SIZE];
+        while file.read_exact(&mut buf).is_ok() {
+            if let Some(record) = self.parse_record(&buf) {
+                if start_ms.is_some() && record.timestamp_ms < start_ms.unwrap_or_default() {
+                    continue;
+                }
+                if let Some(end_ms) = end_ms_exclusive {
+                    if record.timestamp_ms >= end_ms {
+                        break;
+                    }
+                }
+                stats.records_scanned += 1;
+                match on_record(record).map_err(DepthError::Callback)? {
+                    ScanControl::Continue => {}
+                    ScanControl::Stop => break,
+                }
+            }
+        }
+
+        Ok(stats)
+    }
+
+    /// Estimate how many records fall in a time range.
+    pub fn estimate_range_records(
+        &self,
+        start_ms: Option<f64>,
+        end_ms_exclusive: Option<f64>,
+    ) -> Result<usize, DepthError> {
+        let mut file = File::open(&self.path)?;
+        let header = Self::read_header(&mut file)?;
+        let data_start = header.header_size as u64;
+        let file_len = file.metadata()?.len();
+        if file_len <= data_start {
+            return Ok(0);
+        }
+        let total_records = (file_len - data_start) / DEPTH_RECORD_SIZE as u64;
+        let start_record = if let Some(start_ms) = start_ms {
+            self.binary_search_record(&mut file, data_start, total_records, start_ms)?
+        } else {
+            0
+        };
+        let end_record = if let Some(end_ms) = end_ms_exclusive {
+            self.binary_search_record(&mut file, data_start, total_records, end_ms)?
+        } else {
+            total_records
+        };
+        Ok(end_record.saturating_sub(start_record) as usize)
+    }
+
+    /// Scan newly appended records starting at an absolute file offset, updating the offset in place.
+    pub fn scan_new_records<F>(
+        &self,
+        offset: &mut u64,
+        mut on_record: F,
+    ) -> Result<ScanStats, DepthError>
+    where
+        F: FnMut(DepthRecord) -> Result<ScanControl, String>,
+    {
+        let mut file = File::open(&self.path)?;
+        let header = Self::read_header(&mut file)?;
+        let data_start = header.header_size as u64;
+        if *offset < data_start {
+            *offset = data_start;
+        }
+
+        let len = file.metadata()?.len();
+        if len <= *offset {
+            return Ok(ScanStats::default());
+        }
+        file.seek(SeekFrom::Start(*offset))?;
+
+        let mut stats = ScanStats {
+            estimated_records: ((len - *offset) / DEPTH_RECORD_SIZE as u64) as usize,
+            ..ScanStats::default()
+        };
+        let mut buf = [0_u8; DEPTH_RECORD_SIZE];
+        while file.read_exact(&mut buf).is_ok() {
+            *offset = offset.saturating_add(DEPTH_RECORD_SIZE as u64);
+            if let Some(record) = self.parse_record(&buf) {
+                stats.records_scanned += 1;
+                match on_record(record).map_err(DepthError::Callback)? {
+                    ScanControl::Continue => {}
+                    ScanControl::Stop => break,
+                }
+            }
+        }
+        Ok(stats)
     }
 
     /// Reconstruct the DOM state at or immediately before `timestamp_ms`.
@@ -550,7 +744,7 @@ impl DepthReader {
 }
 
 impl DepthBook {
-    fn apply(&mut self, record: &DepthRecord) {
+    pub fn apply(&mut self, record: &DepthRecord) {
         match record.command {
             DepthCommand::ClearBook => {
                 self.bids.clear();
@@ -673,7 +867,7 @@ impl DepthBook {
         }
     }
 
-    fn snapshot(
+    pub fn snapshot(
         &self,
         source_file: &str,
         snapshot_timestamp_ms: f64,
@@ -737,6 +931,84 @@ impl DepthBook {
             bids,
             asks,
         }
+    }
+}
+
+pub fn build_dom_summary(
+    snapshot: &DomSnapshot,
+    activity: &PullStackActivitySummary,
+) -> DomSummary {
+    let near_touch_bid_depth: f64 = snapshot
+        .bids
+        .iter()
+        .take(3)
+        .map(|level| level.quantity as f64)
+        .sum();
+    let near_touch_ask_depth: f64 = snapshot
+        .asks
+        .iter()
+        .take(3)
+        .map(|level| level.quantity as f64)
+        .sum();
+    let near_touch_depth_ratio = if near_touch_ask_depth > 0.0 {
+        Some(near_touch_bid_depth / near_touch_ask_depth)
+    } else {
+        None
+    };
+    let bid_pull_rate = if activity.bid.removed_quantity > 0.0 {
+        activity.bid.estimated_pulled_quantity / activity.bid.removed_quantity
+    } else {
+        0.0
+    };
+    let ask_pull_rate = if activity.ask.removed_quantity > 0.0 {
+        activity.ask.estimated_pulled_quantity / activity.ask.removed_quantity
+    } else {
+        0.0
+    };
+    let stack_bias = if (activity.bid.stacked_quantity + activity.ask.stacked_quantity) > 0.0 {
+        (activity.bid.stacked_quantity - activity.ask.stacked_quantity)
+            / (activity.bid.stacked_quantity + activity.ask.stacked_quantity)
+    } else {
+        0.0
+    };
+    let pull_stack_bias = (activity.bid.stacked_quantity - activity.bid.estimated_pulled_quantity)
+        - (activity.ask.stacked_quantity - activity.ask.estimated_pulled_quantity);
+    let liquidity_bias = if pull_stack_bias > 25.0 || near_touch_depth_ratio.unwrap_or(1.0) > 1.2 {
+        "bid_support".to_string()
+    } else if pull_stack_bias < -25.0 || near_touch_depth_ratio.unwrap_or(1.0) < 0.8 {
+        "ask_resistance".to_string()
+    } else {
+        "balanced".to_string()
+    };
+
+    DomSummary {
+        source_file: snapshot.source_file.clone(),
+        timestamp_ms: snapshot.snapshot_timestamp_ms,
+        best_bid: snapshot.best_bid,
+        best_ask: snapshot.best_ask,
+        spread_ticks: snapshot.spread_ticks,
+        touch_imbalance_ratio: snapshot.touch_imbalance_ratio,
+        near_touch_bid_depth,
+        near_touch_ask_depth,
+        near_touch_depth_ratio,
+        bid_pull_rate,
+        ask_pull_rate,
+        stack_bias,
+        pull_stack_bias,
+        liquidity_bias,
+    }
+}
+
+pub fn build_dom_feature_snapshot(
+    snapshot: &DomSnapshot,
+    activity: PullStackActivitySummary,
+) -> DomFeatureSnapshot {
+    DomFeatureSnapshot {
+        source_file: snapshot.source_file.clone(),
+        timestamp_ms: snapshot.snapshot_timestamp_ms,
+        session_date: snapshot.session_date.clone(),
+        dom_summary: build_dom_summary(snapshot, &activity),
+        activity,
     }
 }
 
@@ -893,5 +1165,168 @@ mod tests {
             agg.get(&(DepthSide::Ask, price_to_tick_key(101.0))),
             Some(&4.0)
         );
+    }
+
+    #[test]
+    fn scan_range_respects_bounds() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("NQ.depth");
+        write_test_depth_file(
+            &path,
+            &[
+                (unix_ms_to_sc(1_000), 1, 0, 0, 0.0, 0),
+                (unix_ms_to_sc(1_000), 2, 0, 1, 100.0, 10),
+                (unix_ms_to_sc(2_000), 3, 1, 1, 101.0, 12),
+                (unix_ms_to_sc(3_000), 4, 0, 1, 100.0, 8),
+            ],
+        );
+        let reader = DepthReader::new(path, 1.0);
+        let mut timestamps = Vec::new();
+        let stats = reader
+            .scan_range(Some(1_500.0), Some(3_000.0), |record| {
+                timestamps.push(record.timestamp_ms);
+                Ok(ScanControl::Continue)
+            })
+            .expect("scan");
+        assert_eq!(timestamps, vec![2_000.0]);
+        assert_eq!(stats.records_scanned, 1);
+    }
+
+    #[test]
+    fn scan_new_records_tails_appends() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("NQ.depth");
+        write_test_depth_file(
+            &path,
+            &[
+                (unix_ms_to_sc(1_000), 1, 0, 0, 0.0, 0),
+                (unix_ms_to_sc(1_000), 2, 1, 1, 100.0, 10),
+            ],
+        );
+        let reader = DepthReader::new(&path, 1.0);
+        let mut offset = reader.data_start_offset();
+        let mut first_pass = Vec::new();
+        reader
+            .scan_new_records(&mut offset, |record| {
+                first_pass.push(record.timestamp_ms);
+                Ok(ScanControl::Continue)
+            })
+            .expect("first scan");
+        assert_eq!(first_pass.len(), 2);
+
+        let mut bytes = std::fs::read(&path).expect("read");
+        for (dt, cmd, flags, num_orders, price, qty) in [
+            (unix_ms_to_sc(2_000), 3_u8, 0_u8, 1_u16, 101.0_f32, 12_u32),
+            (unix_ms_to_sc(2_100), 5_u8, 1_u8, 1_u16, 101.0_f32, 15_u32),
+        ] {
+            bytes.extend_from_slice(&dt.to_le_bytes());
+            bytes.push(cmd);
+            bytes.push(flags);
+            bytes.extend_from_slice(&num_orders.to_le_bytes());
+            bytes.extend_from_slice(&price.to_le_bytes());
+            bytes.extend_from_slice(&qty.to_le_bytes());
+            bytes.extend_from_slice(&0_u32.to_le_bytes());
+        }
+        std::fs::write(&path, bytes).expect("append");
+
+        let mut second_pass = Vec::new();
+        reader
+            .scan_new_records(&mut offset, |record| {
+                second_pass.push(record.timestamp_ms);
+                Ok(ScanControl::Continue)
+            })
+            .expect("second scan");
+        assert_eq!(second_pass, vec![2_000.0, 2_100.0]);
+    }
+
+    #[test]
+    fn build_dom_summary_uses_snapshot_and_activity() {
+        let snapshot = DomSnapshot {
+            source_file: "test.depth".into(),
+            snapshot_timestamp_ms: 2_000.0,
+            session_date: "2026-03-05".into(),
+            best_bid: Some(100.0),
+            best_ask: Some(100.25),
+            spread_ticks: Some(1),
+            touch_imbalance_ratio: Some(1.5),
+            total_bid_levels: 2,
+            total_ask_levels: 2,
+            bids: vec![
+                DomLevel {
+                    price: 100.0,
+                    quantity: 12,
+                    num_orders: 1,
+                    distance_from_touch_ticks: 0,
+                },
+                DomLevel {
+                    price: 99.75,
+                    quantity: 8,
+                    num_orders: 1,
+                    distance_from_touch_ticks: 1,
+                },
+            ],
+            asks: vec![
+                DomLevel {
+                    price: 100.25,
+                    quantity: 10,
+                    num_orders: 1,
+                    distance_from_touch_ticks: 0,
+                },
+                DomLevel {
+                    price: 100.5,
+                    quantity: 6,
+                    num_orders: 1,
+                    distance_from_touch_ticks: 1,
+                },
+            ],
+        };
+        let activity = PullStackActivitySummary {
+            source_file: "test.depth".into(),
+            start_time_ms: 1_000.0,
+            end_time_ms: 2_000.0,
+            session_date: "2026-03-05".into(),
+            record_count: 4,
+            batch_count: 2,
+            bid: SideActivitySummary {
+                stacked_quantity: 20.0,
+                removed_quantity: 10.0,
+                estimated_pulled_quantity: 4.0,
+                ..Default::default()
+            },
+            ask: SideActivitySummary {
+                stacked_quantity: 8.0,
+                removed_quantity: 12.0,
+                estimated_pulled_quantity: 6.0,
+                ..Default::default()
+            },
+            top_pull_levels: Vec::new(),
+            top_stack_levels: Vec::new(),
+        };
+        let summary = build_dom_summary(&snapshot, &activity);
+        assert_eq!(summary.near_touch_bid_depth, 20.0);
+        assert_eq!(summary.near_touch_ask_depth, 16.0);
+        assert_eq!(summary.liquidity_bias, "bid_support");
+    }
+
+    #[test]
+    fn validates_real_sierra_depth_file_when_available() {
+        let path = Path::new(r"T:\SierraChart\Data\MarketDepthData\NQH6.CME.2026-03-05.depth");
+        if !path.exists() {
+            return;
+        }
+        let config = crate::feed::load_feed_config();
+        let reader = DepthReader::new(path, config.price_scale);
+        let (first_ms, last_ms) = reader.time_bounds().expect("time bounds");
+        assert!(last_ms >= first_ms);
+
+        let snapshot = reader.snapshot_at(last_ms, 5).expect("snapshot");
+        assert!(snapshot.best_bid.is_some() || snapshot.best_ask.is_some());
+
+        let start_ms = (last_ms - 30_000.0).max(first_ms);
+        let trades = HashMap::new();
+        let summary = reader
+            .summarize_window(start_ms, last_ms, &trades, None, None)
+            .expect("summary");
+        assert!(summary.record_count > 0 || summary.batch_count > 0);
     }
 }

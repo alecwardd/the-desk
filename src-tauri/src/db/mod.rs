@@ -1,7 +1,9 @@
+use crate::depth::DepthRecord;
 use crate::pipelines::event_detector::MarketEvent;
 use crate::risk::RiskState;
 use crate::rules::SetupDefinition;
 use crate::tick_time_context_from_timestamp_ms;
+use crate::trading_day_from_timestamp_ms;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -153,6 +155,22 @@ pub struct RawTickRecord {
     pub ask: f64,
     pub is_buy: bool,
     pub session_date: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DepthEventRecord {
+    pub id: i64,
+    pub source_file: String,
+    pub timestamp_ms: f64,
+    pub side: Option<String>,
+    pub command: String,
+    pub price: f64,
+    pub quantity: f64,
+    pub num_orders: i64,
+    pub end_of_batch: bool,
+    pub batch_id: Option<i64>,
+    pub trading_day: Option<String>,
 }
 
 /// End-of-session summary with key metrics for historical research.
@@ -2041,6 +2059,83 @@ impl Database {
         Ok(())
     }
 
+    pub fn insert_depth_events_batch(
+        &mut self,
+        source_file: &str,
+        records: &[DepthRecord],
+        starting_batch_id: i64,
+    ) -> Result<i64, DbError> {
+        let tx = self.conn.transaction()?;
+        let mut stmt = tx.prepare(
+            "INSERT INTO depth_events
+             (source_file, timestamp_ms, side, command, price, quantity, num_orders, end_of_batch, batch_id, trading_day)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        )?;
+        let mut batch_id = starting_batch_id;
+        for record in records {
+            let side = record.side.map(|side| format!("{side:?}").to_lowercase());
+            let trading_day = trading_day_from_timestamp_ms(record.timestamp_ms);
+            stmt.execute(params![
+                source_file,
+                record.timestamp_ms,
+                side,
+                format!("{:?}", record.command),
+                record.price,
+                record.quantity as f64,
+                record.num_orders as i64,
+                i64::from(record.end_of_batch),
+                batch_id,
+                trading_day,
+            ])?;
+            if record.end_of_batch {
+                batch_id += 1;
+            }
+        }
+        drop(stmt);
+        tx.commit()?;
+        Ok(batch_id)
+    }
+
+    pub fn insert_dom_snapshot(
+        &self,
+        source_file: &str,
+        timestamp_ms: f64,
+        trading_day: &str,
+        payload: &serde_json::Value,
+    ) -> Result<(), DbError> {
+        self.conn.execute(
+            "INSERT INTO dom_snapshots (source_file, timestamp_ms, trading_day, payload)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                source_file,
+                timestamp_ms,
+                trading_day,
+                serde_json::to_string(payload)?
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_dom_feature_snapshot(
+        &self,
+        source_file: &str,
+        timestamp_ms: f64,
+        trading_day: &str,
+        payload: &serde_json::Value,
+    ) -> Result<(), DbError> {
+        self.conn.execute(
+            "INSERT INTO dom_feature_snapshots (source_file, timestamp_ms, trading_day, payload)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                source_file,
+                timestamp_ms,
+                trading_day,
+                serde_json::to_string(payload)?
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn insert_absorption_event(
         &self,
         timestamp_ms: f64,
@@ -2229,6 +2324,191 @@ impl Database {
         } else {
             Ok(None)
         }
+    }
+
+    pub fn latest_dom_feature_state(&self) -> Result<Option<(f64, serde_json::Value)>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT timestamp_ms, payload
+             FROM dom_feature_snapshots
+             ORDER BY timestamp_ms DESC
+             LIMIT 1",
+        )?;
+        let mut rows = stmt.query([])?;
+        if let Some(row) = rows.next()? {
+            let timestamp_ms: f64 = row.get(0)?;
+            let payload: String = row.get(1)?;
+            Ok(Some((timestamp_ms, serde_json::from_str(&payload)?)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn get_dom_snapshot_near(
+        &self,
+        timestamp_ms: f64,
+    ) -> Result<Option<(f64, serde_json::Value)>, DbError> {
+        self.get_json_snapshot_near("dom_snapshots", timestamp_ms)
+    }
+
+    pub fn get_dom_feature_near(
+        &self,
+        timestamp_ms: f64,
+    ) -> Result<Option<(f64, serde_json::Value)>, DbError> {
+        self.get_json_snapshot_near("dom_feature_snapshots", timestamp_ms)
+    }
+
+    pub fn query_dom_feature_snapshots(
+        &self,
+        start_ms: Option<f64>,
+        end_ms: Option<f64>,
+        limit: usize,
+    ) -> Result<Vec<(f64, serde_json::Value)>, DbError> {
+        use rusqlite::types::Value;
+
+        let mut conditions = Vec::<String>::new();
+        let mut params_vec = Vec::<Value>::new();
+        if let Some(start_ms) = start_ms {
+            params_vec.push(Value::Real(start_ms));
+            conditions.push(format!("timestamp_ms >= ?{}", params_vec.len()));
+        }
+        if let Some(end_ms) = end_ms {
+            params_vec.push(Value::Real(end_ms));
+            conditions.push(format!("timestamp_ms <= ?{}", params_vec.len()));
+        }
+        params_vec.push(Value::Integer(limit as i64));
+        let where_clause = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", conditions.join(" AND "))
+        };
+        let sql = format!(
+            "SELECT timestamp_ms, payload
+             FROM dom_feature_snapshots
+             {where_clause}
+             ORDER BY timestamp_ms ASC
+             LIMIT ?{}",
+            params_vec.len()
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(params_vec), |row| {
+            Ok((row.get::<_, f64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (timestamp_ms, payload) = row?;
+            out.push((timestamp_ms, serde_json::from_str(&payload)?));
+        }
+        Ok(out)
+    }
+
+    pub fn query_depth_events(
+        &self,
+        start_ms: Option<f64>,
+        end_ms: Option<f64>,
+        price_low: Option<f64>,
+        price_high: Option<f64>,
+        limit: usize,
+    ) -> Result<Vec<DepthEventRecord>, DbError> {
+        use rusqlite::types::Value;
+
+        let mut conditions = Vec::<String>::new();
+        let mut params_vec = Vec::<Value>::new();
+        if let Some(start_ms) = start_ms {
+            params_vec.push(Value::Real(start_ms));
+            conditions.push(format!("timestamp_ms >= ?{}", params_vec.len()));
+        }
+        if let Some(end_ms) = end_ms {
+            params_vec.push(Value::Real(end_ms));
+            conditions.push(format!("timestamp_ms <= ?{}", params_vec.len()));
+        }
+        if let Some(price_low) = price_low {
+            params_vec.push(Value::Real(price_low));
+            conditions.push(format!("price >= ?{}", params_vec.len()));
+        }
+        if let Some(price_high) = price_high {
+            params_vec.push(Value::Real(price_high));
+            conditions.push(format!("price <= ?{}", params_vec.len()));
+        }
+        params_vec.push(Value::Integer(limit as i64));
+        let where_clause = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", conditions.join(" AND "))
+        };
+        let sql = format!(
+            "SELECT id, source_file, timestamp_ms, side, command, price, quantity, num_orders, end_of_batch, batch_id, trading_day
+             FROM depth_events
+             {where_clause}
+             ORDER BY timestamp_ms ASC
+             LIMIT ?{}",
+            params_vec.len()
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(params_vec), |row| {
+            Ok(DepthEventRecord {
+                id: row.get(0)?,
+                source_file: row.get(1)?,
+                timestamp_ms: row.get(2)?,
+                side: row.get(3)?,
+                command: row.get(4)?,
+                price: row.get(5)?,
+                quantity: row.get(6)?,
+                num_orders: row.get(7)?,
+                end_of_batch: row.get::<_, i64>(8)? == 1,
+                batch_id: row.get(9)?,
+                trading_day: row.get(10)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    fn get_json_snapshot_near(
+        &self,
+        table: &str,
+        timestamp_ms: f64,
+    ) -> Result<Option<(f64, serde_json::Value)>, DbError> {
+        let before_sql = format!(
+            "SELECT timestamp_ms, payload FROM {table}
+             WHERE timestamp_ms <= ?1 ORDER BY timestamp_ms DESC LIMIT 1"
+        );
+        let after_sql = format!(
+            "SELECT timestamp_ms, payload FROM {table}
+             WHERE timestamp_ms >= ?1 ORDER BY timestamp_ms ASC LIMIT 1"
+        );
+        let before = {
+            let mut stmt = self.conn.prepare(&before_sql)?;
+            let mut rows = stmt.query(params![timestamp_ms])?;
+            if let Some(row) = rows.next()? {
+                let ts: f64 = row.get(0)?;
+                let payload: String = row.get(1)?;
+                Some((ts, serde_json::from_str::<serde_json::Value>(&payload)?))
+            } else {
+                None
+            }
+        };
+        let after = {
+            let mut stmt = self.conn.prepare(&after_sql)?;
+            let mut rows = stmt.query(params![timestamp_ms])?;
+            if let Some(row) = rows.next()? {
+                let ts: f64 = row.get(0)?;
+                let payload: String = row.get(1)?;
+                Some((ts, serde_json::from_str::<serde_json::Value>(&payload)?))
+            } else {
+                None
+            }
+        };
+        Ok(match (before, after) {
+            (Some(b), Some(a)) => {
+                if (b.0 - timestamp_ms).abs() <= (a.0 - timestamp_ms).abs() {
+                    Some(b)
+                } else {
+                    Some(a)
+                }
+            }
+            (Some(b), None) => Some(b),
+            (None, Some(a)) => Some(a),
+            (None, None) => None,
+        })
     }
 
     pub fn list_recent_absorption_events(
@@ -4269,6 +4549,60 @@ mod tests {
         // Query past the end → c (last snapshot).
         let (ts, _) = db.get_snapshot_near(99_000.0).expect("q4").expect("some");
         assert_eq!(ts, 9_000.0);
+    }
+
+    #[test]
+    fn dom_snapshot_helpers_round_trip() {
+        let mut db = test_db();
+        let records = vec![
+            DepthRecord {
+                timestamp_ms: 1_000.0,
+                command: crate::depth::DepthCommand::AddBidLevel,
+                side: Some(crate::depth::DepthSide::Bid),
+                end_of_batch: false,
+                num_orders: 1,
+                price: 21000.0,
+                quantity: 10,
+            },
+            DepthRecord {
+                timestamp_ms: 1_100.0,
+                command: crate::depth::DepthCommand::AddAskLevel,
+                side: Some(crate::depth::DepthSide::Ask),
+                end_of_batch: true,
+                num_orders: 1,
+                price: 21000.25,
+                quantity: 12,
+            },
+        ];
+        let next_batch = db
+            .insert_depth_events_batch("NQ.depth", &records, 42)
+            .expect("insert depth events");
+        assert_eq!(next_batch, 43);
+
+        let snapshot = serde_json::json!({"bestBid": 21000.0, "bestAsk": 21000.25});
+        let feature = serde_json::json!({
+            "domSummary": { "liquidityBias": "bid_support", "pullStackBias": 15.0 },
+            "activity": { "topPullLevels": [], "topStackLevels": [] }
+        });
+        db.insert_dom_snapshot("NQ.depth", 1_100.0, "2026-03-05", &snapshot)
+            .expect("insert snapshot");
+        db.insert_dom_feature_snapshot("NQ.depth", 1_100.0, "2026-03-05", &feature)
+            .expect("insert feature");
+
+        let events = db
+            .query_depth_events(Some(900.0), Some(1_200.0), None, None, 10)
+            .expect("query events");
+        assert_eq!(events.len(), 2);
+        let (ts, payload) = db
+            .get_dom_feature_near(1_050.0)
+            .expect("feature near")
+            .expect("some");
+        assert_eq!(ts, 1_100.0);
+        assert_eq!(payload["domSummary"]["liquidityBias"], "bid_support");
+        let snapshots = db
+            .query_dom_feature_snapshots(Some(900.0), Some(1_200.0), 10)
+            .expect("query features");
+        assert_eq!(snapshots.len(), 1);
     }
 
     #[test]

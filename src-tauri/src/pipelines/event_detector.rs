@@ -819,6 +819,7 @@ mod tests {
             session_type: "RTH".to_string(),
             session_segment: "None".to_string(),
             trading_day: "2026-02-26".to_string(),
+            dom_summary: None,
         }
     }
 

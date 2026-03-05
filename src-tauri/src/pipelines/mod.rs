@@ -36,6 +36,7 @@ pub use vwap::VwapPipeline;
 
 use serde::{Deserialize, Serialize};
 
+use crate::depth::DomSummary;
 use crate::{
     classify_session, et_minutes_from_timestamp, tick_time_context_from_timestamp_ms, SessionType,
 };
@@ -49,6 +50,37 @@ pub struct SessionEndState {
     pub va_high: f64,
     pub va_low: f64,
     pub poc: f64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn market_state_serializes_dom_summary() {
+        let state = MarketState {
+            last_price: 21000.0,
+            dom_summary: Some(DomSummary {
+                source_file: "NQ.depth".into(),
+                timestamp_ms: 1_000.0,
+                spread_ticks: Some(1),
+                touch_imbalance_ratio: Some(1.2),
+                near_touch_bid_depth: 30.0,
+                near_touch_ask_depth: 20.0,
+                near_touch_depth_ratio: Some(1.5),
+                bid_pull_rate: 0.1,
+                ask_pull_rate: 0.4,
+                stack_bias: 0.3,
+                pull_stack_bias: 12.0,
+                liquidity_bias: "bid_support".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&state).expect("serialize");
+        assert_eq!(json["domSummary"]["liquidityBias"], "bid_support");
+        assert_eq!(json["domSummary"]["nearTouchBidDepth"], 30.0);
+    }
 }
 
 /// Consolidated snapshot of all pipeline outputs for the current session.
@@ -209,6 +241,9 @@ pub struct MarketState {
     pub session_segment: String,
     /// Trading day (YYYY-MM-DD) with a 6:00 PM ET roll.
     pub trading_day: String,
+    /// Compact delayed DOM summary when historical depth context is available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dom_summary: Option<DomSummary>,
 }
 
 pub struct PipelineEngine {
@@ -228,6 +263,7 @@ pub struct PipelineEngine {
     pub session_inventory: SessionInventoryPipeline,
     last_trade_price: Option<f64>,
     cumulative_delta: f64,
+    dom_summary: Option<DomSummary>,
 }
 
 impl Default for PipelineEngine {
@@ -256,6 +292,7 @@ impl PipelineEngine {
             session_inventory: SessionInventoryPipeline::new(),
             last_trade_price: None,
             cumulative_delta: 0.0,
+            dom_summary: None,
         }
     }
 
@@ -279,6 +316,11 @@ impl PipelineEngine {
         self.pinch.reset();
         self.session_inventory.reset();
         self.last_trade_price = None;
+        self.dom_summary = None;
+    }
+
+    pub fn set_dom_summary(&mut self, dom_summary: Option<DomSummary>) {
+        self.dom_summary = dom_summary;
     }
 
     /// Current session's ending state for archival into prior-day levels.
@@ -548,6 +590,7 @@ impl PipelineEngine {
             session_type,
             session_segment,
             trading_day,
+            dom_summary: self.dom_summary.clone(),
         }
     }
 

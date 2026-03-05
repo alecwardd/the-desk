@@ -15,8 +15,13 @@ use the_desk_backend::db::{
     AccountStateRecord, Database, HistoricalJobRun, OpenPositionRecord, RiskConfigRecord,
     SessionScopeFilter, SetupPerformanceSortBy, SignalOutcome, TradeRecord,
 };
-use the_desk_backend::depth::{aggregate_trade_volume_by_level, DepthReader};
-use the_desk_backend::feed::scid_reader::{parse_record_scaled, ScanControl, ScidReader};
+use the_desk_backend::depth::{
+    aggregate_trade_volume_by_level, build_dom_feature_snapshot, build_dom_summary, DepthBook,
+    DepthReader, DomFeatureSnapshot, DomSummary, ScanControl as DepthScanControl,
+};
+use the_desk_backend::feed::scid_reader::{
+    parse_record_scaled, ScanControl as ScidScanControl, ScidReader,
+};
 use the_desk_backend::feed::{load_feed_config, load_storage_config, TradeSide};
 use the_desk_backend::outcome_tracker;
 use the_desk_backend::pipelines::{EventDetector, FlowEventEmitter, PipelineEngine, RvolPipeline};
@@ -153,10 +158,69 @@ fn aggregate_window_trades(
     reader
         .scan_range(Some(start_time_ms), Some(end_time_ms), |tick| {
             trades.push((tick.price, tick.side, tick.volume));
-            Ok(ScanControl::Continue)
+            Ok(ScidScanControl::Continue)
         })
         .map_err(db_error)?;
     Ok(aggregate_trade_volume_by_level(trades))
+}
+
+fn latest_depth_reader() -> Result<Option<DepthReader>, McpError> {
+    let config = load_feed_config();
+    let mut files = DepthReader::list_symbol_depth_files(&config).map_err(db_error)?;
+    files.sort();
+    Ok(files
+        .pop()
+        .map(|path| DepthReader::new(path, config.price_scale)))
+}
+
+fn merge_dom_summary_into_snapshot(
+    snapshot: Option<serde_json::Value>,
+    dom_summary: &DomSummary,
+) -> serde_json::Value {
+    let mut snapshot = snapshot.unwrap_or_else(|| serde_json::json!({}));
+    if let Some(obj) = snapshot.as_object_mut() {
+        obj.insert(
+            "domSummary".to_string(),
+            serde_json::to_value(dom_summary).unwrap_or_default(),
+        );
+    }
+    snapshot
+}
+
+fn footprint_from_ticks(ticks: &[the_desk_backend::db::RawTickRecord]) -> Vec<serde_json::Value> {
+    let mut by_price: HashMap<i64, (f64, f64)> = HashMap::new();
+    for tick in ticks {
+        let key = (tick.price / 0.25).round() as i64;
+        let entry = by_price.entry(key).or_insert((0.0, 0.0));
+        if tick.is_buy {
+            entry.1 += tick.volume;
+        } else {
+            entry.0 += tick.volume;
+        }
+    }
+    let mut rows = by_price
+        .into_iter()
+        .map(|(key, (bid_volume, ask_volume))| {
+            let total = bid_volume + ask_volume;
+            let delta = ask_volume - bid_volume;
+            serde_json::json!({
+                "price": key as f64 * 0.25,
+                "bidVolume": bid_volume,
+                "askVolume": ask_volume,
+                "totalVolume": total,
+                "delta": delta,
+                "deltaPerVolume": if total > 0.0 { delta / total } else { 0.0 },
+            })
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|a, b| {
+        a["price"]
+            .as_f64()
+            .unwrap_or_default()
+            .partial_cmp(&b["price"].as_f64().unwrap_or_default())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    rows
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema, Clone)]
@@ -482,6 +546,35 @@ struct LiquidityBehaviorParams {
     /// Center price to inspect.
     price: f64,
     /// Radius around the target price in ticks (default 4, max 20).
+    radius_ticks: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct DomWindowParams {
+    start_time_ms: Option<f64>,
+    end_time_ms: Option<f64>,
+    price_low: Option<f64>,
+    price_high: Option<f64>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct DomTapeContextParams {
+    timestamp_ms: f64,
+    window_ms: Option<f64>,
+    price_low: Option<f64>,
+    price_high: Option<f64>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct ExplainBookReactionParams {
+    timestamp_ms: Option<f64>,
+    price: Option<f64>,
+    start_time_ms: Option<f64>,
+    end_time_ms: Option<f64>,
     radius_ticks: Option<u64>,
 }
 
@@ -1620,6 +1713,325 @@ impl TheDeskMcp {
             "window": { "startTimeMs": start_time_ms, "endTimeMs": end_time_ms },
             "activity": summary,
             "note": "Use this to inspect whether liquidity near a specific level was stacking, getting pulled, or likely being consumed by trades."
+        })))
+    }
+
+    #[tool(
+        description = "Windowed delayed DOM summary using persisted DOM feature snapshots when available. Returns compact DOM summaries across a time range and optionally narrows the reported pull/stack levels to a price band."
+    )]
+    async fn get_dom_window(
+        &self,
+        Parameters(params): Parameters<DomWindowParams>,
+    ) -> Result<CallToolResult, McpError> {
+        if let (Some(start), Some(end)) = (params.start_time_ms, params.end_time_ms) {
+            validate_time_window(start, end)?;
+        }
+        let limit = params.limit.unwrap_or(20).clamp(1, 100);
+        let mut snapshots = {
+            let db = self.db.lock().map_err(|_| lock_error())?;
+            db.query_dom_feature_snapshots(params.start_time_ms, params.end_time_ms, limit)
+                .map_err(db_error)?
+        };
+        if snapshots.is_empty() {
+            if let (Some(start), Some(end)) = (params.start_time_ms, params.end_time_ms) {
+                let price_low = params.price_low;
+                let price_high = params.price_high;
+                let direct = tokio::task::spawn_blocking(move || {
+                    let config = load_feed_config();
+                    let path = DepthReader::find_file_for_timestamp(&config, start)
+                        .map_err(db_error)?
+                        .ok_or_else(|| {
+                            invalid_params_error(format!(
+                                "No Sierra .depth file found for timestamp {start}"
+                            ))
+                        })?;
+                    let depth_reader = DepthReader::new(path, config.price_scale);
+                    let trades = aggregate_window_trades(&config, start, end)?;
+                    let activity = depth_reader
+                        .summarize_window(start, end, &trades, price_low, price_high)
+                        .map_err(db_error)?;
+                    let snapshot = depth_reader.snapshot_at(end, 10).map_err(db_error)?;
+                    let feature = build_dom_feature_snapshot(&snapshot, activity);
+                    Ok::<_, McpError>((
+                        feature.timestamp_ms,
+                        serde_json::to_value(feature).unwrap_or_default(),
+                    ))
+                })
+                .await
+                .map_err(|e| db_error(format!("DOM window task failed: {e}")))??;
+                snapshots.push(direct);
+            }
+        }
+
+        for (_, payload) in &mut snapshots {
+            if let Some(activity) = payload.get_mut("activity").and_then(|v| v.as_object_mut()) {
+                for key in ["topPullLevels", "topStackLevels"] {
+                    if let Some(levels) = activity.get_mut(key).and_then(|v| v.as_array_mut()) {
+                        levels.retain(|level| {
+                            let price = level.get("price").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                            if let Some(low) = params.price_low {
+                                if price < low {
+                                    return false;
+                                }
+                            }
+                            if let Some(high) = params.price_high {
+                                if price > high {
+                                    return false;
+                                }
+                            }
+                            true
+                        });
+                    }
+                }
+            }
+        }
+
+        let latest = snapshots.last().map(|(_, payload)| payload.clone());
+        Ok(text_result(serde_json::json!({
+            "windowStartMs": params.start_time_ms,
+            "windowEndMs": params.end_time_ms,
+            "priceFilter": { "low": params.price_low, "high": params.price_high },
+            "snapshots": snapshots.into_iter().map(|(ts, payload)| serde_json::json!({
+                "timestampMs": ts,
+                "payload": payload
+            })).collect::<Vec<_>>(),
+            "latest": latest,
+            "source": if latest.is_some() { "dom_feature_snapshots" } else { "none" }
+        })))
+    }
+
+    #[tool(
+        description = "One-call delayed DOM + tape context at a timestamp. Combines the nearest DOM snapshot, the nearest persisted DOM feature summary, raw-tick footprint over a short window, and derived flow flags."
+    )]
+    async fn get_dom_tape_context_at(
+        &self,
+        Parameters(params): Parameters<DomTapeContextParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let window_ms = params
+            .window_ms
+            .unwrap_or(60_000.0)
+            .clamp(5_000.0, 300_000.0);
+        let start_time_ms = params.timestamp_ms - window_ms;
+        let end_time_ms = params.timestamp_ms + 1_000.0;
+        validate_time_window(start_time_ms, end_time_ms)?;
+
+        let (mut feature, mut dom_snapshot, ticks) = {
+            let db = self.db.lock().map_err(|_| lock_error())?;
+            (
+                db.get_dom_feature_near(params.timestamp_ms)
+                    .map_err(db_error)?,
+                db.get_dom_snapshot_near(params.timestamp_ms)
+                    .map_err(db_error)?,
+                db.query_ticks_filtered(
+                    Some(start_time_ms),
+                    Some(end_time_ms),
+                    params.price_low,
+                    params.price_high,
+                    None,
+                    2_000,
+                )
+                .map_err(db_error)?,
+            )
+        };
+
+        if feature.is_none() || dom_snapshot.is_none() {
+            let timestamp_ms = params.timestamp_ms;
+            let price_low = params.price_low;
+            let price_high = params.price_high;
+            let fallback = tokio::task::spawn_blocking(move || {
+                let config = load_feed_config();
+                let reader = depth_reader_for_timestamp(timestamp_ms)?;
+                let trades = aggregate_window_trades(&config, start_time_ms, end_time_ms)?;
+                let activity = reader
+                    .summarize_window(start_time_ms, end_time_ms, &trades, price_low, price_high)
+                    .map_err(db_error)?;
+                let snapshot = reader.snapshot_at(timestamp_ms, 10).map_err(db_error)?;
+                let feature = build_dom_feature_snapshot(&snapshot, activity);
+                Ok::<_, McpError>((
+                    (
+                        snapshot.snapshot_timestamp_ms,
+                        serde_json::to_value(&snapshot).unwrap_or_default(),
+                    ),
+                    (
+                        feature.timestamp_ms,
+                        serde_json::to_value(feature).unwrap_or_default(),
+                    ),
+                ))
+            })
+            .await
+            .map_err(|e| db_error(format!("DOM tape context task failed: {e}")))??;
+            dom_snapshot.get_or_insert(fallback.0);
+            feature.get_or_insert(fallback.1);
+        }
+
+        let footprint = footprint_from_ticks(&ticks);
+        let total_volume: f64 = ticks.iter().map(|tick| tick.volume).sum();
+        let net_delta: f64 = ticks
+            .iter()
+            .map(|tick| {
+                if tick.is_buy {
+                    tick.volume
+                } else {
+                    -tick.volume
+                }
+            })
+            .sum();
+        let dom_summary = feature
+            .as_ref()
+            .and_then(|(_, payload)| payload.get("domSummary"))
+            .cloned();
+        let activity = feature
+            .as_ref()
+            .and_then(|(_, payload)| payload.get("activity"))
+            .cloned();
+        let aggressive_buyers = net_delta > 0.0
+            && dom_summary
+                .as_ref()
+                .and_then(|v| v.get("askPullRate"))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0)
+                < 0.5;
+        let aggressive_sellers = net_delta < 0.0
+            && dom_summary
+                .as_ref()
+                .and_then(|v| v.get("bidPullRate"))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0)
+                < 0.5;
+
+        Ok(text_result(serde_json::json!({
+            "timestampMs": params.timestamp_ms,
+            "windowMs": window_ms,
+            "domSnapshot": dom_snapshot.map(|(_, payload)| payload),
+            "domFeature": feature.map(|(_, payload)| payload),
+            "domSummary": dom_summary,
+            "activity": activity,
+            "tape": {
+                "tickCount": ticks.len(),
+                "totalVolume": total_volume,
+                "netDelta": net_delta,
+                "footprint": footprint,
+            },
+            "derivedFlags": {
+                "aggressiveBuyers": aggressive_buyers,
+                "aggressiveSellers": aggressive_sellers,
+                "domSupportsHigher": dom_summary.as_ref().and_then(|v| v.get("liquidityBias")).and_then(|v| v.as_str()) == Some("bid_support"),
+                "domCapsHigher": dom_summary.as_ref().and_then(|v| v.get("liquidityBias")).and_then(|v| v.as_str()) == Some("ask_resistance"),
+            }
+        })))
+    }
+
+    #[tool(
+        description = "Explanation-oriented delayed DOM read around a timestamp or level. Grounds the interpretation in persisted DOM summaries, nearby depth events, and executed tape."
+    )]
+    async fn explain_book_reaction(
+        &self,
+        Parameters(params): Parameters<ExplainBookReactionParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let target_time_ms = params
+            .timestamp_ms
+            .or(params.end_time_ms)
+            .ok_or_else(|| invalid_params_error("timestampMs or endTimeMs is required"))?;
+        let start_time_ms = params.start_time_ms.unwrap_or(target_time_ms - 30_000.0);
+        let end_time_ms = params.end_time_ms.unwrap_or(target_time_ms + 1_000.0);
+        validate_time_window(start_time_ms, end_time_ms)?;
+        let radius_ticks = params.radius_ticks.unwrap_or(6) as f64;
+        let price_low = params.price.map(|price| price - radius_ticks * 0.25);
+        let price_high = params.price.map(|price| price + radius_ticks * 0.25);
+
+        let (feature, depth_events, ticks) = {
+            let db = self.db.lock().map_err(|_| lock_error())?;
+            (
+                db.get_dom_feature_near(target_time_ms).map_err(db_error)?,
+                db.query_depth_events(
+                    Some(start_time_ms),
+                    Some(end_time_ms),
+                    price_low,
+                    price_high,
+                    200,
+                )
+                .map_err(db_error)?,
+                db.query_ticks_filtered(
+                    Some(start_time_ms),
+                    Some(end_time_ms),
+                    price_low,
+                    price_high,
+                    None,
+                    500,
+                )
+                .map_err(db_error)?,
+            )
+        };
+
+        let feature_payload = if let Some((_, payload)) = feature {
+            payload
+        } else {
+            let timestamp_ms = target_time_ms;
+            tokio::task::spawn_blocking(move || {
+                let config = load_feed_config();
+                let reader = depth_reader_for_timestamp(timestamp_ms)?;
+                let trades = aggregate_window_trades(&config, start_time_ms, end_time_ms)?;
+                let activity = reader
+                    .summarize_window(start_time_ms, end_time_ms, &trades, price_low, price_high)
+                    .map_err(db_error)?;
+                let snapshot = reader.snapshot_at(timestamp_ms, 10).map_err(db_error)?;
+                Ok::<_, McpError>(
+                    serde_json::to_value(build_dom_feature_snapshot(&snapshot, activity))
+                        .unwrap_or_default(),
+                )
+            })
+            .await
+            .map_err(|e| db_error(format!("Explain book reaction task failed: {e}")))??
+        };
+
+        let dom_summary = feature_payload
+            .get("domSummary")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        let bid_pull_rate = dom_summary
+            .get("bidPullRate")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        let ask_pull_rate = dom_summary
+            .get("askPullRate")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        let pull_stack_bias = dom_summary
+            .get("pullStackBias")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        let net_delta: f64 = ticks
+            .iter()
+            .map(|tick| {
+                if tick.is_buy {
+                    tick.volume
+                } else {
+                    -tick.volume
+                }
+            })
+            .sum();
+
+        let explanation = if pull_stack_bias > 0.0 && net_delta >= 0.0 {
+            "Book stayed supportive: bid-side liquidity held up better than offer-side liquidity while tape stayed neutral-to-positive."
+        } else if pull_stack_bias < 0.0 && net_delta <= 0.0 {
+            "Book reaction leaned defensive: offers held better than bids while tape skewed seller-led."
+        } else if ask_pull_rate > bid_pull_rate {
+            "Offers were pulling faster than bids, which often reads as upward relief unless tape immediately absorbs it."
+        } else if bid_pull_rate > ask_pull_rate {
+            "Bids were pulling faster than offers, which often reads as local fragility unless aggressive buyers step in."
+        } else {
+            "Liquidity stayed relatively balanced, so the reaction looks more tape-driven than book-driven in this window."
+        };
+
+        Ok(text_result(serde_json::json!({
+            "timestampMs": target_time_ms,
+            "window": { "startTimeMs": start_time_ms, "endTimeMs": end_time_ms },
+            "priceFocus": { "price": params.price, "radiusTicks": params.radius_ticks },
+            "domFeature": feature_payload,
+            "depthEventCount": depth_events.len(),
+            "tapeTickCount": ticks.len(),
+            "netDelta": net_delta,
+            "explanation": explanation,
         })))
     }
 
@@ -3031,13 +3443,66 @@ impl TheDeskMcp {
         Parameters(params): Parameters<SetupContextParams>,
     ) -> Result<CallToolResult, McpError> {
         let db = self.db.lock().map_err(|_| lock_error())?;
-        let snapshot = db.latest_feature_state().ok().flatten();
+        let snapshot = self
+            .live_snapshot()
+            .or_else(|| db.latest_feature_state().ok().flatten());
+        let dom_feature = db.latest_dom_feature_state().ok().flatten();
         let risk = db.load_risk_state().ok().flatten();
         let setup_name = params.setup_name.unwrap_or_default();
+        let last_price = snapshot
+            .as_ref()
+            .and_then(|s| s.get("lastPrice"))
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        let mut nearby_levels = Vec::new();
+        if let Some(snapshot) = snapshot.as_ref() {
+            let level_keys = [
+                ("priorDayHigh", "PriorDayHigh"),
+                ("priorDayLow", "PriorDayLow"),
+                ("priorVaHigh", "PriorVaHigh"),
+                ("priorVaLow", "PriorVaLow"),
+                ("priorPoc", "PriorPoc"),
+                ("overnightHigh", "OvernightHigh"),
+                ("overnightLow", "OvernightLow"),
+                ("ibHigh", "IbHigh"),
+                ("ibLow", "IbLow"),
+                ("orHigh", "OrHigh"),
+                ("orLow", "OrLow"),
+                ("or5Mid", "Or5Mid"),
+                ("poc", "Poc"),
+                ("vaHigh", "VaHigh"),
+                ("vaLow", "VaLow"),
+                ("dnvaHigh", "DnvaHigh"),
+                ("dnvaLow", "DnvaLow"),
+            ];
+            for (key, label) in level_keys {
+                if let Some(price) = snapshot.get(key).and_then(|v| v.as_f64()) {
+                    let distance_ticks = ((last_price - price) / 0.25).abs();
+                    if distance_ticks <= 20.0 {
+                        nearby_levels.push(serde_json::json!({
+                            "level": label,
+                            "price": price,
+                            "distanceTicks": distance_ticks
+                        }));
+                    }
+                }
+            }
+            nearby_levels.sort_by(|a, b| {
+                a["distanceTicks"]
+                    .as_f64()
+                    .unwrap_or(f64::MAX)
+                    .partial_cmp(&b["distanceTicks"].as_f64().unwrap_or(f64::MAX))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
 
         Ok(text_result(serde_json::json!({
             "setupName": setup_name,
             "marketSnapshot": snapshot,
+            "domSummary": dom_feature.as_ref().and_then(|(_, payload)| payload.get("domSummary")).cloned(),
+            "domFeature": dom_feature.as_ref().map(|(_, payload)| payload.clone()),
+            "recentPullStackSummary": dom_feature.as_ref().and_then(|(_, payload)| payload.get("activity")).cloned(),
+            "nearbyLevelReactionContext": nearby_levels,
             "riskState": risk,
             "dataAgeMs": compute_data_age(&db),
             "guidance": "Your playbook defines this setup. Evaluate all conditions before entry."
@@ -3374,6 +3839,136 @@ fn process_tick(
         if let Ok(mut a) = last_ask.lock() {
             *a = ask;
         }
+    }
+}
+
+fn persist_dom_summary_into_feature_state(
+    db: &Database,
+    pipelines: &Arc<Mutex<PipelineEngine>>,
+    last_bid: &Arc<Mutex<f64>>,
+    last_ask: &Arc<Mutex<f64>>,
+    timestamp_ms: f64,
+    dom_summary: &DomSummary,
+) {
+    let payload = {
+        let bid = last_bid.lock().ok().map(|v| *v).unwrap_or_default();
+        let ask = last_ask.lock().ok().map(|v| *v).unwrap_or_default();
+        if bid > 0.0 || ask > 0.0 {
+            pipelines.lock().ok().map(|p| {
+                serde_json::to_value(p.snapshot(bid.max(0.0), ask.max(0.0))).unwrap_or_default()
+            })
+        } else {
+            Some(merge_dom_summary_into_snapshot(
+                db.latest_feature_state().ok().flatten(),
+                dom_summary,
+            ))
+        }
+    };
+    if let Some(payload) = payload {
+        let _ = db.upsert_feature_state(timestamp_ms, &payload);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn persist_depth_records(
+    db: &Arc<Mutex<Database>>,
+    pipelines: &Arc<Mutex<PipelineEngine>>,
+    last_bid: &Arc<Mutex<f64>>,
+    last_ask: &Arc<Mutex<f64>>,
+    reader: &DepthReader,
+    book: &DepthBook,
+    records: &[the_desk_backend::depth::DepthRecord],
+    batch_id: &mut i64,
+) {
+    if records.is_empty() {
+        return;
+    }
+    let Some(last_record) = records.last() else {
+        return;
+    };
+    let source_file = reader.path().to_string_lossy().to_string();
+    let trading_day = session_date_from_timestamp_ms(last_record.timestamp_ms);
+    if let Ok(mut db) = db.lock() {
+        if let Ok(next_batch_id) = db.insert_depth_events_batch(&source_file, records, *batch_id) {
+            *batch_id = next_batch_id;
+        }
+        let snapshot = book.snapshot(&source_file, last_record.timestamp_ms, 10);
+        let snapshot_json = serde_json::to_value(&snapshot).unwrap_or_default();
+        let _ = db.insert_dom_snapshot(
+            &source_file,
+            last_record.timestamp_ms,
+            &trading_day,
+            &snapshot_json,
+        );
+
+        let feature_window_start = (last_record.timestamp_ms - 60_000.0).max(0.0);
+        let feature = {
+            let config = load_feed_config();
+            aggregate_window_trades(&config, feature_window_start, last_record.timestamp_ms)
+                .ok()
+                .and_then(|trades| {
+                    reader
+                        .summarize_window(
+                            feature_window_start,
+                            last_record.timestamp_ms,
+                            &trades,
+                            None,
+                            None,
+                        )
+                        .ok()
+                })
+                .map(|activity| build_dom_feature_snapshot(&snapshot, activity))
+                .unwrap_or_else(|| DomFeatureSnapshot {
+                    source_file: source_file.clone(),
+                    timestamp_ms: snapshot.snapshot_timestamp_ms,
+                    session_date: snapshot.session_date.clone(),
+                    dom_summary: build_dom_summary(
+                        &snapshot,
+                        &the_desk_backend::depth::PullStackActivitySummary {
+                            source_file: source_file.clone(),
+                            start_time_ms: feature_window_start,
+                            end_time_ms: last_record.timestamp_ms,
+                            session_date: snapshot.session_date.clone(),
+                            record_count: records.len(),
+                            batch_count: records.iter().filter(|r| r.end_of_batch).count(),
+                            bid: Default::default(),
+                            ask: Default::default(),
+                            top_pull_levels: Vec::new(),
+                            top_stack_levels: Vec::new(),
+                        },
+                    ),
+                    activity: the_desk_backend::depth::PullStackActivitySummary {
+                        source_file: source_file.clone(),
+                        start_time_ms: feature_window_start,
+                        end_time_ms: last_record.timestamp_ms,
+                        session_date: snapshot.session_date.clone(),
+                        record_count: records.len(),
+                        batch_count: records.iter().filter(|r| r.end_of_batch).count(),
+                        bid: Default::default(),
+                        ask: Default::default(),
+                        top_pull_levels: Vec::new(),
+                        top_stack_levels: Vec::new(),
+                    },
+                })
+        };
+        let feature_json = serde_json::to_value(&feature).unwrap_or_default();
+        let _ = db.insert_dom_feature_snapshot(
+            &source_file,
+            feature.timestamp_ms,
+            &trading_day,
+            &feature_json,
+        );
+        if let Ok(mut pipelines) = pipelines.lock() {
+            pipelines.set_dom_summary(Some(feature.dom_summary.clone()));
+        }
+        persist_dom_summary_into_feature_state(
+            &db,
+            pipelines,
+            last_bid,
+            last_ask,
+            feature.timestamp_ms,
+            &feature.dom_summary,
+        );
     }
 }
 
@@ -3748,6 +4343,62 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    if latest_depth_reader()?.is_some() {
+        let pipelines_depth = Arc::clone(&server.pipelines);
+        let db_depth = Arc::clone(&server.db);
+        let last_bid_depth = Arc::clone(&server.last_bid);
+        let last_ask_depth = Arc::clone(&server.last_ask);
+
+        tokio::spawn(async move {
+            let poll = Duration::from_millis(1_000);
+            let mut active_path: Option<std::path::PathBuf> = None;
+            let mut offset = 0_u64;
+            let mut batch_id = 0_i64;
+            let mut book = DepthBook::default();
+
+            loop {
+                let Some(reader) = latest_depth_reader().ok().flatten() else {
+                    sleep(poll).await;
+                    continue;
+                };
+
+                if active_path.as_deref() != Some(reader.path()) {
+                    active_path = Some(reader.path().to_path_buf());
+                    offset = reader.data_start_offset();
+                    batch_id = 0;
+                    book = DepthBook::default();
+                }
+
+                let mut new_records = Vec::<the_desk_backend::depth::DepthRecord>::new();
+                match reader.scan_new_records(&mut offset, |record| {
+                    book.apply(&record);
+                    new_records.push(record);
+                    Ok(DepthScanControl::Continue)
+                }) {
+                    Ok(_) => {
+                        if !new_records.is_empty() {
+                            persist_depth_records(
+                                &db_depth,
+                                &pipelines_depth,
+                                &last_bid_depth,
+                                &last_ask_depth,
+                                &reader,
+                                &book,
+                                &new_records,
+                                &mut batch_id,
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        eprintln!("[the-desk-mcp] Depth worker error: {err}");
+                    }
+                }
+
+                sleep(poll).await;
+            }
+        });
+    }
+
     let service = server.serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
@@ -3756,6 +4407,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_server() -> TheDeskMcp {
+        let db = Database::open(":memory:").expect("db");
+        TheDeskMcp::new(db, PipelineEngine::new(), ":memory:".into())
+    }
 
     #[test]
     fn parse_setup_perf_sort_validates_values() {
@@ -3795,5 +4451,39 @@ mod tests {
         assert_eq!(normalize_signal_source("live"), Some("live"));
         assert_eq!(normalize_signal_source("backtest"), Some("backtest"));
         assert_eq!(normalize_signal_source("paper"), None);
+    }
+
+    #[tokio::test]
+    async fn dom_window_tool_returns_persisted_feature_snapshots() {
+        let server = test_server();
+        {
+            let db = server.db.lock().expect("db lock");
+            let payload = serde_json::json!({
+                "domSummary": {
+                    "liquidityBias": "bid_support",
+                    "pullStackBias": 12.0
+                },
+                "activity": {
+                    "topPullLevels": [],
+                    "topStackLevels": []
+                }
+            });
+            db.insert_dom_feature_snapshot("NQ.depth", 1_000.0, "2026-03-05", &payload)
+                .expect("insert feature");
+        }
+
+        let result = server
+            .get_dom_window(Parameters(DomWindowParams {
+                start_time_ms: Some(900.0),
+                end_time_ms: Some(1_100.0),
+                price_low: None,
+                price_high: None,
+                limit: Some(10),
+            }))
+            .await
+            .expect("tool call");
+
+        let rendered = format!("{result:?}");
+        assert!(rendered.contains("bid_support"));
     }
 }

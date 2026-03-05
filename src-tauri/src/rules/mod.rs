@@ -65,6 +65,10 @@ pub enum ConditionField {
     AbsorptionAtPrice,
     ExhaustionDetected,
     PinchDetected,
+    DomTouchImbalanceRatio,
+    DomSpreadTicks,
+    DomNearTouchDepthRatio,
+    DomPullStackBias,
 
     // --- Profile / Day Type ---
     DayType,
@@ -410,6 +414,83 @@ fn evaluate_typed_condition(
         }
         ConditionField::PinchDetected => {
             return market.pinch_event_count > 0;
+        }
+        ConditionField::DomTouchImbalanceRatio => {
+            let Some(value) = market
+                .dom_summary
+                .as_ref()
+                .and_then(|dom| dom.touch_imbalance_ratio)
+            else {
+                return false;
+            };
+            if let ConditionValue::Number(threshold) = &cond.value {
+                return match &cond.operator {
+                    ConditionOperator::GreaterThan | ConditionOperator::Above => value > *threshold,
+                    ConditionOperator::LessThan | ConditionOperator::Below => value < *threshold,
+                    ConditionOperator::Within => (value - *threshold).abs() <= 0.1,
+                    ConditionOperator::Outside => (value - *threshold).abs() > 0.1,
+                    ConditionOperator::Equals => (value - *threshold).abs() <= 0.01,
+                    _ => false,
+                };
+            }
+            return value > 1.0;
+        }
+        ConditionField::DomSpreadTicks => {
+            let Some(value) = market
+                .dom_summary
+                .as_ref()
+                .and_then(|dom| dom.spread_ticks)
+                .map(|v| v as f64)
+            else {
+                return false;
+            };
+            if let ConditionValue::Number(threshold) = &cond.value {
+                return match &cond.operator {
+                    ConditionOperator::GreaterThan | ConditionOperator::Above => value > *threshold,
+                    ConditionOperator::LessThan | ConditionOperator::Below => value < *threshold,
+                    ConditionOperator::Within => value <= *threshold,
+                    ConditionOperator::Outside => value > *threshold,
+                    ConditionOperator::Equals => (value - *threshold).abs() <= 0.01,
+                    _ => false,
+                };
+            }
+            return value <= 1.0;
+        }
+        ConditionField::DomNearTouchDepthRatio => {
+            let Some(value) = market
+                .dom_summary
+                .as_ref()
+                .and_then(|dom| dom.near_touch_depth_ratio)
+            else {
+                return false;
+            };
+            if let ConditionValue::Number(threshold) = &cond.value {
+                return match &cond.operator {
+                    ConditionOperator::GreaterThan | ConditionOperator::Above => value > *threshold,
+                    ConditionOperator::LessThan | ConditionOperator::Below => value < *threshold,
+                    ConditionOperator::Within => (value - *threshold).abs() <= 0.1,
+                    ConditionOperator::Outside => (value - *threshold).abs() > 0.1,
+                    ConditionOperator::Equals => (value - *threshold).abs() <= 0.01,
+                    _ => false,
+                };
+            }
+            return value > 1.0;
+        }
+        ConditionField::DomPullStackBias => {
+            let Some(value) = market.dom_summary.as_ref().map(|dom| dom.pull_stack_bias) else {
+                return false;
+            };
+            if let ConditionValue::Number(threshold) = &cond.value {
+                return match &cond.operator {
+                    ConditionOperator::GreaterThan | ConditionOperator::Above => value > *threshold,
+                    ConditionOperator::LessThan | ConditionOperator::Below => value < *threshold,
+                    ConditionOperator::Within => value.abs() <= *threshold,
+                    ConditionOperator::Outside => value.abs() > *threshold,
+                    ConditionOperator::Equals => (value - *threshold).abs() <= 0.01,
+                    _ => false,
+                };
+            }
+            return value > 0.0;
         }
 
         // --- Profile / Day Type ---
@@ -1029,5 +1110,43 @@ mod tests {
         assert!(alert.backtest_summary.is_some());
         assert_eq!(alert.target_prices, vec![21050.0, 21100.0]);
         assert_eq!(alert.stop_price, Some(10.0));
+    }
+
+    #[test]
+    fn dom_touch_imbalance_condition_evaluates() {
+        let tc = SetupCondition {
+            id: "dom-imbalance".into(),
+            field: ConditionField::DomTouchImbalanceRatio,
+            operator: ConditionOperator::GreaterThan,
+            value: ConditionValue::Number(1.1),
+            label: None,
+        };
+        let market = MarketState {
+            dom_summary: Some(crate::depth::DomSummary {
+                touch_imbalance_ratio: Some(1.4),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(evaluate_typed_condition(&tc, &market, None));
+    }
+
+    #[test]
+    fn dom_pull_stack_bias_condition_evaluates() {
+        let tc = SetupCondition {
+            id: "dom-bias".into(),
+            field: ConditionField::DomPullStackBias,
+            operator: ConditionOperator::Above,
+            value: ConditionValue::Number(5.0),
+            label: None,
+        };
+        let market = MarketState {
+            dom_summary: Some(crate::depth::DomSummary {
+                pull_stack_bias: 12.0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(evaluate_typed_condition(&tc, &market, None));
     }
 }

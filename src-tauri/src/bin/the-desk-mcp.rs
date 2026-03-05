@@ -15,7 +15,8 @@ use the_desk_backend::db::{
     AccountStateRecord, Database, HistoricalJobRun, OpenPositionRecord, RiskConfigRecord,
     SessionScopeFilter, SetupPerformanceSortBy, SignalOutcome, TradeRecord,
 };
-use the_desk_backend::feed::scid_reader::{parse_record_scaled, ScidReader};
+use the_desk_backend::depth::{aggregate_trade_volume_by_level, DepthReader};
+use the_desk_backend::feed::scid_reader::{parse_record_scaled, ScanControl, ScidReader};
 use the_desk_backend::feed::{load_feed_config, load_storage_config, TradeSide};
 use the_desk_backend::outcome_tracker;
 use the_desk_backend::pipelines::{EventDetector, FlowEventEmitter, PipelineEngine, RvolPipeline};
@@ -114,6 +115,48 @@ fn no_data(msg: &str) -> CallToolResult {
 
 fn invalid_params_error(msg: impl Into<String>) -> McpError {
     McpError::new(ErrorCode::INVALID_PARAMS, msg.into(), None)
+}
+
+fn validate_time_window(start_time_ms: f64, end_time_ms: f64) -> Result<(), McpError> {
+    if !start_time_ms.is_finite() || !end_time_ms.is_finite() {
+        return Err(invalid_params_error(
+            "startTimeMs/endTimeMs must be finite numbers",
+        ));
+    }
+    if end_time_ms <= start_time_ms {
+        return Err(invalid_params_error(
+            "endTimeMs must be greater than startTimeMs",
+        ));
+    }
+    Ok(())
+}
+
+fn depth_reader_for_timestamp(timestamp_ms: f64) -> Result<DepthReader, McpError> {
+    let config = load_feed_config();
+    let path = DepthReader::find_file_for_timestamp(&config, timestamp_ms)
+        .map_err(db_error)?
+        .ok_or_else(|| {
+            invalid_params_error(format!(
+                "No Sierra .depth file found for timestamp {timestamp_ms}"
+            ))
+        })?;
+    Ok(DepthReader::new(path, config.price_scale))
+}
+
+fn aggregate_window_trades(
+    config: &the_desk_backend::feed::FeedConfig,
+    start_time_ms: f64,
+    end_time_ms: f64,
+) -> Result<HashMap<(the_desk_backend::depth::DepthSide, i64), f64>, McpError> {
+    let reader = ScidReader::from_feed_config(config);
+    let mut trades = Vec::new();
+    reader
+        .scan_range(Some(start_time_ms), Some(end_time_ms), |tick| {
+            trades.push((tick.price, tick.side, tick.volume));
+            Ok(ScanControl::Continue)
+        })
+        .map_err(db_error)?;
+    Ok(aggregate_trade_volume_by_level(trades))
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema, Clone)]
@@ -405,6 +448,41 @@ struct SnapshotAtParams {
     /// Target time as Unix epoch milliseconds. Returns the stored pipeline snapshot
     /// closest to this timestamp. Snapshots are stored every ~30 seconds.
     timestamp_ms: Option<f64>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct DomSnapshotAtParams {
+    /// Target time as Unix epoch milliseconds for delayed DOM reconstruction.
+    timestamp_ms: f64,
+    /// Number of price levels to return on each side (default 10, max 25).
+    levels_per_side: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct PullStackParams {
+    /// Inclusive start time as Unix epoch milliseconds.
+    start_time_ms: f64,
+    /// Exclusive end time as Unix epoch milliseconds.
+    end_time_ms: f64,
+    /// Optional lower bound to focus on a specific price zone.
+    price_low: Option<f64>,
+    /// Optional upper bound to focus on a specific price zone.
+    price_high: Option<f64>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct LiquidityBehaviorParams {
+    /// Inclusive start time as Unix epoch milliseconds.
+    start_time_ms: f64,
+    /// Exclusive end time as Unix epoch milliseconds.
+    end_time_ms: f64,
+    /// Center price to inspect.
+    price: f64,
+    /// Radius around the target price in ticks (default 4, max 20).
+    radius_ticks: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -1440,6 +1518,109 @@ impl TheDeskMcp {
             Ok(None) => Ok(no_data("No pipeline snapshots found. Snapshots are stored every ~30s once data is flowing.")),
             Err(e) => Err(db_error(e)),
         }
+    }
+
+    #[tool(
+        description = "Delayed DOM snapshot reconstructed from Sierra `.depth` history at or immediately before a timestamp. Returns best bid/ask, spread, touch imbalance, and the top resting levels on each side. Use this when you want the ladder view, not just executed tape."
+    )]
+    async fn get_dom_snapshot_at(
+        &self,
+        Parameters(params): Parameters<DomSnapshotAtParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let levels_per_side = params.levels_per_side.unwrap_or(10).clamp(1, 25) as usize;
+        let timestamp_ms = params.timestamp_ms;
+        let snapshot = tokio::task::spawn_blocking(move || {
+            let reader = depth_reader_for_timestamp(timestamp_ms)?;
+            reader
+                .snapshot_at(timestamp_ms, levels_per_side)
+                .map_err(db_error)
+        })
+        .await
+        .map_err(|e| db_error(format!("DOM snapshot task failed: {e}")))??;
+
+        Ok(text_result(serde_json::json!({
+            "snapshot": snapshot,
+            "requestedTimestampMs": timestamp_ms,
+            "note": "This is reconstructed from Sierra historical `.depth` data, not inferred from trade prints."
+        })))
+    }
+
+    #[tool(
+        description = "Estimate pull/stack activity from Sierra `.depth` history over a time window, then align DOM decreases with `.scid` trades to separate likely fills from likely pulls. Use price_low/price_high to focus on a specific zone."
+    )]
+    async fn get_pull_stack_activity(
+        &self,
+        Parameters(params): Parameters<PullStackParams>,
+    ) -> Result<CallToolResult, McpError> {
+        validate_time_window(params.start_time_ms, params.end_time_ms)?;
+        let start_time_ms = params.start_time_ms;
+        let end_time_ms = params.end_time_ms;
+        let price_low = params.price_low;
+        let price_high = params.price_high;
+        let summary = tokio::task::spawn_blocking(move || {
+            let config = load_feed_config();
+            let path = DepthReader::find_file_for_timestamp(&config, start_time_ms)
+                .map_err(db_error)?
+                .ok_or_else(|| {
+                    invalid_params_error(format!(
+                        "No Sierra .depth file found for timestamp {start_time_ms}"
+                    ))
+                })?;
+            let depth_reader = DepthReader::new(path, config.price_scale);
+            let trades = aggregate_window_trades(&config, start_time_ms, end_time_ms)?;
+            depth_reader
+                .summarize_window(start_time_ms, end_time_ms, &trades, price_low, price_high)
+                .map_err(db_error)
+        })
+        .await
+        .map_err(|e| db_error(format!("Pull/stack task failed: {e}")))??;
+
+        Ok(text_result(serde_json::json!({
+            "activity": summary,
+            "priceFilter": { "low": price_low, "high": price_high },
+            "note": "Estimated filled vs pulled is heuristic: DOM decreases are aligned to same-price `.scid` trade volume within the requested window."
+        })))
+    }
+
+    #[tool(
+        description = "Liquidity behavior around a target price over a time window. This focuses pull/stack analysis on a narrow band around a level, such as prior VAH, IB high, or an anchored VWAP level."
+    )]
+    async fn get_liquidity_behavior_at_level(
+        &self,
+        Parameters(params): Parameters<LiquidityBehaviorParams>,
+    ) -> Result<CallToolResult, McpError> {
+        validate_time_window(params.start_time_ms, params.end_time_ms)?;
+        let radius_ticks = params.radius_ticks.unwrap_or(4).clamp(1, 20) as f64;
+        let low = params.price - radius_ticks * 0.25;
+        let high = params.price + radius_ticks * 0.25;
+        let start_time_ms = params.start_time_ms;
+        let end_time_ms = params.end_time_ms;
+        let target_price = params.price;
+        let summary = tokio::task::spawn_blocking(move || {
+            let config = load_feed_config();
+            let path = DepthReader::find_file_for_timestamp(&config, start_time_ms)
+                .map_err(db_error)?
+                .ok_or_else(|| {
+                    invalid_params_error(format!(
+                        "No Sierra .depth file found for timestamp {start_time_ms}"
+                    ))
+                })?;
+            let depth_reader = DepthReader::new(path, config.price_scale);
+            let trades = aggregate_window_trades(&config, start_time_ms, end_time_ms)?;
+            depth_reader
+                .summarize_window(start_time_ms, end_time_ms, &trades, Some(low), Some(high))
+                .map_err(db_error)
+        })
+        .await
+        .map_err(|e| db_error(format!("Liquidity behavior task failed: {e}")))??;
+
+        Ok(text_result(serde_json::json!({
+            "targetPrice": target_price,
+            "radiusTicks": radius_ticks,
+            "window": { "startTimeMs": start_time_ms, "endTimeMs": end_time_ms },
+            "activity": summary,
+            "note": "Use this to inspect whether liquidity near a specific level was stacking, getting pulled, or likely being consumed by trades."
+        })))
     }
 
     #[tool(

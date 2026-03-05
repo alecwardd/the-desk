@@ -568,6 +568,9 @@ impl Database {
         if version < 9 {
             self.migrate_v9()?;
         }
+        if version < 10 {
+            self.migrate_v10()?;
+        }
 
         Ok(())
     }
@@ -1148,6 +1151,58 @@ impl Database {
 
         self.conn
             .execute_batch("UPDATE schema_version SET version = 9;")?;
+        Ok(())
+    }
+
+    /// V10: add depth/DOM storage tables for delayed DOM reconstruction.
+    fn migrate_v10(&self) -> Result<(), DbError> {
+        self.conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS depth_events (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              source_file TEXT NOT NULL,
+              timestamp_ms REAL NOT NULL,
+              side TEXT NULL,
+              command TEXT NOT NULL,
+              price REAL NOT NULL,
+              quantity REAL NOT NULL,
+              num_orders INTEGER NOT NULL DEFAULT 0,
+              end_of_batch INTEGER NOT NULL DEFAULT 0,
+              batch_id INTEGER NULL,
+              trading_day TEXT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_depth_events_ts
+              ON depth_events(timestamp_ms);
+            CREATE INDEX IF NOT EXISTS idx_depth_events_day_command
+              ON depth_events(trading_day, command);
+
+            CREATE TABLE IF NOT EXISTS dom_snapshots (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              source_file TEXT NOT NULL,
+              timestamp_ms REAL NOT NULL,
+              trading_day TEXT NOT NULL,
+              payload TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_dom_snapshots_ts
+              ON dom_snapshots(timestamp_ms);
+            CREATE INDEX IF NOT EXISTS idx_dom_snapshots_day
+              ON dom_snapshots(trading_day, timestamp_ms);
+
+            CREATE TABLE IF NOT EXISTS dom_feature_snapshots (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              source_file TEXT NOT NULL,
+              timestamp_ms REAL NOT NULL,
+              trading_day TEXT NOT NULL,
+              payload TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_dom_feature_snapshots_ts
+              ON dom_feature_snapshots(timestamp_ms);
+            CREATE INDEX IF NOT EXISTS idx_dom_feature_snapshots_day
+              ON dom_feature_snapshots(trading_day, timestamp_ms);
+
+            UPDATE schema_version SET version = 10;
+            ",
+        )?;
         Ok(())
     }
 

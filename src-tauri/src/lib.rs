@@ -1,5 +1,6 @@
 pub mod backfill;
 pub mod db;
+pub mod depth;
 pub mod dtc;
 pub mod feed;
 pub mod outcome_tracker;

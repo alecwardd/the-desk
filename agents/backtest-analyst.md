@@ -30,6 +30,11 @@ Research tools:
 - `query_signal_outcome_conditional` — win rate when setup X fires and session has field=value (e.g. day_type=Trend)
 - `get_signal_performance` — setup-level outcome statistics (win rate, avg R, target/stop hit counts)
 
+Session-scope parameters (supported on the tools above):
+- `sessionType`: `RTH` | `Globex` | `Unknown`
+- `sessionSegment`: `Asia` | `London` | `None` (Globex segmentation)
+- `tradingDay` or `tradingDayStart`/`tradingDayEnd`: `YYYY-MM-DD` with 6:00 PM ET roll
+
 Responsibilities:
 - Maintain research database with sufficient history (minimum 60 RTH sessions)
 - Segment stats clearly when requested: RTH-only vs Globex-only vs Asia-only vs London-only vs combined.

@@ -1,8 +1,10 @@
 use crate::pipelines::event_detector::MarketEvent;
 use crate::risk::RiskState;
 use crate::rules::SetupDefinition;
+use crate::tick_time_context_from_timestamp_ms;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 use thiserror::Error;
 
@@ -220,6 +222,16 @@ pub struct SignalOutcome {
     pub time_to_outcome_ms: Option<f64>,
 }
 
+/// Optional session/trading-day scope filter used by research-style queries.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionScopeFilter {
+    pub session_type: Option<String>,
+    pub session_segment: Option<String>,
+    pub trading_day_start: Option<String>,
+    pub trading_day_end: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReplaySignalRecord {
@@ -261,6 +273,85 @@ pub struct HistoricalJobRunUpdate<'a> {
 
 fn default_signal_source() -> String {
     "live".to_string()
+}
+
+impl SessionScopeFilter {
+    fn is_empty(&self) -> bool {
+        self.session_type.is_none()
+            && self.session_segment.is_none()
+            && self.trading_day_start.is_none()
+            && self.trading_day_end.is_none()
+    }
+}
+
+fn normalize_session_type_filter(value: &str) -> Option<&'static str> {
+    let norm = value.trim().to_ascii_lowercase();
+    match norm.as_str() {
+        "rth" => Some("RTH"),
+        "globex" => Some("Globex"),
+        "unknown" => Some("Unknown"),
+        _ => None,
+    }
+}
+
+fn normalize_session_segment_filter(value: &str) -> Option<&'static str> {
+    let norm = value.trim().to_ascii_lowercase();
+    match norm.as_str() {
+        "asia" => Some("Asia"),
+        "london" => Some("London"),
+        "none" => Some("None"),
+        _ => None,
+    }
+}
+
+fn trading_day_if_scope_match(
+    timestamp_ms: f64,
+    scope: Option<&SessionScopeFilter>,
+) -> Option<String> {
+    let ctx = tick_time_context_from_timestamp_ms(timestamp_ms)?;
+    let Some(scope) = scope else {
+        return Some(ctx.trading_day);
+    };
+    if scope.is_empty() {
+        return Some(ctx.trading_day);
+    }
+
+    if let Some(filter_type) = scope.session_type.as_deref() {
+        let normalized = normalize_session_type_filter(filter_type)?;
+        let current = match ctx.session_type {
+            crate::SessionType::Rth => "RTH",
+            crate::SessionType::Globex => "Globex",
+            crate::SessionType::Unknown => "Unknown",
+        };
+        if current != normalized {
+            return None;
+        }
+    }
+
+    if let Some(filter_segment) = scope.session_segment.as_deref() {
+        let normalized = normalize_session_segment_filter(filter_segment)?;
+        let current = match ctx.session_segment {
+            crate::SessionSegment::Asia => "Asia",
+            crate::SessionSegment::London => "London",
+            crate::SessionSegment::None => "None",
+        };
+        if current != normalized {
+            return None;
+        }
+    }
+
+    if let Some(start) = scope.trading_day_start.as_deref() {
+        if ctx.trading_day.as_str() < start {
+            return None;
+        }
+    }
+    if let Some(end) = scope.trading_day_end.as_deref() {
+        if ctx.trading_day.as_str() > end {
+            return None;
+        }
+    }
+
+    Some(ctx.trading_day)
 }
 
 impl Default for RiskConfigRecord {
@@ -1910,44 +2001,95 @@ impl Database {
         event_type: &str,
         start_date: Option<&str>,
         end_date: Option<&str>,
+        scope: Option<&SessionScopeFilter>,
     ) -> Result<(i64, i64, i64), DbError> {
-        let (total_events, sessions_with, total_sessions) = match (start_date, end_date) {
-            (Some(sd), Some(ed)) => {
-                let total: i64 = self.conn.query_row(
-                    "SELECT COUNT(1) FROM market_events WHERE event_type = ?1 AND session_date BETWEEN ?2 AND ?3",
-                    params![event_type, sd, ed],
-                    |r| r.get(0),
-                )?;
-                let with: i64 = self.conn.query_row(
-                    "SELECT COUNT(DISTINCT session_date) FROM market_events WHERE event_type = ?1 AND session_date BETWEEN ?2 AND ?3",
-                    params![event_type, sd, ed],
-                    |r| r.get(0),
-                )?;
-                let sessions: i64 = self.conn.query_row(
-                    "SELECT COUNT(1) FROM session_summaries WHERE session_date BETWEEN ?1 AND ?2",
-                    params![sd, ed],
-                    |r| r.get(0),
-                )?;
-                (total, with, sessions)
+        let mut event_conditions = vec!["event_type = ?1".to_string()];
+        let mut event_bind_values: Vec<Box<dyn rusqlite::types::ToSql>> =
+            vec![Box::new(event_type.to_string())];
+        if let Some(sd) = start_date {
+            event_conditions.push(format!("session_date >= ?{}", event_bind_values.len() + 1));
+            event_bind_values.push(Box::new(sd.to_string()));
+        }
+        if let Some(ed) = end_date {
+            event_conditions.push(format!("session_date <= ?{}", event_bind_values.len() + 1));
+            event_bind_values.push(Box::new(ed.to_string()));
+        }
+        let event_sql = format!(
+            "SELECT timestamp_ms FROM market_events WHERE {}",
+            event_conditions.join(" AND ")
+        );
+        let mut event_stmt = self.conn.prepare(&event_sql)?;
+        let event_params_ref: Vec<&dyn rusqlite::types::ToSql> =
+            event_bind_values.iter().map(|b| b.as_ref()).collect();
+        let event_rows =
+            event_stmt.query_map(event_params_ref.as_slice(), |row| row.get::<_, f64>(0))?;
+
+        let mut total_events = 0_i64;
+        let mut sessions_with_event = BTreeSet::new();
+        for ts in event_rows.filter_map(|r| r.ok()) {
+            if let Some(trading_day) = trading_day_if_scope_match(ts, scope) {
+                total_events += 1;
+                sessions_with_event.insert(trading_day);
             }
-            _ => {
-                let total: i64 = self.conn.query_row(
-                    "SELECT COUNT(1) FROM market_events WHERE event_type = ?1",
-                    params![event_type],
-                    |r| r.get(0),
-                )?;
-                let with: i64 = self.conn.query_row(
-                    "SELECT COUNT(DISTINCT session_date) FROM market_events WHERE event_type = ?1",
-                    params![event_type],
-                    |r| r.get(0),
-                )?;
-                let sessions: i64 =
-                    self.conn
-                        .query_row("SELECT COUNT(1) FROM session_summaries", [], |r| r.get(0))?;
-                (total, with, sessions)
-            }
+        }
+
+        let mut all_session_conditions = Vec::new();
+        let mut all_session_bind_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        if let Some(sd) = start_date {
+            all_session_conditions.push(format!(
+                "session_date >= ?{}",
+                all_session_bind_values.len() + 1
+            ));
+            all_session_bind_values.push(Box::new(sd.to_string()));
+        }
+        if let Some(ed) = end_date {
+            all_session_conditions.push(format!(
+                "session_date <= ?{}",
+                all_session_bind_values.len() + 1
+            ));
+            all_session_bind_values.push(Box::new(ed.to_string()));
+        }
+        let all_where_clause = if all_session_conditions.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", all_session_conditions.join(" AND "))
         };
-        Ok((total_events, sessions_with, total_sessions))
+        let all_sql = format!("SELECT timestamp_ms FROM market_events {all_where_clause}");
+        let mut all_stmt = self.conn.prepare(&all_sql)?;
+        let all_params_ref: Vec<&dyn rusqlite::types::ToSql> =
+            all_session_bind_values.iter().map(|b| b.as_ref()).collect();
+        let all_rows = all_stmt.query_map(all_params_ref.as_slice(), |row| row.get::<_, f64>(0))?;
+
+        let mut total_sessions = BTreeSet::new();
+        for ts in all_rows.filter_map(|r| r.ok()) {
+            if let Some(trading_day) = trading_day_if_scope_match(ts, scope) {
+                total_sessions.insert(trading_day);
+            }
+        }
+
+        // Include summarized sessions as denominator fallback when there are no event rows.
+        let summary_start = scope
+            .and_then(|s| s.trading_day_start.as_deref())
+            .or(start_date);
+        let summary_end = scope
+            .and_then(|s| s.trading_day_end.as_deref())
+            .or(end_date);
+        let summaries = self.list_session_summaries(
+            summary_start,
+            summary_end,
+            None,
+            scope.and_then(|s| s.session_type.as_deref()),
+            100_000,
+        )?;
+        for s in summaries {
+            total_sessions.insert(s.session_date);
+        }
+
+        Ok((
+            total_events,
+            sessions_with_event.len() as i64,
+            total_sessions.len() as i64,
+        ))
     }
 
     /// Count events of a specific type per session for conditional queries.
@@ -1956,37 +2098,35 @@ impl Database {
         event_type: &str,
         start_date: Option<&str>,
         end_date: Option<&str>,
+        scope: Option<&SessionScopeFilter>,
     ) -> Result<Vec<(String, i64)>, DbError> {
-        let mut results = Vec::new();
-        match (start_date, end_date) {
-            (Some(sd), Some(ed)) => {
-                let mut stmt = self.conn.prepare(
-                    "SELECT session_date, COUNT(1) FROM market_events
-                     WHERE event_type = ?1 AND session_date BETWEEN ?2 AND ?3
-                     GROUP BY session_date",
-                )?;
-                let rows = stmt.query_map(params![event_type, sd, ed], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-                })?;
-                for v in rows.flatten() {
-                    results.push(v);
-                }
-            }
-            _ => {
-                let mut stmt = self.conn.prepare(
-                    "SELECT session_date, COUNT(1) FROM market_events
-                     WHERE event_type = ?1
-                     GROUP BY session_date",
-                )?;
-                let rows = stmt.query_map(params![event_type], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-                })?;
-                for v in rows.flatten() {
-                    results.push(v);
-                }
+        let mut conditions = vec!["event_type = ?1".to_string()];
+        let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> =
+            vec![Box::new(event_type.to_string())];
+        if let Some(sd) = start_date {
+            conditions.push(format!("session_date >= ?{}", bind_values.len() + 1));
+            bind_values.push(Box::new(sd.to_string()));
+        }
+        if let Some(ed) = end_date {
+            conditions.push(format!("session_date <= ?{}", bind_values.len() + 1));
+            bind_values.push(Box::new(ed.to_string()));
+        }
+        let sql = format!(
+            "SELECT timestamp_ms FROM market_events WHERE {}",
+            conditions.join(" AND ")
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+            bind_values.iter().map(|b| b.as_ref()).collect();
+        let rows = stmt.query_map(params_ref.as_slice(), |row| row.get::<_, f64>(0))?;
+
+        let mut by_day: BTreeMap<String, i64> = BTreeMap::new();
+        for ts in rows.filter_map(|r| r.ok()) {
+            if let Some(trading_day) = trading_day_if_scope_match(ts, scope) {
+                *by_day.entry(trading_day).or_insert(0) += 1;
             }
         }
-        Ok(results)
+        Ok(by_day.into_iter().collect())
     }
 
     // ------------------------------------------------------------------
@@ -2106,6 +2246,7 @@ impl Database {
         start_date: Option<&str>,
         end_date: Option<&str>,
         day_type_filter: Option<&str>,
+        session_type_filter: Option<&str>,
         limit: usize,
     ) -> Result<Vec<SessionSummary>, DbError> {
         let mut conditions = Vec::new();
@@ -2122,6 +2263,10 @@ impl Database {
         if let Some(dt) = day_type_filter {
             conditions.push(format!("day_type = ?{}", bind_values.len() + 1));
             bind_values.push(Box::new(dt.to_string()));
+        }
+        if let Some(st) = session_type_filter {
+            conditions.push(format!("session_type = ?{}", bind_values.len() + 1));
+            bind_values.push(Box::new(st.to_string()));
         }
 
         let where_clause = if conditions.is_empty() {
@@ -2198,6 +2343,7 @@ impl Database {
         column: &str,
         start_date: Option<&str>,
         end_date: Option<&str>,
+        session_type_filter: Option<&str>,
     ) -> Result<Vec<f64>, DbError> {
         let allowed = [
             "ib_range",
@@ -2227,20 +2373,28 @@ impl Database {
         if !allowed.contains(&column) {
             return Ok(Vec::new());
         }
-        let sql = match (start_date, end_date) {
-            (Some(sd), Some(ed)) => {
-                let mut stmt = self.conn.prepare(&format!(
-                    "SELECT {column} FROM session_summaries WHERE session_date BETWEEN ?1 AND ?2 AND {column} IS NOT NULL ORDER BY session_date"
-                ))?;
-                let rows = stmt.query_map(params![sd, ed], |row| row.get::<_, f64>(0))?;
-                return Ok(rows.filter_map(|r| r.ok()).collect());
-            }
-            _ => {
-                format!("SELECT {column} FROM session_summaries WHERE {column} IS NOT NULL ORDER BY session_date")
-            }
-        };
+        let mut conditions = vec![format!("{column} IS NOT NULL")];
+        let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        if let Some(sd) = start_date {
+            conditions.push(format!("session_date >= ?{}", bind_values.len() + 1));
+            bind_values.push(Box::new(sd.to_string()));
+        }
+        if let Some(ed) = end_date {
+            conditions.push(format!("session_date <= ?{}", bind_values.len() + 1));
+            bind_values.push(Box::new(ed.to_string()));
+        }
+        if let Some(st) = session_type_filter {
+            conditions.push(format!("session_type = ?{}", bind_values.len() + 1));
+            bind_values.push(Box::new(st.to_string()));
+        }
+        let sql = format!(
+            "SELECT {column} FROM session_summaries WHERE {} ORDER BY session_date",
+            conditions.join(" AND ")
+        );
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map([], |row| row.get::<_, f64>(0))?;
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+            bind_values.iter().map(|b| b.as_ref()).collect();
+        let rows = stmt.query_map(params_ref.as_slice(), |row| row.get::<_, f64>(0))?;
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
@@ -2419,9 +2573,10 @@ impl Database {
         setup_id: Option<&str>,
         start_date: Option<&str>,
         end_date: Option<&str>,
+        scope: Option<&SessionScopeFilter>,
     ) -> Result<Vec<(String, String, Option<f64>, String)>, DbError> {
         let mut stmt = self.conn.prepare(
-            "SELECT setup_id, session_date, r_result, outcome
+            "SELECT setup_id, session_date, r_result, outcome, fired_at_ms
              FROM signal_outcomes WHERE outcome != 'pending'",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -2430,27 +2585,30 @@ impl Database {
                 row.get::<_, String>(1)?,
                 row.get::<_, Option<f64>>(2)?,
                 row.get::<_, String>(3)?,
+                row.get::<_, f64>(4)?,
             ))
         })?;
         let mut results = Vec::new();
         for row in rows.filter_map(|r| r.ok()) {
-            let (sid, session_date, r_result, outcome) = row;
+            let (sid, session_date, r_result, outcome, fired_at_ms) = row;
             if let Some(filter_id) = setup_id {
                 if sid != filter_id {
                     continue;
                 }
             }
+            let analysis_day =
+                trading_day_if_scope_match(fired_at_ms, scope).unwrap_or(session_date.clone());
             if let Some(sd) = start_date {
-                if session_date.as_str() < sd {
+                if analysis_day.as_str() < sd {
                     continue;
                 }
             }
             if let Some(ed) = end_date {
-                if session_date.as_str() > ed {
+                if analysis_day.as_str() > ed {
                     continue;
                 }
             }
-            results.push((sid, session_date, r_result, outcome));
+            results.push((sid, analysis_day, r_result, outcome));
         }
         Ok(results)
     }
@@ -2462,7 +2620,7 @@ impl Database {
         start_date: Option<&str>,
         end_date: Option<&str>,
     ) -> Result<serde_json::Value, DbError> {
-        self.signal_performance_filtered(setup_id, start_date, end_date, None, None)
+        self.signal_performance_filtered(setup_id, start_date, end_date, None, None, None)
     }
 
     pub fn signal_performance_filtered(
@@ -2472,20 +2630,13 @@ impl Database {
         end_date: Option<&str>,
         source: Option<&str>,
         job_id: Option<&str>,
+        scope: Option<&SessionScopeFilter>,
     ) -> Result<serde_json::Value, DbError> {
         let mut conditions = Vec::new();
         let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
         if let Some(setup_id) = setup_id {
             conditions.push(format!("setup_id = ?{}", bind_values.len() + 1));
             bind_values.push(Box::new(setup_id.to_string()));
-        }
-        if let Some(start_date) = start_date {
-            conditions.push(format!("session_date >= ?{}", bind_values.len() + 1));
-            bind_values.push(Box::new(start_date.to_string()));
-        }
-        if let Some(end_date) = end_date {
-            conditions.push(format!("session_date <= ?{}", bind_values.len() + 1));
-            bind_values.push(Box::new(end_date.to_string()));
         }
         if let Some(source) = source {
             conditions.push(format!("source = ?{}", bind_values.len() + 1));
@@ -2500,48 +2651,84 @@ impl Database {
         } else {
             format!("WHERE {}", conditions.join(" AND "))
         };
+        let sql = format!(
+            "SELECT session_date, fired_at_ms, outcome, r_result
+             FROM signal_outcomes {where_clause}"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
         let params_ref: Vec<&dyn rusqlite::types::ToSql> =
             bind_values.iter().map(|b| b.as_ref()).collect();
+        let rows = stmt.query_map(params_ref.as_slice(), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, f64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<f64>>(3)?,
+            ))
+        })?;
 
-        let count_sql =
-            |suffix: &str| format!("SELECT COUNT(1) FROM signal_outcomes {where_clause} {suffix}");
-        let avg_sql = |suffix: &str| {
-            format!("SELECT AVG(r_result) FROM signal_outcomes {where_clause} {suffix}")
+        let mut total = 0_i64;
+        let mut resolved = 0_i64;
+        let mut target_hit = 0_i64;
+        let mut stop_hit = 0_i64;
+        let mut r_sum = 0.0_f64;
+        let mut r_count = 0_i64;
+        let mut winner_sum = 0.0_f64;
+        let mut winner_count = 0_i64;
+        let mut loser_sum = 0.0_f64;
+        let mut loser_count = 0_i64;
+
+        for row in rows.filter_map(|r| r.ok()) {
+            let (session_date, fired_at_ms, outcome, r_result) = row;
+            let analysis_day =
+                trading_day_if_scope_match(fired_at_ms, scope).unwrap_or(session_date.clone());
+            if let Some(sd) = start_date {
+                if analysis_day.as_str() < sd {
+                    continue;
+                }
+            }
+            if let Some(ed) = end_date {
+                if analysis_day.as_str() > ed {
+                    continue;
+                }
+            }
+            total += 1;
+            if outcome != "pending" {
+                resolved += 1;
+            }
+            if outcome == "target_hit" {
+                target_hit += 1;
+            } else if outcome == "stop_hit" {
+                stop_hit += 1;
+            }
+            if let Some(r) = r_result {
+                r_sum += r;
+                r_count += 1;
+                if r > 0.0 {
+                    winner_sum += r;
+                    winner_count += 1;
+                } else if r < 0.0 {
+                    loser_sum += r;
+                    loser_count += 1;
+                }
+            }
+        }
+
+        let avg_r = if r_count > 0 {
+            r_sum / r_count as f64
+        } else {
+            0.0
         };
-
-        let total: i64 = self
-            .conn
-            .query_row(&count_sql(""), params_ref.as_slice(), |r| r.get(0))?;
-        let resolved: i64 = self.conn.query_row(
-            &count_sql("AND outcome != 'pending'"),
-            params_ref.as_slice(),
-            |r| r.get(0),
-        )?;
-        let target_hit: i64 = self.conn.query_row(
-            &count_sql("AND outcome = 'target_hit'"),
-            params_ref.as_slice(),
-            |r| r.get(0),
-        )?;
-        let stop_hit: i64 = self.conn.query_row(
-            &count_sql("AND outcome = 'stop_hit'"),
-            params_ref.as_slice(),
-            |r| r.get(0),
-        )?;
-        let avg_r: Option<f64> = self.conn.query_row(
-            &avg_sql("AND r_result IS NOT NULL"),
-            params_ref.as_slice(),
-            |r| r.get(0),
-        )?;
-        let avg_winner_r: Option<f64> =
-            self.conn
-                .query_row(&avg_sql("AND r_result > 0"), params_ref.as_slice(), |r| {
-                    r.get(0)
-                })?;
-        let avg_loser_r: Option<f64> =
-            self.conn
-                .query_row(&avg_sql("AND r_result < 0"), params_ref.as_slice(), |r| {
-                    r.get(0)
-                })?;
+        let avg_winner_r = if winner_count > 0 {
+            Some(winner_sum / winner_count as f64)
+        } else {
+            None
+        };
+        let avg_loser_r = if loser_count > 0 {
+            Some(loser_sum / loser_count as f64)
+        } else {
+            None
+        };
 
         let mut result = serde_json::json!({
             "totalSignals": total,
@@ -2549,7 +2736,7 @@ impl Database {
             "targetHit": target_hit,
             "stopHit": stop_hit,
             "winRate": if resolved > 0 { target_hit as f64 / resolved as f64 } else { 0.0 },
-            "avgR": avg_r.unwrap_or(0.0),
+            "avgR": avg_r,
             "avgWinnerR": avg_winner_r,
             "avgLoserR": avg_loser_r,
         });

@@ -882,7 +882,14 @@ fn persist_backtest_run(
         "totalEvents": total_events,
     });
     let perf = db
-        .signal_performance_filtered(None, None, None, Some("backtest"), Some(&params.job_id))
+        .signal_performance_filtered(
+            None,
+            None,
+            None,
+            Some("backtest"),
+            Some(&params.job_id),
+            None,
+        )
         .map_err(runtime_err)?;
     let trades = serde_json::json!({ "signalPerformance": perf });
     let params_json = serde_json::json!({

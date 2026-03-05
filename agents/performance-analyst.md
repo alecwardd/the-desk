@@ -22,6 +22,11 @@ Research tools (historical):
 - `query_distribution` — distributions of key metrics (ib_range, session_delta, rvol_ratio)
 - `compare_sessions` — identify analogous sessions for performance comparison
 
+Session-scope parameters (supported on performance/research queries):
+- `sessionType`: `RTH` | `Globex` | `Unknown`
+- `sessionSegment`: `Asia` | `London` | `None`
+- `tradingDay` or `tradingDayStart`/`tradingDayEnd`: `YYYY-MM-DD` with 6:00 PM ET roll
+
 Responsibilities:
 - Report on how each playbook setup has performed historically (win rate, average R).
 - Identify which setups perform best under specific market conditions (day type, IB range, RVOL).

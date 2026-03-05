@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use the_desk_backend::backfill;
 use the_desk_backend::db::{
     AccountStateRecord, Database, HistoricalJobRun, OpenPositionRecord, RiskConfigRecord,
-    SignalOutcome, TradeRecord,
+    SessionScopeFilter, SignalOutcome, TradeRecord,
 };
 use the_desk_backend::feed::scid_reader::{parse_record_scaled, ScidReader};
 use the_desk_backend::feed::{load_feed_config, load_storage_config, TradeSide};
@@ -114,6 +114,136 @@ fn no_data(msg: &str) -> CallToolResult {
 
 fn invalid_params_error(msg: impl Into<String>) -> McpError {
     McpError::new(ErrorCode::INVALID_PARAMS, msg.into(), None)
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema, Clone)]
+#[serde(rename_all = "camelCase")]
+struct SessionScopeParams {
+    /// Session type filter: "RTH", "Globex", or "Unknown".
+    #[serde(alias = "session_type")]
+    session_type: Option<String>,
+    /// Globex segment filter: "Asia", "London", or "None".
+    #[serde(alias = "session_segment")]
+    session_segment: Option<String>,
+    /// Exact trading day (YYYY-MM-DD, 6 PM ET roll).
+    #[serde(alias = "trading_day")]
+    trading_day: Option<String>,
+    /// Trading-day range start (YYYY-MM-DD, 6 PM ET roll).
+    #[serde(alias = "trading_day_start")]
+    trading_day_start: Option<String>,
+    /// Trading-day range end (YYYY-MM-DD, 6 PM ET roll).
+    #[serde(alias = "trading_day_end")]
+    trading_day_end: Option<String>,
+}
+
+fn normalize_session_type_param(value: &str) -> Option<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "rth" => Some("RTH"),
+        "globex" => Some("Globex"),
+        "unknown" => Some("Unknown"),
+        _ => None,
+    }
+}
+
+fn normalize_session_segment_param(value: &str) -> Option<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "asia" => Some("Asia"),
+        "london" => Some("London"),
+        "none" => Some("None"),
+        _ => None,
+    }
+}
+
+fn validate_ymd_opt(label: &str, value: Option<&str>) -> Result<(), McpError> {
+    if let Some(date) = value {
+        if chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").is_err() {
+            return Err(invalid_params_error(format!(
+                "{label} must be YYYY-MM-DD, got: {date}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn build_session_scope_filter(
+    params: &SessionScopeParams,
+) -> Result<Option<SessionScopeFilter>, McpError> {
+    let mut session_type = params
+        .session_type
+        .as_deref()
+        .map(|raw| {
+            normalize_session_type_param(raw).ok_or_else(|| {
+                invalid_params_error(format!(
+                    "sessionType must be one of RTH|Globex|Unknown, got: {raw}"
+                ))
+            })
+        })
+        .transpose()?
+        .map(ToString::to_string);
+
+    let session_segment = params
+        .session_segment
+        .as_deref()
+        .map(|raw| {
+            normalize_session_segment_param(raw).ok_or_else(|| {
+                invalid_params_error(format!(
+                    "sessionSegment must be one of Asia|London|None, got: {raw}"
+                ))
+            })
+        })
+        .transpose()?
+        .map(ToString::to_string);
+
+    if let (Some(st), Some(ss)) = (&session_type, &session_segment) {
+        if st == "RTH" && ss != "None" {
+            return Err(invalid_params_error(
+                "sessionSegment Asia/London is only valid for Globex",
+            ));
+        }
+    }
+    if session_segment
+        .as_deref()
+        .map(|s| s == "Asia" || s == "London")
+        .unwrap_or(false)
+        && session_type.is_none()
+    {
+        session_type = Some("Globex".to_string());
+    }
+
+    let trading_day_start = params
+        .trading_day_start
+        .clone()
+        .or_else(|| params.trading_day.clone());
+    let trading_day_end = params
+        .trading_day_end
+        .clone()
+        .or_else(|| params.trading_day.clone());
+    validate_ymd_opt("tradingDay", params.trading_day.as_deref())?;
+    validate_ymd_opt("tradingDayStart", trading_day_start.as_deref())?;
+    validate_ymd_opt("tradingDayEnd", trading_day_end.as_deref())?;
+    if let (Some(sd), Some(ed)) = (trading_day_start.as_deref(), trading_day_end.as_deref()) {
+        if sd > ed {
+            return Err(invalid_params_error(
+                "tradingDayStart must be on or before tradingDayEnd",
+            ));
+        }
+    }
+
+    let scope = SessionScopeFilter {
+        session_type,
+        session_segment,
+        trading_day_start,
+        trading_day_end,
+    };
+    if scope.session_type.is_none()
+        && scope.session_segment.is_none()
+        && scope.trading_day_start.is_none()
+        && scope.trading_day_end.is_none()
+    {
+        Ok(None)
+    } else {
+        Ok(Some(scope))
+    }
 }
 
 fn historical_job_response(run: &HistoricalJobRun, already_running: bool) -> serde_json::Value {
@@ -357,6 +487,9 @@ struct FrequencyParams {
     start_date: Option<String>,
     /// End date filter (YYYY-MM-DD).
     end_date: Option<String>,
+    /// Optional session/trading-day scope filter.
+    #[serde(flatten)]
+    session_scope: SessionScopeParams,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -373,6 +506,9 @@ struct ConditionalParams {
     start_date: Option<String>,
     /// End date filter (YYYY-MM-DD).
     end_date: Option<String>,
+    /// Optional session/trading-day scope filter.
+    #[serde(flatten)]
+    session_scope: SessionScopeParams,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -383,6 +519,9 @@ struct DistributionParams {
     start_date: Option<String>,
     /// End date filter (YYYY-MM-DD).
     end_date: Option<String>,
+    /// Optional session/trading-day scope filter.
+    #[serde(flatten)]
+    session_scope: SessionScopeParams,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -393,6 +532,9 @@ struct SignalOutcomeDistributionParams {
     start_date: Option<String>,
     /// End date filter (YYYY-MM-DD).
     end_date: Option<String>,
+    /// Optional session/trading-day scope filter.
+    #[serde(flatten)]
+    session_scope: SessionScopeParams,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -407,6 +549,9 @@ struct SignalOutcomeConditionalParams {
     start_date: Option<String>,
     /// End date filter (YYYY-MM-DD).
     end_date: Option<String>,
+    /// Optional session/trading-day scope filter.
+    #[serde(flatten)]
+    session_scope: SessionScopeParams,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -419,6 +564,9 @@ struct SessionHistoryParams {
     day_type: Option<String>,
     /// Maximum number of sessions to return (default 20).
     limit: Option<u64>,
+    /// Optional session/trading-day scope filter.
+    #[serde(flatten)]
+    session_scope: SessionScopeParams,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -451,6 +599,13 @@ struct CompareSessionsParams {
 struct SignalPerformanceParams {
     /// Setup ID to filter by.
     setup_id: Option<String>,
+    /// Start date filter (YYYY-MM-DD).
+    start_date: Option<String>,
+    /// End date filter (YYYY-MM-DD).
+    end_date: Option<String>,
+    /// Optional session/trading-day scope filter.
+    #[serde(flatten)]
+    session_scope: SessionScopeParams,
 }
 
 #[tool_router]
@@ -1782,12 +1937,14 @@ impl TheDeskMcp {
         &self,
         Parameters(params): Parameters<FrequencyParams>,
     ) -> Result<CallToolResult, McpError> {
+        let scope = build_session_scope_filter(&params.session_scope)?;
         let db = self.db.lock().map_err(|_| lock_error())?;
         match research::event_frequency(
             &db,
             &params.event_type,
             params.start_date.as_deref(),
             params.end_date.as_deref(),
+            scope.as_ref(),
         ) {
             Ok(result) => Ok(text_result(
                 serde_json::to_value(&result).unwrap_or_default(),
@@ -1803,6 +1960,7 @@ impl TheDeskMcp {
         &self,
         Parameters(params): Parameters<ConditionalParams>,
     ) -> Result<CallToolResult, McpError> {
+        let scope = build_session_scope_filter(&params.session_scope)?;
         let db = self.db.lock().map_err(|_| lock_error())?;
         let min_count = params.min_count.unwrap_or(1);
         match research::conditional_probability(
@@ -1813,6 +1971,7 @@ impl TheDeskMcp {
             &params.outcome_value,
             params.start_date.as_deref(),
             params.end_date.as_deref(),
+            scope.as_ref(),
         ) {
             Ok(result) => Ok(text_result(
                 serde_json::to_value(&result).unwrap_or_default(),
@@ -1828,12 +1987,14 @@ impl TheDeskMcp {
         &self,
         Parameters(params): Parameters<DistributionParams>,
     ) -> Result<CallToolResult, McpError> {
+        let scope = build_session_scope_filter(&params.session_scope)?;
         let db = self.db.lock().map_err(|_| lock_error())?;
         match research::metric_distribution(
             &db,
             &params.metric,
             params.start_date.as_deref(),
             params.end_date.as_deref(),
+            scope.as_ref(),
         ) {
             Ok(result) => Ok(text_result(
                 serde_json::to_value(&result).unwrap_or_default(),
@@ -1849,12 +2010,14 @@ impl TheDeskMcp {
         &self,
         Parameters(params): Parameters<SignalOutcomeDistributionParams>,
     ) -> Result<CallToolResult, McpError> {
+        let scope = build_session_scope_filter(&params.session_scope)?;
         let db = self.db.lock().map_err(|_| lock_error())?;
         match research::signal_outcome_distribution(
             &db,
             &params.setup_id,
             params.start_date.as_deref(),
             params.end_date.as_deref(),
+            scope.as_ref(),
         ) {
             Ok(result) => Ok(text_result(
                 serde_json::to_value(&result).unwrap_or_default(),
@@ -1870,6 +2033,7 @@ impl TheDeskMcp {
         &self,
         Parameters(params): Parameters<SignalOutcomeConditionalParams>,
     ) -> Result<CallToolResult, McpError> {
+        let scope = build_session_scope_filter(&params.session_scope)?;
         let db = self.db.lock().map_err(|_| lock_error())?;
         match research::signal_outcome_conditional(
             &db,
@@ -1878,6 +2042,7 @@ impl TheDeskMcp {
             &params.field_value,
             params.start_date.as_deref(),
             params.end_date.as_deref(),
+            scope.as_ref(),
         ) {
             Ok(result) => Ok(text_result(
                 serde_json::to_value(&result).unwrap_or_default(),
@@ -1893,12 +2058,22 @@ impl TheDeskMcp {
         &self,
         Parameters(params): Parameters<SessionHistoryParams>,
     ) -> Result<CallToolResult, McpError> {
+        let scope = build_session_scope_filter(&params.session_scope)?;
+        let start_date = scope
+            .as_ref()
+            .and_then(|s| s.trading_day_start.as_deref())
+            .or(params.start_date.as_deref());
+        let end_date = scope
+            .as_ref()
+            .and_then(|s| s.trading_day_end.as_deref())
+            .or(params.end_date.as_deref());
         let db = self.db.lock().map_err(|_| lock_error())?;
         let limit = params.limit.unwrap_or(20) as usize;
         match db.list_session_summaries(
-            params.start_date.as_deref(),
-            params.end_date.as_deref(),
+            start_date,
+            end_date,
             params.day_type.as_deref(),
+            scope.as_ref().and_then(|s| s.session_type.as_deref()),
             limit,
         ) {
             Ok(sessions) => {
@@ -1943,8 +2118,16 @@ impl TheDeskMcp {
         &self,
         Parameters(params): Parameters<SignalPerformanceParams>,
     ) -> Result<CallToolResult, McpError> {
+        let scope = build_session_scope_filter(&params.session_scope)?;
         let db = self.db.lock().map_err(|_| lock_error())?;
-        match db.signal_performance(params.setup_id.as_deref(), None, None) {
+        match db.signal_performance_filtered(
+            params.setup_id.as_deref(),
+            params.start_date.as_deref(),
+            params.end_date.as_deref(),
+            None,
+            None,
+            scope.as_ref(),
+        ) {
             Ok(result) => Ok(text_result(result)),
             Err(e) => Err(db_error(e)),
         }
@@ -1956,10 +2139,10 @@ impl TheDeskMcp {
     async fn get_research_summary(&self) -> Result<CallToolResult, McpError> {
         let db = self.db.lock().map_err(|_| lock_error())?;
         let session_count = db.session_summary_count().unwrap_or(0);
-        let ib_dist = research::metric_distribution(&db, "ib_range", None, None)
+        let ib_dist = research::metric_distribution(&db, "ib_range", None, None, None)
             .ok()
             .map(|d| serde_json::to_value(&d).unwrap_or_default());
-        let delta_dist = research::metric_distribution(&db, "session_delta", None, None)
+        let delta_dist = research::metric_distribution(&db, "session_delta", None, None, None)
             .ok()
             .map(|d| serde_json::to_value(&d).unwrap_or_default());
 

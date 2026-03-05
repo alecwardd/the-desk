@@ -1,4 +1,5 @@
 use crate::db::Database;
+use crate::db::SessionScopeFilter;
 use serde::{Deserialize, Serialize};
 
 /// Result of a frequency query: "How often does event X happen?"
@@ -49,9 +50,10 @@ pub fn event_frequency(
     event_type: &str,
     start_date: Option<&str>,
     end_date: Option<&str>,
+    scope: Option<&SessionScopeFilter>,
 ) -> Result<FrequencyResult, String> {
     let (total, sessions_with, total_sessions) = db
-        .count_events_by_type(event_type, start_date, end_date)
+        .count_events_by_type(event_type, start_date, end_date, scope)
         .map_err(|e| e.to_string())?;
 
     let per_session_avg = if total_sessions > 0 {
@@ -79,6 +81,7 @@ pub fn event_frequency(
 ///
 /// Condition: event_type occurs >= `min_count` times in a session.
 /// Outcome: a field in session_summaries matches a value.
+#[allow(clippy::too_many_arguments)]
 pub fn conditional_probability(
     db: &Database,
     event_type: &str,
@@ -87,13 +90,20 @@ pub fn conditional_probability(
     outcome_value: &str,
     start_date: Option<&str>,
     end_date: Option<&str>,
+    scope: Option<&SessionScopeFilter>,
 ) -> Result<ConditionalResult, String> {
+    let summary_start = scope
+        .and_then(|s| s.trading_day_start.as_deref())
+        .or(start_date);
+    let summary_end = scope
+        .and_then(|s| s.trading_day_end.as_deref())
+        .or(end_date);
     let counts = db
-        .event_counts_per_session(event_type, start_date, end_date)
+        .event_counts_per_session(event_type, start_date, end_date, scope)
         .map_err(|e| e.to_string())?;
 
     let summaries = db
-        .list_session_summaries(start_date, end_date, None, 10_000)
+        .list_session_summaries(summary_start, summary_end, None, None, 10_000)
         .map_err(|e| e.to_string())?;
 
     let summary_map: std::collections::HashMap<String, &crate::db::SessionSummary> = summaries
@@ -166,9 +176,10 @@ pub fn signal_outcome_distribution(
     setup_id: &str,
     start_date: Option<&str>,
     end_date: Option<&str>,
+    scope: Option<&SessionScopeFilter>,
 ) -> Result<DistributionResult, String> {
     let outcomes = db
-        .list_signal_outcomes_for_research(Some(setup_id), start_date, end_date)
+        .list_signal_outcomes_for_research(Some(setup_id), start_date, end_date, scope)
         .map_err(|e| e.to_string())?;
 
     let values: Vec<f64> = outcomes.into_iter().filter_map(|(_, _, r, _)| r).collect();
@@ -226,13 +237,20 @@ pub fn signal_outcome_conditional(
     field_value: &str,
     start_date: Option<&str>,
     end_date: Option<&str>,
+    scope: Option<&SessionScopeFilter>,
 ) -> Result<ConditionalResult, String> {
+    let summary_start = scope
+        .and_then(|s| s.trading_day_start.as_deref())
+        .or(start_date);
+    let summary_end = scope
+        .and_then(|s| s.trading_day_end.as_deref())
+        .or(end_date);
     let outcomes = db
-        .list_signal_outcomes_for_research(Some(setup_id), start_date, end_date)
+        .list_signal_outcomes_for_research(Some(setup_id), start_date, end_date, scope)
         .map_err(|e| e.to_string())?;
 
     let summaries = db
-        .list_session_summaries(start_date, end_date, None, 10_000)
+        .list_session_summaries(summary_start, summary_end, None, None, 10_000)
         .map_err(|e| e.to_string())?;
 
     let summary_map: std::collections::HashMap<String, &crate::db::SessionSummary> = summaries
@@ -291,9 +309,21 @@ pub fn metric_distribution(
     metric: &str,
     start_date: Option<&str>,
     end_date: Option<&str>,
+    scope: Option<&SessionScopeFilter>,
 ) -> Result<DistributionResult, String> {
+    let summary_start = scope
+        .and_then(|s| s.trading_day_start.as_deref())
+        .or(start_date);
+    let summary_end = scope
+        .and_then(|s| s.trading_day_end.as_deref())
+        .or(end_date);
     let mut values = db
-        .metric_values(metric, start_date, end_date)
+        .metric_values(
+            metric,
+            summary_start,
+            summary_end,
+            scope.and_then(|s| s.session_type.as_deref()),
+        )
         .map_err(|e| e.to_string())?;
 
     if values.is_empty() {
@@ -405,7 +435,7 @@ pub fn compare_sessions_multi(
     max_results: usize,
 ) -> Result<Vec<serde_json::Value>, String> {
     let summaries = db
-        .list_session_summaries(None, None, None, 500)
+        .list_session_summaries(None, None, None, None, 500)
         .map_err(|e| e.to_string())?;
 
     let filtered: Vec<&crate::db::SessionSummary> =
@@ -535,7 +565,7 @@ mod tests {
     fn distribution_handles_empty() {
         let file = tempfile::NamedTempFile::new().unwrap();
         let db = Database::open(file.path().to_string_lossy().as_ref()).unwrap();
-        let result = metric_distribution(&db, "ib_range", None, None).unwrap();
+        let result = metric_distribution(&db, "ib_range", None, None, None).unwrap();
         assert_eq!(result.sample_count, 0);
     }
 }

@@ -51,6 +51,9 @@ pub struct SessionEndState {
     pub va_high: f64,
     pub va_low: f64,
     pub poc: f64,
+    pub dnva_high: f64,
+    pub dnva_low: f64,
+    pub dnp: f64,
 }
 
 #[cfg(test)]
@@ -138,6 +141,12 @@ pub struct MarketState {
     pub prior_va_low: f64,
     /// Previous session point of control.
     pub prior_poc: f64,
+    /// Prior RTH session DNVA high.
+    pub prior_dnva_high: f64,
+    /// Prior RTH session DNVA low.
+    pub prior_dnva_low: f64,
+    /// Prior RTH session DNP.
+    pub prior_dnp: f64,
     /// Overnight (Globex) session high.
     pub overnight_high: f64,
     /// Overnight (Globex) session low.
@@ -377,6 +386,9 @@ impl PipelineEngine {
             va_high: self.tpo.va_high(),
             va_low: self.tpo.va_low(),
             poc: self.tpo.poc(),
+            dnva_high: self.delta.dnva_high(),
+            dnva_low: self.delta.dnva_low(),
+            dnp: self.delta.dnp(),
         }
     }
 
@@ -581,6 +593,9 @@ impl PipelineEngine {
             prior_va_high: self.levels.prior_va_high,
             prior_va_low: self.levels.prior_va_low,
             prior_poc: self.levels.prior_poc,
+            prior_dnva_high: self.levels.prior_dnva_high,
+            prior_dnva_low: self.levels.prior_dnva_low,
+            prior_dnp: self.levels.prior_dnp,
             overnight_high: self.levels.overnight_high,
             overnight_low: self.levels.overnight_low,
             session_high: self.levels.session_high,

@@ -131,6 +131,46 @@ impl Default for SessionBuffers {
     }
 }
 
+#[derive(Debug, Clone)]
+struct SegmentBuffers {
+    open_price: f64,
+    high: f64,
+    low: f64,
+    tick_count: i64,
+    volume: f64,
+}
+
+impl Default for SegmentBuffers {
+    fn default() -> Self {
+        Self {
+            open_price: 0.0,
+            high: 0.0,
+            low: 0.0,
+            tick_count: 0,
+            volume: 0.0,
+        }
+    }
+}
+
+impl SegmentBuffers {
+    fn has_data(&self) -> bool {
+        self.tick_count > 0
+    }
+
+    fn observe_trade(&mut self, price: f64, volume: f64) {
+        if self.tick_count == 0 {
+            self.open_price = price;
+            self.high = price;
+            self.low = price;
+        } else {
+            self.high = self.high.max(price);
+            self.low = self.low.min(price);
+        }
+        self.tick_count += 1;
+        self.volume += volume;
+    }
+}
+
 /// Mutable accumulation state for a backfill run, grouped to reduce parameter counts.
 struct BackfillRunState {
     pipeline: PipelineEngine,
@@ -144,6 +184,7 @@ struct BackfillRunState {
     total_signals_fired: usize,
     session_dates: Vec<String>,
     buffers: SessionBuffers,
+    segment_buffers: SegmentBuffers,
 }
 
 pub fn summary_from_state(
@@ -326,6 +367,7 @@ where
         total_signals_fired: 0,
         session_dates: Vec::new(),
         buffers: SessionBuffers::default(),
+        segment_buffers: SegmentBuffers::default(),
     };
     state
         .pipeline
@@ -423,6 +465,7 @@ where
                     params,
                     &mut state,
                     current_session,
+                    current_delta_segment,
                     &current_date,
                     last_tick_meta,
                     source,
@@ -441,9 +484,10 @@ where
                     rules.reset();
                 }
                 state.buffers = SessionBuffers::default();
+                state.segment_buffers = SegmentBuffers::default();
 
                 if new_session == SessionType::Rth || new_session == SessionType::Globex {
-                    if let Some((h, l, c, va_h, va_l, poc)) = db
+                    if let Some((h, l, c, va_h, va_l, poc, dnva_h, dnva_l, dnp)) = db
                         .load_prior_day_full(&current_date)
                         .map_err(runtime_err)
                         .map_err(|e| e.to_string())?
@@ -452,13 +496,31 @@ where
                         if let (Some(vh), Some(vl), Some(pc)) = (va_h, va_l, poc) {
                             state.pipeline.levels.set_prior_profile(vh, vl, pc);
                         }
+                        if let (Some(dh), Some(dl), Some(dp)) = (dnva_h, dnva_l, dnp) {
+                            state.pipeline.levels.set_prior_dnva(dh, dl, dp);
+                        }
                     }
                 }
             } else if new_segment != current_delta_segment
                 && current_delta_segment != DeltaSegment::Unknown
                 && new_segment != DeltaSegment::Unknown
             {
+                // Persist the segment we're leaving (Asia or London) before reset.
+                if current_delta_segment == DeltaSegment::Asia {
+                    persist_segment_summary(
+                        db,
+                        params,
+                        &mut state,
+                        &current_date,
+                        "Asia",
+                        last_tick_meta,
+                        source,
+                        &mut on_progress,
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
                 state.pipeline.reset_segment(new_segment);
+                state.segment_buffers = SegmentBuffers::default();
             }
 
             if new_session != SessionType::Unknown {
@@ -478,6 +540,7 @@ where
             }
             state.buffers.session_tick_count += 1;
             state.buffers.session_volume += tick.volume;
+            state.segment_buffers.observe_trade(tick.price, tick.volume);
 
             state.pipeline.on_trade_with_session_flag(
                 tick.price,
@@ -607,6 +670,7 @@ where
             params,
             &mut state,
             current_session,
+            current_delta_segment,
             &current_date,
             last_tick_meta,
             source,
@@ -663,6 +727,79 @@ where
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+fn persist_segment_summary<F>(
+    db: &Database,
+    params: &BackfillJobParams,
+    state: &mut BackfillRunState,
+    session_date: &str,
+    session_type: &str,
+    last_tick_meta: Option<(f64, f64, f64, f64)>,
+    _source: &str,
+    on_progress: &mut F,
+) -> Result<(), BackfillJobError>
+where
+    F: FnMut(&BackfillProgress),
+{
+    const DNP_TOLERANCE: f64 = 0.5;
+    let should_process = params.force
+        || !db
+            .has_session_summary_for(session_date, session_type)
+            .map_err(runtime_err)?;
+    if !should_process {
+        return Ok(());
+    }
+    if !state.segment_buffers.has_data() {
+        return Ok(());
+    }
+    let (bid, ask, _exit_price, exit_time_ms) = match last_tick_meta {
+        Some(m) => m,
+        None => return Ok(()),
+    };
+    state.progress.current_phase = "persisting_session".to_string();
+    state.progress.current_session_date = Some(session_date.to_string());
+    on_progress(&state.progress);
+
+    let snapshot = state
+        .pipeline
+        .snapshot_for_detection(bid, ask, exit_time_ms);
+    let mut summary = summary_from_state(
+        &snapshot,
+        session_date,
+        session_type,
+        state.segment_buffers.open_price,
+        state.segment_buffers.tick_count,
+        state.segment_buffers.volume,
+        0,
+    );
+    summary.high = state.segment_buffers.high;
+    summary.low = state.segment_buffers.low;
+    db.upsert_session_summary(&summary).map_err(runtime_err)?;
+    db.delete_untested_dnps_touched_by_range(
+        summary.low,
+        summary.high,
+        DNP_TOLERANCE,
+        Some((session_date, session_type)),
+    )
+    .map_err(runtime_err)?;
+    // Track untested DNPs: price did not revisit DNP ± 2 NQ ticks (0.5 pts).
+    if summary.dnp > 0.0 {
+        let dnp_tested = (summary.low <= summary.dnp + DNP_TOLERANCE)
+            && (summary.high >= summary.dnp - DNP_TOLERANCE);
+        if dnp_tested {
+            db.delete_untested_dnp_for_session(session_date, session_type)
+                .map_err(runtime_err)?;
+        } else {
+            db.save_untested_dnp(session_date, session_type, summary.dnp)
+                .map_err(runtime_err)?;
+        }
+    }
+    state.sessions_processed += 1;
+    state.progress.sessions_completed = state.sessions_processed;
+    state.session_dates.push(session_date.to_string());
+    Ok(())
+}
+
 fn prepare_backfill_setups(
     db: &Database,
     params: &BackfillJobParams,
@@ -688,6 +825,7 @@ fn finalize_session_period<F>(
     params: &BackfillJobParams,
     state: &mut BackfillRunState,
     session_type: SessionType,
+    current_delta_segment: DeltaSegment,
     current_date: &str,
     last_tick_meta: Option<(f64, f64, f64, f64)>,
     source: &str,
@@ -709,6 +847,19 @@ where
     }
 
     if session_type == SessionType::Globex {
+        // Persist London summary when transitioning London→RTH (segment is London).
+        if current_delta_segment == DeltaSegment::London {
+            persist_segment_summary(
+                db,
+                params,
+                state,
+                current_date,
+                "London",
+                last_tick_meta,
+                source,
+                on_progress,
+            )?;
+        }
         state.progress.current_phase = "persisting_session".to_string();
         state.progress.current_session_date = Some(current_date.to_string());
         on_progress(&state.progress);
@@ -787,6 +938,9 @@ where
                 end_state.va_high,
                 end_state.va_low,
                 end_state.poc,
+                end_state.dnva_high,
+                end_state.dnva_low,
+                end_state.dnp,
             ),
         )
         .map_err(runtime_err)?;
@@ -815,7 +969,7 @@ where
             .rvol
             .load_historical_curve(&state.rvol_curves);
     } else {
-        db.save_prior_day_full(
+        db.save_prior_day_full_with_dnva(
             current_date,
             end_state.high,
             end_state.low,
@@ -823,6 +977,9 @@ where
             end_state.va_high,
             end_state.va_low,
             end_state.poc,
+            Some(end_state.dnva_high),
+            Some(end_state.dnva_low),
+            Some(end_state.dnp),
         )
         .map_err(runtime_err)?;
         state.sessions_skipped += 1;
@@ -1004,5 +1161,40 @@ mod tests {
         assert!(start.is_some());
         assert!(end.is_some());
         assert!(end.unwrap() > start.unwrap());
+    }
+
+    #[test]
+    fn segment_buffers_track_high_low_ticks_and_volume() {
+        let mut segment = SegmentBuffers::default();
+        segment.observe_trade(21000.0, 4.0);
+        segment.observe_trade(20998.5, 2.0);
+        segment.observe_trade(21002.0, 1.0);
+
+        assert!(segment.has_data());
+        assert_eq!(segment.open_price, 21000.0);
+        assert_eq!(segment.high, 21002.0);
+        assert_eq!(segment.low, 20998.5);
+        assert_eq!(segment.tick_count, 3);
+        assert_eq!(segment.volume, 7.0);
+    }
+
+    #[test]
+    fn segment_buffers_reset_prevents_asia_data_leaking_into_london() {
+        let mut segment = SegmentBuffers::default();
+        segment.observe_trade(20995.0, 3.0);
+        segment.observe_trade(21001.0, 1.0);
+        assert_eq!(segment.high, 21001.0);
+        assert_eq!(segment.low, 20995.0);
+
+        // Simulate Asia→London boundary reset.
+        segment = SegmentBuffers::default();
+        segment.observe_trade(21010.0, 5.0);
+        segment.observe_trade(21012.0, 2.0);
+
+        assert_eq!(segment.open_price, 21010.0);
+        assert_eq!(segment.low, 21010.0);
+        assert_eq!(segment.high, 21012.0);
+        assert_eq!(segment.tick_count, 2);
+        assert_eq!(segment.volume, 7.0);
     }
 }

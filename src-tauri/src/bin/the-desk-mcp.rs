@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use the_desk_backend::backfill;
 use the_desk_backend::db::{
     AccountStateRecord, Database, HistoricalJobRun, OpenPositionRecord, RiskConfigRecord,
-    SessionScopeFilter, SetupPerformanceSortBy, SignalOutcome, TradeRecord,
+    SessionScopeFilter, SessionSummary, SetupPerformanceSortBy, SignalOutcome, TradeRecord,
 };
 use the_desk_backend::depth::{
     aggregate_trade_volume_by_level, build_dom_feature_snapshot, build_dom_summary, DepthBook,
@@ -24,7 +24,9 @@ use the_desk_backend::feed::scid_reader::{
 };
 use the_desk_backend::feed::{load_feed_config, load_storage_config, TradeSide};
 use the_desk_backend::outcome_tracker;
-use the_desk_backend::pipelines::{EventDetector, FlowEventEmitter, PipelineEngine, RvolPipeline};
+use the_desk_backend::pipelines::{
+    EventDetector, FlowEventEmitter, PipelineEngine, PriorSessionData, RvolPipeline,
+};
 use the_desk_backend::research;
 use the_desk_backend::risk::{RiskConfig, RiskState, RiskTracker};
 use the_desk_backend::rules::RulesEngine;
@@ -395,6 +397,35 @@ fn normalize_signal_source(raw: &str) -> Option<&'static str> {
         "live" => Some("live"),
         "backtest" => Some("backtest"),
         _ => None,
+    }
+}
+
+fn load_contextual_prior_dnva(
+    db: &Database,
+    session_type: Option<&str>,
+    session_segment: Option<&str>,
+    trading_day: Option<&str>,
+) -> (Option<(f64, f64, f64)>, Option<(f64, f64, f64)>) {
+    let Some(td) = trading_day else {
+        return (None, None);
+    };
+
+    if session_type == Some("Globex") {
+        match session_segment {
+            Some("London") => (
+                db.load_prior_session_dnva("London", td).ok().flatten(),
+                db.load_session_dnva(td, "Asia").ok().flatten(),
+            ),
+            _ => (
+                db.load_prior_session_dnva("London", td).ok().flatten(),
+                db.load_prior_session_dnva("Asia", td).ok().flatten(),
+            ),
+        }
+    } else {
+        (
+            db.load_session_dnva(td, "London").ok().flatten(),
+            db.load_session_dnva(td, "Asia").ok().flatten(),
+        )
     }
 }
 
@@ -1383,7 +1414,10 @@ impl TheDeskMcp {
         let db = self.db.lock().map_err(|_| lock_error())?;
         match db.latest_feature_state() {
             Ok(Some(s)) => {
-                let is_globex = s.get("sessionType").and_then(|v| v.as_str()) == Some("Globex");
+                let session_type = s.get("sessionType").and_then(|v| v.as_str());
+                let session_segment = s.get("sessionSegment").and_then(|v| v.as_str());
+                let trading_day = s.get("tradingDay").and_then(|v| v.as_str());
+                let is_globex = session_type == Some("Globex");
                 let mut out = serde_json::json!({
                     "sessionType": s.get("sessionType"),
                     "sessionSegment": s.get("sessionSegment"),
@@ -1394,6 +1428,9 @@ impl TheDeskMcp {
                     "priorVaHigh": s.get("priorVaHigh"),
                     "priorVaLow": s.get("priorVaLow"),
                     "priorPoc": s.get("priorPoc"),
+                    "priorDnvaHigh": s.get("priorDnvaHigh"),
+                    "priorDnvaLow": s.get("priorDnvaLow"),
+                    "priorDnp": s.get("priorDnp"),
                     "overnightHigh": s.get("overnightHigh"),
                     "overnightLow": s.get("overnightLow"),
                     "globexOr30High": s.get("globexOr30High"),
@@ -1404,10 +1441,43 @@ impl TheDeskMcp {
                     "sessionLow": s.get("sessionLow"),
                     "ibHigh": s.get("ibHigh"),
                     "ibLow": s.get("ibLow"),
+                    "priorLondonDnvaHigh": serde_json::Value::Null,
+                    "priorLondonDnvaLow": serde_json::Value::Null,
+                    "priorLondonDnp": serde_json::Value::Null,
+                    "priorAsiaDnvaHigh": serde_json::Value::Null,
+                    "priorAsiaDnvaLow": serde_json::Value::Null,
+                    "priorAsiaDnp": serde_json::Value::Null,
+                    "untestedDnps": serde_json::json!([]),
                     "dataAgeMs": compute_data_age(&db)
                 });
                 if is_globex {
                     out["sessionScopeNote"] = serde_json::json!("For Globex, use overnightHigh/overnightLow as the session range. sessionHigh, sessionLow, IB, OR, and OR5 are RTH-only and may be zero or from a prior RTH session.");
+                }
+                let (london_dnva, asia_dnva) =
+                    load_contextual_prior_dnva(&db, session_type, session_segment, trading_day);
+                if let Some((h, l, p)) = london_dnva {
+                    out["priorLondonDnvaHigh"] = serde_json::json!(h);
+                    out["priorLondonDnvaLow"] = serde_json::json!(l);
+                    out["priorLondonDnp"] = serde_json::json!(p);
+                }
+                if let Some((h, l, p)) = asia_dnva {
+                    out["priorAsiaDnvaHigh"] = serde_json::json!(h);
+                    out["priorAsiaDnvaLow"] = serde_json::json!(l);
+                    out["priorAsiaDnp"] = serde_json::json!(p);
+                }
+                // Include untested DNPs from prior sessions (price never revisited DNP).
+                if let Ok(untested) = db.load_untested_dnps(10) {
+                    let list: Vec<serde_json::Value> = untested
+                        .into_iter()
+                        .map(|(sd, st, dnp)| {
+                            serde_json::json!({
+                                "sessionDate": sd,
+                                "sessionType": st,
+                                "dnp": dnp
+                            })
+                        })
+                        .collect();
+                    out["untestedDnps"] = serde_json::json!(list);
                 }
                 Ok(text_result(out))
             }
@@ -3151,6 +3221,7 @@ impl TheDeskMcp {
                             "vaLow": s.val,
                             "dnvaHigh": s.dnva_high,
                             "dnvaLow": s.dnva_low,
+                            "dnp": s.dnp,
                             "sessionDelta": s.session_delta,
                             "closeVsIbMid": s.close_vs_ib_mid,
                             "closeVsVwap": s.close_vs_vwap,
@@ -4217,8 +4288,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         drop(pipelines);
                         if let Some(ref es) = end_state {
                             if let Ok(db) = db_startup.lock() {
-                                let _ = db.save_prior_day_full(
-                                    &date, es.high, es.low, es.close, es.va_high, es.va_low, es.poc,
+                                let _ = db.save_prior_day_full_with_dnva(
+                                    &date,
+                                    es.high,
+                                    es.low,
+                                    es.close,
+                                    es.va_high,
+                                    es.va_low,
+                                    es.poc,
+                                    Some(es.dnva_high),
+                                    Some(es.dnva_low),
+                                    Some(es.dnp),
                                 );
                                 eprintln!(
                                     "[the-desk-mcp] Session boundary: RTH\u{2192}Globex, saved prior day H={:.2} L={:.2} C={:.2}",
@@ -4239,13 +4319,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         };
                         pipelines.reset_session_with_type(new_session == SessionType::Globex);
                         if new_session == SessionType::Rth || new_session == SessionType::Globex {
-                            if let Ok(Some((h, l, c, va_h, va_l, poc))) = prior {
+                            if let Ok(Some((h, l, c, va_h, va_l, poc, dnva_h, dnva_l, dnp))) = prior
+                            {
                                 pipelines.levels.set_prior_day(h, l, c);
                                 if let (Some(vh), Some(vl), Some(pc)) = (va_h, va_l, poc) {
                                     pipelines.levels.set_prior_profile(vh, vl, pc);
                                 }
+                                if let (Some(dh), Some(dl), Some(dp)) = (dnva_h, dnva_l, dnp) {
+                                    pipelines.levels.set_prior_dnva(dh, dl, dp);
+                                }
                             }
                         }
+                        let inv_session_type = if new_session == SessionType::Rth {
+                            "RTH"
+                        } else if new_segment == DeltaSegment::Asia {
+                            "Asia"
+                        } else {
+                            "London"
+                        };
+                        drop(pipelines);
+                        if let Ok(db) = db_startup.lock() {
+                            if let Ok(summaries) = db.list_session_summaries(
+                                None,
+                                None,
+                                None,
+                                Some(inv_session_type),
+                                5,
+                            ) {
+                                let prior_inv: Vec<PriorSessionData> = summaries
+                                    .into_iter()
+                                    .filter(|s| {
+                                        s.dnva_high > 0.0 && s.dnva_low > 0.0 && s.dnp > 0.0
+                                    })
+                                    .map(|s| PriorSessionData {
+                                        final_delta: s.session_delta,
+                                        dnva_high: s.dnva_high,
+                                        dnva_low: s.dnva_low,
+                                        dnp: s.dnp,
+                                    })
+                                    .collect();
+                                if let Ok(mut p) = pipelines_startup.lock() {
+                                    p.session_inventory.load_prior_sessions(prior_inv);
+                                }
+                            }
+                        }
+                        pipelines = match pipelines_startup.lock() {
+                            Ok(p) => p,
+                            Err(_) => return,
+                        };
                         boundary_count += 1;
                     } else if new_segment != current_delta_segment
                         && current_delta_segment != DeltaSegment::Unknown
@@ -4392,9 +4513,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     let date = session_date_from_timestamp_ms(tick.timestamp_ms);
                                     if let Some(ref es) = end_state {
                                         if let Ok(db) = db_bg.lock() {
-                                            let _ = db.save_prior_day_full(
-                                                &date, es.high, es.low, es.close, es.va_high,
-                                                es.va_low, es.poc,
+                                            let _ = db.save_prior_day_full_with_dnva(
+                                                &date,
+                                                es.high,
+                                                es.low,
+                                                es.close,
+                                                es.va_high,
+                                                es.va_low,
+                                                es.poc,
+                                                Some(es.dnva_high),
+                                                Some(es.dnva_low),
+                                                Some(es.dnp),
                                             );
                                         }
                                     }
@@ -4406,10 +4535,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         None
                                     };
                                     p.reset_session_with_type(new_session == SessionType::Globex);
-                                    if let Some((h, l, c, va_h, va_l, poc)) = prior {
+                                    if let Some((h, l, c, va_h, va_l, poc, dnva_h, dnva_l, dnp)) =
+                                        prior
+                                    {
                                         p.levels.set_prior_day(h, l, c);
                                         if let (Some(vh), Some(vl), Some(pc)) = (va_h, va_l, poc) {
                                             p.levels.set_prior_profile(vh, vl, pc);
+                                        }
+                                        if let (Some(dh), Some(dl), Some(dp)) =
+                                            (dnva_h, dnva_l, dnp)
+                                        {
+                                            p.levels.set_prior_dnva(dh, dl, dp);
+                                        }
+                                    }
+                                    let inv_session_type = if new_session == SessionType::Rth {
+                                        "RTH"
+                                    } else if new_segment == DeltaSegment::Asia {
+                                        "Asia"
+                                    } else {
+                                        "London"
+                                    };
+                                    drop(p);
+                                    if let Ok(db) = db_bg.lock() {
+                                        if let Ok(summaries) = db.list_session_summaries(
+                                            None,
+                                            None,
+                                            None,
+                                            Some(inv_session_type),
+                                            5,
+                                        ) {
+                                            let prior_inv: Vec<PriorSessionData> = summaries
+                                                .into_iter()
+                                                .filter(|s| {
+                                                    s.dnva_high > 0.0
+                                                        && s.dnva_low > 0.0
+                                                        && s.dnp > 0.0
+                                                })
+                                                .map(|s| PriorSessionData {
+                                                    final_delta: s.session_delta,
+                                                    dnva_high: s.dnva_high,
+                                                    dnva_low: s.dnva_low,
+                                                    dnp: s.dnp,
+                                                })
+                                                .collect();
+                                            if let Ok(mut p) = pipelines_bg.lock() {
+                                                p.session_inventory.load_prior_sessions(prior_inv);
+                                            }
                                         }
                                     }
                                     eprintln!(
@@ -4602,6 +4773,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
 
+    fn summary_row(
+        session_date: &str,
+        session_type: &str,
+        dnva_high: f64,
+        dnva_low: f64,
+        dnp: f64,
+    ) -> SessionSummary {
+        SessionSummary {
+            session_date: session_date.to_string(),
+            session_type: session_type.to_string(),
+            open_price: dnva_low,
+            high: dnva_high,
+            low: dnva_low,
+            close: dnp,
+            poc: dnp,
+            vah: dnva_high,
+            val: dnva_low,
+            ib_high: 0.0,
+            ib_low: 0.0,
+            ib_range: 0.0,
+            ib_mid: 0.0,
+            or_high: 0.0,
+            or_low: 0.0,
+            day_type: String::new(),
+            profile_shape: String::new(),
+            balance_state: String::new(),
+            total_volume: 0.0,
+            tick_count: 0,
+            session_delta: 0.0,
+            cumulative_delta: 0.0,
+            dnp,
+            dnva_high,
+            dnva_low,
+            vwap_close: 0.0,
+            signal_count: 0,
+            single_prints_direction: String::new(),
+            excess_high: false,
+            excess_low: false,
+            poor_high: false,
+            poor_low: false,
+            rvol_ratio: 0.0,
+            close_vs_ib_mid: "n/a".to_string(),
+            close_vs_vwap: "n/a".to_string(),
+            close_vs_poc: "n/a".to_string(),
+            snapshot_json: None,
+        }
+    }
+
     fn test_server() -> TheDeskMcp {
         let db = Database::open(":memory:").expect("db");
         TheDeskMcp::new(db, PipelineEngine::new(), ":memory:".into())
@@ -4679,5 +4898,93 @@ mod tests {
 
         let rendered = format!("{result:?}");
         assert!(rendered.contains("bid_support"));
+    }
+
+    #[tokio::test]
+    async fn get_key_levels_rth_uses_same_day_asia_and_london_dnva() {
+        let server = test_server();
+        {
+            let db = server.db.lock().expect("db lock");
+            db.upsert_session_summary(&summary_row(
+                "2026-03-05",
+                "Asia",
+                21010.0,
+                20990.0,
+                21000.0,
+            ))
+            .expect("insert asia");
+            db.upsert_session_summary(&summary_row(
+                "2026-03-05",
+                "London",
+                21025.0,
+                21005.0,
+                21015.0,
+            ))
+            .expect("insert london");
+            db.upsert_feature_state(
+                1_000.0,
+                &serde_json::json!({
+                    "sessionType": "RTH",
+                    "sessionSegment": "None",
+                    "tradingDay": "2026-03-05"
+                }),
+            )
+            .expect("seed feature state");
+        }
+
+        let result = server.get_key_levels().await.expect("tool call");
+        let rendered = format!("{result:?}");
+        assert!(rendered.contains("priorAsiaDnvaHigh"));
+        assert!(rendered.contains("21010.0"));
+        assert!(rendered.contains("priorLondonDnvaHigh"));
+        assert!(rendered.contains("21025.0"));
+    }
+
+    #[tokio::test]
+    async fn get_key_levels_globex_london_uses_same_day_asia_and_prior_london() {
+        let server = test_server();
+        {
+            let db = server.db.lock().expect("db lock");
+            db.upsert_session_summary(&summary_row(
+                "2026-03-05",
+                "Asia",
+                21030.0,
+                21010.0,
+                21020.0,
+            ))
+            .expect("insert asia same day");
+            db.upsert_session_summary(&summary_row(
+                "2026-03-04",
+                "London",
+                21040.0,
+                21020.0,
+                21030.0,
+            ))
+            .expect("insert london prior");
+            db.upsert_session_summary(&summary_row(
+                "2026-03-05",
+                "London",
+                21999.0,
+                21990.0,
+                21994.5,
+            ))
+            .expect("insert london same day");
+            db.upsert_feature_state(
+                1_000.0,
+                &serde_json::json!({
+                    "sessionType": "Globex",
+                    "sessionSegment": "London",
+                    "tradingDay": "2026-03-05"
+                }),
+            )
+            .expect("seed feature state");
+        }
+
+        let result = server.get_key_levels().await.expect("tool call");
+        let rendered = format!("{result:?}");
+        assert!(rendered.contains("priorAsiaDnvaHigh"));
+        assert!(rendered.contains("21030.0"));
+        assert!(rendered.contains("priorLondonDnvaHigh"));
+        assert!(rendered.contains("21040.0"));
     }
 }

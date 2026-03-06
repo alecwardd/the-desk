@@ -596,6 +596,18 @@ impl Database {
         if version < 11 {
             self.migrate_v11()?;
         }
+        if version < 12 {
+            self.migrate_v12()?;
+        }
+        if version < 13 {
+            self.migrate_v13()?;
+        }
+        if version < 14 {
+            self.migrate_v14()?;
+        }
+        if version < 15 {
+            self.migrate_v15()?;
+        }
 
         Ok(())
     }
@@ -1255,6 +1267,109 @@ impl Database {
         let _ = self
             .conn
             .execute_batch("ALTER TABLE signal_outcomes ADD COLUMN rvol_bucket_at_fire INTEGER;");
+        Ok(())
+    }
+
+    /// V12: session_summaries composite primary key (session_date, session_type)
+    /// to support Asia, London, and RTH sessions per date.
+    fn migrate_v12(&self) -> Result<(), DbError> {
+        self.conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS session_summaries_new (
+              session_date TEXT NOT NULL,
+              session_type TEXT NOT NULL,
+              open_price REAL, high REAL, low REAL, close REAL,
+              poc REAL, vah REAL, val REAL,
+              ib_high REAL, ib_low REAL, ib_range REAL,
+              ib_mid REAL,
+              or_high REAL, or_low REAL,
+              day_type TEXT,
+              total_volume REAL, tick_count INTEGER,
+              session_delta REAL, cumulative_delta REAL,
+              dnp REAL, dnva_high REAL, dnva_low REAL,
+              vwap_close REAL,
+              signal_count INTEGER DEFAULT 0,
+              single_prints_direction TEXT,
+              excess_high INTEGER DEFAULT 0, excess_low INTEGER DEFAULT 0,
+              poor_high INTEGER DEFAULT 0, poor_low INTEGER DEFAULT 0,
+              rvol_ratio REAL,
+              close_vs_ib_mid TEXT,
+              close_vs_vwap TEXT,
+              close_vs_poc TEXT,
+              snapshot_json TEXT,
+              profile_shape TEXT NOT NULL DEFAULT '',
+              balance_state TEXT NOT NULL DEFAULT '',
+              PRIMARY KEY (session_date, session_type)
+            );
+            INSERT INTO session_summaries_new SELECT
+              session_date,
+              COALESCE(NULLIF(TRIM(session_type), ''), 'RTH'),
+              open_price, high, low, close,
+              poc, vah, val,
+              ib_high, ib_low, ib_range, ib_mid,
+              or_high, or_low,
+              day_type,
+              total_volume, tick_count,
+              session_delta, cumulative_delta,
+              dnp, dnva_high, dnva_low,
+              vwap_close,
+              signal_count,
+              single_prints_direction,
+              excess_high, excess_low, poor_high, poor_low,
+              rvol_ratio,
+              close_vs_ib_mid, close_vs_vwap, close_vs_poc,
+              snapshot_json,
+              profile_shape,
+              balance_state
+            FROM session_summaries;
+            DROP TABLE session_summaries;
+            ALTER TABLE session_summaries_new RENAME TO session_summaries;
+            UPDATE schema_version SET version = 12;
+            ",
+        )?;
+        Ok(())
+    }
+
+    /// V13: prior_day_levels DNVA columns for RTH.
+    fn migrate_v13(&self) -> Result<(), DbError> {
+        let columns = [("dnva_high", "REAL"), ("dnva_low", "REAL"), ("dnp", "REAL")];
+        for (col, def) in &columns {
+            let sql = format!("ALTER TABLE prior_day_levels ADD COLUMN {col} {def}");
+            let _ = self.conn.execute(&sql, []);
+        }
+        self.conn
+            .execute_batch("UPDATE schema_version SET version = 13;")?;
+        Ok(())
+    }
+
+    /// V14: untested_dnps table for DNPs that were not revisited during a session.
+    fn migrate_v14(&self) -> Result<(), DbError> {
+        self.conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS untested_dnps (
+              session_date TEXT NOT NULL,
+              session_type TEXT NOT NULL,
+              dnp REAL NOT NULL,
+              created_at INTEGER NOT NULL,
+              PRIMARY KEY (session_date, session_type)
+            );
+            CREATE INDEX IF NOT EXISTS idx_untested_dnps_created
+              ON untested_dnps (created_at DESC);
+            UPDATE schema_version SET version = 14;
+            ",
+        )?;
+        Ok(())
+    }
+
+    /// V15: index untested DNP values to speed up range-touch cleanup.
+    fn migrate_v15(&self) -> Result<(), DbError> {
+        self.conn.execute_batch(
+            "
+            CREATE INDEX IF NOT EXISTS idx_untested_dnps_dnp
+              ON untested_dnps (dnp);
+            UPDATE schema_version SET version = 15;
+            ",
+        )?;
         Ok(())
     }
 
@@ -1945,6 +2060,75 @@ impl Database {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_prior_day_full_with_dnva(
+        &self,
+        date: &str,
+        high: f64,
+        low: f64,
+        close: f64,
+        va_high: f64,
+        va_low: f64,
+        poc: f64,
+        dnva_high: Option<f64>,
+        dnva_low: Option<f64>,
+        dnp: Option<f64>,
+    ) -> Result<(), DbError> {
+        self.conn.execute(
+            "INSERT INTO prior_day_levels (date, high, low, close, va_high, va_low, poc, dnva_high, dnva_low, dnp)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(date) DO UPDATE SET
+               high=excluded.high, low=excluded.low, close=excluded.close,
+               va_high=excluded.va_high, va_low=excluded.va_low, poc=excluded.poc,
+               dnva_high=excluded.dnva_high, dnva_low=excluded.dnva_low, dnp=excluded.dnp",
+            params![
+                date, high, low, close, va_high, va_low, poc,
+                dnva_high, dnva_low, dnp,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Load prior session DNVA (dnva_high, dnva_low, dnp) for a session type.
+    /// Returns the most recent completed session of that type before the given date.
+    pub fn load_prior_session_dnva(
+        &self,
+        session_type: &str,
+        before_date: &str,
+    ) -> Result<Option<(f64, f64, f64)>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT dnva_high, dnva_low, dnp FROM session_summaries
+             WHERE session_type = ?1 AND session_date < ?2
+             AND dnva_high IS NOT NULL AND dnva_low IS NOT NULL AND dnp IS NOT NULL
+             ORDER BY session_date DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![session_type, before_date])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some((row.get(0)?, row.get(1)?, row.get(2)?)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Load session DNVA for a specific session_date and session_type.
+    pub fn load_session_dnva(
+        &self,
+        session_date: &str,
+        session_type: &str,
+    ) -> Result<Option<(f64, f64, f64)>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT dnva_high, dnva_low, dnp FROM session_summaries
+             WHERE session_date = ?1 AND session_type = ?2
+             AND dnva_high IS NOT NULL AND dnva_low IS NOT NULL AND dnp IS NOT NULL",
+        )?;
+        let mut rows = stmt.query(params![session_date, session_type])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some((row.get(0)?, row.get(1)?, row.get(2)?)))
+        } else {
+            Ok(None)
+        }
+    }
+
     pub fn load_prior_day(&self, before_date: &str) -> Result<Option<(f64, f64, f64)>, DbError> {
         let mut stmt = self.conn.prepare(
             "SELECT high, low, close FROM prior_day_levels WHERE date < ?1 ORDER BY date DESC LIMIT 1",
@@ -1957,14 +2141,27 @@ impl Database {
         }
     }
 
-    /// Load prior-day levels including VA/POC if available.
+    /// Load prior-day levels including VA/POC and DNVA if available.
     #[allow(clippy::type_complexity)]
     pub fn load_prior_day_full(
         &self,
         before_date: &str,
-    ) -> Result<Option<(f64, f64, f64, Option<f64>, Option<f64>, Option<f64>)>, DbError> {
+    ) -> Result<
+        Option<(
+            f64,
+            f64,
+            f64,
+            Option<f64>,
+            Option<f64>,
+            Option<f64>,
+            Option<f64>,
+            Option<f64>,
+            Option<f64>,
+        )>,
+        DbError,
+    > {
         let mut stmt = self.conn.prepare(
-            "SELECT high, low, close, va_high, va_low, poc
+            "SELECT high, low, close, va_high, va_low, poc, dnva_high, dnva_low, dnp
              FROM prior_day_levels WHERE date < ?1 ORDER BY date DESC LIMIT 1",
         )?;
         let mut rows = stmt.query(params![before_date])?;
@@ -1976,6 +2173,9 @@ impl Database {
                 row.get(3)?,
                 row.get(4)?,
                 row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+                row.get(8)?,
             )))
         } else {
             Ok(None)
@@ -2974,7 +3174,7 @@ impl Database {
               excess_high, excess_low, poor_high, poor_low, rvol_ratio,
               close_vs_ib_mid, close_vs_vwap, close_vs_poc, snapshot_json)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35,?36,?37)
-             ON CONFLICT(session_date) DO UPDATE SET
+             ON CONFLICT(session_date, session_type) DO UPDATE SET
                session_type=excluded.session_type, open_price=excluded.open_price,
                high=excluded.high, low=excluded.low, close=excluded.close,
                poc=excluded.poc, vah=excluded.vah, val=excluded.val,
@@ -3007,14 +3207,102 @@ impl Database {
         Ok(())
     }
 
-    /// Check if a session summary exists for a given date.
+    /// Check if a session summary exists for a given date (RTH only, for backward compat).
     pub fn has_session_summary(&self, session_date: &str) -> Result<bool, DbError> {
+        self.has_session_summary_for(session_date, "RTH")
+    }
+
+    /// Check if a session summary exists for a given date and session type.
+    pub fn has_session_summary_for(
+        &self,
+        session_date: &str,
+        session_type: &str,
+    ) -> Result<bool, DbError> {
         let count: i64 = self.conn.query_row(
-            "SELECT COUNT(1) FROM session_summaries WHERE session_date = ?1",
-            params![session_date],
+            "SELECT COUNT(1) FROM session_summaries WHERE session_date = ?1 AND session_type = ?2",
+            params![session_date, session_type],
             |r| r.get(0),
         )?;
         Ok(count > 0)
+    }
+
+    /// Save an untested DNP (price did not revisit DNP ± tolerance during the session).
+    pub fn save_untested_dnp(
+        &self,
+        session_date: &str,
+        session_type: &str,
+        dnp: f64,
+    ) -> Result<(), DbError> {
+        let created_at = chrono::Utc::now().timestamp_millis();
+        self.conn.execute(
+            "INSERT OR REPLACE INTO untested_dnps (session_date, session_type, dnp, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![session_date, session_type, dnp, created_at],
+        )?;
+        Ok(())
+    }
+
+    /// Remove untested DNP record when DNP was tested during session (e.g. on reprocess).
+    pub fn delete_untested_dnp_for_session(
+        &self,
+        session_date: &str,
+        session_type: &str,
+    ) -> Result<(), DbError> {
+        self.conn.execute(
+            "DELETE FROM untested_dnps WHERE session_date = ?1 AND session_type = ?2",
+            params![session_date, session_type],
+        )?;
+        Ok(())
+    }
+
+    /// Remove untested DNP rows that have been touched by a completed session range.
+    pub fn delete_untested_dnps_touched_by_range(
+        &self,
+        low: f64,
+        high: f64,
+        tolerance: f64,
+        exclude_current_session: Option<(&str, &str)>,
+    ) -> Result<usize, DbError> {
+        if low <= 0.0 && high <= 0.0 {
+            return Ok(0);
+        }
+        let tol = tolerance.max(0.0);
+        let lo = low.min(high) - tol;
+        let hi = low.max(high) + tol;
+        let rows = if let Some((session_date, session_type)) = exclude_current_session {
+            self.conn.execute(
+                "DELETE FROM untested_dnps
+                 WHERE dnp BETWEEN ?1 AND ?2
+                 AND NOT (session_date = ?3 AND session_type = ?4)",
+                params![lo, hi, session_date, session_type],
+            )?
+        } else {
+            self.conn.execute(
+                "DELETE FROM untested_dnps WHERE dnp BETWEEN ?1 AND ?2",
+                params![lo, hi],
+            )?
+        };
+        Ok(rows)
+    }
+
+    /// Load recent untested DNPs, most recent first. Used for key levels.
+    pub fn load_untested_dnps(&self, limit: usize) -> Result<Vec<(String, String, f64)>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT session_date, session_type, dnp FROM untested_dnps
+             ORDER BY created_at DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, f64>(2)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(DbError::from)?);
+        }
+        Ok(out)
     }
 
     /// Remove backfill-derived research rows for a session before force reprocess.
@@ -3041,6 +3329,10 @@ impl Database {
         )?;
         tx.execute(
             "DELETE FROM session_volume_curves WHERE session_date = ?1",
+            params![session_date],
+        )?;
+        tx.execute(
+            "DELETE FROM untested_dnps WHERE session_date = ?1",
             params![session_date],
         )?;
         for source in sources {
@@ -3994,7 +4286,7 @@ impl Database {
         events: &[MarketEvent],
         replay_signals: &[ReplaySignalRecord],
         signal_outcomes: &[SignalOutcome],
-        prior_day: (f64, f64, f64, f64, f64, f64),
+        prior_day: (f64, f64, f64, f64, f64, f64, f64, f64, f64),
     ) -> Result<(), DbError> {
         self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
         let result = (|| -> Result<(), DbError> {
@@ -4035,7 +4327,7 @@ impl Database {
             for outcome in signal_outcomes {
                 self.insert_signal_outcome(outcome)?;
             }
-            self.save_prior_day_full(
+            self.save_prior_day_full_with_dnva(
                 session_date,
                 prior_day.0,
                 prior_day.1,
@@ -4043,7 +4335,29 @@ impl Database {
                 prior_day.3,
                 prior_day.4,
                 prior_day.5,
+                Some(prior_day.6),
+                Some(prior_day.7),
+                Some(prior_day.8),
             )?;
+            // Track untested DNPs: price did not revisit DNP ± 2 NQ ticks (0.5 pts).
+            const DNP_TOLERANCE: f64 = 0.5;
+            if summary.low > 0.0 || summary.high > 0.0 {
+                self.delete_untested_dnps_touched_by_range(
+                    summary.low,
+                    summary.high,
+                    DNP_TOLERANCE,
+                    Some((session_date, &summary.session_type)),
+                )?;
+            }
+            if summary.dnp > 0.0 {
+                let dnp_tested = (summary.low <= summary.dnp + DNP_TOLERANCE)
+                    && (summary.high >= summary.dnp - DNP_TOLERANCE);
+                if dnp_tested {
+                    self.delete_untested_dnp_for_session(session_date, &summary.session_type)?;
+                } else {
+                    self.save_untested_dnp(session_date, &summary.session_type, summary.dnp)?;
+                }
+            }
             Ok(())
         })();
 
@@ -4391,6 +4705,87 @@ mod tests {
         assert_eq!(result.3, Some(21080.0));
         assert_eq!(result.4, Some(20950.0));
         assert_eq!(result.5, Some(21020.0));
+    }
+
+    #[test]
+    fn save_prior_day_full_preserves_existing_dnva_columns() {
+        let db = test_db();
+        db.save_prior_day_full_with_dnva(
+            "2026-02-24",
+            21100.0,
+            20900.0,
+            21050.0,
+            21080.0,
+            20950.0,
+            21020.0,
+            Some(21070.0),
+            Some(20970.0),
+            Some(21020.0),
+        )
+        .expect("save full dnva");
+        db.save_prior_day_full(
+            "2026-02-24",
+            21110.0,
+            20910.0,
+            21060.0,
+            21090.0,
+            20960.0,
+            21030.0,
+        )
+        .expect("save legacy");
+
+        let result = db
+            .load_prior_day_full("2026-02-25")
+            .expect("load")
+            .expect("exists");
+        assert_eq!(result.0, 21110.0);
+        assert_eq!(result.1, 20910.0);
+        assert_eq!(result.2, 21060.0);
+        assert_eq!(result.6, Some(21070.0));
+        assert_eq!(result.7, Some(20970.0));
+        assert_eq!(result.8, Some(21020.0));
+    }
+
+    #[test]
+    fn untested_dnp_insert_delete_for_session_roundtrip() {
+        let db = test_db();
+        db.save_untested_dnp("2026-03-04", "RTH", 21000.0)
+            .expect("insert");
+        let entries = db.load_untested_dnps(10).expect("load");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "2026-03-04");
+        assert_eq!(entries[0].1, "RTH");
+        assert_eq!(entries[0].2, 21000.0);
+
+        db.delete_untested_dnp_for_session("2026-03-04", "RTH")
+            .expect("delete");
+        let entries = db.load_untested_dnps(10).expect("load after delete");
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn delete_untested_dnps_touched_by_range_removes_matching_levels() {
+        let db = test_db();
+        db.save_untested_dnp("2026-03-01", "Asia", 20990.0)
+            .expect("insert a");
+        db.save_untested_dnp("2026-03-02", "London", 21010.0)
+            .expect("insert b");
+        db.save_untested_dnp("2026-03-03", "RTH", 21025.0)
+            .expect("insert c");
+
+        let removed = db
+            .delete_untested_dnps_touched_by_range(21005.0, 21015.0, 0.5, None)
+            .expect("delete by range");
+        assert_eq!(removed, 1);
+
+        let mut dnps: Vec<f64> = db
+            .load_untested_dnps(10)
+            .expect("load")
+            .into_iter()
+            .map(|(_, _, dnp)| dnp)
+            .collect();
+        dnps.sort_by(|a, b| a.partial_cmp(b).expect("cmp"));
+        assert_eq!(dnps, vec![20990.0, 21025.0]);
     }
 
     #[test]

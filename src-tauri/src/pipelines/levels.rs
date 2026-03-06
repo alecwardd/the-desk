@@ -74,6 +74,12 @@ pub struct LevelsPipeline {
     pub prior_va_low: f64,
     /// Previous session point of control.
     pub prior_poc: f64,
+    /// Prior RTH session DNVA high (from prior_day_levels).
+    pub prior_dnva_high: f64,
+    /// Prior RTH session DNVA low (from prior_day_levels).
+    pub prior_dnva_low: f64,
+    /// Prior RTH session DNP (from prior_day_levels).
+    pub prior_dnp: f64,
     /// Overnight (Globex) session high.
     pub overnight_high: f64,
     /// Overnight (Globex) session low.
@@ -109,6 +115,9 @@ impl Default for LevelsPipeline {
             prior_va_high: 0.0,
             prior_va_low: 0.0,
             prior_poc: 0.0,
+            prior_dnva_high: 0.0,
+            prior_dnva_low: 0.0,
+            prior_dnp: 0.0,
             overnight_high: 0.0,
             overnight_low: 0.0,
             session_high: 0.0,
@@ -170,6 +179,13 @@ impl LevelsPipeline {
         self.prior_va_high = va_high;
         self.prior_va_low = va_low;
         self.prior_poc = poc;
+    }
+
+    /// Set prior RTH session DNVA from stored data.
+    pub fn set_prior_dnva(&mut self, dnva_high: f64, dnva_low: f64, dnp: f64) {
+        self.prior_dnva_high = dnva_high;
+        self.prior_dnva_low = dnva_low;
+        self.prior_dnp = dnp;
     }
 
     /// Apply one trade update and maintain key levels.

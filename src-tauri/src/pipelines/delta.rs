@@ -66,57 +66,47 @@ impl DeltaPipeline {
         (high + low) / 2.0
     }
 
+    /// DNVA bounds via cumulative percentile: the range containing the middle 70%
+    /// of absolute delta when sweeping from lowest to highest price.
+    /// Returns (dnva_high, dnva_low).
     fn dnva_bounds(&self) -> (f64, f64) {
         if self.delta_by_price.is_empty() {
             return (0.0, 0.0);
         }
         let total_abs: f64 = self.delta_by_price.values().map(|v| v.abs()).sum::<f64>();
-        let target = total_abs * 0.7;
+        if total_abs <= 0.0 {
+            return (0.0, 0.0);
+        }
+        let target_low = total_abs * 0.15; // 15th percentile
+        let target_high = total_abs * 0.85; // 85th percentile
+
         let mut prices: Vec<i64> = self.delta_by_price.keys().copied().collect();
         prices.sort();
-        let mut center = prices[0];
-        let mut best_abs = 0.0;
-        for (price, delta) in &self.delta_by_price {
-            let abs_delta = delta.abs();
-            if abs_delta > best_abs {
-                best_abs = abs_delta;
-                center = *price;
-            }
-        }
-        let mut low = center;
-        let mut high = center;
-        let mut covered = self
-            .delta_by_price
-            .get(&center)
-            .copied()
-            .unwrap_or(0.0)
-            .abs();
-        while covered < target {
-            let below = self
+
+        let mut cumulative = 0.0;
+        let mut low_price: Option<i64> = None;
+        let mut high_price: Option<i64> = None;
+
+        for &price in &prices {
+            let abs_d = self
                 .delta_by_price
-                .get(&(low - 1))
+                .get(&price)
                 .copied()
                 .unwrap_or(0.0)
                 .abs();
-            let above = self
-                .delta_by_price
-                .get(&(high + 1))
-                .copied()
-                .unwrap_or(0.0)
-                .abs();
-            if above >= below {
-                high += 1;
-                covered += above;
-            } else {
-                low -= 1;
-                covered += below;
+            cumulative += abs_d;
+            if low_price.is_none() && cumulative >= target_low {
+                low_price = Some(price);
             }
-            if below == 0.0 && above == 0.0 {
+            if high_price.is_none() && cumulative >= target_high {
+                high_price = Some(price);
                 break;
             }
         }
-        let low = low as f64 * self.tick_size;
-        let high = high as f64 * self.tick_size;
+
+        let last = *prices.last().unwrap();
+        let low = (low_price.unwrap_or(last) as f64) * self.tick_size;
+        let high = (high_price.unwrap_or(last) as f64) * self.tick_size;
         (high, low)
     }
 
@@ -161,5 +151,57 @@ mod tests {
         pipeline.reset();
         assert_eq!(pipeline.session_delta(), 0.0);
         assert_eq!(pipeline.dnp(), 0.0);
+    }
+
+    #[test]
+    fn percentile_dnva_single_price() {
+        let mut p = DeltaPipeline::new(0.25);
+        p.add_trade(21000.0, 100.0, true);
+        assert_eq!(p.dnva_low(), 21000.0);
+        assert_eq!(p.dnva_high(), 21000.0);
+        assert_eq!(p.dnp(), 21000.0);
+    }
+
+    #[test]
+    fn percentile_dnva_skewed_low() {
+        // Most delta at low prices: 21000=80, 21000.25=10, 21000.5=5, 21000.75=5
+        // Total abs=100. 15%=15 (hit at 21000, cum=80), 85%=85 (hit at 21000.25, cum=90)
+        let mut p = DeltaPipeline::new(0.25);
+        p.add_trade(21000.0, 80.0, true);
+        p.add_trade(21000.25, 10.0, false);
+        p.add_trade(21000.5, 5.0, true);
+        p.add_trade(21000.75, 5.0, false);
+        assert_eq!(p.dnva_low(), 21000.0);
+        assert_eq!(p.dnva_high(), 21000.25);
+        assert_eq!(p.dnp(), 21000.125);
+    }
+
+    #[test]
+    fn percentile_dnva_skewed_high() {
+        // Most delta at high prices: 21000=5, 21000.25=5, 21000.5=10, 21000.75=80
+        // Cumulative: 5, 10, 20, 100. 15%=15 (hit at 21000.5, cum=20), 85%=85 (hit at 21000.75, cum=100)
+        let mut p = DeltaPipeline::new(0.25);
+        p.add_trade(21000.0, 5.0, true);
+        p.add_trade(21000.25, 5.0, false);
+        p.add_trade(21000.5, 10.0, true);
+        p.add_trade(21000.75, 80.0, false);
+        assert_eq!(p.dnva_low(), 21000.5);
+        assert_eq!(p.dnva_high(), 21000.75);
+        assert_eq!(p.dnp(), 21000.625);
+    }
+
+    #[test]
+    fn percentile_dnva_spans_middle_70() {
+        // 10 at each of 5 levels: 21000, 21000.25, 21000.5, 21000.75, 21001
+        // Total=50. 15%=7.5 (hit at 21000, cum=10), 85%=42.5 (hit at 21001, cum=50)
+        let mut p = DeltaPipeline::new(0.25);
+        p.add_trade(21000.0, 10.0, true);
+        p.add_trade(21000.25, 10.0, false);
+        p.add_trade(21000.5, 10.0, true);
+        p.add_trade(21000.75, 10.0, false);
+        p.add_trade(21001.0, 10.0, true);
+        assert_eq!(p.dnva_low(), 21000.0);
+        assert_eq!(p.dnva_high(), 21001.0);
+        assert_eq!(p.dnp(), 21000.5);
     }
 }

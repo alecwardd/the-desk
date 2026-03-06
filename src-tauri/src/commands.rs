@@ -136,12 +136,17 @@ pub async fn start_session(state: State<'_, AppState>) -> Result<String, String>
 
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let db = state.db.lock().await;
-    if let Ok(Some((high, low, close, va_h, va_l, p))) = db.load_prior_day_full(&today) {
+    if let Ok(Some((high, low, close, va_h, va_l, p, dnva_h, dnva_l, dnp))) =
+        db.load_prior_day_full(&today)
+    {
         drop(db);
         let mut pipelines = state.pipelines.lock().await;
         pipelines.levels.set_prior_day(high, low, close);
         if let (Some(vh), Some(vl), Some(pc)) = (va_h, va_l, p) {
             pipelines.levels.set_prior_profile(vh, vl, pc);
+        }
+        if let (Some(dh), Some(dl), Some(dp)) = (dnva_h, dnva_l, dnp) {
+            pipelines.levels.set_prior_dnva(dh, dl, dp);
         }
         drop(pipelines);
         let db = state.db.lock().await;
@@ -182,9 +187,7 @@ pub async fn stop_session(state: State<'_, AppState>) -> Result<(), String> {
     let session_id = state.session_id.lock().await.take();
 
     let pipelines = state.pipelines.lock().await;
-    let session_high = pipelines.levels.session_high;
-    let session_low = pipelines.levels.session_low;
-    let last_price = pipelines.levels.last_price;
+    let session_end = pipelines.session_end_state();
     drop(pipelines);
 
     let db = state.db.lock().await;
@@ -196,21 +199,19 @@ pub async fn stop_session(state: State<'_, AppState>) -> Result<(), String> {
     })
     .map_err(|e| e.to_string())?;
 
-    if session_high > 0.0 {
+    if session_end.high > 0.0 {
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-        let pipelines = state.pipelines.lock().await;
-        let va_high = pipelines.tpo.va_high();
-        let va_low = pipelines.tpo.va_low();
-        let poc = pipelines.tpo.poc();
-        drop(pipelines);
-        db.save_prior_day_full(
+        db.save_prior_day_full_with_dnva(
             &today,
-            session_high,
-            session_low,
-            last_price,
-            va_high,
-            va_low,
-            poc,
+            session_end.high,
+            session_end.low,
+            session_end.close,
+            session_end.va_high,
+            session_end.va_low,
+            session_end.poc,
+            Some(session_end.dnva_high),
+            Some(session_end.dnva_low),
+            Some(session_end.dnp),
         )
         .map_err(|e| e.to_string())?;
     }

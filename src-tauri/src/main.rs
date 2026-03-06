@@ -133,7 +133,7 @@ async fn processing_loop(handle: AppHandle, mut rx: broadcast::Receiver<FeedEven
                         }
                         if current_session_type == SessionType::Rth {
                             let date = session_date_from_timestamp_ms(timestamp);
-                            let _ = state.db.lock().await.save_prior_day_full(
+                            let _ = state.db.lock().await.save_prior_day_full_with_dnva(
                                 &date,
                                 end_state.high,
                                 end_state.low,
@@ -141,6 +141,9 @@ async fn processing_loop(handle: AppHandle, mut rx: broadcast::Receiver<FeedEven
                                 end_state.va_high,
                                 end_state.va_low,
                                 end_state.poc,
+                                Some(end_state.dnva_high),
+                                Some(end_state.dnva_low),
+                                Some(end_state.dnp),
                             );
                             pipelines.levels.set_prior_day(
                                 end_state.high,
@@ -151,6 +154,11 @@ async fn processing_loop(handle: AppHandle, mut rx: broadcast::Receiver<FeedEven
                                 end_state.va_high,
                                 end_state.va_low,
                                 end_state.poc,
+                            );
+                            pipelines.levels.set_prior_dnva(
+                                end_state.dnva_high,
+                                end_state.dnva_low,
+                                end_state.dnp,
                             );
                         }
                         pipelines.reset_session_with_type(new_session == SessionType::Globex);
@@ -485,11 +493,29 @@ fn main() {
         pipelines.rvol.load_globex_historical_curve(&curves);
     }
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-    if let Ok(Some((high, low, close, va_h, va_l, poc))) = db.load_prior_day_full(&today) {
+    if let Ok(Some((high, low, close, va_h, va_l, poc, dnva_h, dnva_l, dnp))) =
+        db.load_prior_day_full(&today)
+    {
         pipelines.levels.set_prior_day(high, low, close);
         if let (Some(vh), Some(vl), Some(pc)) = (va_h, va_l, poc) {
             pipelines.levels.set_prior_profile(vh, vl, pc);
         }
+        if let (Some(dh), Some(dl), Some(dp)) = (dnva_h, dnva_l, dnp) {
+            pipelines.levels.set_prior_dnva(dh, dl, dp);
+        }
+    }
+    if let Ok(summaries) = db.list_session_summaries(None, None, None, Some("RTH"), 5) {
+        let prior: Vec<the_desk_backend::pipelines::PriorSessionData> = summaries
+            .into_iter()
+            .filter(|s| s.dnva_high > 0.0 && s.dnva_low > 0.0 && s.dnp > 0.0)
+            .map(|s| the_desk_backend::pipelines::PriorSessionData {
+                final_delta: s.session_delta,
+                dnva_high: s.dnva_high,
+                dnva_low: s.dnva_low,
+                dnp: s.dnp,
+            })
+            .collect();
+        pipelines.session_inventory.load_prior_sessions(prior);
     }
 
     let state = AppState {

@@ -96,6 +96,7 @@ Apply the market-structure-analyst framework:
 - Report initiative/responsive read
 - Note key levels and proximity
 - Include DOM context from `domSummary` in `get_market_snapshot`: liquidity bias, pull rates, near-touch depth ratio
+- For `get_tape_pace`, read `dataQuality`, `isLive`, `eventTimeLagMs`, and `isValid*` first. Prefer `rollingPacePercentile` for intraday participation context, use `pacePercentile` as the session-relative read, and treat both as `0.0-1.0` scales. Use `acceleration` as the smoothed pace-change field, not `rawAcceleration`, unless debugging.
 
 Risk output: **Brief footer only** (session state summary).
 
@@ -138,6 +139,9 @@ If setup conditions are met:
 - Check heat via `get_account_state` open positions
 
 Apply the playbook-evaluator framework for condition status, then risk-coach framework for sizing.
+
+Tape-pace note for setup routing:
+- If `get_tape_pace` returns invalid short windows or `dataQuality != "LIVE"`, do not over-weight thin-tape conclusions in setup quality. Report the degraded tape context explicitly.
 
 Risk output: **Full risk analysis** (sizing, limits, heat, circuit breakers, day-type note).
 
@@ -207,6 +211,11 @@ Then synthesize:
 - Key levels in play with proximity
 - Flow regime and participation quality
 - Risk state and session parameters
+
+Tape participation synthesis:
+- Prefer `rollingPacePercentile` to answer "is pace high for this part of the session?"
+- Use `regimeTicksPerSec30mEma` / `regimeVolumePerSec30mEma` to frame whether the whole session is slow/fast.
+- If the tape tool is `STALE` or `PARTIAL`, say so in the response metadata or body instead of presenting it as a live read.
 
 Risk output: **Full session-start protocol.**
 
@@ -287,6 +296,9 @@ Before the risk footer, include:
 - `Session Scope: [RTH / Globex / Asia / London / Combined]`
 - `Data Quality: [ok / warning / failed]` with an evidence key
 - `Confidence: [high / medium / low]` based on freshness, sample size, and tool completeness
+
+When `get_tape_pace` is materially used in the answer:
+- Fold tape `dataQuality` / `isLive` / invalid-window caveats into the `Data Quality` and `Confidence` lines.
 
 ### When specialist reads conflict:
 State the conflict explicitly. Never resolve it — present both sides:

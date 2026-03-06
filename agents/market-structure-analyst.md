@@ -104,6 +104,7 @@ Cross-agent boundaries:
   - Footprint quality at structural levels (absorption, imbalances, large trade clustering)
   - Flow confirmation or contradiction of structural reads
   - Trade size participation at levels being tested
+  - Tape pace interpretation using the hardened contract (`rollingPacePercentile`, `dataQuality`, `isValid*`, regime EMA, smoothed `acceleration`)
   - When this agent's initiative/responsive read (step 3) shows mixed signals or divergence, recommend consulting orderflow-analyst for the flow-based read
   - When flagging a mixed-context environment, note that orderflow-analyst can provide flow quality to help disambiguate
 

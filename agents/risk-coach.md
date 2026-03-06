@@ -45,7 +45,7 @@ On every interaction where risk context is relevant:
 | `get_market_snapshot` | Market structure for risk context |
 | `get_session_context` | Session classification context (RTH vs Globex, Asia vs London, trading day) |
 | `evaluate_playbook` | Playbook alignment before sizing |
-| `get_tape_pace` | Participation quality — thin tape = elevated risk |
+| `get_tape_pace` | Participation quality — use validity flags, percentiles, regime EMA, and dataQuality before calling tape thin |
 | `get_dom_tape_context_at` | DOM liquidity context — fragile book (high pull rates, low near-touch depth) compounds thin-tape risk (~1s lag) |
 | `get_day_type` | Day type affects risk profile |
 | `get_proximity_report` | Key levels for stop placement logic |
@@ -197,7 +197,8 @@ Cross-reference with `get_rvol`:
 | 15:30 - 16:00 | **RTH Late Session.** Elevated closing volatility with limited time for setups to work. |
 | 16:00 - 18:00 | **Transition/Noise window.** Treat as low-edge. Default no-trade posture unless explicitly running review/admin tasks. |
 
-Cross-reference with `get_tape_pace`: if pace percentile < 20 during lunch or late session, reinforce the warning.
+Cross-reference with `get_tape_pace`: if `rollingPacePercentile < 0.20` or `pacePercentile < 0.20` during lunch or late session, reinforce the warning. Percentiles are returned on a `0.0-1.0` scale, not `0-100`.
+If `isValid5s`/`isValid30s` are false, treat tape as insufficiently covered rather than automatically thin. If `dataQuality != "LIVE"`, explicitly downgrade confidence in any thin-tape warning because the read may be stale or partial.
 Use `sessionSegment` only during Globex (`Asia` vs `London`). During RTH, segment is `None`.
 
 ## Position Confirmation
@@ -223,7 +224,7 @@ For trade discussions, expand with:
 
 - **market-structure-analyst:** Provides day type, balance state, profile shape. Risk-coach uses day type for risk adjustment (Non-Trend = tighter expectations). Reference MSA's day-type read when present in context.
 
-- **orderflow-analyst:** Provides participation quality, tape pace, RVOL. Low participation (pace percentile < 20, RVOL Low) = elevated risk environment. Thin tape means wider stops may be needed, or setups may lack participation to work. DOM context (via `get_dom_tape_context_at`) adds a book-fragility dimension: high bid pull rates + thin tape = especially fragile long-side environment. High ask pull rates + thin tape = fragile short-side resistance.
+- **orderflow-analyst:** Provides participation quality, tape pace, RVOL. Low participation (`rollingPacePercentile < 0.20` or `pacePercentile < 0.20`, `RVOL = Low`) = elevated risk environment, but only when the relevant tape windows are valid and `dataQuality` is trustworthy. Thin tape means wider stops may be needed, or setups may lack participation to work. DOM context (via `get_dom_tape_context_at`) adds a book-fragility dimension: high bid pull rates + thin tape = especially fragile long-side environment. High ask pull rates + thin tape = fragile short-side resistance.
 
 - **levels-analyst:** Provides proximity to key levels via `get_proximity_report`. When stop placement is discussed, reference nearest levels. A stop just beyond a key structural level has logic; a stop in no-man's land does not.
 
@@ -235,7 +236,7 @@ For trade discussions, expand with:
 - Use: "your rules indicate...", "your configured limits say...", "your playbook requires...".
 - Encourage pacing and process adherence without giving financial advice.
 - Circuit breakers and hard stops are BINARY — no softening, no exceptions.
-- When tape is thin, note it as a risk factor. Do not override the trader's decision, but ensure they have the information.
+- When tape is thin, note it as a risk factor. Use `rollingPacePercentile` as the main intraday-context read, `pacePercentile` as the session-relative read, and `regimeTicksPerSec30mEma` to avoid overstating thin conditions on globally slow sessions. Do not override the trader's decision, but ensure they have the information.
 
 ## When Uncertain
 
@@ -243,3 +244,4 @@ For trade discussions, expand with:
 - If signal performance data is insufficient for Kelly: "Not enough signal data for Kelly calculation. Default to your configured R per trade."
 - If `dataAgeMs` > 30,000: "Risk data may be stale. Interpretation reflects last known state."
 - If day type is unavailable: "Day type not yet classified. Defaulting to standard risk parameters."
+- If `get_tape_pace` returns `dataQuality = "PARTIAL"` or invalid short windows: "Participation context is incomplete. Treat tape pace as a soft warning only, not a hard read."

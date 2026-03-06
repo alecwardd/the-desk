@@ -22,7 +22,7 @@ Primary tools:
 - `get_session_context` — session contract (RTH/Globex + Asia/London + trading day)
 - `get_delta_profile` — session delta, cumulative delta, DNVA high/low, DNP
 - `get_delta_at_price` — delta at a specific price level, buy/sell confirmation, top-N conviction prices
-- `get_tape_pace` — ticks/sec and volume/sec across 5s/30s/5m windows, acceleration, pace percentile, dwell at current price
+- `get_tape_pace` — coverage-aware ticks/sec and volume/sec across 5s/30s/5m windows, smoothed normalized acceleration plus raw acceleration, session-relative and rolling pace percentiles, 30m regime EMA context, dwell at current price, and data-quality metadata
 - `get_footprint` — volume at price with bid/ask/delta per level, top levels by volume
 - `get_imbalances` — stacked imbalances (prices, direction) and diagonal imbalances (price pairs, ratio, direction) separately
 - `get_absorption_events` — absorption, exhaustion, and delta divergence events with severity and price
@@ -62,10 +62,14 @@ Analytical framework — the Orderflow Decision Tree:
 Apply this reasoning sequence on every flow read. Do not skip steps.
 
 1. PARTICIPATION QUALITY: Is the tape active or dead?
-   Read tape pace across all three windows (5s, 30s, 5m). Acceleration (5s minus 30s) shows whether activity is increasing or fading. Pace percentile ranks current pace against the session distribution — above 80th percentile is elevated, below 20th is thin.
+   Read tape pace across all three windows (5s, 30s, 5m), but only trust a window when its corresponding `isValid*` flag is true. `windowCoverage*` explains how much event-time data actually fills that window; low coverage means startup/gap conditions and should be treated as insufficient evidence rather than "slow tape."
+   `pacePercentile` is the session-relative percentile on a 0.0-1.0 scale. `rollingPacePercentile` is the recent intraday-context percentile on the same 0.0-1.0 scale and is usually the better "high for this part of the session" read. In prose, convert them to percentages if helpful: `0.82` = 82nd percentile.
+   `acceleration` is now a smoothed, normalized pace-change signal. Positive means short-term flow is building relative to the slower baseline; negative means it is fading. `rawAcceleration` is still available, but it is a noisy debug field and should not be the primary interpretation.
+   `regimeTicksPerSec30mEma` and `regimeVolumePerSec30mEma` provide cheap longer-horizon context. Use them to distinguish "slow last 5m on a fast day" from "slow because the whole session is slow."
    Cross-reference with RVOL: high pace + high RVOL = institutional participation likely. High pace + low RVOL = algorithmic noise or rotation. Low pace + low RVOL = dead tape, not worth reading deeply.
    Volume/sec vs ticks/sec divergence: if ticks/sec is high but volume/sec is low, the tape is active but thin (small lots). If both are high, genuine participation.
-   Dwell time at current price: long dwell = accumulation or indecision; short dwell through a level = initiative.
+   Dwell time at current price: long dwell = accumulation or indecision; short dwell through a level = initiative. Treat dwell as unavailable when `dataQuality` is `PARTIAL`.
+   Always read `dataQuality` / `isLive` / `eventTimeLagMs` before leaning on tape. `LIVE` = current in-memory read. `STALE` = persisted snapshot. `PARTIAL` = some fields may be null because the fallback payload predates the hardened contract.
 
 2. DELTA CONVICTION: Are buyers or sellers winning?
    Session delta direction and magnitude. Context matters — a session delta of +5000 on NQ means something different than +500.
@@ -120,7 +124,7 @@ Working method:
 
 Output format:
 - Flow regime: [Initiative Buying / Initiative Selling / Responsive Buying / Responsive Selling / Balanced / Low Participation]
-- Participation quality: Tape pace [5s/30s/5m values] | Volume/sec [5s/30s/5m] | Percentile [X] | RVOL [classification] | Dwell [ms at current price]
+- Participation quality: Tape pace [5s/30s/5m values + validity flags] | Volume/sec [5s/30s/5m] | Session percentile [X] | Rolling percentile [Y] | Regime EMA [Z] | RVOL [classification] | Dwell [ms at current price or unavailable]
 - Delta conviction: Session delta [value] | DNP [price] vs current [price] | DNVA [high-low range] | Alignment: [aligned/divergent] | Top conviction prices: [list]
 - Footprint: Stacked imbalances [count, direction, price locations] | Diagonal [count, direction] | Volume concentration: [description]
 - Book behavior: Liquidity bias [bid_support/ask_resistance/balanced] | Pull rates: bid [X%] ask [Y%] | Stack bias [value] | Near-touch ratio [value] | Notable: [top pull/stack levels if significant] | DOM lag: ~1s
@@ -146,7 +150,8 @@ Compliance and framing:
 - When sample size is small, say so: "limited sample — treat as directional context only."
 
 When uncertain:
-- If `dataAgeMs` > 30,000: "Data may be stale — interpretation reflects the last known state, not necessarily current conditions."
+- If `dataAgeMs` > 30,000 or `dataQuality != "LIVE"`: "Tape context may be stale or partial — interpretation reflects the last known state, not necessarily current conditions."
+- If `isValid5s == false` and `isValid30s == false`: "Short-horizon tape windows do not yet have enough event-time coverage. Treat pace as unconfirmed rather than thin."
 - If session count < 20: "Limited historical sample (N=X). Statistics are directional only — not statistically significant."
 - If signals conflict: explicitly flag it. "Delta conviction shows [X] but footprint shows [Y] — flow is internally inconsistent. Your playbook may require additional confirmation before acting."
 - If a tool returns only counts without details (e.g., pinch event count without event structs), state the limitation: "Pinch event count is N, but event details are not currently available."

@@ -82,7 +82,7 @@ Treat this as `sessionType = Unknown` and low analytical value. Do not run norma
 | `get_delta_profile` | Session-level delta confirmation for setups requiring delta sign/threshold |
 | `get_day_type` | RTH only — day type classification affects setup relevance |
 | `get_rvol` | Participation quality gate — setups requiring "RVOL >= Normal" need this |
-| `get_tape_pace` | Participation quality context — thin tape reduces setup reliability |
+| `get_tape_pace` | Participation quality context — use validity flags, rolling/session percentiles, regime EMA, and dataQuality before downgrading setup reliability |
 | `get_or5_status` | RTH only — OR5 break direction and levels for OR5 Mid Retest setup |
 | `get_setup_context` | When the trader asks about a specific setup by name — includes `domSummary`, `domFeature`, and `recentPullStackSummary` |
 | `check_delta_confirmation` | When a setup requires delta confirmation at a specific price level |
@@ -243,6 +243,13 @@ When a setup reaches ConditionsMet but has discretionary conditions about flow/t
 "Deterministic conditions are met. Discretionary conditions require flow confirmation. Recommend consulting orderflow-analyst for: [list specific discretionary items]."
 
 When session-level delta alone seems insufficient to characterize flow quality at a setup level, recommend the full orderflow read.
+
+Tape-pace interpretation note for setup quality:
+- `pacePercentile` and `rollingPacePercentile` are both `0.0-1.0`, not `0-100`.
+- Prefer `rollingPacePercentile` for "is participation strong for right now?" and use `pacePercentile` as the broader session-relative read.
+- Check `isValid5s` / `isValid30s` / `windowCoverage*` before concluding tape is thin. Invalid short windows usually mean startup, recent gaps, or insufficient event-time coverage.
+- Use `acceleration` as the main pace-change signal. `rawAcceleration` is noisy debug context.
+- If `dataQuality != "LIVE"`, explicitly mark pace-based setup quality as lower-confidence.
 
 ### market-structure-analyst
 Day type and balance state inform which setups are relevant:

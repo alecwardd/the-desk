@@ -15,7 +15,7 @@ mod tpo;
 mod trade_size;
 mod vwap;
 
-pub use absorption::{AbsorptionEvent, AbsorptionPipeline};
+pub use absorption::{AbsorptionEvent, AbsorptionPipeline, RecentSignalSnapshot};
 pub use day_type::{BalanceState, DayType, DayTypeClassifier, ProfileShape, SinglePrintsDirection};
 pub use delta::DeltaPipeline;
 pub use event_detector::{EventDetector, MarketEvent};
@@ -187,6 +187,30 @@ pub struct MarketState {
     pub imbalance_count: usize,
     /// Number of recent absorption events.
     pub absorption_event_count: usize,
+    /// Number of confirmed absorption events.
+    pub confirmed_absorption_event_count: usize,
+    /// Number of confirmed exhaustion events.
+    pub confirmed_exhaustion_event_count: usize,
+    /// Number of confirmed delta divergence events.
+    pub confirmed_delta_divergence_event_count: usize,
+    /// Whether there is a still-live confirmed absorption near current price.
+    pub has_recent_confirmed_absorption: bool,
+    /// Price of the most recent confirmed absorption considered live for evaluation.
+    pub recent_confirmed_absorption_price: Option<f64>,
+    /// Direction implied by the most recent confirmed absorption.
+    pub recent_confirmed_absorption_direction: Option<String>,
+    /// Age of the most recent confirmed absorption in milliseconds.
+    pub recent_confirmed_absorption_age_ms: Option<f64>,
+    /// Distance from current price to the most recent confirmed absorption, in ticks.
+    pub recent_confirmed_absorption_distance_ticks: Option<f64>,
+    /// Whether there is a still-live confirmed exhaustion signal.
+    pub has_recent_confirmed_exhaustion: bool,
+    /// Price of the most recent confirmed exhaustion considered live for evaluation.
+    pub recent_confirmed_exhaustion_price: Option<f64>,
+    /// Direction implied by the most recent confirmed exhaustion.
+    pub recent_confirmed_exhaustion_direction: Option<String>,
+    /// Age of the most recent confirmed exhaustion in milliseconds.
+    pub recent_confirmed_exhaustion_age_ms: Option<f64>,
     /// Average trade size for current session.
     pub avg_trade_size: f64,
 
@@ -462,8 +486,20 @@ impl PipelineEngine {
         } else {
             0.0
         };
-        self.absorption
-            .on_trade(timestamp_ms, price, volume, move_ticks, is_buy);
+        let tape = self.tape_pace.snapshot(timestamp_ms);
+        let rvol_ratio = self.rvol.rvol_ratio();
+        let key_levels = self.levels.key_levels();
+        self.absorption.on_trade(
+            timestamp_ms,
+            price,
+            volume,
+            move_ticks,
+            is_buy,
+            minute_of_session,
+            tape.pace_percentile,
+            rvol_ratio,
+            &key_levels,
+        );
         self.trade_size.on_trade(volume, price);
         self.or5.on_trade(price, minute_of_session);
         self.rvol.on_trade(volume, minute_of_session);
@@ -553,6 +589,21 @@ impl PipelineEngine {
         } else {
             0
         };
+        let confirmed_absorption_event_count = if include_extended_metrics {
+            self.absorption.count_confirmed("absorption")
+        } else {
+            0
+        };
+        let confirmed_exhaustion_event_count = if include_extended_metrics {
+            self.absorption.count_confirmed("exhaustion")
+        } else {
+            0
+        };
+        let confirmed_delta_divergence_event_count = if include_extended_metrics {
+            self.absorption.count_confirmed("delta_divergence")
+        } else {
+            0
+        };
         let pinch_event_count = if include_extended_metrics {
             self.pinch.recent_events().len()
         } else {
@@ -562,6 +613,18 @@ impl PipelineEngine {
             self.rebid_reoffer.active_zones().len()
         } else {
             0
+        };
+        let recent_absorption = if include_extended_metrics {
+            self.absorption
+                .recent_confirmed_absorption_state(timestamp_ms, self.levels.last_price)
+        } else {
+            RecentSignalSnapshot::default()
+        };
+        let recent_exhaustion = if include_extended_metrics {
+            self.absorption
+                .recent_confirmed_exhaustion_state(timestamp_ms)
+        } else {
+            RecentSignalSnapshot::default()
         };
         MarketState {
             last_price: self.levels.last_price,
@@ -616,6 +679,18 @@ impl PipelineEngine {
             pace_percentile: tape.pace_percentile,
             imbalance_count,
             absorption_event_count,
+            confirmed_absorption_event_count,
+            confirmed_exhaustion_event_count,
+            confirmed_delta_divergence_event_count,
+            has_recent_confirmed_absorption: recent_absorption.is_active,
+            recent_confirmed_absorption_price: recent_absorption.price,
+            recent_confirmed_absorption_direction: recent_absorption.direction,
+            recent_confirmed_absorption_age_ms: recent_absorption.age_ms,
+            recent_confirmed_absorption_distance_ticks: recent_absorption.distance_ticks,
+            has_recent_confirmed_exhaustion: recent_exhaustion.is_active,
+            recent_confirmed_exhaustion_price: recent_exhaustion.price,
+            recent_confirmed_exhaustion_direction: recent_exhaustion.direction,
+            recent_confirmed_exhaustion_age_ms: recent_exhaustion.age_ms,
             avg_trade_size: size.avg_trade_size,
 
             or5_high: self.or5.or5_high(),

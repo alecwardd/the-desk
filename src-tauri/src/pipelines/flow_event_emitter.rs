@@ -30,6 +30,14 @@ impl Default for FlowEventEmitter {
 }
 
 impl FlowEventEmitter {
+    fn absorption_market_event_type(status: &str) -> &'static str {
+        match status {
+            "confirmed" => "absorption_confirmed",
+            "invalidated" => "absorption_invalidated",
+            _ => "absorption_detected",
+        }
+    }
+
     pub fn new() -> Self {
         Self {
             prev_absorption_count: 0,
@@ -153,19 +161,38 @@ impl FlowEventEmitter {
         let count = current.len();
         if count > self.prev_absorption_count {
             for evt in &current[self.prev_absorption_count..] {
-                let event_key = format!("absorption_detected_{}", discretize_price(evt.price));
+                let event_type = Self::absorption_market_event_type(&evt.status);
+                let event_key = format!(
+                    "{}_{}_{}_{}",
+                    event_type,
+                    evt.event_type,
+                    evt.status,
+                    discretize_price(evt.price)
+                );
                 if self.should_emit(&event_key, timestamp_ms, 30_000.0) {
                     events.push(MarketEvent {
                         session_date: session_date.to_string(),
                         timestamp_ms: evt.timestamp_ms,
-                        event_type: "absorption_detected".to_string(),
+                        event_type: event_type.to_string(),
                         level_name: None,
                         price: evt.price,
-                        direction: None,
+                        direction: evt.direction.clone(),
                         sequence_num: None,
                         metadata: Some(serde_json::json!({
                             "eventSubtype": evt.event_type,
+                            "status": evt.status,
                             "severity": evt.severity,
+                            "zoneLow": evt.zone_low,
+                            "zoneHigh": evt.zone_high,
+                            "keyLevel": evt.key_level,
+                            "confirmationDeadlineMs": evt.confirmation_deadline_ms,
+                            "confirmedAtMs": evt.confirmed_at_ms,
+                            "invalidatedAtMs": evt.invalidated_at_ms,
+                            "invalidationReason": evt.invalidation_reason,
+                            "pacePercentile": evt.pace_percentile,
+                            "rvolRatio": evt.rvol_ratio,
+                            "localVolatilityTicks": evt.local_volatility_ticks,
+                            "regimePhase": evt.regime_phase,
                         })),
                         session_type: session_type.clone(),
                         session_segment: session_segment.clone(),
@@ -399,11 +426,40 @@ mod tests {
     }
 
     #[test]
+    fn maps_absorption_status_to_market_event_type() {
+        assert_eq!(
+            FlowEventEmitter::absorption_market_event_type("candidate"),
+            "absorption_detected"
+        );
+        assert_eq!(
+            FlowEventEmitter::absorption_market_event_type("confirmed"),
+            "absorption_confirmed"
+        );
+        assert_eq!(
+            FlowEventEmitter::absorption_market_event_type("invalidated"),
+            "absorption_invalidated"
+        );
+    }
+
+    #[test]
     fn detects_absorption_events() {
         let mut pipelines = PipelineEngine::new();
-        // Feed enough volume at one price to trigger absorption
-        for i in 0..15 {
-            pipelines.on_trade_with_timestamp(21000.0, 10.0, true, 5, 1000.0 + i as f64);
+        let key_levels = [super::super::levels::KeyLevel {
+            level_type: super::super::levels::KeyLevelType::PriorDayHigh,
+            price: 21001.0,
+        }];
+        for i in 0..14 {
+            pipelines.absorption.on_trade(
+                1_000.0 + i as f64 * 250.0,
+                21000.0 + (i.min(4) as f64 * 0.25),
+                10.0,
+                0.25,
+                true,
+                5,
+                0.7,
+                1.0,
+                &key_levels,
+            );
         }
         assert!(!pipelines.absorption.recent_events().is_empty());
 

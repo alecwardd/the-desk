@@ -608,6 +608,9 @@ impl Database {
         if version < 15 {
             self.migrate_v15()?;
         }
+        if version < 16 {
+            self.migrate_v16()?;
+        }
 
         Ok(())
     }
@@ -1368,6 +1371,17 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_untested_dnps_dnp
               ON untested_dnps (dnp);
             UPDATE schema_version SET version = 15;
+            ",
+        )?;
+        Ok(())
+    }
+
+    /// V16: remove legacy `absorption_events` table. `market_events` is canonical.
+    fn migrate_v16(&self) -> Result<(), DbError> {
+        self.conn.execute_batch(
+            "
+            DROP TABLE IF EXISTS absorption_events;
+            UPDATE schema_version SET version = 16;
             ",
         )?;
         Ok(())
@@ -2370,28 +2384,6 @@ impl Database {
         Ok(())
     }
 
-    pub fn insert_absorption_event(
-        &self,
-        timestamp_ms: f64,
-        event_type: &str,
-        price: f64,
-        severity: f64,
-        payload: &serde_json::Value,
-    ) -> Result<(), DbError> {
-        self.conn.execute(
-            "INSERT INTO absorption_events (timestamp_ms, event_type, price, severity, payload)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                timestamp_ms,
-                event_type,
-                price,
-                severity,
-                serde_json::to_string(payload)?
-            ],
-        )?;
-        Ok(())
-    }
-
     pub fn list_recent_ticks(&self, limit: usize) -> Result<Vec<RawTickRecord>, DbError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, timestamp_ms, price, volume, bid, ask, is_buy, session_date
@@ -2745,29 +2737,6 @@ impl Database {
         })
     }
 
-    pub fn list_recent_absorption_events(
-        &self,
-        limit: usize,
-    ) -> Result<Vec<serde_json::Value>, DbError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT timestamp_ms, event_type, price, severity, payload
-             FROM absorption_events ORDER BY timestamp_ms DESC LIMIT ?1",
-        )?;
-        let rows = stmt.query_map([limit as i64], |row| {
-            let payload_str: String = row.get(4)?;
-            let payload: serde_json::Value =
-                serde_json::from_str(&payload_str).unwrap_or_else(|_| serde_json::json!({}));
-            Ok(serde_json::json!({
-                "timestampMs": row.get::<_, f64>(0)?,
-                "eventType": row.get::<_, String>(1)?,
-                "price": row.get::<_, f64>(2)?,
-                "severity": row.get::<_, f64>(3)?,
-                "payload": payload
-            }))
-        })?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
-    }
-
     pub fn list_market_events_by_type(
         &self,
         event_type: &str,
@@ -2780,6 +2749,38 @@ impl Database {
              ORDER BY timestamp_ms DESC LIMIT ?2",
         )?;
         let rows = stmt.query_map(rusqlite::params![event_type, limit as i64], |row| {
+            let metadata_str: Option<String> = row.get(4)?;
+            let metadata: serde_json::Value = metadata_str
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_else(|| serde_json::json!({}));
+            Ok(serde_json::json!({
+                "timestampMs": row.get::<_, f64>(0)?,
+                "eventType": row.get::<_, String>(1)?,
+                "price": row.get::<_, f64>(2)?,
+                "direction": row.get::<_, Option<String>>(3)?,
+                "metadata": metadata,
+                "sessionDate": row.get::<_, String>(5)?,
+                "sessionType": row.get::<_, Option<String>>(6)?,
+                "sessionSegment": row.get::<_, Option<String>>(7)?,
+                "tradingDay": row.get::<_, Option<String>>(8)?,
+            }))
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn list_market_events_by_prefix(
+        &self,
+        event_type_prefix: &str,
+        limit: usize,
+    ) -> Result<Vec<serde_json::Value>, DbError> {
+        let like_pattern = format!("{event_type_prefix}%");
+        let mut stmt = self.conn.prepare(
+            "SELECT timestamp_ms, event_type, price, direction, metadata_json,
+                    session_date, session_type, session_segment, trading_day
+             FROM market_events WHERE event_type LIKE ?1
+             ORDER BY timestamp_ms DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![like_pattern, limit as i64], |row| {
             let metadata_str: Option<String> = row.get(4)?;
             let metadata: serde_json::Value = metadata_str
                 .and_then(|s| serde_json::from_str(&s).ok())

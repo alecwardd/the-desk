@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use the_desk_backend::backfill;
 use the_desk_backend::db::{
     AccountStateRecord, Database, HistoricalJobRun, OpenPositionRecord, RiskConfigRecord,
-    SessionScopeFilter, SessionSummary, SetupPerformanceSortBy, SignalOutcome, TradeRecord,
+    SessionScopeFilter, SetupPerformanceSortBy, SignalOutcome, TradeRecord,
 };
 use the_desk_backend::depth::{
     aggregate_trade_volume_by_level, build_dom_feature_snapshot, build_dom_summary, DepthBook,
@@ -42,6 +42,7 @@ const FRESHNESS_THRESHOLD_MS: f64 = 15_000.0;
 const JOB_PROGRESS_PERSIST_INTERVAL_MS: f64 = 1_000.0;
 const JOB_PROGRESS_RECORD_STEP: usize = 50_000;
 const JOB_PROGRESS_RATE_EMA_ALPHA: f64 = 0.25;
+type DnvaTriple = (f64, f64, f64);
 
 #[derive(Clone)]
 pub struct TheDeskMcp {
@@ -115,6 +116,69 @@ fn text_result(mut json: serde_json::Value) -> CallToolResult {
         }
     }
     CallToolResult::success(vec![Content::text(json.to_string())])
+}
+
+fn normalize_live_absorption_event(
+    evt: &the_desk_backend::pipelines::AbsorptionEvent,
+) -> serde_json::Value {
+    serde_json::json!({
+        "timestampMs": evt.timestamp_ms,
+        "eventType": evt.event_type,
+        "status": evt.status,
+        "price": evt.price,
+        "severity": evt.severity,
+        "direction": evt.direction,
+        "zoneLow": evt.zone_low,
+        "zoneHigh": evt.zone_high,
+        "keyLevel": evt.key_level,
+        "confirmationDeadlineMs": evt.confirmation_deadline_ms,
+        "confirmedAtMs": evt.confirmed_at_ms,
+        "invalidatedAtMs": evt.invalidated_at_ms,
+        "invalidationReason": evt.invalidation_reason,
+        "pacePercentile": evt.pace_percentile,
+        "rvolRatio": evt.rvol_ratio,
+        "localVolatilityTicks": evt.local_volatility_ticks,
+        "regimePhase": evt.regime_phase,
+    })
+}
+
+fn normalize_db_absorption_event(row: &serde_json::Value) -> serde_json::Value {
+    let metadata = row
+        .get("metadata")
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default();
+    let row_event_type = row
+        .get("eventType")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let derived_status = if row_event_type.ends_with("_confirmed") {
+        "confirmed"
+    } else if row_event_type.ends_with("_invalidated") {
+        "invalidated"
+    } else {
+        "candidate"
+    };
+
+    serde_json::json!({
+        "timestampMs": row.get("timestampMs").cloned().unwrap_or(serde_json::json!(null)),
+        "eventType": metadata.get("eventSubtype").cloned().unwrap_or_else(|| serde_json::json!(row_event_type)),
+        "status": metadata.get("status").cloned().unwrap_or_else(|| serde_json::json!(derived_status)),
+        "price": row.get("price").cloned().unwrap_or(serde_json::json!(null)),
+        "severity": metadata.get("severity").cloned().unwrap_or(serde_json::json!(null)),
+        "direction": row.get("direction").cloned().unwrap_or(serde_json::json!(null)),
+        "zoneLow": metadata.get("zoneLow").cloned().unwrap_or(serde_json::json!(null)),
+        "zoneHigh": metadata.get("zoneHigh").cloned().unwrap_or(serde_json::json!(null)),
+        "keyLevel": metadata.get("keyLevel").cloned().unwrap_or(serde_json::json!(null)),
+        "confirmationDeadlineMs": metadata.get("confirmationDeadlineMs").cloned().unwrap_or(serde_json::json!(null)),
+        "confirmedAtMs": metadata.get("confirmedAtMs").cloned().unwrap_or(serde_json::json!(null)),
+        "invalidatedAtMs": metadata.get("invalidatedAtMs").cloned().unwrap_or(serde_json::json!(null)),
+        "invalidationReason": metadata.get("invalidationReason").cloned().unwrap_or(serde_json::json!(null)),
+        "pacePercentile": metadata.get("pacePercentile").cloned().unwrap_or(serde_json::json!(null)),
+        "rvolRatio": metadata.get("rvolRatio").cloned().unwrap_or(serde_json::json!(null)),
+        "localVolatilityTicks": metadata.get("localVolatilityTicks").cloned().unwrap_or(serde_json::json!(null)),
+        "regimePhase": metadata.get("regimePhase").cloned().unwrap_or(serde_json::json!(null)),
+    })
 }
 
 fn no_data(msg: &str) -> CallToolResult {
@@ -405,7 +469,7 @@ fn load_contextual_prior_dnva(
     session_type: Option<&str>,
     session_segment: Option<&str>,
     trading_day: Option<&str>,
-) -> (Option<(f64, f64, f64)>, Option<(f64, f64, f64)>) {
+) -> (Option<DnvaTriple>, Option<DnvaTriple>) {
     let Some(td) = trading_day else {
         return (None, None);
     };
@@ -2277,7 +2341,7 @@ impl TheDeskMcp {
     }
 
     #[tool(
-        description = "Recent absorption events: high-volume levels where price failed to break through (absorption) or where volume declined into a directional move (exhaustion). Each event includes timestamp, price, severity score."
+        description = "Recent absorption-flow lifecycle events (absorption, exhaustion, delta divergence). Each event includes subtype, candidate/confirmed/invalidated status, zone bounds, direction, regime metadata, and severity."
     )]
     async fn get_absorption_events(
         &self,
@@ -2293,14 +2357,7 @@ impl TheDeskMcp {
                     .iter()
                     .rev()
                     .take(limit)
-                    .map(|evt| {
-                        serde_json::json!({
-                            "timestampMs": evt.timestamp_ms,
-                            "eventType": evt.event_type,
-                            "price": evt.price,
-                            "severity": evt.severity,
-                        })
-                    })
+                    .map(normalize_live_absorption_event)
                     .collect();
                 let db = self.db.lock().map_err(|_| lock_error())?;
                 return Ok(text_result(serde_json::json!({
@@ -2312,15 +2369,19 @@ impl TheDeskMcp {
             }
         }
 
-        // Fall back to market_events table (where FlowEventEmitter writes absorption_detected events)
+        // Fall back to market_events table (FlowEventEmitter writes absorption_* lifecycle events)
         let db = self.db.lock().map_err(|_| lock_error())?;
-        match db.list_market_events_by_type("absorption_detected", limit) {
-            Ok(events) => Ok(text_result(serde_json::json!({
-                "events": events,
-                "count": events.len(),
-                "source": "market_events_db",
-                "dataAgeMs": compute_data_age(&db)
-            }))),
+        match db.list_market_events_by_prefix("absorption_", limit) {
+            Ok(events) => {
+                let normalized: Vec<serde_json::Value> =
+                    events.iter().map(normalize_db_absorption_event).collect();
+                Ok(text_result(serde_json::json!({
+                    "events": normalized,
+                    "count": normalized.len(),
+                    "source": "market_events_db",
+                    "dataAgeMs": compute_data_age(&db)
+                })))
+            }
             Err(e) => Err(db_error(e)),
         }
     }
@@ -3037,7 +3098,7 @@ impl TheDeskMcp {
     }
 
     #[tool(
-        description = "Query how often a market event occurs. Returns total occurrences, sessions with event, per-session average, and percentage of sessions. Structural event types: *_test (level tests), ib_extension_hit, ib_formed, or_formed, new_session_high/low, day_type_change, poor_high/low_detected, excess_high/low_detected, or5_mid_retest, dnp_cross, rvol_spike. Flow event types: absorption_detected (metadata.eventSubtype: absorption/exhaustion/delta_divergence), pinch_detected (metadata.timeframe: 1m/5m/15m/30m), acceleration_zone_created, acceleration_zone_held, large_trade_cluster."
+        description = "Query how often a market event occurs. Returns total occurrences, sessions with event, per-session average, and percentage of sessions. Structural event types: *_test (level tests), ib_extension_hit, ib_formed, or_formed, new_session_high/low, day_type_change, poor_high/low_detected, excess_high/low_detected, or5_mid_retest, dnp_cross, rvol_spike. Flow event types: absorption_detected/absorption_confirmed/absorption_invalidated (metadata.eventSubtype: absorption/exhaustion/delta_divergence), pinch_detected (metadata.timeframe: 1m/5m/15m/30m), acceleration_zone_created, acceleration_zone_held, large_trade_cluster."
     )]
     async fn query_event_frequency(
         &self,
@@ -4772,6 +4833,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use the_desk_backend::db::SessionSummary;
 
     fn summary_row(
         session_date: &str,
@@ -4864,6 +4926,39 @@ mod tests {
         assert_eq!(normalize_signal_source("live"), Some("live"));
         assert_eq!(normalize_signal_source("backtest"), Some("backtest"));
         assert_eq!(normalize_signal_source("paper"), None);
+    }
+
+    #[test]
+    fn normalize_db_absorption_event_matches_live_shape() {
+        let row = serde_json::json!({
+            "timestampMs": 1234.0,
+            "eventType": "absorption_confirmed",
+            "price": 21000.0,
+            "direction": "down",
+            "metadata": {
+                "eventSubtype": "absorption",
+                "status": "confirmed",
+                "severity": 3.5,
+                "zoneLow": 20999.5,
+                "zoneHigh": 21000.5,
+                "keyLevel": "PriorDayHigh",
+                "confirmationDeadlineMs": 1500.0,
+                "confirmedAtMs": 1400.0,
+                "invalidatedAtMs": null,
+                "invalidationReason": null,
+                "pacePercentile": 0.8,
+                "rvolRatio": 1.1,
+                "localVolatilityTicks": 4.0,
+                "regimePhase": "open"
+            }
+        });
+
+        let normalized = normalize_db_absorption_event(&row);
+        assert_eq!(normalized["eventType"], "absorption");
+        assert_eq!(normalized["status"], "confirmed");
+        assert_eq!(normalized["zoneLow"], 20999.5);
+        assert_eq!(normalized["pacePercentile"], 0.8);
+        assert!(normalized.get("metadata").is_none());
     }
 
     #[tokio::test]

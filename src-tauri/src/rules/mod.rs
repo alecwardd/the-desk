@@ -268,6 +268,8 @@ fn evaluate_string_condition(condition: &str, market: &MarketState) -> bool {
         "price_in_dnva" => {
             market.last_price >= market.dnva_low && market.last_price <= market.dnva_high
         }
+        "absorption_at_price" => market.has_recent_confirmed_absorption,
+        "exhaustion_detected" => market.has_recent_confirmed_exhaustion,
         "price_vs_dnva_high=above" => market.last_price > market.dnva_high,
         "price_vs_dnva_low=below" => market.last_price < market.dnva_low,
         "price_vs_dnp=above" => market.last_price > market.dnp,
@@ -411,10 +413,10 @@ fn evaluate_typed_condition(
             return false;
         }
         ConditionField::AbsorptionAtPrice => {
-            return market.absorption_event_count > 0;
+            return market.has_recent_confirmed_absorption;
         }
         ConditionField::ExhaustionDetected => {
-            return market.absorption_event_count > 0;
+            return market.has_recent_confirmed_exhaustion;
         }
         ConditionField::PinchDetected => {
             return market.pinch_event_count > 0;
@@ -998,6 +1000,62 @@ mod tests {
             .evaluate(&setup, &market, false)
             .expect("should fire");
         assert_eq!(alert.state_transition, SetupState::ConditionsMet);
+    }
+
+    #[test]
+    fn condition_absorption_at_price_uses_live_signal_state() {
+        let setup = make_setup(vec!["absorption_at_price"], 1.0);
+        let market = MarketState {
+            confirmed_absorption_event_count: 1,
+            has_recent_confirmed_absorption: false,
+            session_delta: 0.0,
+            ..Default::default()
+        };
+        let mut engine = RulesEngine::default();
+        let alert = engine.evaluate(&setup, &market, false);
+        assert!(
+            alert.is_none(),
+            "stale cumulative counts should not satisfy condition"
+        );
+
+        let active_market = MarketState {
+            has_recent_confirmed_absorption: true,
+            session_delta: 10.0,
+            ..Default::default()
+        };
+        let alert = engine.evaluate(&setup, &active_market, false);
+        assert!(
+            alert.is_some(),
+            "active confirmed absorption should satisfy condition"
+        );
+    }
+
+    #[test]
+    fn condition_exhaustion_detected_uses_live_signal_state() {
+        let setup = make_setup(vec!["exhaustion_detected"], 1.0);
+        let market = MarketState {
+            confirmed_exhaustion_event_count: 1,
+            has_recent_confirmed_exhaustion: false,
+            session_delta: 0.0,
+            ..Default::default()
+        };
+        let mut engine = RulesEngine::default();
+        let alert = engine.evaluate(&setup, &market, false);
+        assert!(
+            alert.is_none(),
+            "stale exhaustion counts should not satisfy condition"
+        );
+
+        let active_market = MarketState {
+            has_recent_confirmed_exhaustion: true,
+            session_delta: 10.0,
+            ..Default::default()
+        };
+        let alert = engine.evaluate(&setup, &active_market, false);
+        assert!(
+            alert.is_some(),
+            "active confirmed exhaustion should satisfy condition"
+        );
     }
 
     #[test]

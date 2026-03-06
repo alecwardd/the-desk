@@ -185,6 +185,60 @@ fn no_data(msg: &str) -> CallToolResult {
     CallToolResult::success(vec![Content::text(msg.to_string())])
 }
 
+const TAPE_PACE_RESPONSE_KEYS: &[&str] = &[
+    "ticksPerSec5s",
+    "ticksPerSec30s",
+    "ticksPerSec5m",
+    "volumePerSec5s",
+    "volumePerSec30s",
+    "volumePerSec5m",
+    "acceleration",
+    "rawAcceleration",
+    "pacePercentile",
+    "rollingPacePercentile",
+    "regimeTicksPerSec30mEma",
+    "regimeVolumePerSec30mEma",
+    "windowCoverage5s",
+    "windowCoverage30s",
+    "windowCoverage5m",
+    "isValid5s",
+    "isValid30s",
+    "isValid5m",
+    "windowAnchorTimestampMs",
+    "lastTradeTimestampMs",
+    "dwellAtCurrentPriceMs",
+    "currentPrice",
+];
+
+fn build_tape_pace_response(
+    mut payload: serde_json::Value,
+    data_age_ms: f64,
+    is_live: bool,
+    now_ms: f64,
+) -> serde_json::Value {
+    if let Some(obj) = payload.as_object_mut() {
+        let last_trade_timestamp_ms = obj.get("lastTradeTimestampMs").and_then(|v| v.as_f64());
+        let has_all_keys = TAPE_PACE_RESPONSE_KEYS
+            .iter()
+            .all(|key| obj.contains_key(*key));
+        let data_quality = if !has_all_keys {
+            "PARTIAL"
+        } else if is_live {
+            "LIVE"
+        } else {
+            "STALE"
+        };
+        obj.insert(
+            "eventTimeLagMs".to_string(),
+            serde_json::json!(last_trade_timestamp_ms.map(|ts| (now_ms - ts).max(0.0))),
+        );
+        obj.insert("dataQuality".to_string(), serde_json::json!(data_quality));
+        obj.insert("isLive".to_string(), serde_json::json!(is_live));
+        obj.insert("dataAgeMs".to_string(), serde_json::json!(data_age_ms));
+    }
+    payload
+}
+
 fn invalid_params_error(msg: impl Into<String>) -> McpError {
     McpError::new(ErrorCode::INVALID_PARAMS, msg.into(), None)
 }
@@ -1551,22 +1605,18 @@ impl TheDeskMcp {
     }
 
     #[tool(
-        description = "Tape pace analytics: rolling ticks/sec and volume/sec over 5-second, 30-second, and 5-minute windows. Includes tape acceleration (rate of change), pace percentile (current vs session distribution), and dwell time at current price. Use to gauge market activity intensity and participation quality."
+        description = "Tape pace analytics with coverage-aware rolling ticks/sec and volume/sec over 5-second, 30-second, and 5-minute windows. Returns both session-relative and rolling-context pace percentiles, smoothed normalized acceleration plus raw acceleration, 30-minute regime baselines, window validity/coverage, dwell at current price, and explicit data quality metadata so agents can distinguish live vs stale tape context."
     )]
     async fn get_tape_pace(&self) -> Result<CallToolResult, McpError> {
         let db = self.db.lock().map_err(|_| lock_error())?;
+        let now_ms = chrono::Utc::now().timestamp_millis() as f64;
+        let data_age_ms = compute_data_age(&db);
         // Try live pipeline first for full snapshot including volume/sec and dwell.
         // Use try_lock to avoid blocking when backfill/poll holds the lock.
         if let Ok(pipelines) = self.pipelines.try_lock() {
-            let now_ms = chrono::Utc::now().timestamp_millis() as f64;
             let snap = pipelines.tape_pace.snapshot(now_ms);
             let last_price = pipelines.levels.last_price;
-            let dwell = if last_price > 0.0 {
-                pipelines.tape_pace.dwell_at_price(last_price)
-            } else {
-                0.0
-            };
-            return Ok(text_result(serde_json::json!({
+            let payload = serde_json::json!({
                 "ticksPerSec5s": snap.ticks_per_sec_5s,
                 "ticksPerSec30s": snap.ticks_per_sec_30s,
                 "ticksPerSec5m": snap.ticks_per_sec_5m,
@@ -1574,23 +1624,67 @@ impl TheDeskMcp {
                 "volumePerSec30s": snap.volume_per_sec_30s,
                 "volumePerSec5m": snap.volume_per_sec_5m,
                 "acceleration": snap.acceleration,
+                "rawAcceleration": snap.raw_acceleration,
                 "pacePercentile": snap.pace_percentile,
-                "dwellAtCurrentPriceMs": dwell,
-                "currentPrice": last_price,
-                "dataAgeMs": compute_data_age(&db)
-            })));
+                "rollingPacePercentile": snap.rolling_pace_percentile,
+                "regimeTicksPerSec30mEma": snap.regime_ticks_per_sec_30m_ema,
+                "regimeVolumePerSec30mEma": snap.regime_volume_per_sec_30m_ema,
+                "windowCoverage5s": snap.coverage_5s,
+                "windowCoverage30s": snap.coverage_30s,
+                "windowCoverage5m": snap.coverage_5m,
+                "isValid5s": snap.valid_5s,
+                "isValid30s": snap.valid_30s,
+                "isValid5m": snap.valid_5m,
+                "windowAnchorTimestampMs": snap.window_anchor_timestamp_ms,
+                "lastTradeTimestampMs": snap.last_trade_timestamp_ms,
+                "dwellAtCurrentPriceMs": if last_price > 0.0 {
+                    pipelines.tape_pace.dwell_at_price(last_price, now_ms)
+                } else {
+                    None
+                },
+                "currentPrice": if last_price > 0.0 { Some(last_price) } else { None::<f64> },
+            });
+            return Ok(text_result(build_tape_pace_response(
+                payload,
+                data_age_ms,
+                true,
+                now_ms,
+            )));
         }
         // Fallback to DB
         match db.latest_feature_state() {
-            Ok(Some(s)) => Ok(text_result(serde_json::json!({
-                "ticksPerSec5s": s.get("tapePace5s"),
-                "ticksPerSec30s": s.get("tapePace30s"),
-                "ticksPerSec5m": s.get("tapePace5m"),
-                "acceleration": s.get("tapeAcceleration"),
-                "pacePercentile": s.get("pacePercentile"),
-                "note": "Falling back to DB snapshot. Volume/sec and dwell not available.",
-                "dataAgeMs": compute_data_age(&db)
-            }))),
+            Ok(Some(s)) => {
+                let payload = serde_json::json!({
+                    "ticksPerSec5s": s.get("tapePace5s").cloned().unwrap_or(serde_json::Value::Null),
+                    "ticksPerSec30s": s.get("tapePace30s").cloned().unwrap_or(serde_json::Value::Null),
+                    "ticksPerSec5m": s.get("tapePace5m").cloned().unwrap_or(serde_json::Value::Null),
+                    "volumePerSec5s": s.get("tapeVolumePerSec5s").cloned().unwrap_or(serde_json::Value::Null),
+                    "volumePerSec30s": s.get("tapeVolumePerSec30s").cloned().unwrap_or(serde_json::Value::Null),
+                    "volumePerSec5m": s.get("tapeVolumePerSec5m").cloned().unwrap_or(serde_json::Value::Null),
+                    "acceleration": s.get("tapeAcceleration").cloned().unwrap_or(serde_json::Value::Null),
+                    "rawAcceleration": s.get("tapeRawAcceleration").cloned().unwrap_or(serde_json::Value::Null),
+                    "pacePercentile": s.get("pacePercentile").cloned().unwrap_or(serde_json::Value::Null),
+                    "rollingPacePercentile": s.get("tapeRollingPercentile").cloned().unwrap_or(serde_json::Value::Null),
+                    "regimeTicksPerSec30mEma": s.get("tapeRegimeTicksPerSec30mEma").cloned().unwrap_or(serde_json::Value::Null),
+                    "regimeVolumePerSec30mEma": s.get("tapeRegimeVolumePerSec30mEma").cloned().unwrap_or(serde_json::Value::Null),
+                    "windowCoverage5s": s.get("tapeCoverage5s").cloned().unwrap_or(serde_json::Value::Null),
+                    "windowCoverage30s": s.get("tapeCoverage30s").cloned().unwrap_or(serde_json::Value::Null),
+                    "windowCoverage5m": s.get("tapeCoverage5m").cloned().unwrap_or(serde_json::Value::Null),
+                    "isValid5s": s.get("tapeValid5s").cloned().unwrap_or(serde_json::Value::Null),
+                    "isValid30s": s.get("tapeValid30s").cloned().unwrap_or(serde_json::Value::Null),
+                    "isValid5m": s.get("tapeValid5m").cloned().unwrap_or(serde_json::Value::Null),
+                    "windowAnchorTimestampMs": s.get("tapeWindowAnchorTimestampMs").cloned().unwrap_or(serde_json::Value::Null),
+                    "lastTradeTimestampMs": s.get("tapeLastTradeTimestampMs").cloned().unwrap_or(serde_json::Value::Null),
+                    "dwellAtCurrentPriceMs": s.get("tapeDwellAtCurrentPriceMs").cloned().unwrap_or(serde_json::Value::Null),
+                    "currentPrice": s.get("lastPrice").cloned().unwrap_or(serde_json::Value::Null),
+                });
+                Ok(text_result(build_tape_pace_response(
+                    payload,
+                    data_age_ms,
+                    false,
+                    now_ms,
+                )))
+            }
             Ok(None) => Ok(no_data("No tape pace data")),
             Err(e) => Err(db_error(e)),
         }
@@ -4886,6 +4980,66 @@ mod tests {
     fn test_server() -> TheDeskMcp {
         let db = Database::open(":memory:").expect("db");
         TheDeskMcp::new(db, PipelineEngine::new(), ":memory:".into())
+    }
+
+    #[test]
+    fn tape_pace_response_marks_live_and_recomputes_event_lag() {
+        let payload = serde_json::json!({
+            "ticksPerSec5s": 1.2,
+            "ticksPerSec30s": 1.0,
+            "ticksPerSec5m": 0.8,
+            "volumePerSec5s": 12.0,
+            "volumePerSec30s": 10.0,
+            "volumePerSec5m": 8.0,
+            "acceleration": 0.15,
+            "rawAcceleration": 0.2,
+            "pacePercentile": 0.7,
+            "rollingPacePercentile": 0.8,
+            "regimeTicksPerSec30mEma": 0.9,
+            "regimeVolumePerSec30mEma": 9.0,
+            "windowCoverage5s": 1.0,
+            "windowCoverage30s": 1.0,
+            "windowCoverage5m": 1.0,
+            "isValid5s": true,
+            "isValid30s": true,
+            "isValid5m": true,
+            "windowAnchorTimestampMs": 12_000.0,
+            "lastTradeTimestampMs": 12_000.0,
+            "dwellAtCurrentPriceMs": 2_500.0,
+            "currentPrice": 21000.25
+        });
+        let rendered = build_tape_pace_response(payload, 250.0, true, 12_900.0);
+        assert_eq!(
+            rendered.get("dataQuality").and_then(|v| v.as_str()),
+            Some("LIVE")
+        );
+        assert_eq!(rendered.get("isLive").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            rendered.get("eventTimeLagMs").and_then(|v| v.as_f64()),
+            Some(900.0)
+        );
+    }
+
+    #[test]
+    fn tape_pace_response_marks_partial_when_payload_is_missing_fields() {
+        let payload = serde_json::json!({
+            "ticksPerSec5s": 1.2,
+            "pacePercentile": 0.7,
+            "lastTradeTimestampMs": 12_000.0
+        });
+        let rendered = build_tape_pace_response(payload, 2_000.0, false, 13_000.0);
+        assert_eq!(
+            rendered.get("dataQuality").and_then(|v| v.as_str()),
+            Some("PARTIAL")
+        );
+        assert_eq!(
+            rendered.get("isLive").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            rendered.get("eventTimeLagMs").and_then(|v| v.as_f64()),
+            Some(1_000.0)
+        );
     }
 
     #[test]

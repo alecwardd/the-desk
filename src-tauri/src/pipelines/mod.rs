@@ -173,16 +173,43 @@ pub struct MarketState {
     pub ib_high: f64,
     /// Initial balance low (first 60 minutes of RTH).
     pub ib_low: f64,
-    /// Rolling 5-second tape pace (ticks/sec).
-    pub tape_pace_5s: f64,
-    /// Rolling 30-second tape pace (ticks/sec).
-    pub tape_pace_30s: f64,
-    /// Rolling 5-minute tape pace (ticks/sec).
-    pub tape_pace_5m: f64,
-    /// Tape pace acceleration proxy (5s minus 30s).
-    pub tape_acceleration: f64,
+    /// Rolling 5-second tape pace (ticks/sec) when the window has sufficient coverage.
+    pub tape_pace_5s: Option<f64>,
+    /// Rolling 30-second tape pace (ticks/sec) when the window has sufficient coverage.
+    pub tape_pace_30s: Option<f64>,
+    /// Rolling 5-minute tape pace (ticks/sec) when the window has sufficient coverage.
+    pub tape_pace_5m: Option<f64>,
+    /// Smoothed and normalized tape acceleration.
+    pub tape_acceleration: Option<f64>,
+    /// Raw 5s minus 30s pace spread for debugging and calibration.
+    pub tape_raw_acceleration: Option<f64>,
     /// Current pace percentile vs session distribution (0.0-1.0).
     pub pace_percentile: f64,
+    /// Current pace percentile vs the recent rolling intraday distribution (0.0-1.0).
+    pub tape_rolling_percentile: f64,
+    /// Rolling 5-second tape volume pace (contracts/sec).
+    pub tape_volume_per_sec_5s: Option<f64>,
+    /// Rolling 30-second tape volume pace (contracts/sec).
+    pub tape_volume_per_sec_30s: Option<f64>,
+    /// Rolling 5-minute tape volume pace (contracts/sec).
+    pub tape_volume_per_sec_5m: Option<f64>,
+    /// Longer-horizon tape regime baseline.
+    pub tape_regime_ticks_per_sec_30m_ema: Option<f64>,
+    pub tape_regime_volume_per_sec_30m_ema: Option<f64>,
+    /// Window coverage ratios (0.0-1.0).
+    pub tape_coverage_5s: f64,
+    pub tape_coverage_30s: f64,
+    pub tape_coverage_5m: f64,
+    /// Whether each tape window has enough event-time coverage to trust.
+    pub tape_valid_5s: bool,
+    pub tape_valid_30s: bool,
+    pub tape_valid_5m: bool,
+    /// Event-time anchor and freshness metadata for the tape snapshot.
+    pub tape_window_anchor_timestamp_ms: Option<f64>,
+    pub tape_last_trade_timestamp_ms: Option<f64>,
+    pub tape_event_time_lag_ms: Option<f64>,
+    /// Dwell time at the current price level using the event-time anchor.
+    pub tape_dwell_at_current_price_ms: Option<f64>,
     /// Recent stacked imbalance count.
     pub imbalance_count: usize,
     /// Number of recent absorption events.
@@ -676,7 +703,31 @@ impl PipelineEngine {
             tape_pace_30s: tape.ticks_per_sec_30s,
             tape_pace_5m: tape.ticks_per_sec_5m,
             tape_acceleration: tape.acceleration,
+            tape_raw_acceleration: tape.raw_acceleration,
             pace_percentile: tape.pace_percentile,
+            tape_rolling_percentile: tape.rolling_pace_percentile,
+            tape_volume_per_sec_5s: tape.volume_per_sec_5s,
+            tape_volume_per_sec_30s: tape.volume_per_sec_30s,
+            tape_volume_per_sec_5m: tape.volume_per_sec_5m,
+            tape_regime_ticks_per_sec_30m_ema: tape.regime_ticks_per_sec_30m_ema,
+            tape_regime_volume_per_sec_30m_ema: tape.regime_volume_per_sec_30m_ema,
+            tape_coverage_5s: tape.coverage_5s,
+            tape_coverage_30s: tape.coverage_30s,
+            tape_coverage_5m: tape.coverage_5m,
+            tape_valid_5s: tape.valid_5s,
+            tape_valid_30s: tape.valid_30s,
+            tape_valid_5m: tape.valid_5m,
+            tape_window_anchor_timestamp_ms: tape.window_anchor_timestamp_ms,
+            tape_last_trade_timestamp_ms: tape.last_trade_timestamp_ms,
+            tape_event_time_lag_ms: tape.event_time_lag_ms,
+            tape_dwell_at_current_price_ms: if self.levels.last_price > 0.0 {
+                tape.window_anchor_timestamp_ms.and_then(|anchor_ms| {
+                    self.tape_pace
+                        .dwell_at_price(self.levels.last_price, anchor_ms)
+                })
+            } else {
+                None
+            },
             imbalance_count,
             absorption_event_count,
             confirmed_absorption_event_count,

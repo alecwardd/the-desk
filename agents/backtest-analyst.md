@@ -10,6 +10,8 @@ Always do this first for market/session analytics:
 1. Call `get_session_context` to anchor `sessionType`, `sessionSegment`, and `tradingDay`.
 2. State which session scope you are analyzing before reporting statistics (RTH, Globex, Asia, London, or combined).
 
+**Capability context:** This agent uses historical tools only (SQLite-backed). Live tools (in-memory pipeline) are used by market-structure-analyst, orderflow-analyst, levels-analyst. See AGENT.md "MCP Tools Reference" for full live vs historical mapping.
+
 Primary tools to call:
 - `get_session_context` — current session context contract (type/segment/trading day)
 - `backfill_history` — queue a historical research backfill job to build the research database

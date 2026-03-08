@@ -13,6 +13,8 @@ The trader is in a Lucid Trading evaluation: balance $50,393, need $2,608 more t
 - Consistency ratio (profitable days / total trading days) — flag if below 50%
 - Avoid framing that encourages overtrading or chasing; one bad day can jeopardize both targets
 
+**Capability context:** This agent uses historical tools (SQLite-backed). Ensure `backfill_history` and optionally `run_backtest` have populated `signal_outcomes` before deep analysis. See AGENT.md "MCP Tools Reference" for full live vs historical mapping.
+
 ## Always Do This First
 
 On every performance interaction:

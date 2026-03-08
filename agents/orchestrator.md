@@ -19,6 +19,8 @@ When synthesizing responses, factor in proximity to the pass target and the cons
 
 **Risk context is always present.** Every response you give includes a risk footer. The risk-coach has final word on any trade-related discussion. You never skip risk.
 
+**Tool context:** Live tools (get_market_snapshot, get_tpo_profile, etc.) read current session from the pipeline. Historical tools (query_event_frequency, get_session_history, etc.) read from SQLite and require backfill. Route `historical_research` intent to backtest-analyst. See AGENT.md "MCP Tools Reference" for full live vs historical mapping.
+
 ## Always Do This First
 
 On every interaction, regardless of topic:

@@ -2480,6 +2480,32 @@ impl Database {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    pub fn list_ticks_in_range(
+        &self,
+        start_ms: f64,
+        end_ms: f64,
+    ) -> Result<Vec<RawTickRecord>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, timestamp_ms, price, volume, bid, ask, is_buy, session_date
+             FROM raw_ticks
+             WHERE timestamp_ms >= ?1 AND timestamp_ms < ?2
+             ORDER BY timestamp_ms ASC",
+        )?;
+        let rows = stmt.query_map(params![start_ms, end_ms], |row| {
+            Ok(RawTickRecord {
+                id: row.get(0)?,
+                timestamp_ms: row.get(1)?,
+                price: row.get(2)?,
+                volume: row.get(3)?,
+                bid: row.get(4)?,
+                ask: row.get(5)?,
+                is_buy: row.get::<_, i64>(6)? == 1,
+                session_date: row.get(7)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     /// Return the pipeline snapshot stored closest in time to `timestamp_ms`.
     /// Also returns the actual snapshot timestamp so callers can see how close the match was.
     pub fn get_snapshot_near(
@@ -2686,6 +2712,69 @@ impl Database {
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn list_depth_events_in_range(
+        &self,
+        start_ms: f64,
+        end_ms: f64,
+        source_file: Option<&str>,
+    ) -> Result<Vec<DepthEventRecord>, DbError> {
+        fn map_depth_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DepthEventRecord> {
+            Ok(DepthEventRecord {
+                id: row.get(0)?,
+                source_file: row.get(1)?,
+                timestamp_ms: row.get(2)?,
+                side: row.get(3)?,
+                command: row.get(4)?,
+                price: row.get(5)?,
+                quantity: row.get(6)?,
+                num_orders: row.get(7)?,
+                end_of_batch: row.get::<_, i64>(8)? == 1,
+                batch_id: row.get(9)?,
+                trading_day: row.get(10)?,
+            })
+        }
+
+        let mut sql = String::from(
+            "SELECT id, source_file, timestamp_ms, side, command, price, quantity, num_orders, end_of_batch, batch_id, trading_day
+             FROM depth_events
+             WHERE timestamp_ms >= ?1 AND timestamp_ms < ?2",
+        );
+        if source_file.is_some() {
+            sql.push_str(" AND source_file = ?3");
+        }
+        sql.push_str(" ORDER BY timestamp_ms ASC, id ASC");
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let out = if let Some(source_file) = source_file {
+            let rows = stmt.query_map(params![start_ms, end_ms, source_file], map_depth_row)?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        } else {
+            let rows = stmt.query_map(params![start_ms, end_ms], map_depth_row)?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        Ok(out)
+    }
+
+    pub fn latest_depth_clear_before(
+        &self,
+        source_file: &str,
+        timestamp_ms: f64,
+    ) -> Result<Option<f64>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT timestamp_ms
+             FROM depth_events
+             WHERE source_file = ?1 AND command = 'ClearBook' AND timestamp_ms <= ?2
+             ORDER BY timestamp_ms DESC, id DESC
+             LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![source_file, timestamp_ms])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(row.get(0)?))
+        } else {
+            Ok(None)
+        }
     }
 
     fn get_json_snapshot_near(

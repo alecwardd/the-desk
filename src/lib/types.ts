@@ -198,3 +198,76 @@ export interface AccountStateRecord {
   positionSizingMethod: string;
   kellyFraction: number;
 }
+
+export interface DomLevel {
+  price: number;
+  quantity: number;
+  numOrders: number;
+  distanceFromTouchTicks: number;
+}
+
+export interface VolumeProfileLevel {
+  price: number;
+  buyVol: number;
+  sellVol: number;
+  totalVol: number;
+}
+
+export interface PullStackDelta {
+  side: "bid" | "ask";
+  price: number;
+  stackedQuantity: number;
+  removedQuantity: number;
+  estimatedFilledQuantity: number;
+  estimatedPulledQuantity: number;
+}
+
+export interface TapePrint {
+  timestampMs: number;
+  price: number;
+  volume: number;
+  side: "buy" | "sell" | "unknown";
+  bid: number;
+  ask: number;
+  crossesSpread: boolean;
+}
+
+export interface DomReplayFrame {
+  timestampMs: number;
+  eventKind: "snapshot" | "trade" | "depth";
+  bestBid: number | null;
+  bestAsk: number | null;
+  bids: DomLevel[];
+  asks: DomLevel[];
+  lastTrade: TapePrint | null;
+  recentTape: TapePrint[];
+  volumeProfile: VolumeProfileLevel[];
+  pullStackDeltas: PullStackDelta[];
+  cursor: number;
+  totalEvents: number;
+  clipStartMs: number;
+  clipEndMs: number;
+  warning?: string | null;
+}
+
+export interface DomReplayStatus {
+  isLoaded: boolean;
+  isPlaying: boolean;
+  cursor: number;
+  totalEvents: number;
+  currentTimestampMs: number | null;
+  startMs: number | null;
+  endMs: number | null;
+  speed: number;
+  warning?: string | null;
+}
+
+export interface DomReplayLoadResult {
+  tickCount: number;
+  depthBatchCount: number;
+  totalEvents: number;
+  startMs: number;
+  endMs: number;
+  sourceSummary: string;
+  warning?: string | null;
+}

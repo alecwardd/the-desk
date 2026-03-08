@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use tauri::async_runtime::JoinHandle;
 use tauri::{AppHandle, Emitter, Manager};
 use the_desk_backend::db::Database;
+use the_desk_backend::dom_replay::DomReplayClip;
 use the_desk_backend::dtc::DtcClient;
 use the_desk_backend::feed::scid_reader::ScidReader;
 use the_desk_backend::feed::{load_feed_config, FeedEvent, TradeSide};
@@ -45,6 +46,30 @@ impl Default for ReplayRuntime {
     }
 }
 
+pub(crate) struct DomReplayRuntime {
+    pub clip: Option<DomReplayClip>,
+    pub cursor: usize,
+    pub speed: f64,
+    pub is_playing: bool,
+    pub current_timestamp_ms: Option<f64>,
+    pub task: Option<JoinHandle<()>>,
+    pub stop_tx: Option<watch::Sender<bool>>,
+}
+
+impl Default for DomReplayRuntime {
+    fn default() -> Self {
+        Self {
+            clip: None,
+            cursor: 0,
+            speed: 1.0,
+            is_playing: false,
+            current_timestamp_ms: None,
+            task: None,
+            stop_tx: None,
+        }
+    }
+}
+
 pub(crate) struct AppState {
     pub dtc: Mutex<DtcClient>,
     pub pipelines: Mutex<PipelineEngine>,
@@ -57,6 +82,7 @@ pub(crate) struct AppState {
     pub dtc_tx: broadcast::Sender<FeedEvent>,
     pub session_id: Mutex<Option<String>>,
     pub replay: Mutex<ReplayRuntime>,
+    pub dom_replay: Mutex<DomReplayRuntime>,
     pub scid_feed_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     pub scid_shutdown_tx: Mutex<Option<watch::Sender<bool>>>,
 }
@@ -552,6 +578,7 @@ fn main() {
         dtc_tx: tx,
         session_id: Mutex::new(None),
         replay: Mutex::new(ReplayRuntime::default()),
+        dom_replay: Mutex::new(DomReplayRuntime::default()),
         scid_feed_task: Mutex::new(None),
         scid_shutdown_tx: Mutex::new(None),
     };
@@ -593,6 +620,12 @@ fn main() {
             commands::pause_replay,
             commands::seek_replay,
             commands::stop_replay,
+            commands::dom_replay_load,
+            commands::dom_replay_start,
+            commands::dom_replay_pause,
+            commands::dom_replay_stop,
+            commands::dom_replay_seek,
+            commands::dom_replay_status,
             commands::list_session_events,
             commands::list_recordings,
             commands::start_mock_feed,

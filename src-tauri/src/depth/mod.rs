@@ -462,6 +462,16 @@ impl DepthReader {
         timestamp_ms: f64,
         levels_per_side: usize,
     ) -> Result<DomSnapshot, DepthError> {
+        let (last_ts, book) = self.book_at(timestamp_ms)?;
+        Ok(book.snapshot(
+            self.path.to_string_lossy().as_ref(),
+            last_ts,
+            levels_per_side,
+        ))
+    }
+
+    /// Reconstruct the full depth book state at or immediately before `timestamp_ms`.
+    pub fn book_at(&self, timestamp_ms: f64) -> Result<(f64, DepthBook), DepthError> {
         let mut file = File::open(&self.path)?;
         let header = Self::read_header(&mut file)?;
         let data_start = header.header_size as u64;
@@ -490,11 +500,7 @@ impl DepthReader {
             record_index += 1;
         }
 
-        Ok(book.snapshot(
-            self.path.to_string_lossy().as_ref(),
-            last_ts,
-            levels_per_side,
-        ))
+        Ok((last_ts, book))
     }
 
     /// Summarize stacking and pulling behavior in a time window.
@@ -867,6 +873,11 @@ impl DepthBook {
         }
     }
 
+    pub fn level_quantity_and_orders(&self, side: DepthSide, key: i64) -> Option<(u32, u16)> {
+        self.level(side, key)
+            .map(|level| (level.quantity, level.num_orders))
+    }
+
     pub fn snapshot(
         &self,
         source_file: &str,
@@ -1041,11 +1052,11 @@ fn estimate_fill_consumption(
     consumed
 }
 
-fn price_to_tick_key(price: f64) -> i64 {
+pub fn price_to_tick_key(price: f64) -> i64 {
     (price / NQ_TICK_SIZE).round() as i64
 }
 
-fn tick_key_to_price(key: i64) -> f64 {
+pub fn tick_key_to_price(key: i64) -> f64 {
     key as f64 * NQ_TICK_SIZE
 }
 

@@ -10,6 +10,9 @@ import type {
   SessionEventInput,
   SessionEventRecord,
   SessionRecord,
+  DomReplayFrame,
+  DomReplayLoadResult,
+  DomReplayStatus,
   Setup,
   SetupAlert,
   TradeInput,
@@ -24,6 +27,7 @@ export const events = {
   coachingPrompt: "coaching-prompt",
   riskState: "risk-state",
   dtcStatus: "dtc-status",
+  domReplayFrame: "dom-replay-frame",
 } as const;
 
 export async function subscribe<T>(
@@ -112,10 +116,21 @@ export const replayBridge = {
   stop: () => invoke<void>("stop_replay"),
 };
 
+export const domReplayBridge = {
+  load: (startMs: number, endMs: number, levelsPerSide = 12) =>
+    invoke<DomReplayLoadResult>("dom_replay_load", { startMs, endMs, levelsPerSide }),
+  start: (speed = 1) => invoke<void>("dom_replay_start", { speed }),
+  pause: () => invoke<void>("dom_replay_pause"),
+  stop: () => invoke<void>("dom_replay_stop"),
+  seek: (timestampMs: number) => invoke<void>("dom_replay_seek", { timestampMs }),
+  status: () => invoke<DomReplayStatus>("dom_replay_status"),
+};
+
 export type StreamPayloads = {
   [events.marketState]: MarketState;
   [events.setupAlert]: SetupAlert;
   [events.coachingPrompt]: CoachingPrompt;
   [events.riskState]: RiskState;
   [events.dtcStatus]: string;
+  [events.domReplayFrame]: DomReplayFrame;
 };

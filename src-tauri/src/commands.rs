@@ -1,9 +1,13 @@
 use std::time::Duration;
 
-use tauri::State;
+use tauri::{AppHandle, Emitter, Manager, State};
 use the_desk_backend::db::{
     AccountStateRecord, JournalEntry, OpenPositionRecord, RiskConfigRecord, SessionEventInput,
     SessionEventRecord, SessionRecord, TradeRecord,
+};
+use the_desk_backend::dom_replay::{
+    apply_event_and_frame, build_clip, frame_from_state, seek_cursor_for_timestamp,
+    state_at_cursor, DomReplayEventKind, DomReplayLoadResult, DomReplayStatus,
 };
 use the_desk_backend::dtc::{run_mock_dtc_server, TradeSide};
 use the_desk_backend::feed::scid_reader::ScidReader;
@@ -444,6 +448,241 @@ pub async fn stop_replay(state: State<'_, AppState>) -> Result<(), String> {
     }
     replay.cursor = 0;
     replay.is_playing = false;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn dom_replay_load(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    start_ms: f64,
+    end_ms: f64,
+    levels_per_side: Option<usize>,
+) -> Result<DomReplayLoadResult, String> {
+    let config = load_feed_config();
+    let db = state.db.lock().await;
+    let clip = build_clip(
+        &db,
+        &config,
+        start_ms,
+        end_ms,
+        levels_per_side.unwrap_or(12),
+    )
+    .map_err(|err| err.to_string())?;
+    drop(db);
+
+    let result = DomReplayLoadResult {
+        tick_count: clip
+            .events
+            .iter()
+            .filter(|event| matches!(event, the_desk_backend::dom_replay::ReplayEvent::Trade(_)))
+            .count(),
+        depth_batch_count: clip
+            .events
+            .iter()
+            .filter(|event| matches!(event, the_desk_backend::dom_replay::ReplayEvent::Depth(_)))
+            .count(),
+        total_events: clip.events.len(),
+        start_ms: clip.start_ms,
+        end_ms: clip.end_ms,
+        source_summary: clip.source_summary.clone(),
+        warning: clip.warning.clone(),
+    };
+
+    {
+        let mut dom = state.dom_replay.lock().await;
+        if let Some(stop_tx) = dom.stop_tx.take() {
+            let _ = stop_tx.send(true);
+        }
+        if let Some(task) = dom.task.take() {
+            task.abort();
+        }
+        dom.cursor = 0;
+        dom.speed = 1.0;
+        dom.is_playing = false;
+        dom.current_timestamp_ms = Some(clip.start_ms);
+        dom.clip = Some(clip);
+    }
+
+    emit_dom_replay_preview(&app, &state).await?;
+    Ok(result)
+}
+
+#[tauri::command]
+pub async fn dom_replay_start(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    speed: Option<f64>,
+) -> Result<(), String> {
+    let mut dom = state.dom_replay.lock().await;
+    let Some(clip) = dom.clip.clone() else {
+        return Err("No DOM replay loaded. Call dom_replay_load first.".to_string());
+    };
+    if let Some(stop_tx) = dom.stop_tx.take() {
+        let _ = stop_tx.send(true);
+    }
+    if let Some(task) = dom.task.take() {
+        task.abort();
+    }
+
+    let start_cursor = dom.cursor.min(clip.events.len());
+    let speed = speed.unwrap_or(1.0).clamp(0.1, 10.0);
+    let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
+    dom.stop_tx = Some(stop_tx);
+    dom.speed = speed;
+    dom.is_playing = true;
+    let app_handle = app.clone();
+
+    dom.task = Some(tauri::async_runtime::spawn(async move {
+        let mut state_snapshot = state_at_cursor(&clip, start_cursor);
+        let mut previous_ts = state_snapshot.timestamp_ms;
+        let app_state = app_handle.state::<AppState>();
+
+        for cursor in start_cursor..clip.events.len() {
+            let event_ts = clip.events[cursor].timestamp_ms();
+            let wait_secs = ((event_ts - previous_ts).max(0.0) / speed) / 1000.0;
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs_f64(wait_secs)) => {}
+                _ = stop_rx.changed() => {
+                    break;
+                }
+            }
+            if *stop_rx.borrow() {
+                break;
+            }
+
+            let Some(frame) = apply_event_and_frame(&clip, &mut state_snapshot, cursor) else {
+                break;
+            };
+            previous_ts = frame.timestamp_ms;
+            let _ = app_handle.emit("dom-replay-frame", &frame);
+
+            let mut runtime = app_state.dom_replay.lock().await;
+            runtime.cursor = cursor + 1;
+            runtime.current_timestamp_ms = Some(frame.timestamp_ms);
+        }
+
+        let mut runtime = app_state.dom_replay.lock().await;
+        runtime.is_playing = false;
+        runtime.task = None;
+        runtime.stop_tx = None;
+    }));
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn dom_replay_pause(state: State<'_, AppState>) -> Result<(), String> {
+    let mut dom = state.dom_replay.lock().await;
+    if let Some(stop_tx) = dom.stop_tx.take() {
+        let _ = stop_tx.send(true);
+    }
+    if let Some(task) = dom.task.take() {
+        task.abort();
+    }
+    dom.is_playing = false;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn dom_replay_stop(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    {
+        let mut dom = state.dom_replay.lock().await;
+        if let Some(stop_tx) = dom.stop_tx.take() {
+            let _ = stop_tx.send(true);
+        }
+        if let Some(task) = dom.task.take() {
+            task.abort();
+        }
+        dom.cursor = 0;
+        dom.is_playing = false;
+        dom.current_timestamp_ms = dom.clip.as_ref().map(|clip| clip.start_ms);
+    }
+    emit_dom_replay_preview(&app, &state).await?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn dom_replay_seek(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    timestamp_ms: f64,
+) -> Result<(), String> {
+    {
+        let mut dom = state.dom_replay.lock().await;
+        if dom.clip.is_none() {
+            return Err("No DOM replay loaded".to_string());
+        }
+        if let Some(stop_tx) = dom.stop_tx.take() {
+            let _ = stop_tx.send(true);
+        }
+        if let Some(task) = dom.task.take() {
+            task.abort();
+        }
+        dom.is_playing = false;
+        let (cursor, clamped_ts) = {
+            let clip = dom.clip.as_ref().expect("clip checked");
+            (
+                seek_cursor_for_timestamp(clip, timestamp_ms),
+                timestamp_ms.clamp(clip.start_ms, clip.end_ms),
+            )
+        };
+        dom.cursor = cursor;
+        dom.current_timestamp_ms = Some(clamped_ts);
+    }
+    emit_dom_replay_preview(&app, &state).await?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn dom_replay_status(state: State<'_, AppState>) -> Result<DomReplayStatus, String> {
+    let dom = state.dom_replay.lock().await;
+    let (is_loaded, total_events, start_ms, end_ms, warning) = if let Some(clip) = &dom.clip {
+        (
+            true,
+            clip.events.len(),
+            Some(clip.start_ms),
+            Some(clip.end_ms),
+            clip.warning.clone(),
+        )
+    } else {
+        (false, 0, None, None, None)
+    };
+    Ok(DomReplayStatus {
+        is_loaded,
+        is_playing: dom.is_playing,
+        cursor: dom.cursor,
+        total_events,
+        current_timestamp_ms: dom.current_timestamp_ms,
+        start_ms,
+        end_ms,
+        speed: dom.speed,
+        warning,
+    })
+}
+
+async fn emit_dom_replay_preview(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+) -> Result<(), String> {
+    let (frame, current_ts) = {
+        let dom = state.dom_replay.lock().await;
+        let Some(clip) = dom.clip.as_ref() else {
+            return Err("No DOM replay loaded".to_string());
+        };
+        let state_snapshot = state_at_cursor(clip, dom.cursor);
+        let frame = frame_from_state(
+            clip,
+            &state_snapshot,
+            DomReplayEventKind::Snapshot,
+            Vec::new(),
+            dom.cursor,
+        );
+        (frame, state_snapshot.timestamp_ms)
+    };
+    app.emit("dom-replay-frame", &frame)
+        .map_err(|err| err.to_string())?;
+    let mut dom = state.dom_replay.lock().await;
+    dom.current_timestamp_ms = Some(current_ts);
     Ok(())
 }
 

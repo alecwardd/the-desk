@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { PreSessionBriefing } from "./components/briefing/pre-session-briefing";
 import { CoachingFeed } from "./components/coaching/coaching-feed";
 import { MarketSidebar } from "./components/dashboard/market-sidebar";
+import { DomVisualizer } from "./components/dom/dom-visualizer";
 import { OnboardingWizard } from "./components/onboarding/onboarding-wizard";
 import { PlaybookBuilder } from "./components/playbook/playbook-builder";
 import { SetupList } from "./components/playbook/setup-list";
@@ -21,7 +22,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Card, CardContent } from "@/components/ui/card";
 
-type View = "dashboard" | "briefing" | "review" | "settings" | "playbook";
+type View = "dashboard" | "briefing" | "review" | "settings" | "playbook" | "domReplay";
 
 export default function App() {
   const connection = useConnection();
@@ -354,6 +355,13 @@ export default function App() {
             <SettingsPanel />
           </main>
         </div>
+      ) : view === "domReplay" ? (
+        <div className="flex flex-col overflow-hidden">
+          {statusBanner}
+          <main className="flex-1 min-h-0 overflow-auto">
+            <DomVisualizer />
+          </main>
+        </div>
       ) : (
         <div className="flex flex-col overflow-hidden">
           {statusBanner}
@@ -402,6 +410,9 @@ export default function App() {
           </Button>
           <Button variant="ghost" size="sm" onClick={() => setView("dashboard")}>
             Dashboard
+          </Button>
+          <Button variant="ghost" size="sm" onClick={() => setView("domReplay")}>
+            DOM
           </Button>
           <Button variant="ghost" size="sm" onClick={() => setView("playbook")}>
             Playbook

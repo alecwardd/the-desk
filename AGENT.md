@@ -13,6 +13,7 @@ Read these documents in order:
 1. **CLAUDE.md** — Project rules, architecture, conventions (READ FIRST)
 2. **README.md** — Architecture overview, project structure, data flow
 3. **Relevant skill** from `skills/` — Domain knowledge for your task
+4. **`docs/dom-replay.md`** — Required reading for DOM visualizer and historical ladder replay tasks
 
 ---
 
@@ -100,6 +101,19 @@ When implementing a feature:
 5. **Add `ConditionField` variants** if the rules engine needs to evaluate the new data
 6. **Add MCP tool** in `src/bin/the-desk-mcp.rs` if agents need access
 7. **Run `cargo test`** before declaring done
+
+### DOM Replay Tasks
+
+If the task touches the DOM visualizer, historical ladder playback, or replay UI:
+
+1. Read `docs/dom-replay.md` before making changes
+2. Treat `src-tauri/src/dom_replay.rs` as the backend source of truth
+3. Keep DOM replay separate from `.desk` session replay in `src-tauri/src/recording/mod.rs`
+4. Preserve the current behavioral contract:
+   - SQLite first, Sierra file fallback second
+   - timestamp-based seek
+   - session-to-cursor volume profile
+   - no fake DOM when depth is unavailable
 
 ---
 

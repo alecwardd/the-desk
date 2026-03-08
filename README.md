@@ -126,6 +126,7 @@ the-desk/
 │   ├── dtc-protocol/           # DTC protocol reference
 │   ├── compliance-research/    # Coaching vs advisory positioning
 │   └── tauri-bridge/           # IPC patterns
+├── docs/dom-replay.md          # DOM replay visualizer guide for users and agents
 ├── agents/                     # Cursor agent definitions (10 agents)
 ├── CLAUDE.md                   # Project rules for all agents
 └── AGENT.md                    # Agent workflow instructions
@@ -193,6 +194,19 @@ Historical jobs are asynchronous:
 2. Poll `get_backfill_status(jobId)`
 3. Inspect the final `result` when status is `completed`
 4. Call `cancel_backfill(jobId)` to stop a long-running replay safely
+
+## DOM Replay Visualizer
+
+The desktop app now includes a historical DOM replay workspace for NQ.
+
+- Open the app and use the footer navigation to select `DOM`
+- Load a 30-minute clip with `Start` and `End`
+- Replay at original tempo or slow it down with the speed controls
+- Use the scrubber to jump to a timestamp while keeping the ladder, tape, and session-to-cursor profile aligned
+
+The visualizer uses SQLite depth/tick history first and falls back to Sierra `.depth` / `.scid` files when needed. It is designed for review and research, not order entry.
+
+See [docs/dom-replay.md](/C:/the-desk/docs/dom-replay.md) for the full guide.
 
 ## Data Flow & Latency
 

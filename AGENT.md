@@ -38,6 +38,8 @@ Sierra Chart (.scid) → Rust Pipeline Engine → SQLite → MCP Server → Curs
 When you need specialized help, spawn subagents for these tasks.
 
 > **Path note:** Agent definitions live in `agents/` at the project root. Cursor also discovers them at `.cursor/agents/` (symlinked). Both paths resolve to the same files.
+>
+> **Tool capability:** See **MCP Tools Reference** below for live vs historical tool mapping and agent-to-capability matrix.
 
 ### Orchestrator (Primary Entry Point)
 **When:** The trader interacts with The Desk for any market question, setup evaluation, trade recording, or session management. This is the default agent.
@@ -128,7 +130,22 @@ When implementing a feature:
 
 ## MCP Tools Reference
 
-The MCP server (`src/bin/the-desk-mcp.rs`) exposes 54 tools across 11 categories:
+The MCP server (`src/bin/the-desk-mcp.rs`) exposes 54 tools across 11 categories.
+
+### Live vs Historical — Quick Reference
+
+**Live tools** read from the in-memory pipeline (current session only). They answer "what's happening now?" and require an active feed or startup backfill. Use for: market reads, setup checks, levels, flow, risk, DOM.
+
+**Historical tools** read from SQLite (session_summaries, market_events, signal_outcomes, raw_ticks). They answer "what happened in the past?" and require `backfill_history` to have been run. Use for: event frequency, conditional probability, session comparison, setup performance, backtests.
+
+| Context | Primary tools |
+|---------|---------------|
+| **Live (current session)** | `get_market_snapshot`, `get_session_context`, `get_tpo_profile`, `get_delta_profile`, `get_key_levels`, `get_tape_pace`, `get_footprint`, `get_or5_status`, `get_rvol`, `get_day_type`, `get_rebid_reoffer_zones`, `get_pinch_events`, `get_session_inventory`, `evaluate_playbook`, `get_setup_context`, `check_delta_confirmation`, `get_proximity_report`, `get_imbalances`, `get_absorption_events`, `get_trade_size_profile`, DOM tools |
+| **Historical (backfill data)** | `get_snapshot_at`, `get_footprint_window`, `query_ticks`, `get_session_history`, `get_research_summary`, `query_event_frequency`, `query_conditional`, `query_distribution`, `compare_sessions`, `get_setup_performance_matrix`, `query_signal_outcome_*`, `get_signal_performance`, `backfill_history`, `run_backtest`, `get_backfill_status`, `get_backtest_results`, `compare_backtests` |
+
+**Data dependency:** Historical tools return empty or minimal data until `backfill_history` has populated the database. Call `get_research_summary` first to check session count; if low, run backfill before deep analysis.
+
+### Full Tool List by Category
 
 | Category | Tools | Description |
 |----------|-------|-------------|
@@ -186,6 +203,24 @@ The MCP server (`src/bin/the-desk-mcp.rs`) exposes 54 tools across 11 categories
 | | `get_backtest_results` | Retrieve stored backtest runs with metrics |
 | | `compare_backtests` | Compare two or more backtest runs side-by-side |
 | **Storage** | `archive_status` | Hot/warm/cold tier sizes, session count, last archive date |
+
+### Agent-to-Capability Mapping
+
+| Agent | Primary context | Key tools |
+|-------|------------------|-----------|
+| **orchestrator** | Both — routes by intent | All; routes `historical_research` to backtest-analyst |
+| **market-structure-analyst** | Live + historical | Live: `get_tpo_profile`, `get_key_levels`, `get_day_type`, `get_rvol`, `get_delta_profile`. Historical: `query_event_frequency`, `query_conditional`, `query_distribution`, `compare_sessions`, `get_session_history`, `get_research_summary` |
+| **orderflow-analyst** | Live + historical | Live: `get_delta_profile`, `get_tape_pace`, `get_footprint`, `get_imbalances`, `get_absorption_events`, DOM tools. Historical: same research tools as market-structure |
+| **levels-analyst** | Live + historical | Live: `get_key_levels`, `get_proximity_report`, `get_or5_status`. Historical: `query_event_frequency`, `query_conditional`, `compare_sessions`, `get_session_history` |
+| **playbook-evaluator** | Live only | `evaluate_playbook`, `get_setup_context`, `get_market_snapshot`, `get_key_levels`, `get_proximity_report` |
+| **backtest-analyst** | Historical only | `backfill_history`, `run_backtest`, `get_backfill_status`, `get_backtest_results`, `compare_backtests`, `compare_sessions`, `get_session_history`, `get_research_summary`, all `query_*` research tools |
+| **performance-analyst** | Historical only | `get_setup_performance_matrix`, `get_signal_performance`, `query_signal_outcome_*`, `query_distribution`, `query_conditional`, `get_session_history`, `get_research_summary` |
+| **risk-coach** | Live | `get_risk_state`, `get_risk_config`, `get_account_state`, `get_kelly_position_size`, `record_trade_result`, `save_account_state`, `init_risk_state` |
+| **data-integrity-validator** | Both | `validate_data_integrity`, `get_feed_health`, `get_session_summary` |
+
+### Event Types for `query_event_frequency`
+
+Structural: `ib_formed`, `or_formed`, `ib_mid_test`, `ib_extension_hit`, `ib_ext_0.5x_high`, `ib_ext_1.0x_high`, `ib_ext_1.5x_high`, `new_session_high`, `new_session_low`, `dnp_cross`, `day_type_change`, `poor_high_detected`, `poor_low_detected`, `excess_high_detected`, `excess_low_detected`, `or5_mid_retest`. Flow: `absorption_detected`, `pinch_detected`, `acceleration_zone_created`, `acceleration_zone_held`, `large_trade_cluster`, `rvol_spike`.
 
 ---
 

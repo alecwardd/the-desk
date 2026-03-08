@@ -181,6 +181,10 @@ cd src-tauri && cargo check
 cd src-tauri && cargo build --release --bin the-desk-mcp
 
 # Queue a historical backfill via MCP, then poll `get_backfill_status`
+
+# Run backfill from CLI (no MCP needed — useful for weekend prep)
+cd src-tauri && cargo run --bin the-desk-backfill -- --start 2026-03-02 --end 2026-03-06 --run-rules
+# Or load all available: cargo run --bin the-desk-backfill -- --run-rules
 ```
 
 Historical jobs are asynchronous:

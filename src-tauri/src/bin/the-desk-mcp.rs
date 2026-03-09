@@ -1,3 +1,5 @@
+use chrono::{NaiveDateTime, TimeZone, Utc};
+use chrono_tz::Tz;
 use rmcp::{
     handler::server::{tool::ToolRouter, wrapper::Parameters},
     model::*,
@@ -12,8 +14,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use the_desk_backend::backfill;
 use the_desk_backend::db::{
-    AccountStateRecord, Database, HistoricalJobRun, OpenPositionRecord, RiskConfigRecord,
-    SessionScopeFilter, SetupPerformanceSortBy, SignalOutcome, TradeRecord,
+    AccountStateRecord, Database, HistoricalJobRun, ImportedFillRecord, JournalEntry,
+    OpenPositionRecord, RiskConfigRecord, SessionRecord, SessionScopeFilter,
+    SetupPerformanceSortBy, SignalOutcome, TradeImportBatchRecord, TradeRecord, TradeReviewUpdate,
 };
 use the_desk_backend::depth::{
     aggregate_trade_volume_by_level, build_dom_feature_snapshot, build_dom_summary, DepthBook,
@@ -32,8 +35,9 @@ use the_desk_backend::risk::{RiskConfig, RiskState, RiskTracker};
 use the_desk_backend::rules::RulesEngine;
 use the_desk_backend::{
     classify_delta_segment, classify_session, et_minutes_from_timestamp, globex_open_ms,
-    minute_of_session_from_timestamp, session_date_from_timestamp_ms, DeltaSegment, SessionType,
-    GLOBEX_OPEN_ET, RTH_CLOSE_ET, RTH_OPEN_ET,
+    minute_of_session_from_timestamp, session_date_from_timestamp_ms,
+    trading_day_from_timestamp_ms, DeltaSegment, SessionType, GLOBEX_OPEN_ET, RTH_CLOSE_ET,
+    RTH_OPEN_ET,
 };
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::{sleep, Duration};
@@ -183,6 +187,158 @@ fn normalize_db_absorption_event(row: &serde_json::Value) -> serde_json::Value {
 
 fn no_data(msg: &str) -> CallToolResult {
     CallToolResult::success(vec![Content::text(msg.to_string())])
+}
+
+fn resolve_session_id(
+    db: &Database,
+    requested_session_id: Option<&str>,
+) -> Result<Option<String>, McpError> {
+    if let Some(session_id) = requested_session_id {
+        return Ok(Some(session_id.to_string()));
+    }
+    Ok(db
+        .get_latest_open_session()
+        .map_err(db_error)?
+        .map(|session| session.id))
+}
+
+fn infer_session_type_label(timestamp_ms: f64) -> String {
+    match et_minutes_from_timestamp(timestamp_ms)
+        .map(classify_session)
+        .unwrap_or(SessionType::Unknown)
+    {
+        SessionType::Rth => "rth".to_string(),
+        SessionType::Globex => "globex".to_string(),
+        SessionType::Unknown => "unknown".to_string(),
+    }
+}
+
+fn parse_import_timestamp(raw: &str, timezone: Tz) -> Result<f64, McpError> {
+    let parsed = NaiveDateTime::parse_from_str(raw.trim(), "%Y-%m-%d %H:%M:%S%.f")
+        .or_else(|_| NaiveDateTime::parse_from_str(raw.trim(), "%Y-%m-%d  %H:%M:%S%.f"))
+        .map_err(|e| invalid_params_error(format!("invalid fill timestamp `{raw}`: {e}")))?;
+    timezone
+        .from_local_datetime(&parsed)
+        .single()
+        .map(|dt| dt.with_timezone(&Utc).timestamp_millis() as f64)
+        .ok_or_else(|| invalid_params_error(format!("ambiguous or invalid timestamp `{raw}`")))
+}
+
+#[derive(Debug, Clone)]
+struct FillSlice {
+    timestamp_ms: f64,
+    price: f64,
+    quantity: i64,
+    symbol: String,
+    trade_account: Option<String>,
+    batch_id: String,
+    fingerprint: String,
+    order_side: String,
+    open_close: Option<String>,
+    service_order_id: Option<String>,
+    external_order_id: Option<String>,
+    raw_payload: serde_json::Value,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveImportedTrade {
+    session_id: Option<String>,
+    instrument: String,
+    trade_account: Option<String>,
+    direction: String,
+    entry_start_ms: f64,
+    last_exit_ms: f64,
+    signed_position: i64,
+    entry_qty_total: i64,
+    exit_qty_total: i64,
+    max_open_size: i64,
+    weighted_entry_notional: f64,
+    weighted_exit_notional: f64,
+    fill_refs: Vec<FillSlice>,
+}
+
+fn signed_delta_for_fill(side: &str, quantity: i64) -> Result<i64, McpError> {
+    match side.to_ascii_lowercase().as_str() {
+        "buy" => Ok(quantity),
+        "sell" => Ok(-quantity),
+        other => Err(invalid_params_error(format!(
+            "unsupported buy/sell value `{other}`"
+        ))),
+    }
+}
+
+fn build_imported_trade_record(
+    state: &ActiveImportedTrade,
+    source: &str,
+    notes: &str,
+) -> TradeRecord {
+    let entry_price = if state.entry_qty_total > 0 {
+        state.weighted_entry_notional / state.entry_qty_total as f64
+    } else {
+        0.0
+    };
+    let exit_price = if state.exit_qty_total > 0 {
+        state.weighted_exit_notional / state.exit_qty_total as f64
+    } else {
+        0.0
+    };
+    let gross_points = if state.exit_qty_total > 0 {
+        let per_contract = if state.direction == "long" {
+            exit_price - entry_price
+        } else {
+            entry_price - exit_price
+        };
+        Some(per_contract * state.exit_qty_total as f64)
+    } else {
+        None
+    };
+    TradeRecord {
+        id: uuid::Uuid::new_v4().to_string(),
+        session_id: state.session_id.clone(),
+        setup_id: None,
+        instrument: Some(state.instrument.clone()),
+        trade_account: state.trade_account.clone(),
+        entry_time: state.entry_start_ms,
+        entry_price,
+        exit_time: Some(state.last_exit_ms),
+        exit_price: Some(exit_price),
+        direction: state.direction.clone(),
+        size: state.max_open_size,
+        max_open_size: Some(state.max_open_size),
+        stop_price: None,
+        target_prices: Vec::new(),
+        result_r: None,
+        gross_points,
+        planned: false,
+        rules_followed: None,
+        emotional_state: None,
+        thesis: None,
+        review_tags: Vec::new(),
+        mistake_tags: Vec::new(),
+        entry_fill_count: state
+            .fill_refs
+            .iter()
+            .filter(|fill| {
+                signed_delta_for_fill(&fill.order_side, fill.quantity)
+                    .unwrap_or_default()
+                    .signum()
+                    == if state.direction == "long" { 1 } else { -1 }
+            })
+            .count() as i64,
+        exit_fill_count: state
+            .fill_refs
+            .iter()
+            .filter(|fill| {
+                signed_delta_for_fill(&fill.order_side, fill.quantity)
+                    .unwrap_or_default()
+                    .signum()
+                    == if state.direction == "long" { -1 } else { 1 }
+            })
+            .count() as i64,
+        import_batch_id: Some(state.fill_refs[0].batch_id.clone()),
+        notes: notes.to_string(),
+        source: source.to_string(),
+    }
 }
 
 const TAPE_PACE_RESPONSE_KEYS: &[&str] = &[
@@ -1064,6 +1220,171 @@ struct SignalPerformanceParams {
     session_scope: SessionScopeParams,
 }
 
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct StartTradingSessionParams {
+    session_id: Option<String>,
+    session_type: Option<String>,
+    start_time_ms: Option<f64>,
+    pre_session_note: Option<String>,
+    recording_path: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct EndTradingSessionParams {
+    session_id: Option<String>,
+    end_time_ms: Option<f64>,
+    recording_path: Option<String>,
+    session_note: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct UpsertTradeEntryParams {
+    id: Option<String>,
+    session_id: Option<String>,
+    setup_id: Option<String>,
+    instrument: Option<String>,
+    trade_account: Option<String>,
+    entry_time_ms: Option<f64>,
+    entry_price: f64,
+    exit_time_ms: Option<f64>,
+    exit_price: Option<f64>,
+    direction: String,
+    size: i64,
+    max_open_size: Option<i64>,
+    stop_price: Option<f64>,
+    target_prices: Option<Vec<f64>>,
+    result_r: Option<f64>,
+    gross_points: Option<f64>,
+    planned: Option<bool>,
+    rules_followed: Option<bool>,
+    emotional_state: Option<String>,
+    thesis: Option<String>,
+    review_tags: Option<Vec<String>>,
+    mistake_tags: Option<Vec<String>>,
+    entry_fill_count: Option<i64>,
+    exit_fill_count: Option<i64>,
+    import_batch_id: Option<String>,
+    notes: Option<String>,
+    source: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct CloseTradeEntryParams {
+    id: String,
+    exit_price: f64,
+    exit_time_ms: Option<f64>,
+    result_r: Option<f64>,
+    gross_points: Option<f64>,
+    notes: Option<String>,
+    update_risk_state: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct ReviewTradeEntryParams {
+    id: String,
+    planned: bool,
+    rules_followed: Option<bool>,
+    emotional_state: Option<String>,
+    thesis: Option<String>,
+    review_tags: Option<Vec<String>>,
+    mistake_tags: Option<Vec<String>>,
+    notes: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct SaveJournalEntryParams {
+    id: Option<String>,
+    session_id: Option<String>,
+    date: Option<String>,
+    content: String,
+    tags: Option<Vec<String>>,
+    setup_references: Option<Vec<String>>,
+    trade_references: Option<Vec<String>>,
+    created_at_ms: Option<f64>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct TradeListParams {
+    session_id: Option<String>,
+    limit: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct TradeEntryIdParams {
+    id: String,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct SessionJournalParams {
+    session_id: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct RecentJournalNotesParams {
+    limit: Option<u64>,
+    tag: Option<String>,
+    setup_reference: Option<String>,
+    trade_reference: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct SessionReviewContextParams {
+    session_id: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct JournalPatternParams {
+    start_date: Option<String>,
+    end_date: Option<String>,
+    session_type: Option<String>,
+    limit: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize, serde::Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct ImportedFillRowInput {
+    entry_time: String,
+    last_activity_time: Option<String>,
+    symbol: String,
+    status: String,
+    internal_order_id: Option<String>,
+    order_type: Option<String>,
+    buy_sell: String,
+    open_close: Option<String>,
+    order_quantity: Option<i64>,
+    price: Option<f64>,
+    filled_quantity: Option<i64>,
+    average_fill_price: f64,
+    parent_internal_order_id: Option<String>,
+    service_order_id: Option<String>,
+    trade_account: Option<String>,
+    exchange_order_id: Option<String>,
+    text_tag: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct ImportTradeFillsParams {
+    rows: Vec<ImportedFillRowInput>,
+    batch_id: Option<String>,
+    session_id: Option<String>,
+    source: Option<String>,
+    timezone: Option<String>,
+    notes: Option<String>,
+}
+
 #[tool_router]
 impl TheDeskMcp {
     fn new(db: Database, pipelines: PipelineEngine, db_path: String) -> Self {
@@ -1411,44 +1732,64 @@ impl TheDeskMcp {
         serde_json::to_value(&snapshot).ok()
     }
 
+    fn try_data_age_ms(&self) -> Option<f64> {
+        let db = self.db.try_lock().ok()?;
+        Some(compute_data_age(&db))
+    }
+
+    fn try_latest_feature_state(&self) -> Option<(serde_json::Value, f64)> {
+        let db = self.db.try_lock().ok()?;
+        let snapshot = db.latest_feature_state().ok().flatten()?;
+        Some((snapshot, compute_data_age(&db)))
+    }
+
+    fn try_latest_dom_feature_state(&self) -> Option<(f64, serde_json::Value)> {
+        let db = self.db.try_lock().ok()?;
+        db.latest_dom_feature_state().ok().flatten()
+    }
+
+    fn snapshot_with_fallback(&self) -> Option<(serde_json::Value, f64, &'static str)> {
+        if let Some(snapshot) = self.live_snapshot() {
+            return Some((
+                snapshot,
+                self.try_data_age_ms().unwrap_or(-1.0),
+                "live_pipeline",
+            ));
+        }
+
+        let (snapshot, data_age_ms) = self.try_latest_feature_state()?;
+        Some((snapshot, data_age_ms, "database"))
+    }
+
     #[tool(
         description = "Current market snapshot: last price, VWAP with 1/2/3 SD bands, TPO value area (high/low/POC), delta neutral value area (DNVA high/low/DNP), session delta, cumulative delta, key levels (prior day H/L/C, prior VA/POC, overnight range, OR, IB), Globex/London opening ranges, and session context (sessionType, sessionSegment, tradingDay), plus tape pace, imbalance count, absorption event count, and average trade size. Prefers live pipeline state; falls back to last persisted snapshot."
     )]
     async fn get_market_snapshot(&self) -> Result<CallToolResult, McpError> {
-        let db = self.db.lock().map_err(|_| lock_error())?;
-        let dom_feature = db.latest_dom_feature_state().ok().flatten();
-        if let Some(snapshot) = self.live_snapshot() {
+        let dom_feature = self.try_latest_dom_feature_state();
+        if let Some((snapshot, data_age_ms, source)) = self.snapshot_with_fallback() {
             return Ok(text_result(serde_json::json!({
                 "snapshot": snapshot,
                 "domSummary": dom_feature.as_ref().and_then(|(_, p)| p.get("domSummary")).cloned(),
-                "source": "live_pipeline"
+                "dataAgeMs": data_age_ms,
+                "source": source
             })));
         }
-        match db.latest_feature_state() {
-            Ok(Some(snapshot)) => Ok(text_result(serde_json::json!({
-                "snapshot": snapshot,
-                "domSummary": dom_feature.as_ref().and_then(|(_, p)| p.get("domSummary")).cloned(),
-                "dataAgeMs": compute_data_age(&db),
-                "source": "database"
-            }))),
-            Ok(None) => Ok(no_data(
-                "No market snapshot available yet. Ensure Sierra Chart is running and .scid data is being ingested.",
-            )),
-            Err(e) => Err(db_error(e)),
-        }
+        Ok(no_data(
+            "No market snapshot available yet or database is temporarily busy. Ensure Sierra Chart is running and .scid data is being ingested.",
+        ))
     }
 
     #[tool(
         description = "Current session context: sessionType (RTH/Globex/Unknown), sessionSegment (Asia/London/None), tradingDay (6 PM ET roll), and data freshness."
     )]
     async fn get_session_context(&self) -> Result<CallToolResult, McpError> {
-        let db = self.db.lock().map_err(|_| lock_error())?;
         let now_ms = chrono::Utc::now().timestamp_millis() as f64;
-        let context_ts = db
-            .latest_tick_timestamp_ms()
-            .ok()
-            .flatten()
-            .unwrap_or(now_ms);
+        let data_age_ms = self.try_data_age_ms().unwrap_or(-1.0);
+        let context_ts = if data_age_ms.is_finite() && data_age_ms >= 0.0 {
+            now_ms - data_age_ms
+        } else {
+            now_ms
+        };
         let et_minutes = et_minutes_from_timestamp(context_ts).unwrap_or(-1);
         let (is_transition, transition_from, transition_to, transition_phase) =
             if let Some((from, to, phase)) = transition_hint(et_minutes) {
@@ -1466,8 +1807,11 @@ impl TheDeskMcp {
                     serde_json::Value::Null,
                 )
             };
-        match db.latest_feature_state() {
-            Ok(Some(s)) => Ok(text_result(serde_json::json!({
+        match self
+            .live_snapshot()
+            .or_else(|| self.try_latest_feature_state().map(|(s, _)| s))
+        {
+            Some(s) => Ok(text_result(serde_json::json!({
                 "sessionType": s.get("sessionType"),
                 "sessionSegment": s.get("sessionSegment"),
                 "tradingDay": s.get("tradingDay"),
@@ -1476,10 +1820,9 @@ impl TheDeskMcp {
                 "transitionTo": transition_to,
                 "transitionPhase": transition_phase,
                 "etMinutes": et_minutes,
-                "dataAgeMs": compute_data_age(&db)
+                "dataAgeMs": data_age_ms
             }))),
-            Ok(None) => Ok(no_data("No session context available")),
-            Err(e) => Err(db_error(e)),
+            None => Ok(no_data("No session context available")),
         }
     }
 
@@ -1487,9 +1830,8 @@ impl TheDeskMcp {
         description = "TPO (Time-Price-Opportunity) profile data: POC (point of control), value area high/low, opening range high/low (first 30 min), initial balance high/low (first 60 min). Use for auction market theory analysis."
     )]
     async fn get_tpo_profile(&self) -> Result<CallToolResult, McpError> {
-        let db = self.db.lock().map_err(|_| lock_error())?;
-        match db.latest_feature_state() {
-            Ok(Some(s)) => Ok(text_result(serde_json::json!({
+        match self.snapshot_with_fallback() {
+            Some((s, data_age_ms, _)) => Ok(text_result(serde_json::json!({
                 "poc": s.get("poc"),
                 "vaHigh": s.get("vaHigh"),
                 "vaLow": s.get("vaLow"),
@@ -1497,10 +1839,9 @@ impl TheDeskMcp {
                 "orLow": s.get("orLow"),
                 "ibHigh": s.get("ibHigh"),
                 "ibLow": s.get("ibLow"),
-                "dataAgeMs": compute_data_age(&db)
+                "dataAgeMs": data_age_ms
             }))),
-            Ok(None) => Ok(no_data("No TPO data available")),
-            Err(e) => Err(db_error(e)),
+            None => Ok(no_data("No TPO data available")),
         }
     }
 
@@ -1508,9 +1849,8 @@ impl TheDeskMcp {
         description = "Delta profile: segment delta (Asia-only, London-only, or RTH-only), combined Globex delta (Asia+London when in Globex), cumulative delta, DNVA high/low, DNP. Use for inventory and positioning analysis."
     )]
     async fn get_delta_profile(&self) -> Result<CallToolResult, McpError> {
-        let db = self.db.lock().map_err(|_| lock_error())?;
-        match db.latest_feature_state() {
-            Ok(Some(s)) => Ok(text_result(serde_json::json!({
+        match self.snapshot_with_fallback() {
+            Some((s, data_age_ms, _)) => Ok(text_result(serde_json::json!({
                 "sessionDelta": s.get("sessionDelta"),
                 "globexDelta": s.get("globexDelta"),
                 "cumulativeDelta": s.get("cumulativeDelta"),
@@ -1518,10 +1858,9 @@ impl TheDeskMcp {
                 "dnvaLow": s.get("dnvaLow"),
                 "dnp": s.get("dnp"),
                 "sessionSegment": s.get("sessionSegment"),
-                "dataAgeMs": compute_data_age(&db)
+                "dataAgeMs": data_age_ms
             }))),
-            Ok(None) => Ok(no_data("No delta data available")),
-            Err(e) => Err(db_error(e)),
+            None => Ok(no_data("No delta data available")),
         }
     }
 
@@ -1608,9 +1947,8 @@ impl TheDeskMcp {
         description = "Tape pace analytics with coverage-aware rolling ticks/sec and volume/sec over 5-second, 30-second, and 5-minute windows. Returns both session-relative and rolling-context pace percentiles, smoothed normalized acceleration plus raw acceleration, 30-minute regime baselines, window validity/coverage, dwell at current price, and explicit data quality metadata so agents can distinguish live vs stale tape context."
     )]
     async fn get_tape_pace(&self) -> Result<CallToolResult, McpError> {
-        let db = self.db.lock().map_err(|_| lock_error())?;
         let now_ms = chrono::Utc::now().timestamp_millis() as f64;
-        let data_age_ms = compute_data_age(&db);
+        let data_age_ms = self.try_data_age_ms().unwrap_or(-1.0);
         // Try live pipeline first for full snapshot including volume/sec and dwell.
         // Use try_lock to avoid blocking when backfill/poll holds the lock.
         if let Ok(pipelines) = self.pipelines.try_lock() {
@@ -1652,8 +1990,8 @@ impl TheDeskMcp {
             )));
         }
         // Fallback to DB
-        match db.latest_feature_state() {
-            Ok(Some(s)) => {
+        match self.try_latest_feature_state() {
+            Some((s, _)) => {
                 let payload = serde_json::json!({
                     "ticksPerSec5s": s.get("tapePace5s").cloned().unwrap_or(serde_json::Value::Null),
                     "ticksPerSec30s": s.get("tapePace30s").cloned().unwrap_or(serde_json::Value::Null),
@@ -1685,8 +2023,7 @@ impl TheDeskMcp {
                     now_ms,
                 )))
             }
-            Ok(None) => Ok(no_data("No tape pace data")),
-            Err(e) => Err(db_error(e)),
+            None => Ok(no_data("No tape pace data")),
         }
     }
 
@@ -2453,30 +2790,35 @@ impl TheDeskMcp {
                     .take(limit)
                     .map(normalize_live_absorption_event)
                     .collect();
-                let db = self.db.lock().map_err(|_| lock_error())?;
                 return Ok(text_result(serde_json::json!({
                     "events": events,
                     "count": events.len(),
                     "source": "live_pipeline",
-                    "dataAgeMs": compute_data_age(&db)
+                    "dataAgeMs": self.try_data_age_ms().unwrap_or(-1.0)
                 })));
             }
         }
 
         // Fall back to market_events table (FlowEventEmitter writes absorption_* lifecycle events)
-        let db = self.db.lock().map_err(|_| lock_error())?;
-        match db.list_market_events_by_prefix("absorption_", limit) {
-            Ok(events) => {
+        match self.db.try_lock().ok().and_then(|db| {
+            let data_age_ms = compute_data_age(&db);
+            db.list_market_events_by_prefix("absorption_", limit)
+                .ok()
+                .map(|events| (events, data_age_ms))
+        }) {
+            Some((events, data_age_ms)) => {
                 let normalized: Vec<serde_json::Value> =
                     events.iter().map(normalize_db_absorption_event).collect();
                 Ok(text_result(serde_json::json!({
                     "events": normalized,
                     "count": normalized.len(),
                     "source": "market_events_db",
-                    "dataAgeMs": compute_data_age(&db)
+                    "dataAgeMs": data_age_ms
                 })))
             }
-            Err(e) => Err(db_error(e)),
+            None => Ok(no_data(
+                "No absorption data available or database is temporarily busy.",
+            )),
         }
     }
 
@@ -2797,6 +3139,786 @@ impl TheDeskMcp {
     }
 
     #[tool(
+        description = "Start a trading session in the local journal store. Creates a session row that trades and journal entries can attach to. Use this at the beginning of a discretionary review or live session when you want Cursor agents to log journal context consistently."
+    )]
+    async fn start_trading_session(
+        &self,
+        Parameters(params): Parameters<StartTradingSessionParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let db = self.db.lock().map_err(|_| lock_error())?;
+        let start_time_ms = params
+            .start_time_ms
+            .unwrap_or_else(|| Utc::now().timestamp_millis() as f64);
+        let session = SessionRecord {
+            id: params
+                .session_id
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+            date: trading_day_from_timestamp_ms(start_time_ms),
+            session_type: params
+                .session_type
+                .unwrap_or_else(|| infer_session_type_label(start_time_ms)),
+            start_time: start_time_ms,
+            end_time: None,
+            recording_path: params.recording_path,
+            pre_session_note: params.pre_session_note,
+        };
+        db.upsert_session(&session).map_err(db_error)?;
+        Ok(text_result(serde_json::json!({
+            "started": true,
+            "session": session
+        })))
+    }
+
+    #[tool(
+        description = "End a trading session in the local journal store. Optionally saves a freeform session note as a journal entry linked to the session."
+    )]
+    async fn end_trading_session(
+        &self,
+        Parameters(params): Parameters<EndTradingSessionParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let db = self.db.lock().map_err(|_| lock_error())?;
+        let session_id = resolve_session_id(&db, params.session_id.as_deref())?
+            .ok_or_else(|| invalid_params_error("no open session found to close"))?;
+        let end_time_ms = params
+            .end_time_ms
+            .unwrap_or_else(|| Utc::now().timestamp_millis() as f64);
+        db.update_session_end(&session_id, end_time_ms, params.recording_path.as_deref())
+            .map_err(db_error)?;
+
+        if let Some(content) = params.session_note.filter(|note| !note.trim().is_empty()) {
+            let entry = JournalEntry {
+                id: uuid::Uuid::new_v4().to_string(),
+                session_id: Some(session_id.clone()),
+                date: trading_day_from_timestamp_ms(end_time_ms),
+                content,
+                tags: vec!["session-end".to_string()],
+                setup_references: Vec::new(),
+                trade_references: Vec::new(),
+                created_at: end_time_ms,
+            };
+            db.upsert_journal_entry(&entry).map_err(db_error)?;
+        }
+
+        Ok(text_result(serde_json::json!({
+            "ended": true,
+            "sessionId": session_id,
+            "endTimeMs": end_time_ms
+        })))
+    }
+
+    #[tool(
+        description = "Create or update a trade journal entry. Supports manual chat-first trade logging as well as imported-fill normalization. If session_id is omitted, the latest open session is used when available."
+    )]
+    async fn upsert_trade_entry(
+        &self,
+        Parameters(params): Parameters<UpsertTradeEntryParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let db = self.db.lock().map_err(|_| lock_error())?;
+        let entry_time = params
+            .entry_time_ms
+            .unwrap_or_else(|| Utc::now().timestamp_millis() as f64);
+        let session_id = resolve_session_id(&db, params.session_id.as_deref())?;
+        let direction = params.direction.clone();
+        let trade = TradeRecord {
+            id: params
+                .id
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+            session_id,
+            setup_id: params.setup_id,
+            instrument: params.instrument,
+            trade_account: params.trade_account,
+            entry_time,
+            entry_price: params.entry_price,
+            exit_time: params.exit_time_ms,
+            exit_price: params.exit_price,
+            direction: direction.clone(),
+            size: params.size,
+            max_open_size: params.max_open_size.or(Some(params.size)),
+            stop_price: params.stop_price,
+            target_prices: params.target_prices.unwrap_or_default(),
+            result_r: params.result_r,
+            gross_points: params.gross_points.or_else(|| {
+                params.exit_price.map(|exit_price| {
+                    let per_contract = if direction.eq_ignore_ascii_case("long") {
+                        exit_price - params.entry_price
+                    } else {
+                        params.entry_price - exit_price
+                    };
+                    per_contract * params.size as f64
+                })
+            }),
+            planned: params.planned.unwrap_or(false),
+            rules_followed: params.rules_followed,
+            emotional_state: params.emotional_state,
+            thesis: params.thesis,
+            review_tags: params.review_tags.unwrap_or_default(),
+            mistake_tags: params.mistake_tags.unwrap_or_default(),
+            entry_fill_count: params.entry_fill_count.unwrap_or(1),
+            exit_fill_count: params
+                .exit_fill_count
+                .unwrap_or_else(|| i64::from(params.exit_price.is_some())),
+            import_batch_id: params.import_batch_id,
+            notes: params.notes.unwrap_or_default(),
+            source: params.source.unwrap_or_else(|| "manual_chat".to_string()),
+        };
+        db.upsert_trade(&trade).map_err(db_error)?;
+        Ok(text_result(serde_json::json!({
+            "saved": true,
+            "trade": trade
+        })))
+    }
+
+    #[tool(
+        description = "Close a trade journal entry with exit details. Optionally updates risk state when result_r is supplied and update_risk_state is true."
+    )]
+    async fn close_trade_entry(
+        &self,
+        Parameters(params): Parameters<CloseTradeEntryParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let db = self.db.lock().map_err(|_| lock_error())?;
+        let mut trade = db
+            .get_trade(&params.id)
+            .map_err(db_error)?
+            .ok_or_else(|| invalid_params_error("trade not found"))?;
+        let exit_time_ms = params
+            .exit_time_ms
+            .unwrap_or_else(|| Utc::now().timestamp_millis() as f64);
+        trade.exit_time = Some(exit_time_ms);
+        trade.exit_price = Some(params.exit_price);
+        if let Some(result_r) = params.result_r {
+            trade.result_r = Some(result_r);
+        }
+        trade.gross_points = params.gross_points.or_else(|| {
+            let per_contract = if trade.direction.eq_ignore_ascii_case("long") {
+                params.exit_price - trade.entry_price
+            } else {
+                trade.entry_price - params.exit_price
+            };
+            Some(per_contract * trade.size as f64)
+        });
+        if let Some(notes) = params.notes {
+            trade.notes = notes;
+        }
+        trade.exit_fill_count = trade.exit_fill_count.max(1);
+        db.upsert_trade(&trade).map_err(db_error)?;
+
+        let mut updated_risk_state = None;
+        if params.update_risk_state.unwrap_or(false) {
+            let result_r = trade.result_r.ok_or_else(|| {
+                invalid_params_error("result_r is required when update_risk_state is true")
+            })?;
+            let risk_state = db.load_risk_state().map_err(db_error)?.unwrap_or_default();
+            let config = db.load_risk_config().map_err(db_error)?;
+            let mut tracker = RiskTracker::new(RiskConfig {
+                max_daily_loss_r: config.max_daily_loss_r,
+                max_trades_per_session: config.max_trades_per_session.unwrap_or(8) as usize,
+            });
+            tracker.restore_state(risk_state);
+            tracker.record_trade_result(result_r);
+            let new_state = tracker.state();
+            db.save_risk_state(&new_state).map_err(db_error)?;
+            updated_risk_state = Some(new_state);
+        }
+
+        Ok(text_result(serde_json::json!({
+            "closed": true,
+            "trade": trade,
+            "updatedRiskState": updated_risk_state
+        })))
+    }
+
+    #[tool(
+        description = "Update structured trade review fields including thesis, review tags, mistake tags, discipline flags, and notes."
+    )]
+    async fn review_trade_entry(
+        &self,
+        Parameters(params): Parameters<ReviewTradeEntryParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let db = self.db.lock().map_err(|_| lock_error())?;
+        db.update_trade_review(
+            &params.id,
+            &TradeReviewUpdate {
+                planned: params.planned,
+                rules_followed: params.rules_followed,
+                emotional_state: params.emotional_state,
+                thesis: params.thesis,
+                review_tags: params.review_tags.unwrap_or_default(),
+                mistake_tags: params.mistake_tags.unwrap_or_default(),
+                notes: params.notes.unwrap_or_default(),
+            },
+        )
+        .map_err(db_error)?;
+        let trade = db.get_trade(&params.id).map_err(db_error)?;
+        Ok(text_result(serde_json::json!({
+            "updated": true,
+            "trade": trade
+        })))
+    }
+
+    #[tool(
+        description = "Save a journal note. If session_id is omitted, the latest open session is used when available."
+    )]
+    async fn save_journal_entry(
+        &self,
+        Parameters(params): Parameters<SaveJournalEntryParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let db = self.db.lock().map_err(|_| lock_error())?;
+        let created_at = params
+            .created_at_ms
+            .unwrap_or_else(|| Utc::now().timestamp_millis() as f64);
+        let entry = JournalEntry {
+            id: params
+                .id
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+            session_id: resolve_session_id(&db, params.session_id.as_deref())?,
+            date: params
+                .date
+                .unwrap_or_else(|| trading_day_from_timestamp_ms(created_at)),
+            content: params.content,
+            tags: params.tags.unwrap_or_default(),
+            setup_references: params.setup_references.unwrap_or_default(),
+            trade_references: params.trade_references.unwrap_or_default(),
+            created_at,
+        };
+        db.upsert_journal_entry(&entry).map_err(db_error)?;
+        Ok(text_result(serde_json::json!({
+            "saved": true,
+            "journalEntry": entry
+        })))
+    }
+
+    #[tool(
+        description = "List trade journal entries. Without filters, returns the most recent trade entries across sessions."
+    )]
+    async fn list_trade_entries(
+        &self,
+        Parameters(params): Parameters<TradeListParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let db = self.db.lock().map_err(|_| lock_error())?;
+        let limit = params.limit.unwrap_or(50).min(500) as usize;
+        let trades = if let Some(session_id) = params.session_id {
+            db.list_trades_for_session(&session_id).map_err(db_error)?
+        } else {
+            db.list_recent_trades(limit).map_err(db_error)?
+        };
+        Ok(text_result(serde_json::json!({
+            "trades": trades,
+            "count": trades.len()
+        })))
+    }
+
+    #[tool(description = "Get a single trade journal entry by ID.")]
+    async fn get_trade_entry(
+        &self,
+        Parameters(params): Parameters<TradeEntryIdParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let db = self.db.lock().map_err(|_| lock_error())?;
+        match db.get_trade(&params.id).map_err(db_error)? {
+            Some(trade) => Ok(text_result(serde_json::json!({ "trade": trade }))),
+            None => Ok(no_data("Trade not found.")),
+        }
+    }
+
+    #[tool(
+        description = "Return journal notes for a session. If session_id is omitted, uses the latest open session when available."
+    )]
+    async fn get_session_journal(
+        &self,
+        Parameters(params): Parameters<SessionJournalParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let db = self.db.lock().map_err(|_| lock_error())?;
+        let session_id = resolve_session_id(&db, params.session_id.as_deref())?
+            .ok_or_else(|| invalid_params_error("no session found"))?;
+        let session = db.get_session(&session_id).map_err(db_error)?;
+        let entries = db.get_journal_for_session(&session_id).map_err(db_error)?;
+        Ok(text_result(serde_json::json!({
+            "session": session,
+            "journalEntries": entries,
+            "count": entries.len()
+        })))
+    }
+
+    #[tool(
+        description = "Get a compact slice of recent journal notes. Supports filtering by tag, setup reference, or trade reference."
+    )]
+    async fn get_recent_journal_notes(
+        &self,
+        Parameters(params): Parameters<RecentJournalNotesParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let db = self.db.lock().map_err(|_| lock_error())?;
+        let limit = params.limit.unwrap_or(5).min(25) as usize;
+        let filtered: Vec<JournalEntry> = db
+            .list_recent_journal_entries(limit * 10)
+            .map_err(db_error)?
+            .into_iter()
+            .filter(|entry| {
+                let tag_ok = params
+                    .tag
+                    .as_ref()
+                    .map(|tag| entry.tags.iter().any(|t| t == tag))
+                    .unwrap_or(true);
+                let setup_ok = params
+                    .setup_reference
+                    .as_ref()
+                    .map(|setup| entry.setup_references.iter().any(|value| value == setup))
+                    .unwrap_or(true);
+                let trade_ok = params
+                    .trade_reference
+                    .as_ref()
+                    .map(|trade_id| entry.trade_references.iter().any(|value| value == trade_id))
+                    .unwrap_or(true);
+                tag_ok && setup_ok && trade_ok
+            })
+            .take(limit)
+            .collect();
+        Ok(text_result(serde_json::json!({
+            "journalEntries": filtered,
+            "count": filtered.len()
+        })))
+    }
+
+    #[tool(
+        description = "Return a structured session review bundle: session metadata, trade journal entries, journal notes, and deterministic summary metrics for debrief workflows."
+    )]
+    async fn get_session_review_context(
+        &self,
+        Parameters(params): Parameters<SessionReviewContextParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let db = self.db.lock().map_err(|_| lock_error())?;
+        let session_id = resolve_session_id(&db, params.session_id.as_deref())?
+            .ok_or_else(|| invalid_params_error("no session found"))?;
+        let session = db.get_session(&session_id).map_err(db_error)?;
+        let trades = db.list_trades_for_session(&session_id).map_err(db_error)?;
+        let journal = db.get_journal_for_session(&session_id).map_err(db_error)?;
+        let closed_trades = trades
+            .iter()
+            .filter(|trade| trade.exit_time.is_some())
+            .count();
+        let winning_trades = trades
+            .iter()
+            .filter(|trade| trade.gross_points.unwrap_or(0.0) > 0.0)
+            .count();
+        let losing_trades = trades
+            .iter()
+            .filter(|trade| trade.gross_points.unwrap_or(0.0) < 0.0)
+            .count();
+        let total_gross_points: f64 = trades.iter().filter_map(|trade| trade.gross_points).sum();
+        let planned_count = trades.iter().filter(|trade| trade.planned).count();
+        let rules_broken_count = trades
+            .iter()
+            .filter(|trade| matches!(trade.rules_followed, Some(false)))
+            .count();
+
+        Ok(text_result(serde_json::json!({
+            "session": session,
+            "trades": trades,
+            "journalEntries": journal,
+            "summary": {
+                "tradeCount": trades.len(),
+                "closedTradeCount": closed_trades,
+                "winningTradeCount": winning_trades,
+                "losingTradeCount": losing_trades,
+                "plannedTradeCount": planned_count,
+                "rulesBrokenTradeCount": rules_broken_count,
+                "journalEntryCount": journal.len(),
+                "grossPoints": total_gross_points
+            }
+        })))
+    }
+
+    #[tool(
+        description = "Aggregate deterministic journal patterns across sessions: planned-vs-unplanned counts, rules adherence, emotional states, review tags, mistake tags, and gross points."
+    )]
+    async fn query_journal_patterns(
+        &self,
+        Parameters(params): Parameters<JournalPatternParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let db = self.db.lock().map_err(|_| lock_error())?;
+        let limit = params.limit.unwrap_or(200).min(2000) as usize;
+        let sessions = db.list_sessions(limit).map_err(db_error)?;
+        let filtered_sessions: Vec<SessionRecord> = sessions
+            .into_iter()
+            .filter(|session| {
+                let start_ok = params
+                    .start_date
+                    .as_ref()
+                    .map(|start| &session.date >= start)
+                    .unwrap_or(true);
+                let end_ok = params
+                    .end_date
+                    .as_ref()
+                    .map(|end| &session.date <= end)
+                    .unwrap_or(true);
+                let type_ok = params
+                    .session_type
+                    .as_ref()
+                    .map(|session_type| session.session_type.eq_ignore_ascii_case(session_type))
+                    .unwrap_or(true);
+                start_ok && end_ok && type_ok
+            })
+            .collect();
+
+        let mut planned = 0usize;
+        let mut unplanned = 0usize;
+        let mut rules_followed_true = 0usize;
+        let mut rules_followed_false = 0usize;
+        let mut emotional_counts: HashMap<String, usize> = HashMap::new();
+        let mut review_tag_counts: HashMap<String, usize> = HashMap::new();
+        let mut mistake_tag_counts: HashMap<String, usize> = HashMap::new();
+        let mut total_gross_points = 0.0;
+        let mut trade_count = 0usize;
+
+        for session in &filtered_sessions {
+            for trade in db.list_trades_for_session(&session.id).map_err(db_error)? {
+                trade_count += 1;
+                if trade.planned {
+                    planned += 1;
+                } else {
+                    unplanned += 1;
+                }
+                match trade.rules_followed {
+                    Some(true) => rules_followed_true += 1,
+                    Some(false) => rules_followed_false += 1,
+                    None => {}
+                }
+                if let Some(emotion) = trade.emotional_state.clone() {
+                    *emotional_counts.entry(emotion).or_default() += 1;
+                }
+                for tag in trade.review_tags {
+                    *review_tag_counts.entry(tag).or_default() += 1;
+                }
+                for tag in trade.mistake_tags {
+                    *mistake_tag_counts.entry(tag).or_default() += 1;
+                }
+                total_gross_points += trade.gross_points.unwrap_or(0.0);
+            }
+        }
+
+        Ok(text_result(serde_json::json!({
+            "sessionCount": filtered_sessions.len(),
+            "tradeCount": trade_count,
+            "plannedCount": planned,
+            "unplannedCount": unplanned,
+            "rulesFollowedCount": rules_followed_true,
+            "rulesBrokenCount": rules_followed_false,
+            "emotionalStateCounts": emotional_counts,
+            "reviewTagCounts": review_tag_counts,
+            "mistakeTagCounts": mistake_tag_counts,
+            "grossPoints": total_gross_points
+        })))
+    }
+
+    #[tool(
+        description = "Import broker-exported fills into the trade journal. Accepts an array of fill rows, skips duplicates idempotently, stores raw import rows, and synthesizes normalized round-trip trade entries."
+    )]
+    async fn import_trade_fills(
+        &self,
+        Parameters(params): Parameters<ImportTradeFillsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let db = self.db.lock().map_err(|_| lock_error())?;
+        let timezone: Tz = params
+            .timezone
+            .as_deref()
+            .unwrap_or("America/New_York")
+            .parse()
+            .map_err(|e| invalid_params_error(format!("invalid timezone: {e}")))?;
+        let batch_id = params
+            .batch_id
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let source = params.source.unwrap_or_else(|| "imported_fill".to_string());
+
+        let mut fills: Vec<FillSlice> = Vec::new();
+        let mut skipped_duplicates = 0usize;
+        for row in params.rows {
+            if !row.status.eq_ignore_ascii_case("filled") {
+                continue;
+            }
+            let quantity = row.filled_quantity.unwrap_or(0);
+            if quantity <= 0 {
+                continue;
+            }
+            let timestamp_ms = parse_import_timestamp(
+                row.last_activity_time
+                    .as_deref()
+                    .unwrap_or(row.entry_time.as_str()),
+                timezone,
+            )?;
+            let base_fingerprint = format!(
+                "{}|{}|{}|{:.0}|{:.4}|{}|{}",
+                row.symbol,
+                row.trade_account.clone().unwrap_or_default(),
+                row.service_order_id
+                    .clone()
+                    .or(row.internal_order_id.clone())
+                    .unwrap_or_default(),
+                timestamp_ms,
+                row.average_fill_price,
+                quantity,
+                row.buy_sell.to_ascii_lowercase()
+            );
+            if db
+                .imported_fill_exists(&format!("{base_fingerprint}:0"))
+                .map_err(db_error)?
+            {
+                skipped_duplicates += 1;
+                continue;
+            }
+            let raw_payload = serde_json::to_value(&row)
+                .map_err(|e| invalid_params_error(format!("fill row serialization failed: {e}")))?;
+            fills.push(FillSlice {
+                timestamp_ms,
+                price: row.average_fill_price,
+                quantity,
+                symbol: row.symbol,
+                trade_account: row.trade_account,
+                batch_id: batch_id.clone(),
+                fingerprint: base_fingerprint,
+                order_side: row.buy_sell,
+                open_close: row.open_close,
+                service_order_id: row.service_order_id,
+                external_order_id: row.exchange_order_id,
+                raw_payload,
+            });
+        }
+
+        fills.sort_by(|a, b| {
+            a.timestamp_ms
+                .partial_cmp(&b.timestamp_ms)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        if fills.is_empty() {
+            return Ok(text_result(serde_json::json!({
+                "imported": false,
+                "reason": "no new filled rows after duplicate filtering"
+            })));
+        }
+
+        let session_id = if let Some(session_id) = params.session_id {
+            session_id
+        } else {
+            let first_ts = fills[0].timestamp_ms;
+            let session = SessionRecord {
+                id: uuid::Uuid::new_v4().to_string(),
+                date: trading_day_from_timestamp_ms(first_ts),
+                session_type: infer_session_type_label(first_ts),
+                start_time: first_ts,
+                end_time: fills.last().map(|fill| fill.timestamp_ms),
+                recording_path: None,
+                pre_session_note: None,
+            };
+            db.upsert_session(&session).map_err(db_error)?;
+            session.id
+        };
+
+        db.insert_trade_import_batch(&TradeImportBatchRecord {
+            batch_id: batch_id.clone(),
+            source: source.clone(),
+            imported_at: Utc::now().timestamp_millis() as f64,
+            notes: params.notes.unwrap_or_default(),
+            fill_count: fills.len() as i64,
+        })
+        .map_err(db_error)?;
+
+        let mut active_by_key: HashMap<(String, Option<String>), ActiveImportedTrade> =
+            HashMap::new();
+        let mut imported_trades: Vec<TradeRecord> = Vec::new();
+
+        for fill in fills {
+            let key = (fill.symbol.clone(), fill.trade_account.clone());
+            let delta = signed_delta_for_fill(&fill.order_side, fill.quantity)?;
+            let mut remaining = delta.unsigned_abs() as i64;
+            let entry_sign = delta.signum();
+
+            let state = active_by_key
+                .entry(key.clone())
+                .or_insert_with(|| ActiveImportedTrade {
+                    session_id: Some(session_id.clone()),
+                    instrument: fill.symbol.clone(),
+                    trade_account: fill.trade_account.clone(),
+                    direction: if entry_sign > 0 {
+                        "long".to_string()
+                    } else {
+                        "short".to_string()
+                    },
+                    entry_start_ms: fill.timestamp_ms,
+                    last_exit_ms: fill.timestamp_ms,
+                    signed_position: 0,
+                    entry_qty_total: 0,
+                    exit_qty_total: 0,
+                    max_open_size: 0,
+                    weighted_entry_notional: 0.0,
+                    weighted_exit_notional: 0.0,
+                    fill_refs: Vec::new(),
+                });
+
+            if state.signed_position == 0 {
+                state.direction = if entry_sign > 0 {
+                    "long".to_string()
+                } else {
+                    "short".to_string()
+                };
+                state.entry_start_ms = fill.timestamp_ms;
+            }
+
+            if state.signed_position == 0 || state.signed_position.signum() == entry_sign {
+                state.signed_position += delta;
+                state.entry_qty_total += remaining;
+                state.weighted_entry_notional += fill.price * remaining as f64;
+                state.max_open_size = state.max_open_size.max(state.signed_position.abs());
+                state.fill_refs.push(FillSlice {
+                    fingerprint: format!("{}:0", fill.fingerprint),
+                    quantity: remaining,
+                    ..fill.clone()
+                });
+                continue;
+            }
+
+            let mut split_index = 0usize;
+            while remaining > 0 {
+                let closable = remaining.min(state.signed_position.abs());
+                state.exit_qty_total += closable;
+                state.weighted_exit_notional += fill.price * closable as f64;
+                state.last_exit_ms = fill.timestamp_ms;
+                state.fill_refs.push(FillSlice {
+                    fingerprint: format!("{}:{split_index}", fill.fingerprint),
+                    quantity: closable,
+                    ..fill.clone()
+                });
+                split_index += 1;
+                remaining -= closable;
+                state.signed_position += if state.signed_position > 0 {
+                    -closable
+                } else {
+                    closable
+                };
+
+                if state.signed_position == 0 {
+                    let trade =
+                        build_imported_trade_record(state, &source, "Imported from broker fills");
+                    db.upsert_trade(&trade).map_err(db_error)?;
+                    for fill_ref in &state.fill_refs {
+                        if db
+                            .imported_fill_exists(&fill_ref.fingerprint)
+                            .map_err(db_error)?
+                        {
+                            continue;
+                        }
+                        db.insert_imported_fill(&ImportedFillRecord {
+                            fingerprint: fill_ref.fingerprint.clone(),
+                            batch_id: fill_ref.batch_id.clone(),
+                            trade_id: Some(trade.id.clone()),
+                            symbol: fill_ref.symbol.clone(),
+                            trade_account: fill_ref.trade_account.clone(),
+                            fill_time: fill_ref.timestamp_ms,
+                            order_side: fill_ref.order_side.clone(),
+                            open_close: fill_ref.open_close.clone(),
+                            quantity: fill_ref.quantity,
+                            price: fill_ref.price,
+                            status: "Filled".to_string(),
+                            external_order_id: fill_ref.external_order_id.clone(),
+                            service_order_id: fill_ref.service_order_id.clone(),
+                            raw_payload: fill_ref.raw_payload.clone(),
+                        })
+                        .map_err(db_error)?;
+                    }
+                    imported_trades.push(trade);
+                    *state = ActiveImportedTrade {
+                        session_id: Some(session_id.clone()),
+                        instrument: fill.symbol.clone(),
+                        trade_account: fill.trade_account.clone(),
+                        direction: if entry_sign > 0 {
+                            "long".to_string()
+                        } else {
+                            "short".to_string()
+                        },
+                        entry_start_ms: fill.timestamp_ms,
+                        last_exit_ms: fill.timestamp_ms,
+                        signed_position: 0,
+                        entry_qty_total: 0,
+                        exit_qty_total: 0,
+                        max_open_size: 0,
+                        weighted_entry_notional: 0.0,
+                        weighted_exit_notional: 0.0,
+                        fill_refs: Vec::new(),
+                    };
+                }
+
+                if remaining > 0 && state.signed_position == 0 {
+                    state.direction = if entry_sign > 0 {
+                        "long".to_string()
+                    } else {
+                        "short".to_string()
+                    };
+                    state.entry_start_ms = fill.timestamp_ms;
+                    state.signed_position = if entry_sign > 0 {
+                        remaining
+                    } else {
+                        -remaining
+                    };
+                    state.entry_qty_total = remaining;
+                    state.max_open_size = remaining;
+                    state.weighted_entry_notional = fill.price * remaining as f64;
+                    state.fill_refs.push(FillSlice {
+                        fingerprint: format!("{}:{split_index}", fill.fingerprint),
+                        quantity: remaining,
+                        ..fill.clone()
+                    });
+                    remaining = 0;
+                }
+            }
+        }
+
+        for state in active_by_key
+            .values()
+            .filter(|state| state.signed_position != 0)
+        {
+            let mut trade =
+                build_imported_trade_record(state, &source, "Imported from broker fills");
+            trade.exit_time = None;
+            trade.exit_price = None;
+            trade.gross_points = None;
+            trade.exit_fill_count = 0;
+            db.upsert_trade(&trade).map_err(db_error)?;
+            for fill_ref in &state.fill_refs {
+                if db
+                    .imported_fill_exists(&fill_ref.fingerprint)
+                    .map_err(db_error)?
+                {
+                    continue;
+                }
+                db.insert_imported_fill(&ImportedFillRecord {
+                    fingerprint: fill_ref.fingerprint.clone(),
+                    batch_id: fill_ref.batch_id.clone(),
+                    trade_id: Some(trade.id.clone()),
+                    symbol: fill_ref.symbol.clone(),
+                    trade_account: fill_ref.trade_account.clone(),
+                    fill_time: fill_ref.timestamp_ms,
+                    order_side: fill_ref.order_side.clone(),
+                    open_close: fill_ref.open_close.clone(),
+                    quantity: fill_ref.quantity,
+                    price: fill_ref.price,
+                    status: "Filled".to_string(),
+                    external_order_id: fill_ref.external_order_id.clone(),
+                    service_order_id: fill_ref.service_order_id.clone(),
+                    raw_payload: fill_ref.raw_payload.clone(),
+                })
+                .map_err(db_error)?;
+            }
+            imported_trades.push(trade);
+        }
+
+        Ok(text_result(serde_json::json!({
+            "imported": true,
+            "batchId": batch_id,
+            "sessionId": session_id,
+            "skippedDuplicates": skipped_duplicates,
+            "createdTradeCount": imported_trades.len(),
+            "trades": imported_trades
+        })))
+    }
+
+    #[tool(
         description = "Record a completed trade result. Updates risk state (daily P&L, consecutive wins/losses, drawdown, at_limit). Also creates a trade record for performance tracking. Call after a trade is closed to keep risk state current."
     )]
     async fn record_trade_result(
@@ -2810,20 +3932,34 @@ impl TheDeskMcp {
         let now_ms = chrono::Utc::now().timestamp_millis() as f64;
         let trade = TradeRecord {
             id: trade_id.clone(),
-            session_id: None,
+            session_id: resolve_session_id(&db, None)?,
             setup_id: params.setup_id.clone(),
+            instrument: None,
+            trade_account: None,
             entry_time: now_ms,
             entry_price: params.entry_price,
             exit_time: Some(now_ms),
             exit_price: Some(params.exit_price),
             direction: params.direction.clone(),
             size: params.size,
+            max_open_size: Some(params.size),
             stop_price: params.stop_price,
             target_prices: Vec::new(),
             result_r: Some(params.result_r),
+            gross_points: Some(if params.direction.eq_ignore_ascii_case("long") {
+                (params.exit_price - params.entry_price) * params.size as f64
+            } else {
+                (params.entry_price - params.exit_price) * params.size as f64
+            }),
             planned: true,
             rules_followed: None,
             emotional_state: None,
+            thesis: None,
+            review_tags: Vec::new(),
+            mistake_tags: Vec::new(),
+            entry_fill_count: 1,
+            exit_fill_count: 1,
+            import_batch_id: None,
             notes: params.notes.unwrap_or_default(),
             source: "mcp".to_string(),
         };
@@ -3724,7 +4860,6 @@ impl TheDeskMcp {
         &self,
         Parameters(params): Parameters<DeltaAtPriceParams>,
     ) -> Result<CallToolResult, McpError> {
-        let db = self.db.lock().map_err(|_| lock_error())?;
         if let Ok(pipelines) = self.pipelines.try_lock() {
             let price = params.price.unwrap_or(pipelines.levels.last_price);
             let top_n = params.top_n.unwrap_or(10);
@@ -3757,7 +4892,7 @@ impl TheDeskMcp {
                 "confirmsSell": confirms_sell,
                 "sessionDelta": pipelines.delta.session_delta(),
                 "topPricesByDelta": top,
-                "dataAgeMs": compute_data_age(&db)
+                "dataAgeMs": self.try_data_age_ms().unwrap_or(-1.0)
             })));
         }
         Ok(no_data(
@@ -3772,7 +4907,6 @@ impl TheDeskMcp {
         &self,
         Parameters(params): Parameters<DeltaConfirmParams>,
     ) -> Result<CallToolResult, McpError> {
-        let db = self.db.lock().map_err(|_| lock_error())?;
         let is_buy = params.is_buy_setup.unwrap_or(true);
 
         // Try pipeline for price-level delta (try_lock to avoid blocking)
@@ -3794,13 +4928,13 @@ impl TheDeskMcp {
                 "price": price,
                 "bothConfirm": session_confirms && price_confirms,
                 "direction": if is_buy { "long" } else { "short" },
-                "dataAgeMs": compute_data_age(&db)
+                "dataAgeMs": self.try_data_age_ms().unwrap_or(-1.0)
             })));
         }
 
         // Fallback: session-level only
-        match db.latest_feature_state() {
-            Ok(Some(s)) => {
+        match self.try_latest_feature_state() {
+            Some((s, data_age_ms)) => {
                 let session_delta = s
                     .get("sessionDelta")
                     .and_then(|v| v.as_f64())
@@ -3815,11 +4949,10 @@ impl TheDeskMcp {
                     "sessionDelta": session_delta,
                     "direction": if is_buy { "long" } else { "short" },
                     "note": "Price-level delta not available (pipeline not live).",
-                    "dataAgeMs": compute_data_age(&db)
+                    "dataAgeMs": data_age_ms
                 })))
             }
-            Ok(None) => Ok(no_data("No delta data available")),
-            Err(e) => Err(db_error(e)),
+            None => Ok(no_data("No delta data available")),
         }
     }
 
@@ -3904,9 +5037,8 @@ impl TheDeskMcp {
         &self,
         Parameters(params): Parameters<ProximityParams>,
     ) -> Result<CallToolResult, McpError> {
-        let db = self.db.lock().map_err(|_| lock_error())?;
-        match db.latest_feature_state() {
-            Ok(Some(s)) => {
+        match self.snapshot_with_fallback() {
+            Some((s, data_age_ms, _)) => {
                 let last_price = s.get("lastPrice").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let max_ticks = params.max_distance_ticks.unwrap_or(20.0);
 
@@ -3970,11 +5102,10 @@ impl TheDeskMcp {
                     "lastPrice": last_price,
                     "maxDistanceTicks": max_ticks,
                     "nearbyLevels": levels,
-                    "dataAgeMs": compute_data_age(&db)
+                    "dataAgeMs": data_age_ms
                 })))
             }
-            Ok(None) => Ok(no_data("No market data available for proximity report")),
-            Err(e) => Err(db_error(e)),
+            None => Ok(no_data("No market data available for proximity report")),
         }
     }
 

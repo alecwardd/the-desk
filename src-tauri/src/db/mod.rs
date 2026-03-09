@@ -69,20 +69,42 @@ pub struct TradeRecord {
     pub id: String,
     pub session_id: Option<String>,
     pub setup_id: Option<String>,
+    pub instrument: Option<String>,
+    pub trade_account: Option<String>,
     pub entry_time: f64,
     pub entry_price: f64,
     pub exit_time: Option<f64>,
     pub exit_price: Option<f64>,
     pub direction: String,
     pub size: i64,
+    pub max_open_size: Option<i64>,
     pub stop_price: Option<f64>,
     pub target_prices: Vec<f64>,
     pub result_r: Option<f64>,
+    pub gross_points: Option<f64>,
     pub planned: bool,
     pub rules_followed: Option<bool>,
     pub emotional_state: Option<String>,
+    pub thesis: Option<String>,
+    pub review_tags: Vec<String>,
+    pub mistake_tags: Vec<String>,
+    pub entry_fill_count: i64,
+    pub exit_fill_count: i64,
+    pub import_batch_id: Option<String>,
     pub notes: String,
     pub source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TradeReviewUpdate {
+    pub planned: bool,
+    pub rules_followed: Option<bool>,
+    pub emotional_state: Option<String>,
+    pub thesis: Option<String>,
+    pub review_tags: Vec<String>,
+    pub mistake_tags: Vec<String>,
+    pub notes: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -100,6 +122,35 @@ pub struct JournalEntry {
     pub setup_references: Vec<String>,
     pub trade_references: Vec<String>,
     pub created_at: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TradeImportBatchRecord {
+    pub batch_id: String,
+    pub source: String,
+    pub imported_at: f64,
+    pub notes: String,
+    pub fill_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportedFillRecord {
+    pub fingerprint: String,
+    pub batch_id: String,
+    pub trade_id: Option<String>,
+    pub symbol: String,
+    pub trade_account: Option<String>,
+    pub fill_time: f64,
+    pub order_side: String,
+    pub open_close: Option<String>,
+    pub quantity: i64,
+    pub price: f64,
+    pub status: String,
+    pub external_order_id: Option<String>,
+    pub service_order_id: Option<String>,
+    pub raw_payload: serde_json::Value,
 }
 
 // ---------------------------------------------------------------------------
@@ -610,6 +661,9 @@ impl Database {
         }
         if version < 16 {
             self.migrate_v16()?;
+        }
+        if version < 17 {
+            self.migrate_v17()?;
         }
 
         Ok(())
@@ -1387,6 +1441,64 @@ impl Database {
         Ok(())
     }
 
+    /// V17: trade journal enrichment fields plus fill-import ledger tables.
+    fn migrate_v17(&self) -> Result<(), DbError> {
+        let trade_columns = [
+            ("instrument", "TEXT NULL"),
+            ("trade_account", "TEXT NULL"),
+            ("max_open_size", "INTEGER NULL"),
+            ("gross_points", "REAL NULL"),
+            ("thesis", "TEXT NULL"),
+            ("review_tags", "TEXT NOT NULL DEFAULT '[]'"),
+            ("mistake_tags", "TEXT NOT NULL DEFAULT '[]'"),
+            ("entry_fill_count", "INTEGER NOT NULL DEFAULT 1"),
+            ("exit_fill_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("import_batch_id", "TEXT NULL"),
+        ];
+        for (col, def) in &trade_columns {
+            let sql = format!("ALTER TABLE trades ADD COLUMN {col} {def}");
+            let _ = self.conn.execute(&sql, []);
+        }
+
+        self.conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS trade_import_batches (
+              batch_id TEXT PRIMARY KEY,
+              source TEXT NOT NULL,
+              imported_at REAL NOT NULL,
+              notes TEXT NOT NULL DEFAULT '',
+              fill_count INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS trade_fill_imports (
+              fingerprint TEXT PRIMARY KEY,
+              batch_id TEXT NOT NULL REFERENCES trade_import_batches(batch_id),
+              trade_id TEXT NULL REFERENCES trades(id),
+              symbol TEXT NOT NULL,
+              trade_account TEXT NULL,
+              fill_time REAL NOT NULL,
+              order_side TEXT NOT NULL,
+              open_close TEXT NULL,
+              quantity INTEGER NOT NULL,
+              price REAL NOT NULL,
+              status TEXT NOT NULL,
+              external_order_id TEXT NULL,
+              service_order_id TEXT NULL,
+              raw_payload TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_trade_import_batches_time
+              ON trade_import_batches(imported_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_trade_fill_imports_batch
+              ON trade_fill_imports(batch_id);
+            CREATE INDEX IF NOT EXISTS idx_trade_fill_imports_trade
+              ON trade_fill_imports(trade_id);
+            CREATE INDEX IF NOT EXISTS idx_trade_fill_imports_time
+              ON trade_fill_imports(fill_time);
+            UPDATE schema_version SET version = 17;
+            ",
+        )?;
+        Ok(())
+    }
+
     // ------------------------------------------------------------------
     // Setup CRUD
     // ------------------------------------------------------------------
@@ -1571,6 +1683,30 @@ impl Database {
         Ok(())
     }
 
+    pub fn upsert_session(&self, session: &SessionRecord) -> Result<(), DbError> {
+        self.conn.execute(
+            "INSERT INTO sessions (id, date, session_type, start_time, end_time, recording_path, pre_session_note)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(id) DO UPDATE SET
+               date = excluded.date,
+               session_type = excluded.session_type,
+               start_time = excluded.start_time,
+               end_time = excluded.end_time,
+               recording_path = excluded.recording_path,
+               pre_session_note = excluded.pre_session_note",
+            params![
+                session.id,
+                session.date,
+                session.session_type,
+                session.start_time,
+                session.end_time,
+                session.recording_path,
+                session.pre_session_note,
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn update_session_end(
         &self,
         id: &str,
@@ -1624,33 +1760,187 @@ impl Database {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    pub fn get_latest_open_session(&self) -> Result<Option<SessionRecord>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, date, session_type, start_time, end_time, recording_path, pre_session_note
+             FROM sessions
+             WHERE end_time IS NULL
+             ORDER BY start_time DESC
+             LIMIT 1",
+        )?;
+        let mut rows = stmt.query([])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(SessionRecord {
+                id: row.get(0)?,
+                date: row.get(1)?,
+                session_type: row.get(2)?,
+                start_time: row.get(3)?,
+                end_time: row.get(4)?,
+                recording_path: row.get(5)?,
+                pre_session_note: row.get(6)?,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
     // ------------------------------------------------------------------
     // Trade CRUD
     // ------------------------------------------------------------------
 
+    fn trade_from_row(row: &rusqlite::Row<'_>) -> Result<TradeRecord, rusqlite::Error> {
+        let target_prices: Vec<f64> = row
+            .get::<_, String>(13)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        let review_tags: Vec<String> = row
+            .get::<_, String>(20)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        let mistake_tags: Vec<String> = row
+            .get::<_, String>(21)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        Ok(TradeRecord {
+            id: row.get(0)?,
+            session_id: row.get(1)?,
+            setup_id: row.get(2)?,
+            instrument: row.get(3)?,
+            trade_account: row.get(4)?,
+            entry_time: row.get(5)?,
+            entry_price: row.get(6)?,
+            exit_time: row.get(7)?,
+            exit_price: row.get(8)?,
+            direction: row.get(9)?,
+            size: row.get(10)?,
+            max_open_size: row.get(11)?,
+            stop_price: row.get(12)?,
+            target_prices,
+            result_r: row.get(14)?,
+            gross_points: row.get(15)?,
+            planned: row.get::<_, i64>(16)? == 1,
+            rules_followed: row.get::<_, Option<i64>>(17)?.map(|v| v == 1),
+            emotional_state: row.get(18)?,
+            thesis: row.get(19)?,
+            review_tags,
+            mistake_tags,
+            entry_fill_count: row.get(22)?,
+            exit_fill_count: row.get(23)?,
+            import_batch_id: row.get(24)?,
+            notes: row.get(25)?,
+            source: row.get(26)?,
+        })
+    }
+
     pub fn insert_trade(&self, trade: &TradeRecord) -> Result<(), DbError> {
         let targets_json = serde_json::to_string(&trade.target_prices)?;
+        let review_tags_json = serde_json::to_string(&trade.review_tags)?;
+        let mistake_tags_json = serde_json::to_string(&trade.mistake_tags)?;
         self.conn.execute(
-            "INSERT INTO trades (id, session_id, setup_id, entry_time, entry_price,
-                exit_time, exit_price, direction, size, stop_price, target_prices,
-                result_r, planned, rules_followed, emotional_state, notes, source)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+            "INSERT INTO trades (id, session_id, setup_id, instrument, trade_account, entry_time, entry_price,
+                exit_time, exit_price, direction, size, max_open_size, stop_price, target_prices,
+                result_r, gross_points, planned, rules_followed, emotional_state, thesis, review_tags,
+                mistake_tags, entry_fill_count, exit_fill_count, import_batch_id, notes, source)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)",
             params![
                 trade.id,
                 trade.session_id,
                 trade.setup_id,
+                trade.instrument,
+                trade.trade_account,
                 trade.entry_time,
                 trade.entry_price,
                 trade.exit_time,
                 trade.exit_price,
                 trade.direction,
                 trade.size,
+                trade.max_open_size,
                 trade.stop_price,
                 targets_json,
                 trade.result_r,
+                trade.gross_points,
                 i64::from(trade.planned),
                 trade.rules_followed.map(i64::from),
                 trade.emotional_state,
+                trade.thesis,
+                review_tags_json,
+                mistake_tags_json,
+                trade.entry_fill_count,
+                trade.exit_fill_count,
+                trade.import_batch_id,
+                trade.notes,
+                trade.source,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn upsert_trade(&self, trade: &TradeRecord) -> Result<(), DbError> {
+        let targets_json = serde_json::to_string(&trade.target_prices)?;
+        let review_tags_json = serde_json::to_string(&trade.review_tags)?;
+        let mistake_tags_json = serde_json::to_string(&trade.mistake_tags)?;
+        self.conn.execute(
+            "INSERT INTO trades (id, session_id, setup_id, instrument, trade_account, entry_time, entry_price,
+                exit_time, exit_price, direction, size, max_open_size, stop_price, target_prices,
+                result_r, gross_points, planned, rules_followed, emotional_state, thesis, review_tags,
+                mistake_tags, entry_fill_count, exit_fill_count, import_batch_id, notes, source)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)
+             ON CONFLICT(id) DO UPDATE SET
+                session_id = excluded.session_id,
+                setup_id = excluded.setup_id,
+                instrument = excluded.instrument,
+                trade_account = excluded.trade_account,
+                entry_time = excluded.entry_time,
+                entry_price = excluded.entry_price,
+                exit_time = excluded.exit_time,
+                exit_price = excluded.exit_price,
+                direction = excluded.direction,
+                size = excluded.size,
+                max_open_size = excluded.max_open_size,
+                stop_price = excluded.stop_price,
+                target_prices = excluded.target_prices,
+                result_r = excluded.result_r,
+                gross_points = excluded.gross_points,
+                planned = excluded.planned,
+                rules_followed = excluded.rules_followed,
+                emotional_state = excluded.emotional_state,
+                thesis = excluded.thesis,
+                review_tags = excluded.review_tags,
+                mistake_tags = excluded.mistake_tags,
+                entry_fill_count = excluded.entry_fill_count,
+                exit_fill_count = excluded.exit_fill_count,
+                import_batch_id = excluded.import_batch_id,
+                notes = excluded.notes,
+                source = excluded.source",
+            params![
+                trade.id,
+                trade.session_id,
+                trade.setup_id,
+                trade.instrument,
+                trade.trade_account,
+                trade.entry_time,
+                trade.entry_price,
+                trade.exit_time,
+                trade.exit_price,
+                trade.direction,
+                trade.size,
+                trade.max_open_size,
+                trade.stop_price,
+                targets_json,
+                trade.result_r,
+                trade.gross_points,
+                i64::from(trade.planned),
+                trade.rules_followed.map(i64::from),
+                trade.emotional_state,
+                trade.thesis,
+                review_tags_json,
+                mistake_tags_json,
+                trade.entry_fill_count,
+                trade.exit_fill_count,
+                trade.import_batch_id,
                 trade.notes,
                 trade.source,
             ],
@@ -1672,57 +1962,74 @@ impl Database {
         Ok(())
     }
 
-    pub fn update_trade_review(
-        &self,
-        id: &str,
-        planned: bool,
-        rules_followed: Option<bool>,
-        emotional_state: Option<&str>,
-        notes: &str,
-    ) -> Result<(), DbError> {
+    pub fn update_trade_review(&self, id: &str, review: &TradeReviewUpdate) -> Result<(), DbError> {
+        let review_tags_json = serde_json::to_string(&review.review_tags)?;
+        let mistake_tags_json = serde_json::to_string(&review.mistake_tags)?;
         self.conn.execute(
-            "UPDATE trades SET planned = ?1, rules_followed = ?2, emotional_state = ?3, notes = ?4 WHERE id = ?5",
-            params![i64::from(planned), rules_followed.map(i64::from), emotional_state, notes, id],
+            "UPDATE trades
+             SET planned = ?1, rules_followed = ?2, emotional_state = ?3, thesis = ?4,
+                 review_tags = ?5, mistake_tags = ?6, notes = ?7
+             WHERE id = ?8",
+            params![
+                i64::from(review.planned),
+                review.rules_followed.map(i64::from),
+                review.emotional_state,
+                review.thesis,
+                review_tags_json,
+                mistake_tags_json,
+                review.notes,
+                id
+            ],
         )?;
         Ok(())
     }
 
     pub fn list_trades_for_session(&self, session_id: &str) -> Result<Vec<TradeRecord>, DbError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, session_id, setup_id, entry_time, entry_price, exit_time, exit_price,
-                    direction, size, stop_price, target_prices, result_r, planned,
-                    rules_followed, emotional_state, notes, source
+            "SELECT id, session_id, setup_id, instrument, trade_account, entry_time, entry_price,
+                    exit_time, exit_price, direction, size, max_open_size, stop_price, target_prices,
+                    result_r, gross_points, planned, rules_followed, emotional_state, thesis,
+                    review_tags, mistake_tags, entry_fill_count, exit_fill_count, import_batch_id,
+                    notes, source
              FROM trades WHERE session_id = ?1 ORDER BY entry_time",
         )?;
-        let rows = stmt.query_map([session_id], |row| {
-            let targets_str: String = row.get(10)?;
-            let target_prices: Vec<f64> = serde_json::from_str(&targets_str).unwrap_or_default();
-            Ok(TradeRecord {
-                id: row.get(0)?,
-                session_id: row.get(1)?,
-                setup_id: row.get(2)?,
-                entry_time: row.get(3)?,
-                entry_price: row.get(4)?,
-                exit_time: row.get(5)?,
-                exit_price: row.get(6)?,
-                direction: row.get(7)?,
-                size: row.get(8)?,
-                stop_price: row.get(9)?,
-                target_prices,
-                result_r: row.get(11)?,
-                planned: row.get::<_, i64>(12)? == 1,
-                rules_followed: row.get::<_, Option<i64>>(13)?.map(|v| v == 1),
-                emotional_state: row.get(14)?,
-                notes: row.get::<_, String>(15)?,
-                source: row.get(16)?,
-            })
-        })?;
+        let rows = stmt.query_map([session_id], Self::trade_from_row)?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     pub fn get_open_trade(&self, session_id: &str) -> Result<Option<TradeRecord>, DbError> {
         let trades = self.list_trades_for_session(session_id)?;
         Ok(trades.into_iter().find(|t| t.exit_time.is_none()))
+    }
+
+    pub fn get_trade(&self, id: &str) -> Result<Option<TradeRecord>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_id, setup_id, instrument, trade_account, entry_time, entry_price,
+                    exit_time, exit_price, direction, size, max_open_size, stop_price, target_prices,
+                    result_r, gross_points, planned, rules_followed, emotional_state, thesis,
+                    review_tags, mistake_tags, entry_fill_count, exit_fill_count, import_batch_id,
+                    notes, source
+             FROM trades WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query([id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(Self::trade_from_row(row)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn list_recent_trades(&self, limit: usize) -> Result<Vec<TradeRecord>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_id, setup_id, instrument, trade_account, entry_time, entry_price,
+                    exit_time, exit_price, direction, size, max_open_size, stop_price, target_prices,
+                    result_r, gross_points, planned, rules_followed, emotional_state, thesis,
+                    review_tags, mistake_tags, entry_fill_count, exit_fill_count, import_batch_id,
+                    notes, source
+             FROM trades ORDER BY entry_time DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit as i64], Self::trade_from_row)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     // ------------------------------------------------------------------
@@ -1739,6 +2046,35 @@ impl Database {
             params![
                 entry.id, entry.session_id, entry.date, entry.content,
                 tags, setup_refs, trade_refs, entry.created_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn upsert_journal_entry(&self, entry: &JournalEntry) -> Result<(), DbError> {
+        let tags = serde_json::to_string(&entry.tags)?;
+        let setup_refs = serde_json::to_string(&entry.setup_references)?;
+        let trade_refs = serde_json::to_string(&entry.trade_references)?;
+        self.conn.execute(
+            "INSERT INTO journal_entries (id, session_id, date, content, tags, setup_references, trade_references, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(id) DO UPDATE SET
+               session_id = excluded.session_id,
+               date = excluded.date,
+               content = excluded.content,
+               tags = excluded.tags,
+               setup_references = excluded.setup_references,
+               trade_references = excluded.trade_references,
+               created_at = excluded.created_at",
+            params![
+                entry.id,
+                entry.session_id,
+                entry.date,
+                entry.content,
+                tags,
+                setup_refs,
+                trade_refs,
+                entry.created_at,
             ],
         )?;
         Ok(())
@@ -1791,6 +2127,96 @@ impl Database {
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn list_recent_journal_entries(&self, limit: usize) -> Result<Vec<JournalEntry>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_id, date, content, tags, setup_references, trade_references, created_at
+             FROM journal_entries ORDER BY created_at DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit as i64], |row| {
+            let tags: Vec<String> = row
+                .get::<_, String>(4)
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default();
+            let setup_refs: Vec<String> = row
+                .get::<_, String>(5)
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default();
+            let trade_refs: Vec<String> = row
+                .get::<_, String>(6)
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default();
+            Ok(JournalEntry {
+                id: row.get(0)?,
+                session_id: row.get(1)?,
+                date: row.get(2)?,
+                content: row.get(3)?,
+                tags,
+                setup_references: setup_refs,
+                trade_references: trade_refs,
+                created_at: row.get(7)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn insert_trade_import_batch(&self, batch: &TradeImportBatchRecord) -> Result<(), DbError> {
+        self.conn.execute(
+            "INSERT INTO trade_import_batches (batch_id, source, imported_at, notes, fill_count)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(batch_id) DO UPDATE SET
+               source = excluded.source,
+               imported_at = excluded.imported_at,
+               notes = excluded.notes,
+               fill_count = excluded.fill_count",
+            params![
+                batch.batch_id,
+                batch.source,
+                batch.imported_at,
+                batch.notes,
+                batch.fill_count,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn imported_fill_exists(&self, fingerprint: &str) -> Result<bool, DbError> {
+        let exists: i64 = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM trade_fill_imports WHERE fingerprint = ?1)",
+            [fingerprint],
+            |row| row.get(0),
+        )?;
+        Ok(exists == 1)
+    }
+
+    pub fn insert_imported_fill(&self, fill: &ImportedFillRecord) -> Result<(), DbError> {
+        self.conn.execute(
+            "INSERT INTO trade_fill_imports (
+                fingerprint, batch_id, trade_id, symbol, trade_account, fill_time, order_side,
+                open_close, quantity, price, status, external_order_id, service_order_id, raw_payload
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            params![
+                fill.fingerprint,
+                fill.batch_id,
+                fill.trade_id,
+                fill.symbol,
+                fill.trade_account,
+                fill.fill_time,
+                fill.order_side,
+                fill.open_close,
+                fill.quantity,
+                fill.price,
+                fill.status,
+                fill.external_order_id,
+                fill.service_order_id,
+                fill.raw_payload.to_string(),
+            ],
+        )?;
+        Ok(())
     }
 
     // ------------------------------------------------------------------
@@ -4727,18 +5153,28 @@ mod tests {
             id: "t1".into(),
             session_id: Some("sess1".into()),
             setup_id: None,
+            instrument: Some("MNQ".into()),
+            trade_account: Some("SIM".into()),
             entry_time: 1740001000.0,
             entry_price: 21000.0,
             exit_time: None,
             exit_price: None,
             direction: "long".into(),
             size: 1,
+            max_open_size: Some(1),
             stop_price: Some(20990.0),
             target_prices: vec![21020.0, 21040.0],
             result_r: None,
+            gross_points: None,
             planned: true,
             rules_followed: None,
             emotional_state: None,
+            thesis: Some("VWAP reclaim".into()),
+            review_tags: vec!["planned".into()],
+            mistake_tags: Vec::new(),
+            entry_fill_count: 1,
+            exit_fill_count: 0,
+            import_batch_id: None,
             notes: String::new(),
             source: "manual".into(),
         };

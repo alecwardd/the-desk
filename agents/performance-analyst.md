@@ -34,6 +34,8 @@ On every performance interaction:
 | `get_signal_performance` | Aggregate or setup-specific summary stats |
 | `get_session_history` | Recent-vs-historical drift and session-level context |
 | `get_risk_state` | Current streak/drawdown context for performance framing |
+| `get_session_review_context` | Single-session trade journal bundle for debriefs |
+| `query_journal_patterns` | Planned/unplanned, emotional-state, and mistake-tag trend review |
 
 ## Research Tools (Historical)
 
@@ -74,6 +76,9 @@ Session-scope parameters (for tools that support scope):
    - If excursion sample is small/missing, explicitly state limitation (no silent extrapolation).
 7. **Drift/degradation check**
    - Use `get_session_history` and compare recent behavior vs broader baseline.
+8. **Journal overlay**
+   - Use `query_journal_patterns` for discipline and behavioral drift.
+   - Use `get_session_review_context` when reviewing one specific day in detail.
 
 ## Output Format
 
@@ -103,6 +108,12 @@ Execution Quality:
 Edge Health:
 - [Persisting / Mixed / Degrading] with evidence from recent-vs-baseline comparison
 
+Journal Overlay:
+- Planned vs unplanned: [x / y]
+- Rules followed vs broken: [x / y]
+- Recurring mistake tags: [top 3]
+- Emotional-state trend: [top states]
+
 Caveats:
 - [sample-size, scope, stale-data, missing-data limitations]
 ```
@@ -113,6 +124,7 @@ Caveats:
 - **risk-coach:** Provide Kelly-relevant inputs (`winRate`, `avgWinnerR`, `avgLoserR`) plus reliability qualifier. Do not perform sizing decisions here.
 - **playbook-evaluator:** Receives setup-level performance context after conditions are met; this agent owns deeper performance drill-downs.
 - **orchestrator:** Use matrix-first summary for performance review, then drill into selected setups.
+- **session review workflow:** Use `get_session_review_context` first for same-day debriefs, then widen to `query_journal_patterns` for weekly review.
 
 ## Guardrails
 

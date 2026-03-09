@@ -3,7 +3,7 @@ use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, State};
 use the_desk_backend::db::{
     AccountStateRecord, JournalEntry, OpenPositionRecord, RiskConfigRecord, SessionEventInput,
-    SessionEventRecord, SessionRecord, TradeRecord,
+    SessionEventRecord, SessionRecord, TradeRecord, TradeReviewUpdate,
 };
 use the_desk_backend::dom_replay::{
     apply_event_and_frame, build_clip, frame_from_state, seek_cursor_for_timestamp,
@@ -16,6 +16,7 @@ use the_desk_backend::recording::{ReplayEngine, SessionRecorder};
 use the_desk_backend::risk::RiskState;
 use the_desk_backend::rules::SetupDefinition;
 use the_desk_backend::templates;
+use the_desk_backend::{classify_session, et_minutes_from_timestamp, SessionType};
 
 use super::AppState;
 
@@ -138,8 +139,32 @@ pub async fn start_session(state: State<'_, AppState>) -> Result<String, String>
     state.pipelines.lock().await.reset_session();
     state.rules.lock().await.reset();
 
+    let now_ms = chrono::Utc::now().timestamp_millis() as f64;
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let rec_path = super::data_dir()
+        .join(format!("{today}_{session_id}.desk"))
+        .to_string_lossy()
+        .to_string();
+    let session_type = match et_minutes_from_timestamp(now_ms)
+        .map(classify_session)
+        .unwrap_or(SessionType::Unknown)
+    {
+        SessionType::Rth => "rth",
+        SessionType::Globex => "globex",
+        SessionType::Unknown => "unknown",
+    };
+
     let db = state.db.lock().await;
+    db.create_session(&SessionRecord {
+        id: session_id.clone(),
+        date: today.clone(),
+        session_type: session_type.to_string(),
+        start_time: now_ms,
+        end_time: None,
+        recording_path: Some(rec_path.clone()),
+        pre_session_note: None,
+    })
+    .map_err(|e| e.to_string())?;
     if let Ok(Some((high, low, close, va_h, va_l, p, dnva_h, dnva_l, dnp))) =
         db.load_prior_day_full(&today)
     {
@@ -171,12 +196,6 @@ pub async fn start_session(state: State<'_, AppState>) -> Result<String, String>
         .map_err(|e| e.to_string())?;
     }
 
-    let dir = super::data_dir();
-    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-    let rec_path = dir
-        .join(format!("{today}_{session_id}.desk"))
-        .to_string_lossy()
-        .to_string();
     let mut recorder = state.recorder.lock().await;
     *recorder = SessionRecorder::new(rec_path);
     recorder.start();
@@ -189,6 +208,7 @@ pub async fn start_session(state: State<'_, AppState>) -> Result<String, String>
 #[tauri::command]
 pub async fn stop_session(state: State<'_, AppState>) -> Result<(), String> {
     let session_id = state.session_id.lock().await.take();
+    let recording_path = Some(state.recorder.lock().await.path().to_string());
 
     let pipelines = state.pipelines.lock().await;
     let session_end = pipelines.session_end_state();
@@ -216,6 +236,14 @@ pub async fn stop_session(state: State<'_, AppState>) -> Result<(), String> {
             Some(session_end.dnva_high),
             Some(session_end.dnva_low),
             Some(session_end.dnp),
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    if let Some(ref session_id) = session_id {
+        db.update_session_end(
+            session_id,
+            chrono::Utc::now().timestamp_millis() as f64,
+            recording_path.as_deref(),
         )
         .map_err(|e| e.to_string())?;
     }
@@ -830,10 +858,13 @@ pub async fn list_templates() -> Result<Vec<SetupDefinition>, String> {
 #[tauri::command]
 pub async fn create_trade(
     state: State<'_, AppState>,
-    trade: TradeRecord,
+    mut trade: TradeRecord,
 ) -> Result<TradeRecord, String> {
+    if trade.session_id.is_none() {
+        trade.session_id = state.session_id.lock().await.clone();
+    }
     let db = state.db.lock().await;
-    db.insert_trade(&trade).map_err(|e| e.to_string())?;
+    db.upsert_trade(&trade).map_err(|e| e.to_string())?;
     Ok(trade)
 }
 
@@ -884,21 +915,30 @@ pub async fn get_open_trade(
 
 /// Update trade review fields (planned, rules_followed, emotional_state, notes).
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn review_trade(
     state: State<'_, AppState>,
     id: String,
     planned: bool,
     rules_followed: Option<bool>,
     emotional_state: Option<String>,
+    thesis: Option<String>,
+    review_tags: Vec<String>,
+    mistake_tags: Vec<String>,
     notes: String,
 ) -> Result<(), String> {
     let db = state.db.lock().await;
     db.update_trade_review(
         &id,
-        planned,
-        rules_followed,
-        emotional_state.as_deref(),
-        &notes,
+        &TradeReviewUpdate {
+            planned,
+            rules_followed,
+            emotional_state,
+            thesis,
+            review_tags,
+            mistake_tags,
+            notes,
+        },
     )
     .map_err(|e| e.to_string())
 }
@@ -926,10 +966,13 @@ pub async fn list_sessions(
 #[tauri::command]
 pub async fn save_journal_entry(
     state: State<'_, AppState>,
-    entry: JournalEntry,
+    mut entry: JournalEntry,
 ) -> Result<(), String> {
+    if entry.session_id.is_none() {
+        entry.session_id = state.session_id.lock().await.clone();
+    }
     let db = state.db.lock().await;
-    db.insert_journal_entry(&entry).map_err(|e| e.to_string())
+    db.upsert_journal_entry(&entry).map_err(|e| e.to_string())
 }
 
 /// Get journal entries for a session.

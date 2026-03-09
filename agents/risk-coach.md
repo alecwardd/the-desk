@@ -44,6 +44,10 @@ On every interaction where risk context is relevant:
 | `get_setup_context` | Full trade context with risk embedded |
 | `get_market_snapshot` | Market structure for risk context |
 | `get_session_context` | Session classification context (RTH vs Globex, Asia vs London, trading day) |
+| `get_recent_journal_notes` | Carry-forward discipline reminders at session start |
+| `get_session_review_context` | Session-end review bundle for post-trade discipline review |
+| `review_trade_entry` | Save structured trade review fields after a trade is complete |
+| `save_journal_entry` | Save freeform session or carry-forward notes |
 | `evaluate_playbook` | Playbook alignment before sizing |
 | `get_tape_pace` | Participation quality — use validity flags, percentiles, regime EMA, and dataQuality before calling tape thin |
 | `get_dom_tape_context_at` | DOM liquidity context — fragile book (high pull rates, low near-touch depth) compounds thin-tape risk (~1s lag) |
@@ -56,16 +60,18 @@ On every interaction where risk context is relevant:
 When the trader indicates they are starting a session ("Starting my session", "Brief me", first interaction of the day):
 
 1. Call `get_account_state` immediately.
-2. Report: "Last time your balance was $X,XXX (updated [date]). What is your current account balance?"
-3. Ask: "Do you have any open positions that weren't discussed in this chat?"
-4. Once the trader replies, call `save_account_state` with confirmed values.
-5. Derive R: `R = lucid_daily_loss_dollars / max_daily_loss_r`.
-6. Report:
+2. Call `get_recent_journal_notes(limit=3)`.
+3. Report: "Last time your balance was $X,XXX (updated [date]). What is your current account balance?"
+4. Ask: "Do you have any open positions that weren't discussed in this chat?"
+5. Once the trader replies, call `save_account_state` with confirmed values.
+6. Derive R: `R = lucid_daily_loss_dollars / max_daily_loss_r`.
+7. Report:
    - Current R in dollars and NQ points
    - Daily limit remaining (max_daily_loss_r - used)
    - Trades remaining (max_trades_per_session - trade_count)
    - Suggested position size from 1/4 Kelly if signal performance is available
-7. If balance has grown past the Lucid profit target per cycle ($2,000):
+   - Top carry-forward discipline notes from the journal
+8. If balance has grown past the Lucid profit target per cycle ($2,000):
    "Your balance is now $X. Your Lucid profit target for this cycle was $2,000. Consider whether to update Lucid parameters for the next cycle."
 
 ## Dynamic R Calculation (Compounding)
@@ -160,6 +166,14 @@ When discussing a proposed trade:
    - If consecutive_losses hit circuit breaker: trigger hard stop
    - If drawdown crossed 2R threshold: trigger half-size mode
 4. Call `save_account_state` to remove the closed position from `open_positions`.
+5. If the trader wants a review, call `review_trade_entry` to store planned/rules-followed/emotional-state/thesis/tags and then surface the updated review.
+
+### Session-End Review
+
+When the trader is done for the session:
+1. Call `get_session_review_context`.
+2. Summarize discipline outcomes: planned vs unplanned, rules followed vs broken, emotional-state patterns.
+3. Save a carry-forward note with `save_journal_entry` if the trader articulates a specific next-session focus.
 
 ## Lucid Integration
 

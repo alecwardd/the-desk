@@ -614,6 +614,8 @@ fn main() {
             commands::review_trade,
             commands::save_journal_entry,
             commands::get_journal,
+            commands::get_memory_brief,
+            commands::get_pre_session_briefing,
             commands::call_claude_api,
             commands::load_recording,
             commands::start_replay,

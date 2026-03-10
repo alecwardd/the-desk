@@ -12,6 +12,9 @@ use the_desk_backend::dom_replay::{
 use the_desk_backend::dtc::{run_mock_dtc_server, TradeSide};
 use the_desk_backend::feed::scid_reader::ScidReader;
 use the_desk_backend::feed::{load_feed_config, FeedEvent};
+use the_desk_backend::memory::{
+    build_memory_brief, detect_behavioral_patterns, MemoryBrief, MemoryBriefQuery,
+};
 use the_desk_backend::recording::{ReplayEngine, SessionRecorder};
 use the_desk_backend::risk::RiskState;
 use the_desk_backend::rules::SetupDefinition;
@@ -19,6 +22,12 @@ use the_desk_backend::templates;
 use the_desk_backend::{classify_session, et_minutes_from_timestamp, SessionType};
 
 use super::AppState;
+
+#[derive(serde::Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct StartSessionInput {
+    pub pre_session_note: Option<String>,
+}
 
 /// Frontend payload describing a trade to record.
 #[derive(serde::Deserialize)]
@@ -132,7 +141,10 @@ pub async fn get_risk_state(state: State<'_, AppState>) -> Result<RiskState, Str
 
 /// Begin a new trading session, resetting pipelines and starting a recorder.
 #[tauri::command]
-pub async fn start_session(state: State<'_, AppState>) -> Result<String, String> {
+pub async fn start_session(
+    state: State<'_, AppState>,
+    input: Option<StartSessionInput>,
+) -> Result<String, String> {
     let session_id = uuid::Uuid::new_v4().to_string();
     *state.session_id.lock().await = Some(session_id.clone());
 
@@ -162,7 +174,7 @@ pub async fn start_session(state: State<'_, AppState>) -> Result<String, String>
         start_time: now_ms,
         end_time: None,
         recording_path: Some(rec_path.clone()),
-        pre_session_note: None,
+        pre_session_note: input.and_then(|input| input.pre_session_note),
     })
     .map_err(|e| e.to_string())?;
     if let Ok(Some((high, low, close, va_h, va_l, p, dnva_h, dnva_l, dnp))) =
@@ -984,6 +996,34 @@ pub async fn get_journal(
     let db = state.db.lock().await;
     db.get_journal_for_session(&session_id)
         .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn get_memory_brief(
+    state: State<'_, AppState>,
+    query: MemoryBriefQuery,
+) -> Result<MemoryBrief, String> {
+    let db = state.db.lock().await;
+    let _ = detect_behavioral_patterns(&db);
+    build_memory_brief(&db, query).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn get_pre_session_briefing(
+    state: State<'_, AppState>,
+    pre_session_note: Option<String>,
+) -> Result<MemoryBrief, String> {
+    let db = state.db.lock().await;
+    let _ = detect_behavioral_patterns(&db);
+    build_memory_brief(
+        &db,
+        MemoryBriefQuery {
+            intent: "session_start".to_string(),
+            pre_session_note,
+            ..MemoryBriefQuery::default()
+        },
+    )
+    .map_err(|e| e.to_string())
 }
 
 // ---------------------------------------------------------------------------

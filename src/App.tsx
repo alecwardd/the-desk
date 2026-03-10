@@ -175,18 +175,28 @@ export default function App() {
         id: crypto.randomUUID(),
         sessionId,
         setupId: prompt.setupId,
+        instrument: null,
+        tradeAccount: null,
         entryTime: Date.now(),
         entryPrice,
         exitTime: null,
         exitPrice: null,
         direction,
         size,
+        maxOpenSize: null,
         stopPrice: null,
         targetPrices: [],
         resultR: null,
+        grossPoints: null,
         planned: true,
         rulesFollowed: null,
         emotionalState: null,
+        thesis: null,
+        reviewTags: [],
+        mistakeTags: [],
+        entryFillCount: 1,
+        exitFillCount: 0,
+        importBatchId: null,
         notes: "",
         source: "manual",
       };
@@ -212,7 +222,7 @@ export default function App() {
 
   async function handleStartSession(focusNote?: string) {
     try {
-      const sid = await sessionBridge.start();
+      const sid = await sessionBridge.start(focusNote);
       setSessionId(sid);
       if (focusNote) {
         setPreSessionNote(focusNote);

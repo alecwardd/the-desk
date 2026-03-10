@@ -1,4 +1,9 @@
 use crate::depth::DepthRecord;
+use crate::memory::{
+    AgentInsightQuery, AgentInsightRecord, BehavioralPatternQuery, BehavioralPatternRecord,
+    MemoryFollowupQuery, MemoryFollowupRecord, INSIGHT_DISMISSED, INSIGHT_PINNED,
+    INSIGHT_SUPERSEDED,
+};
 use crate::pipelines::event_detector::MarketEvent;
 use crate::risk::RiskState;
 use crate::rules::SetupDefinition;
@@ -664,6 +669,9 @@ impl Database {
         }
         if version < 17 {
             self.migrate_v17()?;
+        }
+        if version < 18 {
+            self.migrate_v18()?;
         }
 
         Ok(())
@@ -1499,6 +1507,78 @@ impl Database {
         Ok(())
     }
 
+    /// V18: memory system tables for agent insights, behavioral patterns, and follow-ups.
+    fn migrate_v18(&self) -> Result<(), DbError> {
+        self.conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS agent_insights (
+              id TEXT PRIMARY KEY,
+              created_at_ms REAL NOT NULL,
+              updated_at_ms REAL NOT NULL,
+              session_id TEXT NULL REFERENCES sessions(id),
+              trade_id TEXT NULL REFERENCES trades(id),
+              setup_id TEXT NULL REFERENCES setups(id),
+              category TEXT NOT NULL,
+              status TEXT NOT NULL,
+              summary TEXT NOT NULL,
+              evidence_json TEXT NOT NULL,
+              tags_json TEXT NOT NULL DEFAULT '[]',
+              scope_json TEXT NOT NULL DEFAULT '{}',
+              confidence REAL NOT NULL DEFAULT 0.5,
+              salience REAL NOT NULL DEFAULT 0.5,
+              times_surfaced INTEGER NOT NULL DEFAULT 0,
+              last_surfaced_ms REAL NULL,
+              superseded_by TEXT NULL,
+              source TEXT NOT NULL DEFAULT 'agent',
+              helpful_count INTEGER NOT NULL DEFAULT 0,
+              irrelevant_count INTEGER NOT NULL DEFAULT 0,
+              wrong_count INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_agent_insights_status
+              ON agent_insights(status, updated_at_ms DESC);
+            CREATE INDEX IF NOT EXISTS idx_agent_insights_setup
+              ON agent_insights(setup_id, category);
+            CREATE INDEX IF NOT EXISTS idx_agent_insights_session
+              ON agent_insights(session_id);
+
+            CREATE TABLE IF NOT EXISTS behavioral_patterns (
+              id TEXT PRIMARY KEY,
+              detected_at_ms REAL NOT NULL,
+              pattern_type TEXT NOT NULL,
+              description TEXT NOT NULL,
+              metric_json TEXT NOT NULL,
+              scope_json TEXT NOT NULL DEFAULT '{}',
+              sample_size INTEGER NOT NULL,
+              confidence REAL NOT NULL DEFAULT 0.5,
+              active INTEGER NOT NULL DEFAULT 1,
+              superseded_by TEXT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_behavioral_patterns_active
+              ON behavioral_patterns(active, pattern_type, sample_size DESC);
+
+            CREATE TABLE IF NOT EXISTS memory_followups (
+              id TEXT PRIMARY KEY,
+              created_at_ms REAL NOT NULL,
+              resolved_at_ms REAL NULL,
+              session_id TEXT NULL REFERENCES sessions(id),
+              trade_id TEXT NULL REFERENCES trades(id),
+              source TEXT NOT NULL DEFAULT 'agent',
+              title TEXT NOT NULL,
+              detail TEXT NOT NULL DEFAULT '',
+              status TEXT NOT NULL DEFAULT 'open',
+              tags_json TEXT NOT NULL DEFAULT '[]',
+              due_context_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS idx_memory_followups_status
+              ON memory_followups(status, created_at_ms DESC);
+            CREATE INDEX IF NOT EXISTS idx_memory_followups_session
+              ON memory_followups(session_id);
+            UPDATE schema_version SET version = 18;
+            ",
+        )?;
+        Ok(())
+    }
+
     // ------------------------------------------------------------------
     // Setup CRUD
     // ------------------------------------------------------------------
@@ -2162,6 +2242,571 @@ impl Database {
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn upsert_agent_insight(&self, insight: &AgentInsightRecord) -> Result<(), DbError> {
+        self.conn.execute(
+            "INSERT INTO agent_insights (
+                id, created_at_ms, updated_at_ms, session_id, trade_id, setup_id, category, status,
+                summary, evidence_json, tags_json, scope_json, confidence, salience,
+                times_surfaced, last_surfaced_ms, superseded_by, source,
+                helpful_count, irrelevant_count, wrong_count
+            ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
+                ?9, ?10, ?11, ?12, ?13, ?14,
+                ?15, ?16, ?17, ?18,
+                ?19, ?20, ?21
+            )
+            ON CONFLICT(id) DO UPDATE SET
+                updated_at_ms = excluded.updated_at_ms,
+                session_id = excluded.session_id,
+                trade_id = excluded.trade_id,
+                setup_id = excluded.setup_id,
+                category = excluded.category,
+                status = excluded.status,
+                summary = excluded.summary,
+                evidence_json = excluded.evidence_json,
+                tags_json = excluded.tags_json,
+                scope_json = excluded.scope_json,
+                confidence = excluded.confidence,
+                salience = excluded.salience,
+                times_surfaced = excluded.times_surfaced,
+                last_surfaced_ms = excluded.last_surfaced_ms,
+                superseded_by = excluded.superseded_by,
+                source = excluded.source,
+                helpful_count = excluded.helpful_count,
+                irrelevant_count = excluded.irrelevant_count,
+                wrong_count = excluded.wrong_count",
+            params![
+                insight.id,
+                insight.created_at_ms,
+                insight.updated_at_ms,
+                insight.session_id,
+                insight.trade_id,
+                insight.setup_id,
+                insight.category,
+                insight.status,
+                insight.summary,
+                serde_json::to_string(&insight.evidence)?,
+                serde_json::to_string(&insight.tags)?,
+                serde_json::to_string(&insight.scope)?,
+                insight.confidence,
+                insight.salience,
+                insight.times_surfaced,
+                insight.last_surfaced_ms,
+                insight.superseded_by,
+                insight.source,
+                insight.helpful_count,
+                insight.irrelevant_count,
+                insight.wrong_count,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_agent_insight(&self, id: &str) -> Result<Option<AgentInsightRecord>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, created_at_ms, updated_at_ms, session_id, trade_id, setup_id, category, status,
+                    summary, evidence_json, tags_json, scope_json, confidence, salience,
+                    times_surfaced, last_surfaced_ms, superseded_by, source,
+                    helpful_count, irrelevant_count, wrong_count
+             FROM agent_insights WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query([id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(Self::agent_insight_from_row(row)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn list_agent_insights(
+        &self,
+        query: &AgentInsightQuery,
+    ) -> Result<Vec<AgentInsightRecord>, DbError> {
+        let mut sql = String::from(
+            "SELECT id, created_at_ms, updated_at_ms, session_id, trade_id, setup_id, category, status,
+                    summary, evidence_json, tags_json, scope_json, confidence, salience,
+                    times_surfaced, last_surfaced_ms, superseded_by, source,
+                    helpful_count, irrelevant_count, wrong_count
+             FROM agent_insights WHERE 1=1",
+        );
+        let mut params_vec: Vec<rusqlite::types::Value> = Vec::new();
+
+        if let Some(category) = query.category.as_ref() {
+            sql.push_str(&format!(" AND category = ?{}", params_vec.len() + 1));
+            params_vec.push(category.clone().into());
+        }
+        if let Some(setup_id) = query.setup_id.as_ref() {
+            sql.push_str(&format!(" AND setup_id = ?{}", params_vec.len() + 1));
+            params_vec.push(setup_id.clone().into());
+        }
+        if let Some(statuses) = query.statuses.as_ref() {
+            if !statuses.is_empty() {
+                let placeholders = (0..statuses.len())
+                    .map(|offset| format!("?{}", params_vec.len() + offset + 1))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                sql.push_str(&format!(" AND status IN ({placeholders})"));
+                for status in statuses {
+                    params_vec.push(status.clone().into());
+                }
+            }
+        }
+        if let Some(start_date) = query.start_date.as_ref() {
+            sql.push_str(&format!(
+                " AND date(created_at_ms / 1000, 'unixepoch') >= ?{}",
+                params_vec.len() + 1
+            ));
+            params_vec.push(start_date.clone().into());
+        }
+        if let Some(end_date) = query.end_date.as_ref() {
+            sql.push_str(&format!(
+                " AND date(created_at_ms / 1000, 'unixepoch') <= ?{}",
+                params_vec.len() + 1
+            ));
+            params_vec.push(end_date.clone().into());
+        }
+
+        sql.push_str(" ORDER BY updated_at_ms DESC");
+        if let Some(limit) = query.limit {
+            sql.push_str(&format!(" LIMIT ?{}", params_vec.len() + 1));
+            params_vec.push((limit as i64).into());
+        }
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(
+            rusqlite::params_from_iter(params_vec),
+            Self::agent_insight_from_row,
+        )?;
+        let mut items = rows.collect::<Result<Vec<_>, _>>()?;
+        items.retain(|insight| {
+            let tag_ok = query
+                .tag
+                .as_ref()
+                .map(|tag| insight.tags.iter().any(|value| value == tag))
+                .unwrap_or(true);
+            let scope = &insight.scope;
+            let session_type_ok = query
+                .session_type
+                .as_ref()
+                .map(|session_type| {
+                    scope
+                        .get("sessionType")
+                        .and_then(|value| value.as_str())
+                        .map(|value| value.eq_ignore_ascii_case(session_type))
+                        .unwrap_or(false)
+                })
+                .unwrap_or(true);
+            let session_segment_ok = query
+                .session_segment
+                .as_ref()
+                .map(|session_segment| {
+                    scope
+                        .get("sessionSegment")
+                        .and_then(|value| value.as_str())
+                        .map(|value| value.eq_ignore_ascii_case(session_segment))
+                        .unwrap_or(false)
+                })
+                .unwrap_or(true);
+            let time_bucket_ok = query
+                .time_bucket
+                .as_ref()
+                .map(|time_bucket| {
+                    scope
+                        .get("timeBucket")
+                        .and_then(|value| value.as_str())
+                        .map(|value| value == time_bucket)
+                        .unwrap_or(false)
+                })
+                .unwrap_or(true);
+            let day_type_ok = query
+                .day_type
+                .as_ref()
+                .map(|day_type| {
+                    scope
+                        .get("dayType")
+                        .and_then(|value| value.as_str())
+                        .map(|value| value.eq_ignore_ascii_case(day_type))
+                        .unwrap_or(false)
+                })
+                .unwrap_or(true);
+            tag_ok && session_type_ok && session_segment_ok && time_bucket_ok && day_type_ok
+        });
+        Ok(items)
+    }
+
+    pub fn update_agent_insight_status(
+        &self,
+        id: &str,
+        status: &str,
+        updated_at_ms: f64,
+    ) -> Result<(), DbError> {
+        self.conn.execute(
+            "UPDATE agent_insights SET status = ?1, updated_at_ms = ?2 WHERE id = ?3",
+            params![status, updated_at_ms, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn acknowledge_agent_insight(
+        &self,
+        id: &str,
+        action: &str,
+        surfaced_at_ms: f64,
+    ) -> Result<Option<AgentInsightRecord>, DbError> {
+        let insight = match self.get_agent_insight(id)? {
+            Some(insight) => insight,
+            None => return Ok(None),
+        };
+        let mut updated = insight.clone();
+        updated.times_surfaced += 1;
+        updated.last_surfaced_ms = Some(surfaced_at_ms);
+        updated.updated_at_ms = surfaced_at_ms;
+        match action {
+            "helpful" => updated.helpful_count += 1,
+            "irrelevant" => updated.irrelevant_count += 1,
+            "wrong" => {
+                updated.wrong_count += 1;
+                updated.status = INSIGHT_DISMISSED.to_string();
+            }
+            "pin" => updated.status = INSIGHT_PINNED.to_string(),
+            _ => {}
+        }
+        self.upsert_agent_insight(&updated)?;
+        Ok(Some(updated))
+    }
+
+    pub fn supersede_agent_insight(
+        &self,
+        previous_id: &str,
+        replacement_id: &str,
+        updated_at_ms: f64,
+    ) -> Result<(), DbError> {
+        self.conn.execute(
+            "UPDATE agent_insights
+             SET status = ?1, superseded_by = ?2, updated_at_ms = ?3
+             WHERE id = ?4",
+            params![
+                INSIGHT_SUPERSEDED,
+                replacement_id,
+                updated_at_ms,
+                previous_id
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn deactivate_behavioral_patterns(&self) -> Result<(), DbError> {
+        self.conn
+            .execute("UPDATE behavioral_patterns SET active = 0", [])?;
+        Ok(())
+    }
+
+    pub fn upsert_behavioral_pattern(
+        &self,
+        pattern: &BehavioralPatternRecord,
+    ) -> Result<(), DbError> {
+        self.conn.execute(
+            "INSERT INTO behavioral_patterns (
+                id, detected_at_ms, pattern_type, description, metric_json,
+                scope_json, sample_size, confidence, active, superseded_by
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            ON CONFLICT(id) DO UPDATE SET
+                detected_at_ms = excluded.detected_at_ms,
+                pattern_type = excluded.pattern_type,
+                description = excluded.description,
+                metric_json = excluded.metric_json,
+                scope_json = excluded.scope_json,
+                sample_size = excluded.sample_size,
+                confidence = excluded.confidence,
+                active = excluded.active,
+                superseded_by = excluded.superseded_by",
+            params![
+                pattern.id,
+                pattern.detected_at_ms,
+                pattern.pattern_type,
+                pattern.description,
+                serde_json::to_string(&pattern.metric)?,
+                serde_json::to_string(&pattern.scope)?,
+                pattern.sample_size,
+                pattern.confidence,
+                i64::from(pattern.active),
+                pattern.superseded_by,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_behavioral_patterns(
+        &self,
+        query: &BehavioralPatternQuery,
+    ) -> Result<Vec<BehavioralPatternRecord>, DbError> {
+        let mut sql = String::from(
+            "SELECT id, detected_at_ms, pattern_type, description, metric_json,
+                    scope_json, sample_size, confidence, active, superseded_by
+             FROM behavioral_patterns WHERE 1=1",
+        );
+        let mut params_vec: Vec<rusqlite::types::Value> = Vec::new();
+        if let Some(pattern_type) = query.pattern_type.as_ref() {
+            sql.push_str(&format!(" AND pattern_type = ?{}", params_vec.len() + 1));
+            params_vec.push(pattern_type.clone().into());
+        }
+        if let Some(active_only) = query.active_only {
+            sql.push_str(&format!(" AND active = ?{}", params_vec.len() + 1));
+            params_vec.push(i64::from(active_only).into());
+        }
+        if let Some(min_sample_size) = query.min_sample_size {
+            sql.push_str(&format!(" AND sample_size >= ?{}", params_vec.len() + 1));
+            params_vec.push(min_sample_size.into());
+        }
+        sql.push_str(" ORDER BY detected_at_ms DESC, sample_size DESC");
+        if let Some(limit) = query.limit {
+            sql.push_str(&format!(" LIMIT ?{}", params_vec.len() + 1));
+            params_vec.push((limit as i64).into());
+        }
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(
+            rusqlite::params_from_iter(params_vec),
+            Self::behavioral_pattern_from_row,
+        )?;
+        let mut items = rows.collect::<Result<Vec<_>, _>>()?;
+        items.retain(|pattern| {
+            let scope = &pattern.scope;
+            let setup_ok = query
+                .setup_id
+                .as_ref()
+                .map(|setup_id| {
+                    scope.get("setupId").and_then(|value| value.as_str()) == Some(setup_id.as_str())
+                })
+                .unwrap_or(true);
+            let session_type_ok = query
+                .session_type
+                .as_ref()
+                .map(|session_type| {
+                    scope
+                        .get("sessionType")
+                        .and_then(|value| value.as_str())
+                        .map(|value| value.eq_ignore_ascii_case(session_type))
+                        .unwrap_or(false)
+                })
+                .unwrap_or(true);
+            let session_segment_ok = query
+                .session_segment
+                .as_ref()
+                .map(|session_segment| {
+                    scope
+                        .get("sessionSegment")
+                        .and_then(|value| value.as_str())
+                        .map(|value| value.eq_ignore_ascii_case(session_segment))
+                        .unwrap_or(false)
+                })
+                .unwrap_or(true);
+            let time_bucket_ok = query
+                .time_bucket
+                .as_ref()
+                .map(|time_bucket| {
+                    scope.get("timeBucket").and_then(|value| value.as_str())
+                        == Some(time_bucket.as_str())
+                })
+                .unwrap_or(true);
+            let day_type_ok = query
+                .day_type
+                .as_ref()
+                .map(|day_type| {
+                    scope
+                        .get("dayType")
+                        .and_then(|value| value.as_str())
+                        .map(|value| value.eq_ignore_ascii_case(day_type))
+                        .unwrap_or(false)
+                })
+                .unwrap_or(true);
+            setup_ok && session_type_ok && session_segment_ok && time_bucket_ok && day_type_ok
+        });
+        Ok(items)
+    }
+
+    pub fn upsert_memory_followup(&self, followup: &MemoryFollowupRecord) -> Result<(), DbError> {
+        self.conn.execute(
+            "INSERT INTO memory_followups (
+                id, created_at_ms, resolved_at_ms, session_id, trade_id, source,
+                title, detail, status, tags_json, due_context_json
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            ON CONFLICT(id) DO UPDATE SET
+                resolved_at_ms = excluded.resolved_at_ms,
+                session_id = excluded.session_id,
+                trade_id = excluded.trade_id,
+                source = excluded.source,
+                title = excluded.title,
+                detail = excluded.detail,
+                status = excluded.status,
+                tags_json = excluded.tags_json,
+                due_context_json = excluded.due_context_json",
+            params![
+                followup.id,
+                followup.created_at_ms,
+                followup.resolved_at_ms,
+                followup.session_id,
+                followup.trade_id,
+                followup.source,
+                followup.title,
+                followup.detail,
+                followup.status,
+                serde_json::to_string(&followup.tags)?,
+                serde_json::to_string(&followup.due_context)?,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_memory_followup(&self, id: &str) -> Result<Option<MemoryFollowupRecord>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, created_at_ms, resolved_at_ms, session_id, trade_id, source,
+                    title, detail, status, tags_json, due_context_json
+             FROM memory_followups WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query([id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(Self::memory_followup_from_row(row)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn list_memory_followups(
+        &self,
+        query: &MemoryFollowupQuery,
+    ) -> Result<Vec<MemoryFollowupRecord>, DbError> {
+        let mut sql = String::from(
+            "SELECT id, created_at_ms, resolved_at_ms, session_id, trade_id, source,
+                    title, detail, status, tags_json, due_context_json
+             FROM memory_followups WHERE 1=1",
+        );
+        let mut params_vec: Vec<rusqlite::types::Value> = Vec::new();
+        if let Some(status) = query.status.as_ref() {
+            sql.push_str(&format!(" AND status = ?{}", params_vec.len() + 1));
+            params_vec.push(status.clone().into());
+        }
+        if let Some(session_id) = query.session_id.as_ref() {
+            sql.push_str(&format!(" AND session_id = ?{}", params_vec.len() + 1));
+            params_vec.push(session_id.clone().into());
+        }
+        if let Some(trade_id) = query.trade_id.as_ref() {
+            sql.push_str(&format!(" AND trade_id = ?{}", params_vec.len() + 1));
+            params_vec.push(trade_id.clone().into());
+        }
+        sql.push_str(" ORDER BY created_at_ms DESC");
+        if let Some(limit) = query.limit {
+            sql.push_str(&format!(" LIMIT ?{}", params_vec.len() + 1));
+            params_vec.push((limit as i64).into());
+        }
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(
+            rusqlite::params_from_iter(params_vec),
+            Self::memory_followup_from_row,
+        )?;
+        let mut items = rows.collect::<Result<Vec<_>, _>>()?;
+        items.retain(|followup| {
+            query
+                .setup_id
+                .as_ref()
+                .map(|setup_id| {
+                    followup
+                        .due_context
+                        .get("setupId")
+                        .and_then(|value| value.as_str())
+                        == Some(setup_id.as_str())
+                })
+                .unwrap_or(true)
+        });
+        Ok(items)
+    }
+
+    fn agent_insight_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentInsightRecord> {
+        Ok(AgentInsightRecord {
+            id: row.get(0)?,
+            created_at_ms: row.get(1)?,
+            updated_at_ms: row.get(2)?,
+            session_id: row.get(3)?,
+            trade_id: row.get(4)?,
+            setup_id: row.get(5)?,
+            category: row.get(6)?,
+            status: row.get(7)?,
+            summary: row.get(8)?,
+            evidence: row
+                .get::<_, String>(9)
+                .ok()
+                .and_then(|value| serde_json::from_str(&value).ok())
+                .unwrap_or_else(|| serde_json::json!({})),
+            tags: row
+                .get::<_, String>(10)
+                .ok()
+                .and_then(|value| serde_json::from_str(&value).ok())
+                .unwrap_or_default(),
+            scope: row
+                .get::<_, String>(11)
+                .ok()
+                .and_then(|value| serde_json::from_str(&value).ok())
+                .unwrap_or_else(|| serde_json::json!({})),
+            confidence: row.get(12)?,
+            salience: row.get(13)?,
+            times_surfaced: row.get(14)?,
+            last_surfaced_ms: row.get(15)?,
+            superseded_by: row.get(16)?,
+            source: row.get(17)?,
+            helpful_count: row.get(18)?,
+            irrelevant_count: row.get(19)?,
+            wrong_count: row.get(20)?,
+        })
+    }
+
+    fn behavioral_pattern_from_row(
+        row: &rusqlite::Row<'_>,
+    ) -> rusqlite::Result<BehavioralPatternRecord> {
+        Ok(BehavioralPatternRecord {
+            id: row.get(0)?,
+            detected_at_ms: row.get(1)?,
+            pattern_type: row.get(2)?,
+            description: row.get(3)?,
+            metric: row
+                .get::<_, String>(4)
+                .ok()
+                .and_then(|value| serde_json::from_str(&value).ok())
+                .unwrap_or_else(|| serde_json::json!({})),
+            scope: row
+                .get::<_, String>(5)
+                .ok()
+                .and_then(|value| serde_json::from_str(&value).ok())
+                .unwrap_or_else(|| serde_json::json!({})),
+            sample_size: row.get(6)?,
+            confidence: row.get(7)?,
+            active: row.get::<_, i64>(8)? == 1,
+            superseded_by: row.get(9)?,
+        })
+    }
+
+    fn memory_followup_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryFollowupRecord> {
+        Ok(MemoryFollowupRecord {
+            id: row.get(0)?,
+            created_at_ms: row.get(1)?,
+            resolved_at_ms: row.get(2)?,
+            session_id: row.get(3)?,
+            trade_id: row.get(4)?,
+            source: row.get(5)?,
+            title: row.get(6)?,
+            detail: row.get(7)?,
+            status: row.get(8)?,
+            tags: row
+                .get::<_, String>(9)
+                .ok()
+                .and_then(|value| serde_json::from_str(&value).ok())
+                .unwrap_or_default(),
+            due_context: row
+                .get::<_, String>(10)
+                .ok()
+                .and_then(|value| serde_json::from_str(&value).ok())
+                .unwrap_or_else(|| serde_json::json!({})),
+        })
     }
 
     pub fn insert_trade_import_batch(&self, batch: &TradeImportBatchRecord) -> Result<(), DbError> {

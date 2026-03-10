@@ -202,7 +202,7 @@ Full parallel sweep:
 - `get_day_type`
 - `get_key_levels`, `get_proximity_report` (structural levels)
 - `get_session_history(limit=5)` (multi-session context)
-- `get_recent_journal_notes(limit=3)` (carry-forward discipline notes)
+- `get_pre_session_briefing` (ranked carry-forward memory: recent sessions, patterns, insights, follow-ups)
 - `get_dom_tape_context_at` (DOM liquidity context)
 
 Execute the risk-coach session-start protocol:
@@ -214,7 +214,7 @@ Then synthesize:
 - Market structure read (day type, balance state, value migration)
 - Key levels in play with proximity
 - Flow regime and participation quality
-- Carry-forward journal reminders: repeat mistakes, best practices, session focus
+- Carry-forward memory reminders: repeat mistakes, validated patterns, candidate insights, session focus
 - Risk state and session parameters
 
 Tape participation synthesis:
@@ -231,14 +231,14 @@ Full parallel sweep:
 - `get_rvol`, `get_tape_pace` (overnight participation)
 - `get_key_levels`, `get_proximity_report` (prior RTH carry-forward + overnight references)
 - `get_session_history(limit=5)` (multi-session context)
-- `get_recent_journal_notes(limit=3)` (carry-forward discipline notes)
+- `get_pre_session_briefing` (ranked carry-forward memory: recent sessions, patterns, insights, follow-ups)
 - `evaluate_playbook` (valid-vs-dormant setup framing in Globex)
 
 Globex synthesis requirements:
 - Explicitly state `sessionSegment` (`Asia` or `London`).
 - Summarize overnight structure and prior RTH carry-forward.
 - Include Globex-valid setup state and mark RTH-only setup context as dormant.
-- Surface the most relevant carry-forward journal notes before the trader starts making decisions.
+- Surface the most relevant carry-forward memory before the trader starts making decisions.
 - Do not use day type / IB / OR / OR5 framing.
 
 Risk output: **Full session-start protocol.**
@@ -249,9 +249,10 @@ Primary intent: `session_review`.
 
 Route behavior:
 1. Call `get_session_review_context` for the target or latest open session.
-2. Call `query_journal_patterns` for repeated discipline patterns and mistake tags.
-3. For broader historical drill-down, pair with `performance` routing and `get_session_history(limit=20)`.
-4. If the trader wants to log or edit notes, use `save_journal_entry` and `review_trade_entry`.
+2. Call `get_memory_brief(intent="trade_review")` for ranked carry-forward memory and open follow-ups.
+3. Call `query_journal_patterns` for repeated discipline patterns and mistake tags.
+4. For broader historical drill-down, pair with `performance` routing and `get_session_history(limit=20)`.
+5. If the trader wants to log or edit notes, use `save_journal_entry`, `review_trade_entry`, `save_agent_insight`, and `create_memory_followup`.
 
 Report:
 - Session trade summary and gross points

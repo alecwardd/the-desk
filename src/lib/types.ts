@@ -133,18 +133,28 @@ export interface TradeRecord {
   id: string;
   sessionId?: string | null;
   setupId?: string | null;
+  instrument?: string | null;
+  tradeAccount?: string | null;
   entryTime: number;
   entryPrice: number;
   exitTime?: number | null;
   exitPrice?: number | null;
   direction: string;
   size: number;
+  maxOpenSize?: number | null;
   stopPrice?: number | null;
   targetPrices: number[];
   resultR?: number | null;
+  grossPoints?: number | null;
   planned: boolean;
   rulesFollowed?: boolean | null;
   emotionalState?: string | null;
+  thesis?: string | null;
+  reviewTags: string[];
+  mistakeTags: string[];
+  entryFillCount: number;
+  exitFillCount: number;
+  importBatchId?: string | null;
   notes: string;
   source: string;
 }
@@ -168,6 +178,77 @@ export interface JournalEntry {
   setupReferences: string[];
   tradeReferences: string[];
   createdAt: number;
+}
+
+export interface AgentInsightRecord {
+  id: string;
+  createdAtMs: number;
+  updatedAtMs: number;
+  sessionId?: string | null;
+  tradeId?: string | null;
+  setupId?: string | null;
+  category: string;
+  status: string;
+  summary: string;
+  evidence: Record<string, unknown>;
+  tags: string[];
+  scope: Record<string, unknown>;
+  confidence: number;
+  salience: number;
+  timesSurfaced: number;
+  lastSurfacedMs?: number | null;
+  supersededBy?: string | null;
+  source: string;
+  helpfulCount: number;
+  irrelevantCount: number;
+  wrongCount: number;
+}
+
+export interface BehavioralPatternRecord {
+  id: string;
+  detectedAtMs: number;
+  patternType: string;
+  description: string;
+  metric: Record<string, unknown>;
+  scope: Record<string, unknown>;
+  sampleSize: number;
+  confidence: number;
+  active: boolean;
+  supersededBy?: string | null;
+}
+
+export interface MemoryFollowupRecord {
+  id: string;
+  createdAtMs: number;
+  resolvedAtMs?: number | null;
+  sessionId?: string | null;
+  tradeId?: string | null;
+  source: string;
+  title: string;
+  detail: string;
+  status: string;
+  tags: string[];
+  dueContext: Record<string, unknown>;
+}
+
+export interface MemorySessionSnapshot {
+  session: SessionRecord;
+  tradeCount: number;
+  closedTradeCount: number;
+  grossPoints: number;
+  netR: number;
+  emotionalStates: string[];
+  mistakeTags: string[];
+}
+
+export interface MemoryBrief {
+  recentSessions: MemorySessionSnapshot[];
+  patterns: BehavioralPatternRecord[];
+  insights: AgentInsightRecord[];
+  followups: MemoryFollowupRecord[];
+  summary: Record<string, unknown>;
+  preSessionNote?: string | null;
+  retrievalContext: Record<string, unknown>;
 }
 
 export interface RiskConfigRecord {

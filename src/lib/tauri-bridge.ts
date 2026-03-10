@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type {
   AccountStateRecord,
+  MemoryBrief,
   CoachingPrompt,
   JournalEntry,
   MarketState,
@@ -78,7 +79,10 @@ export const accountBridge = {
 };
 
 export const sessionBridge = {
-  start: () => invoke<string>("start_session"),
+  start: (preSessionNote?: string) =>
+    invoke<string>("start_session", {
+      input: preSessionNote ? { preSessionNote } : undefined,
+    }),
   stop: () => invoke<void>("stop_session"),
   list: (limit = 50) => invoke<SessionRecord[]>("list_sessions", { limit }),
   addEvent: (event: SessionEventInput) => invoke<void>("add_session_event", { event }),
@@ -98,14 +102,43 @@ export const tradeBridge = {
     planned: boolean,
     rulesFollowed: boolean | null,
     emotionalState: string | null,
+    thesis: string | null,
+    reviewTags: string[],
+    mistakeTags: string[],
     notes: string
-  ) => invoke<void>("review_trade", { id, planned, rulesFollowed, emotionalState, notes }),
+  ) =>
+    invoke<void>("review_trade", {
+      id,
+      planned,
+      rulesFollowed,
+      emotionalState,
+      thesis,
+      reviewTags,
+      mistakeTags,
+      notes,
+    }),
 };
 
 export const journalBridge = {
   save: (entry: JournalEntry) => invoke<void>("save_journal_entry", { entry }),
   getForSession: (sessionId: string) =>
     invoke<JournalEntry[]>("get_journal", { sessionId }),
+};
+
+export const memoryBridge = {
+  getBrief: (query: {
+    intent: string;
+    sessionId?: string | null;
+    setupId?: string | null;
+    sessionType?: string | null;
+    sessionSegment?: string | null;
+    dayType?: string | null;
+    timeBucket?: string | null;
+    preSessionNote?: string | null;
+    limit?: number;
+  }) => invoke<MemoryBrief>("get_memory_brief", { query }),
+  getPreSessionBriefing: (preSessionNote?: string) =>
+    invoke<MemoryBrief>("get_pre_session_briefing", { preSessionNote }),
 };
 
 export const replayBridge = {

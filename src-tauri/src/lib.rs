@@ -4,6 +4,7 @@ pub mod depth;
 pub mod dom_replay;
 pub mod dtc;
 pub mod feed;
+pub mod memory;
 pub mod outcome_tracker;
 pub mod pipelines;
 pub mod recording;

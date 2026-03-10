@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -14,11 +14,13 @@ import {
 import { Textarea } from "@/components/ui/textarea";
 import type {
   CoachingPrompt,
+  MemoryBrief,
   RiskState,
   SessionEventRecord,
   SetupAlert,
   TradeRecord,
 } from "../../lib/types";
+import { journalBridge, memoryBridge, tradeBridge } from "../../lib/tauri-bridge";
 
 interface Props {
   prompts: CoachingPrompt[];
@@ -76,21 +78,40 @@ export function SessionReview({
     [sessionEvents]
   );
 
-  const trades = useMemo(() => {
-    return sessionEvents
-      .filter((e) => e.eventType === "trade_opened" || e.eventType === "trade_closed")
-      .reduce<TradeRecord[]>((acc, e) => {
-        const data = e.data as unknown as TradeRecord;
-        if (data?.id && !acc.some((t) => t.id === data.id)) acc.push(data);
-        return acc;
-      }, []);
-  }, [sessionEvents]);
+  const [trades, setTrades] = useState<TradeRecord[]>([]);
+  const [memoryBrief, setMemoryBrief] = useState<MemoryBrief | null>(null);
 
   const [tradeEdits, setTradeEdits] = useState<Record<string, TradeCardState>>({});
   const [journalText, setJournalText] = useState("");
+  const [saveState, setSaveState] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!sessionId) return;
+    tradeBridge.list(sessionId).then(setTrades).catch(() => setTrades([]));
+    journalBridge
+      .getForSession(sessionId)
+      .then((entries) => {
+        const reviewEntry =
+          entries.find((entry) => entry.tags.includes("session-review")) ??
+          entries[entries.length - 1];
+        setJournalText(reviewEntry?.content ?? "");
+      })
+      .catch(() => setJournalText(""));
+    memoryBridge
+      .getBrief({ intent: "trade_review", sessionId, limit: 4 })
+      .then(setMemoryBrief)
+      .catch(() => setMemoryBrief(null));
+  }, [sessionId]);
 
   function getTradeEdit(tradeId: string): TradeCardState {
-    return tradeEdits[tradeId] ?? { planned: true, emotionalState: "Calm", notes: "" };
+    const trade = trades.find((item) => item.id === tradeId);
+    return (
+      tradeEdits[tradeId] ?? {
+        planned: trade?.planned ?? true,
+        emotionalState: trade?.emotionalState ?? "Calm",
+        notes: trade?.notes ?? "",
+      }
+    );
   }
 
   function updateTradeEdit(tradeId: string, patch: Partial<TradeCardState>) {
@@ -98,6 +119,41 @@ export function SessionReview({
       ...prev,
       [tradeId]: { ...getTradeEdit(tradeId), ...patch },
     }));
+  }
+
+  async function saveTradeReview(tradeId: string) {
+    const edit = getTradeEdit(tradeId);
+    const trade = trades.find((item) => item.id === tradeId);
+    await tradeBridge.review(
+      tradeId,
+      edit.planned,
+      trade?.rulesFollowed ?? null,
+      edit.emotionalState,
+      trade?.thesis ?? null,
+      trade?.reviewTags ?? [],
+      trade?.mistakeTags ?? [],
+      edit.notes
+    );
+    if (sessionId) {
+      const latestTrades = await tradeBridge.list(sessionId).catch(() => null);
+      if (latestTrades) setTrades(latestTrades);
+    }
+    setSaveState(`Saved trade ${tradeId.slice(0, 6)}`);
+  }
+
+  async function saveJournal() {
+    if (!sessionId) return;
+    await journalBridge.save({
+      id: `session-review-${sessionId}`,
+      sessionId,
+      date: new Date().toISOString().slice(0, 10),
+      content: journalText,
+      tags: ["session-review"],
+      setupReferences: [],
+      tradeReferences: trades.map((trade) => trade.id),
+      createdAt: Date.now(),
+    });
+    setSaveState("Saved journal review");
   }
 
   return (
@@ -114,6 +170,29 @@ export function SessionReview({
             <span className="text-text-muted text-xs font-semibold">Pre-session note</span>
             <p className="text-text-secondary mt-0.5 text-sm">{preSessionNote}</p>
           </div>
+        )}
+        {memoryBrief && (
+          <>
+            <div className="rounded border border-border-subtle bg-surface p-3 space-y-2">
+              <h3 className="text-text-primary text-sm font-semibold">Memory Brief</h3>
+              {memoryBrief.patterns.slice(0, 2).map((pattern) => (
+                <p key={pattern.id} className="text-text-secondary text-sm">
+                  {pattern.description}
+                </p>
+              ))}
+              {memoryBrief.insights.slice(0, 2).map((insight) => (
+                <p key={insight.id} className="text-text-secondary text-sm">
+                  {insight.summary}
+                </p>
+              ))}
+              {memoryBrief.followups.slice(0, 2).map((followup) => (
+                <p key={followup.id} className="text-text-secondary text-sm">
+                  Follow-up: {followup.title}
+                </p>
+              ))}
+            </div>
+            <Separator />
+          </>
         )}
 
         <div>
@@ -272,6 +351,14 @@ export function SessionReview({
                           updateTradeEdit(trade.id, { notes: e.target.value })
                         }
                       />
+                      <Button
+                        variant="outline"
+                        size="xs"
+                        className="mt-2"
+                        onClick={() => void saveTradeReview(trade.id)}
+                      >
+                        Save Review
+                      </Button>
                     </div>
                   );
                 })}
@@ -311,6 +398,12 @@ export function SessionReview({
             onChange={(e) => setJournalText(e.target.value)}
             className="min-h-24 text-sm"
           />
+          <div className="mt-2 flex items-center gap-2">
+            <Button variant="outline" size="sm" onClick={() => void saveJournal()}>
+              Save Journal
+            </Button>
+            {saveState && <span className="text-text-muted text-xs">{saveState}</span>}
+          </div>
         </div>
       </CardContent>
     </Card>

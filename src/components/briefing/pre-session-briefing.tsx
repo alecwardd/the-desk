@@ -5,8 +5,14 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Separator } from "@/components/ui/separator";
 import { Textarea } from "@/components/ui/textarea";
-import type { AccountStateRecord, MarketState, RiskState, Setup } from "../../lib/types";
-import { accountBridge } from "../../lib/tauri-bridge";
+import type {
+  AccountStateRecord,
+  MarketState,
+  MemoryBrief,
+  RiskState,
+  Setup,
+} from "../../lib/types";
+import { accountBridge, memoryBridge } from "../../lib/tauri-bridge";
 import { generateBriefingSynthesis } from "../../lib/claude";
 
 interface Props {
@@ -22,6 +28,7 @@ export function PreSessionBriefing({ marketState, setups, riskState, onStartSess
   const [loadingBriefing, setLoadingBriefing] = useState(false);
   const [accountState, setAccountState] = useState<AccountStateRecord | null>(null);
   const [currentBalance, setCurrentBalance] = useState("");
+  const [memoryBrief, setMemoryBrief] = useState<MemoryBrief | null>(null);
   const activeSetups = setups.filter((s) => s.active);
 
   useEffect(() => {
@@ -45,6 +52,13 @@ export function PreSessionBriefing({ marketState, setups, riskState, onStartSess
       .catch(() => setBriefingNarrative(null))
       .finally(() => setLoadingBriefing(false));
   }, [marketState]);
+
+  useEffect(() => {
+    memoryBridge
+      .getPreSessionBriefing(focusNote || undefined)
+      .then(setMemoryBrief)
+      .catch(() => setMemoryBrief(null));
+  }, [focusNote]);
 
   const handleStartSession = useCallback(async () => {
     const balanceNum = currentBalance ? parseFloat(currentBalance) : accountState?.lastBalanceDollars;
@@ -71,6 +85,33 @@ export function PreSessionBriefing({ marketState, setups, riskState, onStartSess
         )}
         {loadingBriefing && (
           <p className="text-text-muted text-xs">Generating briefing...</p>
+        )}
+        {memoryBrief && (
+          <div className="rounded-md border border-border-subtle bg-surface p-3 space-y-2">
+            <div>
+              <h3 className="text-text-primary text-sm font-semibold">Carry-Forward Memory</h3>
+              <p className="text-text-muted text-xs">
+                {memoryBrief.patterns.length} patterns, {memoryBrief.insights.length} insights,{" "}
+                {memoryBrief.followups.length} follow-ups
+              </p>
+            </div>
+            {memoryBrief.patterns.slice(0, 2).map((pattern) => (
+              <p key={pattern.id} className="text-text-secondary text-sm">
+                {pattern.description}
+              </p>
+            ))}
+            {memoryBrief.insights.slice(0, 2).map((insight) => (
+              <p key={insight.id} className="text-text-secondary text-sm">
+                {insight.summary}
+                <span className="text-text-muted"> [{insight.status}]</span>
+              </p>
+            ))}
+            {memoryBrief.followups.slice(0, 2).map((followup) => (
+              <p key={followup.id} className="text-text-secondary text-sm">
+                Follow-up: {followup.title}
+              </p>
+            ))}
+          </div>
         )}
 
         <div>

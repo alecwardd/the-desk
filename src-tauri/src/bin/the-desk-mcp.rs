@@ -26,6 +26,12 @@ use the_desk_backend::feed::scid_reader::{
     parse_record_scaled, ScanControl as ScidScanControl, ScidReader,
 };
 use the_desk_backend::feed::{load_feed_config, load_storage_config, TradeSide};
+use the_desk_backend::memory::{
+    build_memory_brief as memory_build_memory_brief,
+    detect_behavioral_patterns as memory_detect_behavioral_patterns,
+    save_agent_insight as memory_save_agent_insight, AgentInsightQuery, BehavioralPatternQuery,
+    MemoryBriefQuery, MemoryFollowupRecord, SaveAgentInsightInput,
+};
 use the_desk_backend::outcome_tracker;
 use the_desk_backend::pipelines::{
     EventDetector, FlowEventEmitter, PipelineEngine, PriorSessionData, RvolPipeline,
@@ -1349,6 +1355,102 @@ struct JournalPatternParams {
     start_date: Option<String>,
     end_date: Option<String>,
     session_type: Option<String>,
+    limit: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct SaveAgentInsightParams {
+    id: Option<String>,
+    session_id: Option<String>,
+    trade_id: Option<String>,
+    setup_id: Option<String>,
+    category: String,
+    summary: String,
+    evidence: serde_json::Value,
+    tags: Option<Vec<String>>,
+    scope: Option<serde_json::Value>,
+    confidence: Option<f64>,
+    salience: Option<f64>,
+    source: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct RecallAgentInsightsParams {
+    category: Option<String>,
+    setup_id: Option<String>,
+    statuses: Option<Vec<String>>,
+    tag: Option<String>,
+    session_type: Option<String>,
+    session_segment: Option<String>,
+    time_bucket: Option<String>,
+    day_type: Option<String>,
+    start_date: Option<String>,
+    end_date: Option<String>,
+    limit: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct InsightAcknowledgeParams {
+    id: String,
+    action: String,
+    surfaced_at_ms: Option<f64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct SupersedeInsightParams {
+    previous_id: String,
+    replacement_id: String,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct BehavioralPatternMemoryParams {
+    pattern_type: Option<String>,
+    session_type: Option<String>,
+    session_segment: Option<String>,
+    time_bucket: Option<String>,
+    day_type: Option<String>,
+    setup_id: Option<String>,
+    min_sample_size: Option<i64>,
+    active_only: Option<bool>,
+    limit: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct CreateMemoryFollowupParams {
+    id: Option<String>,
+    session_id: Option<String>,
+    trade_id: Option<String>,
+    source: Option<String>,
+    title: String,
+    detail: Option<String>,
+    tags: Option<Vec<String>>,
+    due_context: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct ResolveMemoryFollowupParams {
+    id: String,
+    resolution_note: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct MemoryBriefParams {
+    intent: Option<String>,
+    session_id: Option<String>,
+    setup_id: Option<String>,
+    session_type: Option<String>,
+    session_segment: Option<String>,
+    day_type: Option<String>,
+    time_bucket: Option<String>,
+    pre_session_note: Option<String>,
     limit: Option<u64>,
 }
 
@@ -3605,6 +3707,258 @@ impl TheDeskMcp {
             "reviewTagCounts": review_tag_counts,
             "mistakeTagCounts": mistake_tag_counts,
             "grossPoints": total_gross_points
+        })))
+    }
+
+    #[tool(
+        description = "Save an agent-authored memory insight. New insights start as candidate unless they are reinforced by a matching prior insight or explicitly backed by patternIds in evidence."
+    )]
+    async fn save_agent_insight(
+        &self,
+        Parameters(params): Parameters<SaveAgentInsightParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let db = self.db.lock().map_err(|_| lock_error())?;
+        let session_id = resolve_session_id(&db, params.session_id.as_deref())?;
+        let record = memory_save_agent_insight(
+            &db,
+            SaveAgentInsightInput {
+                id: params.id,
+                session_id,
+                trade_id: params.trade_id,
+                setup_id: params.setup_id,
+                category: params.category,
+                summary: params.summary,
+                evidence: params.evidence,
+                tags: params.tags,
+                scope: params.scope,
+                confidence: params.confidence,
+                salience: params.salience,
+                source: params.source,
+            },
+        )
+        .map_err(|e| invalid_params_error(e.to_string()))?;
+        Ok(text_result(serde_json::json!({
+            "agentInsight": record
+        })))
+    }
+
+    #[tool(
+        description = "Recall stored agent insights with filters for category, setup, status, and context scope."
+    )]
+    async fn recall_agent_insights(
+        &self,
+        Parameters(params): Parameters<RecallAgentInsightsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let db = self.db.lock().map_err(|_| lock_error())?;
+        let insights = db
+            .list_agent_insights(&AgentInsightQuery {
+                category: params.category,
+                setup_id: params.setup_id,
+                statuses: params.statuses,
+                tag: params.tag,
+                session_type: params.session_type,
+                session_segment: params.session_segment,
+                time_bucket: params.time_bucket,
+                day_type: params.day_type,
+                start_date: params.start_date,
+                end_date: params.end_date,
+                limit: params.limit.map(|limit| limit.min(200) as usize),
+            })
+            .map_err(db_error)?;
+        Ok(text_result(serde_json::json!({
+            "insights": insights,
+            "count": insights.len()
+        })))
+    }
+
+    #[tool(
+        description = "Acknowledge an insight after surfacing it. Supported actions: surfaced, helpful, irrelevant, wrong, pin."
+    )]
+    async fn acknowledge_agent_insight(
+        &self,
+        Parameters(params): Parameters<InsightAcknowledgeParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let db = self.db.lock().map_err(|_| lock_error())?;
+        let surfaced_at_ms = params
+            .surfaced_at_ms
+            .unwrap_or_else(|| Utc::now().timestamp_millis() as f64);
+        let updated = db
+            .acknowledge_agent_insight(&params.id, &params.action, surfaced_at_ms)
+            .map_err(db_error)?;
+        Ok(text_result(serde_json::json!({
+            "insight": updated,
+            "updated": updated.is_some()
+        })))
+    }
+
+    #[tool(description = "Supersede an older insight with a newer replacement insight ID.")]
+    async fn supersede_agent_insight(
+        &self,
+        Parameters(params): Parameters<SupersedeInsightParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let db = self.db.lock().map_err(|_| lock_error())?;
+        db.supersede_agent_insight(
+            &params.previous_id,
+            &params.replacement_id,
+            Utc::now().timestamp_millis() as f64,
+        )
+        .map_err(db_error)?;
+        Ok(text_result(serde_json::json!({
+            "superseded": true,
+            "previousId": params.previous_id,
+            "replacementId": params.replacement_id
+        })))
+    }
+
+    #[tool(
+        description = "Run deterministic behavioral memory detection over stored sessions, trades, and reviews, then upsert active behavioral patterns."
+    )]
+    async fn detect_behavioral_patterns(&self) -> Result<CallToolResult, McpError> {
+        let db = self.db.lock().map_err(|_| lock_error())?;
+        let patterns = memory_detect_behavioral_patterns(&db).map_err(db_error)?;
+        Ok(text_result(serde_json::json!({
+            "patterns": patterns,
+            "count": patterns.len()
+        })))
+    }
+
+    #[tool(
+        description = "Get active behavioral patterns with optional scope filters and minimum sample size."
+    )]
+    async fn get_behavioral_patterns(
+        &self,
+        Parameters(params): Parameters<BehavioralPatternMemoryParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let db = self.db.lock().map_err(|_| lock_error())?;
+        let patterns = db
+            .list_behavioral_patterns(&BehavioralPatternQuery {
+                pattern_type: params.pattern_type,
+                session_type: params.session_type,
+                session_segment: params.session_segment,
+                time_bucket: params.time_bucket,
+                day_type: params.day_type,
+                setup_id: params.setup_id,
+                min_sample_size: params.min_sample_size,
+                active_only: params.active_only.or(Some(true)),
+                limit: params.limit.map(|limit| limit.min(200) as usize),
+            })
+            .map_err(db_error)?;
+        Ok(text_result(serde_json::json!({
+            "patterns": patterns,
+            "count": patterns.len()
+        })))
+    }
+
+    #[tool(description = "Create an open follow-up item for later session review or confirmation.")]
+    async fn create_memory_followup(
+        &self,
+        Parameters(params): Parameters<CreateMemoryFollowupParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let db = self.db.lock().map_err(|_| lock_error())?;
+        let session_id = resolve_session_id(&db, params.session_id.as_deref())?;
+        let followup = MemoryFollowupRecord {
+            id: params
+                .id
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+            created_at_ms: Utc::now().timestamp_millis() as f64,
+            resolved_at_ms: None,
+            session_id,
+            trade_id: params.trade_id,
+            source: params.source.unwrap_or_else(|| "agent".to_string()),
+            title: params.title,
+            detail: params.detail.unwrap_or_default(),
+            status: "open".to_string(),
+            tags: params.tags.unwrap_or_default(),
+            due_context: params.due_context.unwrap_or_else(|| serde_json::json!({})),
+        };
+        db.upsert_memory_followup(&followup).map_err(db_error)?;
+        Ok(text_result(serde_json::json!({
+            "followup": followup
+        })))
+    }
+
+    #[tool(
+        description = "Resolve an open memory follow-up, optionally attaching a resolution note."
+    )]
+    async fn resolve_memory_followup(
+        &self,
+        Parameters(params): Parameters<ResolveMemoryFollowupParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let db = self.db.lock().map_err(|_| lock_error())?;
+        let mut followup = db
+            .get_memory_followup(&params.id)
+            .map_err(db_error)?
+            .ok_or_else(|| invalid_params_error("memory follow-up not found"))?;
+        followup.status = "resolved".to_string();
+        followup.resolved_at_ms = Some(Utc::now().timestamp_millis() as f64);
+        if let Some(resolution_note) = params.resolution_note {
+            followup.due_context["resolutionNote"] = serde_json::json!(resolution_note);
+        }
+        db.upsert_memory_followup(&followup).map_err(db_error)?;
+        Ok(text_result(serde_json::json!({
+            "followup": followup
+        })))
+    }
+
+    #[tool(
+        description = "Return a ranked memory brief for session_start, setup_check, trade_review, or weekly_review. Includes recent sessions, matching patterns, matching insights, and open follow-ups."
+    )]
+    async fn get_memory_brief(
+        &self,
+        Parameters(params): Parameters<MemoryBriefParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let db = self.db.lock().map_err(|_| lock_error())?;
+        let _ = memory_detect_behavioral_patterns(&db);
+        let brief = memory_build_memory_brief(
+            &db,
+            MemoryBriefQuery {
+                intent: params
+                    .intent
+                    .ok_or_else(|| invalid_params_error("intent is required"))?,
+                session_id: params.session_id,
+                setup_id: params.setup_id,
+                session_type: params.session_type,
+                session_segment: params.session_segment,
+                day_type: params.day_type,
+                time_bucket: params.time_bucket,
+                pre_session_note: params.pre_session_note,
+                limit: params.limit.map(|limit| limit.min(10) as usize),
+            },
+        )
+        .map_err(db_error)?;
+        Ok(text_result(serde_json::json!(brief)))
+    }
+
+    #[tool(
+        description = "Build a session-start memory packet that merges the ranked memory brief with current account and risk context."
+    )]
+    async fn get_pre_session_briefing(
+        &self,
+        Parameters(params): Parameters<MemoryBriefParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let db = self.db.lock().map_err(|_| lock_error())?;
+        let _ = memory_detect_behavioral_patterns(&db);
+        let memory_brief = memory_build_memory_brief(
+            &db,
+            MemoryBriefQuery {
+                intent: "session_start".to_string(),
+                session_id: params.session_id,
+                setup_id: params.setup_id,
+                session_type: params.session_type,
+                session_segment: params.session_segment,
+                day_type: params.day_type,
+                time_bucket: params.time_bucket,
+                pre_session_note: params.pre_session_note,
+                limit: params.limit.map(|limit| limit.min(10) as usize),
+            },
+        )
+        .map_err(db_error)?;
+        let account_state = db.load_account_state().map_err(db_error)?;
+        let risk_state = db.load_risk_state().map_err(db_error)?;
+        Ok(text_result(serde_json::json!({
+            "memoryBrief": memory_brief,
+            "accountState": account_state,
+            "riskState": risk_state
         })))
     }
 

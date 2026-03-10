@@ -44,7 +44,7 @@ On every interaction where risk context is relevant:
 | `get_setup_context` | Full trade context with risk embedded |
 | `get_market_snapshot` | Market structure for risk context |
 | `get_session_context` | Session classification context (RTH vs Globex, Asia vs London, trading day) |
-| `get_recent_journal_notes` | Carry-forward discipline reminders at session start |
+| `get_pre_session_briefing` | Carry-forward ranked memory at session start (recent sessions, patterns, insights, follow-ups) |
 | `get_session_review_context` | Session-end review bundle for post-trade discipline review |
 | `review_trade_entry` | Save structured trade review fields after a trade is complete |
 | `save_journal_entry` | Save freeform session or carry-forward notes |
@@ -60,7 +60,7 @@ On every interaction where risk context is relevant:
 When the trader indicates they are starting a session ("Starting my session", "Brief me", first interaction of the day):
 
 1. Call `get_account_state` immediately.
-2. Call `get_recent_journal_notes(limit=3)`.
+2. Call `get_pre_session_briefing`.
 3. Report: "Last time your balance was $X,XXX (updated [date]). What is your current account balance?"
 4. Ask: "Do you have any open positions that weren't discussed in this chat?"
 5. Once the trader replies, call `save_account_state` with confirmed values.
@@ -70,7 +70,7 @@ When the trader indicates they are starting a session ("Starting my session", "B
    - Daily limit remaining (max_daily_loss_r - used)
    - Trades remaining (max_trades_per_session - trade_count)
    - Suggested position size from 1/4 Kelly if signal performance is available
-   - Top carry-forward discipline notes from the journal
+   - Top carry-forward memory items from the briefing
 8. If balance has grown past the Lucid profit target per cycle ($2,000):
    "Your balance is now $X. Your Lucid profit target for this cycle was $2,000. Consider whether to update Lucid parameters for the next cycle."
 
@@ -172,8 +172,9 @@ When discussing a proposed trade:
 
 When the trader is done for the session:
 1. Call `get_session_review_context`.
-2. Summarize discipline outcomes: planned vs unplanned, rules followed vs broken, emotional-state patterns.
-3. Save a carry-forward note with `save_journal_entry` if the trader articulates a specific next-session focus.
+2. Call `get_memory_brief(intent="trade_review")` to retrieve carry-forward memory and open follow-ups.
+3. Summarize discipline outcomes: planned vs unplanned, rules followed vs broken, emotional-state patterns.
+4. Save a carry-forward note with `save_journal_entry`, `save_agent_insight`, or `create_memory_followup` if the trader articulates a specific next-session focus.
 
 ## Lucid Integration
 

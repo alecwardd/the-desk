@@ -18,6 +18,126 @@ Living document for trade setup ideas, backtesting hypotheses, and research find
 
 ---
 
+## March 2026 Research Snapshot
+
+Grounding for the additions below. This pass combined:
+- Local sample from `~/.the-desk/data.db`: 3.53M raw ticks, 191,819 `market_events`, 222 `session_summaries`
+- Valid RTH sample: 81 usable RTH sessions from 2025-11-28 through 2026-03-06
+- Current-market research as of 2026-03-09 on 0DTE, dealer gamma, CME liquidity, and around-the-clock NQ flow
+
+### Style Inference From Existing Playbook
+
+The current system clearly encodes a discretionary NQ/MNQ style built around:
+- Market Profile / auction context first
+- Levels as locations, not entries
+- Delta, liquidity, and inventory confirmation before execution
+- OR5 / IB / DNVA / DNP / VWAP / rebid-reoffer / session inventory / pinch concepts
+- London and RTH handoff awareness
+
+### Local Findings That Matter
+
+These are the highest-signal observations from the local history sample:
+- **Double Distribution dominates.** 52 of 81 valid RTH sessions were classified `DoubleDistribution`. Only 7 of 81 were `Trend`.
+- **London did not carry cleanly into RTH.** London and RTH closed in the same direction only 41.5% of the time; reversal happened 58.5% of the time.
+- **One-sided IB extension was cleaner than generic IB extension.**
+  - `up_only`: 12 sessions, 75.0% closed up
+  - `down_only`: 8 sessions, 62.5% closed down
+  - `both_sides`: 43 sessions, noisy / mixed
+- **Raw pinch was not compelling as a standalone directional edge.** Higher-severity pinch events did not show strong session-close alignment in the current sample.
+- **Absorption failure looked more actionable than absorption itself.**
+  - RTH `absorption_confirmed` with `direction=down` aligned with down closes only 38.9%
+  - RTH `absorption_invalidated` with `direction=down` flipped to opposite-direction close behavior 58.8%
+
+### Instrumentation Caveats
+
+Do not use these fields for serious strategy selection until they are repaired:
+- `signal_outcomes` is currently dominated by one custom setup (`Volume Value Area Traverse`) with clearly broken `time_exit` / excursion behavior
+- `single_prints_direction` in `session_summaries` is currently not useful for statistical slicing
+- `poor_high` / `poor_low` flags are sparse or incomplete in the current stored sample
+
+### Regime-First Conclusion
+
+The strongest conclusion from this pass is not "add more standalone setups." It is:
+
+> Add regime overlays first, then decide which existing setups are even allowed to fire.
+
+Current local evidence suggests:
+- Use **initiative / continuation logic** only when the day is proving one-sided and accepting away from balance
+- Use **inventory-clear / mean-reversion / repair logic** when the session is behaving like a double-distribution migration or London-to-RTH unwind
+- Treat **pinch**, **OR5**, and **raw absorption** as context-dependent, not standalone edge
+
+---
+
+## Priority 0 — Regime Overlay
+
+### IDEA-000: Regime-Gated Setup Selector
+
+**Status:** Researched
+**Source:** Local 2025-11-28 through 2026-03-06 database study; 0DTE / dealer gamma literature; CME liquidity research
+**Complements:** All existing setup templates
+
+**Concept:** Stop treating every setup as always-on. Add a top-level regime selector that determines which setup families are valid:
+- **Initiative / continuation**
+- **Responsive / mean reversion**
+- **Transition / stand aside**
+
+The regime layer should drive which existing templates are active, not just how they are narrated.
+
+**Local Rationale:**
+- Most valid RTH sessions in the current sample were `DoubleDistribution`, not clean trend days
+- London-RTH reversal was more common than London-RTH continuation
+- One-sided IB extension had meaning; generic IB extension did not
+- Raw pinch did not show enough standalone value to justify unrestricted firing
+
+**Primary Regime Buckets:**
+1. **One-Sided Acceptance**
+   - High RVOL
+   - One-sided IB extension
+   - Price accepted above/below VWAP and DNP
+   - No meaningful opposite-side extension
+   - Allowed setup families:
+     - OR5 continuation
+     - IB Extension Play
+     - Single Print Continuation
+     - Rebid / Reoffer hold
+2. **Migration / Inventory Clear**
+   - Double-distribution behavior
+   - Both-side extension or London unwind into RTH
+   - Acceptance back into prior value or current value
+   - Allowed setup families:
+     - DNVA retest
+     - VWAP band repair
+     - Session inventory clear
+     - London inventory unwind
+3. **Transition / Liquidity Failure**
+   - Mixed direction
+   - Failed absorption
+   - Liquidity pulling / pace expanding through defended level
+   - Allowed setup families:
+     - Absorption failure / liquidity vacuum
+     - Failed-breakout trap
+   - Reduce or disable:
+     - Blind continuation entries
+
+**Implementation Notes:**
+- Add a top-level `regime_selector` or `setup_family_gate` to `MarketState`
+- Inputs can be built from existing pipelines:
+  - `day_type`
+  - `balance_state`
+  - IB extension state
+  - London and overnight session direction
+  - VWAP / DNP acceptance
+  - absorption confirmed vs invalidated
+  - pace percentile / RVOL
+- Rules engine should check regime before evaluating setup conditions
+
+**Backtesting Hypotheses:**
+> Does gating OR5, IB Extension, and Single Print Continuation to one-sided acceptance regimes improve win rate versus ungated firing?
+
+> Does gating DNVA, VWAP band, and session inventory setups to migration / inventory-clear regimes improve expectancy?
+
+---
+
 ## Priority 1 — Implementable with Existing Pipelines
 
 ### IDEA-001: Opening Drive Classification
@@ -76,6 +196,54 @@ Living document for trade setup ideas, backtesting hypotheses, and research find
 
 ---
 
+### IDEA-011: One-Sided IB Extension Acceptance
+
+**Status:** Researched
+**Source:** Local 2025-11-28 through 2026-03-06 database study
+**Complements:** IB Extension Play (tpl_ib_extension), OR5 Mid Retest (tpl_or5_mid_retest)
+
+**Concept:** The useful signal is not "IB extension happened." It is whether extension stayed one-sided or became two-sided. Two-sided extension usually means migration / auction, not trend acceptance.
+
+**Local Statistics:**
+- `up_only`: 12 sessions, 75.0% closed up
+- `down_only`: 8 sessions, 62.5% closed down
+- `both_sides`: 43 sessions, mixed / noisy
+- `none`: 18 sessions
+
+**Setup — One-Sided Acceptance Continuation:**
+- Context:
+  - First valid IB extension is one-sided
+  - Opposite-side extension does not print
+  - RVOL >= Elevated
+  - Price remains accepted above VWAP + DNP for longs, below for shorts
+- Entry:
+  - First pullback to the extension origin, VWAP, OR5 mid, or developing value edge
+- Stop:
+  - Back inside IB or through the acceptance level
+- Target:
+  - 0.5x / 1.0x / 1.5x IB extensions
+  - Late-session trend continuation only if opposite extension still absent
+
+**Setup — Extension Failure Reclassification:**
+- If the opposite-side extension prints:
+  - Cancel continuation bias
+  - Reclassify the day as migration / double-distribution until proven otherwise
+  - Switch to responsive setups (DNVA, VWAP-band, inventory-clear, failed-break)
+
+**Implementation Notes:**
+- Add a session-level `ib_extension_state` enum:
+  - `None`
+  - `UpOnly`
+  - `DownOnly`
+  - `BothSides`
+- Store the first extension timestamp and direction
+- Use it as a hard filter for IB continuation and OR5 continuation logic
+
+**Backtesting Hypothesis:**
+> When the first IB extension remains one-sided for at least 30 minutes and RVOL >= Elevated, what is the R-distribution of trading the first pullback in extension direction?
+
+---
+
 ### IDEA-002: Trapped Trader Reversal
 
 **Status:** Researched
@@ -121,6 +289,60 @@ Living document for trade setup ideas, backtesting hypotheses, and research find
 > When price breaks IB high with absorption detected within 5 ticks, and price fails to hold for 3+ minutes, what is the R-distribution of fading the breakout targeting POC?
 
 > When stacked imbalances (≥3 levels, ≥4:1 ratio) form but price fails to extend, what is the reversal probability within the next 15 minutes?
+
+---
+
+### IDEA-012: Absorption Failure / Liquidity Vacuum
+
+**Status:** Researched
+**Source:** Local 2025-11-28 through 2026-03-06 database study; CME liquidity research
+**Complements:** IDEA-002 Trapped Trader Reversal, Rebid/Reoffer, Absorption pipeline
+
+**Concept:** The better signal may be the *failure* of a defended level, not the original absorption itself. A failed defense plus liquidity pull creates a vacuum move that can travel faster than the original defense setup.
+
+**Local Statistics:**
+- RTH `absorption_confirmed`, `direction=down`: aligned with down closes only 38.9%
+- RTH `absorption_invalidated`, `direction=down`: flipped to opposite-direction close behavior 58.8%
+
+This is not enough to call it validated, but it is enough to promote failure-of-defense into a first-class research track.
+
+**Setup — Failed Absorption Reversal / Vacuum:**
+- Context:
+  - Absorption detected at a key level
+  - Price does not reject cleanly
+  - Absorption invalidates or times out
+  - DOM shows pulling through the defended level
+  - Pace expands into the break
+- Entry:
+  - Through the failed zone, not at the original defense price
+- Stop:
+  - Back inside the defended absorption zone
+- Target 1:
+  - Next nearby key level
+- Target 2:
+  - Opposite value edge if the move becomes inventory-clearing
+
+**Critical Rule:**
+- Do not treat visible resting size as sufficient evidence.
+- Require:
+  - failed defense
+  - pace expansion
+  - liquidity pull / inability to refill
+
+**Implementation Notes:**
+- Extend absorption tracking with:
+  - `absorption_state = detected | confirmed | invalidated`
+  - `time_to_invalidation_ms`
+  - `liquidity_pull_rate`
+  - `pace_at_failure`
+- Tie invalidation to level context:
+  - IB high / low
+  - prior day high / low
+  - VAH / VAL
+  - DNVA boundary
+
+**Backtesting Hypothesis:**
+> When absorption at a key level invalidates within X minutes and pace percentile expands above Y, what is the directional follow-through over the next 15 and 30 minutes?
 
 ---
 
@@ -321,6 +543,54 @@ Living document for trade setup ideas, backtesting hypotheses, and research find
 
 ---
 
+### IDEA-016: VWAP Pipeline Enhancements (Dual Session + Anchored)
+
+**Status:** Idea
+**Source:** QA review of `vwap.rs` pipeline, March 2026
+**Complements:** VWAP Band Zone Entry (tpl_vwap_band_zone), all VWAP-referencing setups
+
+**Concept:** The current VWAP pipeline is mathematically correct and incremental, but it only supports a single session-anchored VWAP at a time. Two enhancements would increase its value as a trading reference:
+
+**Enhancement 1 — Dual VWAP (Globex + Developing RTH):**
+
+Currently VWAP resets fully at each session boundary (6 PM ET for Globex, 9:30 AM ET for RTH). This means:
+- During Globex, there is one VWAP covering Asia + London (correct — London does not reset it)
+- At RTH open, the Globex VWAP is discarded and a fresh RTH VWAP begins
+
+The problem: Globex VWAP is a meaningful reference level during the first 30-60 minutes of RTH, especially on London-to-RTH handoff and gap days. Losing it at 9:30 removes context the trader needs.
+
+- Add a second `VwapPipeline` accumulator to `PipelineEngine` (e.g., `vwap_prior_session`)
+- At RTH open, snapshot the Globex VWAP + bands into `prior_globex_vwap`, `prior_globex_vwap_1sd_upper/lower`
+- Expose in MarketState for the first 60-90 minutes of RTH, then let it age out
+- Zero additional per-tick cost (just a snapshot at boundary)
+
+**Enhancement 2 — Anchored VWAP:**
+
+Allow VWAP to be anchored from a user-specified event or time, not just the session open. Common anchors:
+- Previous day's high/low (naked VPOC equivalent for VWAP)
+- Significant absorption event
+- IB high/low break
+- OR5 break
+
+- Add a small `AnchoredVwap` struct (same `sum_pv / sum_v` math, separate accumulator)
+- Allow 1-3 active anchored VWAPs at a time via MCP tool (e.g., `anchor_vwap { from_timestamp_ms }`)
+- Each anchored VWAP accumulates independently and can be queried or cleared
+- Useful for playbook rules that reference "VWAP from the break" or "VWAP from the session low"
+
+**Implementation Notes:**
+- Enhancement 1 is trivial — one extra `VwapPipeline` instance + snapshot at boundary
+- Enhancement 2 requires MCP tool integration and a small vec of active anchors
+- Both are O(1) per tick, no recalculation
+- Add `prior_globex_vwap`, `prior_globex_vwap_1sd_upper`, `prior_globex_vwap_1sd_lower` to MarketState
+- Add `anchored_vwaps: Vec<AnchoredVwapState>` (capped at 3) with MCP create/clear tools
+
+**Backtesting Hypotheses:**
+> On London-to-RTH unwind days (IDEA-014), does prior Globex VWAP act as support/resistance during the first 60 minutes of RTH?
+
+> When VWAP is anchored from the IB break point, does price respect the anchored VWAP ±1SD bands more reliably than session VWAP bands for continuation entries?
+
+---
+
 ## Priority 3 — Requires External Data
 
 ### IDEA-008: 0DTE Gamma Regime Trading
@@ -356,6 +626,55 @@ Living document for trade setup ideas, backtesting hypotheses, and research find
 - Compute GEX from NDX/QQQ/SPX chains → map to NQ price levels
 - Add `gamma_regime: GammaRegime` to MarketState (Positive, Negative, Neutral)
 - Add `gamma_flip_level`, `call_wall`, `put_wall` to key levels
+
+---
+
+### IDEA-013: Gamma-Gated Setup Overlay
+
+**Status:** Researched
+**Source:** Local 2025-11-28 through 2026-03-06 database study; Cboe March 2026 volume data; Dim/Eraker/Vilkov; Adams/Fontaine/Ornthanalai
+**Complements:** IDEA-000 Regime Selector, IDEA-008 0DTE Gamma Regime Trading
+**Requires:** External gamma / wall / flip data
+
+**Concept:** Gamma should not be treated as a standalone setup. It should be used as a selector for which of *your existing setups* are appropriate.
+
+**Current-Market Motivation (as of 2026-03-09):**
+- Cboe reported SPX 0DTE volume hit a record 63% of SPX trading in February 2026
+- NQ already has Monday-Friday weekly expiries on CME
+- Recent literature suggests regime dependence matters more than blanket "0DTE causes volatility" claims:
+  - Positive dealer gamma tends to strengthen reversal behavior
+  - Negative dealer gamma tends to strengthen momentum behavior
+  - Broad market impact can be modest on average, so the useful application is *filtering*, not narrative overreach
+
+**Overlay Rules:**
+- **Positive gamma / inside major wall**
+  - Favor:
+    - DNVA retest
+    - VWAP band repair
+    - failed-breakout traps
+    - session inventory clear
+  - De-emphasize:
+    - blind breakout continuation
+- **Negative gamma / outside major wall**
+  - Favor:
+    - OR5 continuation
+    - one-sided IB extension acceptance
+    - single-print continuation
+    - acceleration-zone hold
+  - De-emphasize:
+    - passive mean reversion
+
+**Implementation Notes:**
+- Use the same gamma data feed planned in IDEA-008
+- Add:
+  - `gamma_regime`
+  - `inside_major_gamma_wall`
+  - `distance_to_call_wall`
+  - `distance_to_put_wall`
+- Feed those fields into the regime selector first, then the setup templates
+
+**Backtesting Hypothesis:**
+> Does positive-gamma gating improve DNVA / VWAP-band expectancy, and does negative-gamma gating improve OR5 / IB-extension expectancy, versus ungated baseline?
 
 ---
 
@@ -423,22 +742,125 @@ All three align → highest probability
 
 ---
 
+### IDEA-014: London Inventory Unwind Into RTH
+
+**Status:** Researched
+**Source:** Local 2025-11-28 through 2026-03-06 database study
+**Complements:** Session Inventory Clear (tpl_session_inventory_clear), DNVA Retest (tpl_dnva_retest), VWAP Band Zone Entry (tpl_vwap_band_zone)
+
+**Concept:** In the current local sample, London direction was more likely to unwind than continue into RTH. This suggests a dedicated handoff setup: trade the unwind only when RTH opens back into value and inventory begins clearing.
+
+**Local Statistics:**
+- London and RTH closed same direction only 41.5%
+- Reversal happened 58.5%
+- Reverse handoff days were mostly high-RVOL and often `DoubleDistribution`
+
+**Setup — London Inventory Unwind:**
+- Context:
+  - London trended materially
+  - RTH opens back inside prior value, overnight value, or current developing value
+  - DNP / VWAP reclaim confirms clearing
+  - No clean one-sided acceptance away from value
+- Entry:
+  - First pullback after reclaim of DNP / VWAP / value edge
+- Stop:
+  - Back through the reclaim level or back outside accepted value
+- Target 1:
+  - Developing POC or prior close
+- Target 2:
+  - Opposite side of current value if unwind becomes full migration
+
+**Do Not Use When:**
+- London delta and price both remain one-sided through the RTH open
+- RTH immediately shows one-sided IB extension acceptance
+- Gamma / event regime strongly favors continuation instead of repair
+
+**Implementation Notes:**
+- Add a `london_rth_handoff_state`:
+  - `Continuation`
+  - `Unwind`
+  - `Unclear`
+- Inputs:
+  - London open/close direction
+  - RTH open relative to prior / overnight value
+  - DNP / VWAP acceptance
+  - early RTH delta sign
+
+**Backtesting Hypothesis:**
+> When London trends but RTH opens back inside value and reclaims DNP/VWAP, what is the probability of a move to POC or opposite value edge before IB completes?
+
+---
+
+### IDEA-015: Post-Macro / Post-Earnings Jump Repair-or-Go
+
+**Status:** Researched
+**Source:** CME around-the-clock liquidity research; jump-risk literature; local style fit
+**Complements:** IDEA-000 Regime Selector, Session Inventory Clear, OR5 Mid Retest, DNVA Retest
+**Requires:** External event calendar for clean automation; otherwise usable as a discretionary overlay
+
+**Concept:** NQ is unusually exposed to post-earnings and macro jump risk. The useful setup is not "trade the news." It is classify the jump day into:
+- **acceptance / continuation**
+- **repair / re-entry into value**
+
+**Why This Matters:**
+- CME documented a 107% increase in Nasdaq futures volume in the hour after Nvidia earnings on 2025-02-26
+- Jump risk clusters around the open and close in recent equity-index research
+
+**Setup — Jump Acceptance Continuation:**
+- Context:
+  - Overnight or 8:30 ET shock moves price outside prior value
+  - First pullback holds outside prior value
+  - DNP / VWAP / delta remain aligned with shock direction
+- Entry:
+  - First pullback that holds outside value
+- Stop:
+  - Back inside prior value
+- Target:
+  - Next structural level, then session range expansion
+
+**Setup — Jump Repair:**
+- Context:
+  - Shock move initially leaves prior value
+  - Price then re-enters prior value
+  - Delta pinches back through DNP / VWAP
+  - Value re-acceptance confirmed
+- Entry:
+  - First pullback after re-entry / reclaim
+- Stop:
+  - Back outside value
+- Target:
+  - POC, prior close, or opposite value edge
+
+**Implementation Notes:**
+- External calendar improves automation, but core structure can be detected from price and session references alone
+- Add an optional `event_day_context` flag if macro / earnings calendar is integrated later
+
+**Backtesting Hypothesis:**
+> On overnight gap or 8:30 ET shock days, does value re-entry plus DNP/VWAP reclaim outperform generic gap-fill or breakout logic?
+
+---
+
 ## Backtesting Queue
 
 Ordered by expected information value × implementation ease:
 
 | # | Hypothesis | Setup | Data Needed | Priority |
 |---|-----------|-------|-------------|----------|
-| 1 | Open Drive + RVOL ≥ Elevated → pullback to VWAP win rate | IDEA-001 | session_summaries, events | High |
-| 2 | Absorption at IB break + price fails to hold 3 min → fade R-dist | IDEA-002 | absorption events, IB levels | High |
-| 3 | Naked VPOC fill rate within 1/3/5/10 sessions | IDEA-003 | session_summaries POC + ticks | High |
-| 4 | CVD divergence at VA boundary → reversal within 30 min | IDEA-004 | delta pipeline, events | Medium |
-| 5 | London sweep of Asia range → RTH direction prediction | IDEA-005 | Globex session data | Medium |
-| 6 | Volume bars vs time bars: R-distribution comparison for existing setups | IDEA-006 | .scid tick data | Medium |
-| 7 | Regime filter (RV ratio) improves DNVA/VWAP band win rate | IDEA-007 | session_summaries, 5-min RV | Medium |
-| 8 | Stacked imbalances (≥3, ≥4:1) fail → reversal probability | IDEA-002 | footprint data | Medium |
-| 9 | Narrow IB (<0.7x avg) → breakout continuation rate | IDEA-001 | session_summaries IB range | Low |
-| 10 | Three-session alignment → range extension beyond IB | IDEA-005 | multi-session data | Low |
+| 1 | One-sided vs both-sided IB extension: first pullback expectancy | IDEA-011 | session_summaries, IB extension events | High |
+| 2 | London trends, RTH opens back in value, DNP/VWAP reclaim → unwind probability | IDEA-014 | multi-session summaries, delta, VWAP | High |
+| 3 | Absorption invalidation + pace expansion at key level → 15/30 min follow-through | IDEA-012 | absorption events, pace, key levels | High |
+| 4 | Open Drive + RVOL ≥ Elevated → pullback to VWAP win rate | IDEA-001 | session_summaries, events | High |
+| 5 | Regime selector improves OR5 / IB / DNVA / VWAP family expectancy | IDEA-000 | session_summaries, events, setup outcomes | High |
+| 6 | Naked VPOC fill rate within 1/3/5/10 sessions | IDEA-003 | session_summaries POC + ticks | Medium |
+| 7 | CVD divergence at VA boundary → reversal within 30 min | IDEA-004 | delta pipeline, events | Medium |
+| 8 | London sweep of Asia range → RTH direction prediction | IDEA-005 | Globex session data | Medium |
+| 9 | Volume bars vs time bars: R-distribution comparison for existing setups | IDEA-006 | .scid tick data | Medium |
+| 10 | Positive-gamma gating vs negative-gamma gating on existing setup families | IDEA-013 | options / gamma data + setup outcomes | Medium |
+| 11 | Stacked imbalances (≥3, ≥4:1) fail → reversal probability | IDEA-002 | footprint data | Medium |
+| 12 | Narrow IB (<0.7x avg) → breakout continuation rate | IDEA-001 | session_summaries IB range | Low |
+| 13 | Three-session alignment → range extension beyond IB | IDEA-005 | multi-session data | Low |
+| 14 | Prior Globex VWAP as S/R in first 60 min of RTH on unwind days | IDEA-016 | session VWAP snapshots, ticks | Low |
+| 15 | Anchored VWAP from IB break: band respect vs session VWAP bands | IDEA-016 | IB break events, ticks | Low |
 
 ---
 
@@ -453,6 +875,10 @@ Ordered by expected information value × implementation ease:
 | Park & Kownatzki (2024) — SSRN 4872960 | Microstructure regimes, volatility scaling | High |
 | CBOE Research | 0DTE market impact | High |
 | Adams, Fontaine, Ornthanalai (2024) — Bank of Canada | 0DTE market dynamics | High |
+| Cboe volume report (2026-03-04) | SPX 0DTE share of volume | High |
+| CME around-the-clock liquidity note (2025) | NQ after-hours volume and earnings response | High |
+| CME liquidity beyond order-book depth (2025) | Liquidity vacuum / fill-rate framing | High |
+| Božović (2025) — SSRN 5223127 | Intraday jump clustering around open / close | High |
 | Hawkes process forecasting — arxiv 2408.03594 | Order flow clustering | Medium-High |
 | ICT/SMC practitioner community | FVG, SMT divergence, session sweeps | Medium |
 | SpotGamma | GEX levels, gamma regime | Medium-High |

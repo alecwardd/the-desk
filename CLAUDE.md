@@ -15,6 +15,8 @@ The Desk is a backend intelligence platform for discretionary NQ futures traders
 
 **It does NOT place or execute trades.** It is a trading partner — grounded in the trader's playbook and live market structure data. It can share opinions, flag concerns, and offer its read on the market, but the trader always makes the final call.
 
+**Primary interface:** AI agents in Cursor (and Claude Code, Codex) — not the Tauri desktop app. Coding agents should focus on the backend and MCP unless explicitly asked to work on the Tauri/React UI.
+
 ---
 
 ## Architecture (Mandatory — Never Violate)
@@ -66,8 +68,8 @@ LAYER 3: MCP Server + LLM Orchestration
 | Data source | Sierra Chart `.scid` | Binary tick data, 40-byte records |
 | Database | SQLite (rusqlite) | Raw ticks, computed state, session history |
 | Compression | zstd | Cold storage archival |
-| Desktop frame | Tauri 2.x | Optional visualization layer |
-| Frontend | React 19 + TypeScript | Optional UI (shadcn/ui, dark theme) |
+| Desktop frame | Tauri 2.x | Optional visualization layer (primary: MCP + Cursor agents) |
+| Frontend | React 19 + TypeScript | Optional UI (shadcn/ui, dark theme) — only when explicitly asked |
 | LLM | Claude API | Coaching prompts via Cursor agents |
 
 ---
@@ -188,7 +190,7 @@ the-desk/
 │   ├── dtc/                          # DTC protocol (legacy reference)
 │   ├── risk/mod.rs                   # Risk state tracking
 │   └── recording/mod.rs             # Session recording + replay
-├── src/                              # React frontend (optional)
+├── src/                              # React frontend (optional — only when explicitly asked)
 ├── docs/
 │   ├── decision-log.md               # ADR-style decisions (living)
 │   └── archive/v0-tauri-gui/         # Pre-pivot planning docs (reference)

@@ -20,6 +20,8 @@ Sierra Chart (.scid files) → Rust Pipeline Engine → SQLite → MCP Server �
 8. **Specialized subagents** (market structure, order flow, levels, performance) access domain-specific tools and report to the orchestrator
 9. **You chat with agents** in Cursor who reference live (1-5s delayed) market data and historical statistics
 
+The primary interaction is via Cursor agents. The Tauri desktop app (DOM replay, optional dashboards) is secondary — use it when you want a visual replay; agents focus on backend and MCP by default.
+
 ## Ingestion Modes
 
 The Desk intentionally runs three ingestion paths:

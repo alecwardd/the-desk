@@ -34,6 +34,18 @@ Sierra Chart (.scid) → Rust Pipeline Engine → SQLite → MCP Server → Curs
 
 ---
 
+## Agent Scope (Default Focus)
+
+**Primary:** You work in this repo to support the agentic trading partner. Your outputs appear in Cursor, Claude Code, Codex, or similar platforms. Focus on:
+- Rust backend (pipelines, rules, feed, db, research)
+- MCP server and tools
+- Agent definitions and prompts
+- SQLite, backfill, research queries
+
+**Secondary (only when explicitly asked):** The Tauri desktop app and React frontend (`src/`, `src-tauri` Tauri-specific code) are optional. Do NOT modify Tauri/React unless the user explicitly requests work on the desktop app, DOM replay, or UI.
+
+---
+
 ## Subagent Patterns
 
 When you need specialized help, spawn subagents for these tasks.
@@ -94,6 +106,8 @@ When you need specialized help, spawn subagents for these tasks.
 
 When implementing a feature:
 
+**Scope check:** Is this task about the Tauri app, DOM replay, or React UI? If no, focus on Rust/MCP. If yes, read `docs/dom-replay.md` (for DOM) or `skills/tauri-bridge/SKILL.md` (for IPC) first.
+
 1. **Read the relevant skill** from `skills/` for domain knowledge
 2. **Write the Rust code** in the appropriate module (`pipelines/`, `rules/`, `feed/`, `db/`)
 3. **Write tests** alongside the code — every pipeline must have unit tests
@@ -102,7 +116,7 @@ When implementing a feature:
 6. **Add MCP tool** in `src/bin/the-desk-mcp.rs` if agents need access
 7. **Run `cargo test`** before declaring done
 
-### DOM Replay Tasks
+### DOM Replay / Tauri UI Tasks (Only When Explicitly Asked)
 
 If the task touches the DOM visualizer, historical ladder playback, or replay UI:
 

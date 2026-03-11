@@ -1,0 +1,10 @@
+---
+description: Default agent scope — backend/MCP first, Tauri only when asked
+alwaysApply: true
+---
+
+# Agent Scope
+
+**Default focus:** Rust backend, MCP server, agent definitions, research, SQLite. Output in Cursor/Claude Code/Codex.
+
+**Do not touch** `src/` (React) or Tauri-specific UI code unless the user explicitly asks for desktop app, DOM replay, or frontend work.

@@ -131,13 +131,35 @@ pub fn minute_of_session_from_timestamp(timestamp_ms: f64) -> i32 {
     0
 }
 
+/// Current date string (YYYY-MM-DD) in Eastern Time.
+pub fn et_now_date() -> String {
+    Utc::now()
+        .with_timezone(&Eastern)
+        .format("%Y-%m-%d")
+        .to_string()
+}
+
+/// Current trading day — rolls forward after 6 PM ET (Globex open).
+/// Use this when loading prior-day levels so that during Globex the query
+/// `date < trading_day` correctly includes today's RTH data.
+pub fn et_now_trading_day() -> String {
+    let et = Utc::now().with_timezone(&Eastern);
+    let et_minutes = (et.hour() as i32 * 60) + et.minute() as i32;
+    let date = if et_minutes >= GLOBEX_OPEN_ET {
+        et.date_naive() + chrono::Duration::days(1)
+    } else {
+        et.date_naive()
+    };
+    date.format("%Y-%m-%d").to_string()
+}
+
 /// Format a timestamp as a session date string (YYYY-MM-DD) in Eastern Time.
 pub fn session_date_from_timestamp_ms(timestamp_ms: f64) -> String {
     let ts = timestamp_ms as i64;
     if let Some(dt) = Utc.timestamp_millis_opt(ts).single() {
         dt.with_timezone(&Eastern).format("%Y-%m-%d").to_string()
     } else {
-        chrono::Local::now().format("%Y-%m-%d").to_string()
+        et_now_date()
     }
 }
 
@@ -154,7 +176,7 @@ pub fn trading_day_from_timestamp_ms(timestamp_ms: f64) -> String {
         };
         return date.format("%Y-%m-%d").to_string();
     }
-    chrono::Local::now().format("%Y-%m-%d").to_string()
+    et_now_trading_day()
 }
 
 /// Convert a Unix timestamp (milliseconds) to all session-relative ET metadata in one pass.

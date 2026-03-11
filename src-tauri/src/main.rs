@@ -536,7 +536,7 @@ fn main() {
     if let Ok(curves) = db.recent_session_volume_curves("Globex", 20) {
         pipelines.rvol.load_globex_historical_curve(&curves);
     }
-    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let today = the_desk_backend::et_now_trading_day();
     if let Ok(Some((high, low, close, va_h, va_l, poc, dnva_h, dnva_l, dnp))) =
         db.load_prior_day_full(&today)
     {

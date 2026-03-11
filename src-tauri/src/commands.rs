@@ -19,7 +19,9 @@ use the_desk_backend::recording::{ReplayEngine, SessionRecorder};
 use the_desk_backend::risk::RiskState;
 use the_desk_backend::rules::SetupDefinition;
 use the_desk_backend::templates;
-use the_desk_backend::{classify_session, et_minutes_from_timestamp, SessionType};
+use the_desk_backend::{
+    classify_session, et_minutes_from_timestamp, et_now_date, et_now_trading_day, SessionType,
+};
 
 use super::AppState;
 
@@ -152,9 +154,10 @@ pub async fn start_session(
     state.rules.lock().await.reset();
 
     let now_ms = chrono::Utc::now().timestamp_millis() as f64;
-    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let session_date = et_now_date();
+    let query_date = et_now_trading_day();
     let rec_path = super::data_dir()
-        .join(format!("{today}_{session_id}.desk"))
+        .join(format!("{session_date}_{session_id}.desk"))
         .to_string_lossy()
         .to_string();
     let session_type = match et_minutes_from_timestamp(now_ms)
@@ -169,7 +172,7 @@ pub async fn start_session(
     let db = state.db.lock().await;
     db.create_session(&SessionRecord {
         id: session_id.clone(),
-        date: today.clone(),
+        date: session_date,
         session_type: session_type.to_string(),
         start_time: now_ms,
         end_time: None,
@@ -178,7 +181,7 @@ pub async fn start_session(
     })
     .map_err(|e| e.to_string())?;
     if let Ok(Some((high, low, close, va_h, va_l, p, dnva_h, dnva_l, dnp))) =
-        db.load_prior_day_full(&today)
+        db.load_prior_day_full(&query_date)
     {
         drop(db);
         let mut pipelines = state.pipelines.lock().await;
@@ -236,7 +239,7 @@ pub async fn stop_session(state: State<'_, AppState>) -> Result<(), String> {
     .map_err(|e| e.to_string())?;
 
     if session_end.high > 0.0 {
-        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let today = et_now_date();
         db.save_prior_day_full_with_dnva(
             &today,
             session_end.high,
@@ -798,7 +801,7 @@ pub async fn set_prior_day_levels(
         .await
         .levels
         .set_prior_day(high, low, close);
-    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let today = et_now_date();
     let db = state.db.lock().await;
     db.save_prior_day(&today, high, low, close)
         .map_err(|e| e.to_string())?;

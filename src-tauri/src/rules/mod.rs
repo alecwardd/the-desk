@@ -375,7 +375,11 @@ fn evaluate_typed_condition(
         }
         ConditionField::DayOfWeek => {
             if let ConditionValue::Text(day) = &cond.value {
-                let today = chrono::Local::now().format("%A").to_string().to_lowercase();
+                let today = chrono::Utc::now()
+                    .with_timezone(&chrono_tz::US::Eastern)
+                    .format("%A")
+                    .to_string()
+                    .to_lowercase();
                 return today == day.to_lowercase();
             }
             return false;

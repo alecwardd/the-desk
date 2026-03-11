@@ -5861,6 +5861,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         pipelines.rvol.load_historical_curve(&curves);
     }
 
+    // Load prior-day levels so MCP tools return correct values before backfill.
+    let today = the_desk_backend::et_now_trading_day();
+    if let Ok(Some((high, low, close, va_h, va_l, poc, dnva_h, dnva_l, dnp))) =
+        db.load_prior_day_full(&today)
+    {
+        pipelines.levels.set_prior_day(high, low, close);
+        if let (Some(vh), Some(vl), Some(pc)) = (va_h, va_l, poc) {
+            pipelines.levels.set_prior_profile(vh, vl, pc);
+        }
+        if let (Some(dh), Some(dl), Some(dp)) = (dnva_h, dnva_l, dnp) {
+            pipelines.levels.set_prior_dnva(dh, dl, dp);
+        }
+    }
+
     let config = load_feed_config();
     let reader = ScidReader::from_feed_config(&config);
     let scid_available = reader.path().exists();

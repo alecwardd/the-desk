@@ -230,13 +230,22 @@ The MCP server (`src/bin/the-desk-mcp.rs`) exposes 54 tools across 11 categories
 | | `cancel_backfill` | Cancel in-flight backfill/backtest job |
 | | `get_backtest_results` | Retrieve stored backtest runs with metrics |
 | | `compare_backtests` | Compare two or more backtest runs side-by-side |
+| **Memory** | `get_memory_brief` | Ranked carry-forward memory by intent (session_start, setup_check, trade_review, weekly_review) |
+| | `get_pre_session_briefing` | Memory brief + account + risk state for session start |
+| | `save_agent_insight` | Persist LLM-authored insight (candidate/validated lifecycle) |
+| | `recall_agent_insights` | Query insights by category, setup, status |
+| | `acknowledge_agent_insight` | Mark insight surfaced/helpful/irrelevant/wrong/pin |
+| | `create_memory_followup` | Open follow-up for next session |
+| | `resolve_memory_followup` | Close follow-up with optional note |
+| | `detect_behavioral_patterns` | Run deterministic pattern detection |
+| | `get_behavioral_patterns` | Query detected patterns |
 | **Storage** | `archive_status` | Hot/warm/cold tier sizes, session count, last archive date |
 
 ### Agent-to-Capability Mapping
 
 | Agent | Primary context | Key tools |
 |-------|------------------|-----------|
-| **orchestrator** | Both — routes by intent | All; routes `historical_research` to backtest-analyst |
+| **orchestrator** | Both — routes by intent | All; routes `historical_research` to backtest-analyst. Memory: `get_pre_session_briefing`, `get_memory_brief`, `save_agent_insight`, `recall_agent_insights`, `acknowledge_agent_insight`, `create_memory_followup`, `resolve_memory_followup`, `detect_behavioral_patterns`, `get_behavioral_patterns` |
 | **market-structure-analyst** | Live + historical | Live: `get_tpo_profile`, `get_key_levels`, `get_day_type`, `get_rvol`, `get_delta_profile`. Historical: `query_event_frequency`, `query_conditional`, `query_distribution`, `compare_sessions`, `get_session_history`, `get_research_summary` |
 | **orderflow-analyst** | Live + historical | Live: `get_delta_profile`, `get_tape_pace`, `get_footprint`, `get_imbalances`, `get_absorption_events`, DOM tools. Historical: same research tools as market-structure |
 | **levels-analyst** | Live + historical | Live: `get_key_levels`, `get_proximity_report`, `get_or5_status`. Historical: `query_event_frequency`, `query_conditional`, `compare_sessions`, `get_session_history` |

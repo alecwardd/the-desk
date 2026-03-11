@@ -71,6 +71,7 @@ Intent classes:
 - `historical_research` — history/backtest/what-if/conditional stats
 - `globex_context` — overnight/Asia/London context
 - `data_health` — stale feed/missing ticks/integrity checks
+- `memory_capture` — "remember this", "note that", "next session focus on X", or agent-detected save-worthy moment
 
 Arbitration policy (Primary + Secondary):
 1. Select one `primary_intent` from explicit user wording.
@@ -85,6 +86,7 @@ Arbitration policy (Primary + Secondary):
    6. `setup`
    7. `market_read`
    8. levels/performance
+   9. `memory_capture`
 
 ### Market Read ("What's the market doing?", "Give me a read", "What's happening?")
 
@@ -260,6 +262,49 @@ Report:
 - Rules-followed vs deviation count
 - Repeated emotional states, review tags, and mistake tags
 - Carry-forward focus for next session
+
+### Observation Capture (Proactive)
+
+The agent proactively saves insights and follow-ups without being asked. Memory capture happens alongside the primary response — never delay or replace analysis to save an insight. Call save tools in parallel with the response when possible.
+
+**When to save (agent decides):**
+
+| Trigger | Tool | Category |
+|---------|------|----------|
+| Trader shares a market observation worth recalling ("NQ chopped around VWAP all Asia session", "that level held three times") | `save_agent_insight` | `market_observation` |
+| Trader or agent notes a regime/context pattern ("low RVOL sessions keep faking out OR breaks", "trend days after inside days") | `save_agent_insight` | `regime_note` |
+| Trader reflects on behavior, emotional state, or a lesson learned | `save_agent_insight` | `session_context` |
+| Trader says "next session", "tomorrow", "follow up on", or any forward-looking intent | `create_memory_followup` | — |
+| Agent recognizes a repeated pattern across the conversation (e.g., trader keeps asking about the same level, or keeps second-guessing entries) | `save_agent_insight` | `behavioral` |
+| During debrief/review, a setup-specific lesson emerges | `save_agent_insight` | `playbook` |
+
+**When NOT to save:**
+- Routine market reads with no novel observation
+- Repeated information already captured this session
+- Vague or trivial remarks
+
+**Evidence structure for LLM-authored insights:**
+
+```json
+{
+  "conversationSummary": "1-2 sentence summary of what was discussed",
+  "sessionId": "if applicable",
+  "tradeId": "if applicable"
+}
+```
+
+The agent already has market context from baseline calls (`get_market_snapshot`, `get_session_context`). No extra calls needed — include relevant context in the `summary` field of the insight.
+
+**Follow-up lifecycle:**
+- Create via `create_memory_followup` when forward-looking intent is detected
+- Follow-ups surface automatically in `get_pre_session_briefing` next session
+- Resolve via `resolve_memory_followup` when addressed
+
+**Insight lifecycle:**
+- New insights start as `candidate` status
+- `get_memory_brief` surfaces them ranked by salience
+- Trader feedback (helpful/irrelevant/wrong) via `acknowledge_agent_insight` adjusts future ranking
+- Insights that prove consistently helpful get promoted to `validated`
 
 ### Performance Review ("How am I doing?", "What's my win rate?", "Performance")
 

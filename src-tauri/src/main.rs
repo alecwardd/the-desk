@@ -10,7 +10,7 @@ use the_desk_backend::db::Database;
 use the_desk_backend::dom_replay::DomReplayClip;
 use the_desk_backend::dtc::DtcClient;
 use the_desk_backend::feed::scid_reader::ScidReader;
-use the_desk_backend::feed::{load_feed_config, FeedEvent, TradeSide};
+use the_desk_backend::feed::{load_feed_config, resolve_contract_metadata, FeedEvent, TradeSide};
 use the_desk_backend::outcome_tracker;
 use the_desk_backend::pipelines::{EventDetector, FlowEventEmitter, PipelineEngine};
 use the_desk_backend::recording::{RecordingEntry, SessionRecorder};
@@ -110,7 +110,9 @@ async fn processing_loop(handle: AppHandle, mut rx: broadcast::Receiver<FeedEven
     let mut last_ask: f64 = 0.0;
     let mut current_session_type = SessionType::Unknown;
     let mut current_delta_segment = DeltaSegment::Unknown;
-    let mut tick_buffer: Vec<(f64, f64, f64, f64, f64, bool, String)> = Vec::with_capacity(128);
+    let feed_contract = resolve_contract_metadata(&load_feed_config());
+    let mut tick_buffer: Vec<(f64, f64, f64, f64, f64, bool, String, String, String)> =
+        Vec::with_capacity(128);
     let mut event_buffer: Vec<the_desk_backend::pipelines::MarketEvent> = Vec::new();
 
     loop {
@@ -159,7 +161,7 @@ async fn processing_loop(handle: AppHandle, mut rx: broadcast::Receiver<FeedEven
                         }
                         if current_session_type == SessionType::Rth {
                             let date = session_date_from_timestamp_ms(timestamp);
-                            let _ = state.db.lock().await.save_prior_day_full_with_dnva(
+                            let _ = state.db.lock().await.save_prior_day_full_with_dnva_contract(
                                 &date,
                                 end_state.high,
                                 end_state.low,
@@ -170,11 +172,18 @@ async fn processing_loop(handle: AppHandle, mut rx: broadcast::Receiver<FeedEven
                                 Some(end_state.dnva_high),
                                 Some(end_state.dnva_low),
                                 Some(end_state.dnp),
+                                Some(feed_contract.root_symbol.as_str()),
+                                Some(feed_contract.contract_symbol.as_str()),
                             );
                             pipelines.levels.set_prior_day(
                                 end_state.high,
                                 end_state.low,
                                 end_state.close,
+                            );
+                            pipelines.levels.set_prior_day_contract_context(
+                                Some(feed_contract.root_symbol.as_str()),
+                                Some(feed_contract.contract_symbol.as_str()),
+                                Some(feed_contract.contract_symbol.as_str()),
                             );
                             pipelines.levels.set_prior_profile(
                                 end_state.va_high,
@@ -374,7 +383,17 @@ async fn processing_loop(handle: AppHandle, mut rx: broadcast::Receiver<FeedEven
                     } else {
                         price + 0.25
                     };
-                    tick_buffer.push((timestamp, price, volume, bid, ask, is_buy, session_date));
+                    tick_buffer.push((
+                        timestamp,
+                        price,
+                        volume,
+                        bid,
+                        ask,
+                        is_buy,
+                        session_date,
+                        feed_contract.root_symbol.clone(),
+                        feed_contract.contract_symbol.clone(),
+                    ));
 
                     if tick_buffer.len() >= 100 || last_tick_flush.elapsed() >= tick_flush_interval
                     {
@@ -435,6 +454,8 @@ async fn processing_loop(handle: AppHandle, mut rx: broadcast::Receiver<FeedEven
                                 session_date: the_desk_backend::session_date_from_timestamp_ms(
                                     timestamp,
                                 ),
+                                root_symbol: Some(feed_contract.root_symbol.clone()),
+                                contract_symbol: Some(feed_contract.contract_symbol.clone()),
                                 source: "live".to_string(),
                                 job_id: None,
                                 fired_at_ms: timestamp,
@@ -530,6 +551,9 @@ fn main() {
     }
 
     let mut pipelines = PipelineEngine::new();
+    let feed_config = load_feed_config();
+    let feed_contract = resolve_contract_metadata(&feed_config);
+    pipelines.set_contract_metadata(feed_contract.clone());
     if let Ok(curves) = db.recent_session_volume_curves("RTH", 20) {
         pipelines.rvol.load_historical_curve(&curves);
     }
@@ -537,14 +561,26 @@ fn main() {
         pipelines.rvol.load_globex_historical_curve(&curves);
     }
     let today = the_desk_backend::et_now_trading_day();
-    if let Ok(Some((high, low, close, va_h, va_l, poc, dnva_h, dnva_l, dnp))) =
-        db.load_prior_day_full(&today)
+    if let Ok(Some(prior_ref)) = db.load_prior_day_reference_scoped(
+        &today,
+        Some(feed_contract.root_symbol.as_str()),
+        Some(feed_contract.contract_symbol.as_str()),
+    )
     {
-        pipelines.levels.set_prior_day(high, low, close);
-        if let (Some(vh), Some(vl), Some(pc)) = (va_h, va_l, poc) {
+        pipelines
+            .levels
+            .set_prior_day(prior_ref.high, prior_ref.low, prior_ref.close);
+        pipelines.levels.set_prior_day_contract_context(
+            prior_ref.root_symbol.as_deref(),
+            prior_ref.contract_symbol.as_deref(),
+            Some(feed_contract.contract_symbol.as_str()),
+        );
+        if let (Some(vh), Some(vl), Some(pc)) = (prior_ref.va_high, prior_ref.va_low, prior_ref.poc) {
             pipelines.levels.set_prior_profile(vh, vl, pc);
         }
-        if let (Some(dh), Some(dl), Some(dp)) = (dnva_h, dnva_l, dnp) {
+        if let (Some(dh), Some(dl), Some(dp)) =
+            (prior_ref.dnva_high, prior_ref.dnva_low, prior_ref.dnp)
+        {
             pipelines.levels.set_prior_dnva(dh, dl, dp);
         }
     }

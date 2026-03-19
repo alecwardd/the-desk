@@ -211,6 +211,8 @@ pub struct RawTickRecord {
     pub ask: f64,
     pub is_buy: bool,
     pub session_date: String,
+    pub root_symbol: Option<String>,
+    pub contract_symbol: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -235,6 +237,12 @@ pub struct DepthEventRecord {
 pub struct SessionSummary {
     pub session_date: String,
     pub session_type: String,
+    pub root_symbol: String,
+    pub contract_symbol: String,
+    pub contract_month: Option<String>,
+    pub symbol_resolution_mode: String,
+    pub carry_forward_levels_valid: bool,
+    pub rollover_warning: Option<String>,
     pub open_price: f64,
     pub high: f64,
     pub low: f64,
@@ -272,6 +280,22 @@ pub struct SessionSummary {
     pub snapshot_json: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PriorDayReference {
+    pub high: f64,
+    pub low: f64,
+    pub close: f64,
+    pub va_high: Option<f64>,
+    pub va_low: Option<f64>,
+    pub poc: Option<f64>,
+    pub dnva_high: Option<f64>,
+    pub dnva_low: Option<f64>,
+    pub dnp: Option<f64>,
+    pub root_symbol: Option<String>,
+    pub contract_symbol: Option<String>,
+}
+
 /// Signal outcome tracking record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -280,6 +304,10 @@ pub struct SignalOutcome {
     pub setup_id: String,
     pub setup_name: Option<String>,
     pub session_date: String,
+    #[serde(default)]
+    pub root_symbol: Option<String>,
+    #[serde(default)]
+    pub contract_symbol: Option<String>,
     #[serde(default = "default_signal_source")]
     pub source: String,
     #[serde(default)]
@@ -328,6 +356,12 @@ pub struct SessionScopeFilter {
     pub session_segment: Option<String>,
     pub trading_day_start: Option<String>,
     pub trading_day_end: Option<String>,
+    pub root_symbol: Option<String>,
+    pub contract_symbol: Option<String>,
+    #[serde(default = "default_include_rollover_sessions")]
+    pub include_rollover_sessions: bool,
+    #[serde(default)]
+    pub continuous_mode: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -336,6 +370,10 @@ pub struct ReplaySignalRecord {
     pub signal_id: String,
     pub timestamp_ms: f64,
     pub session_date: String,
+    #[serde(default)]
+    pub root_symbol: Option<String>,
+    #[serde(default)]
+    pub contract_symbol: Option<String>,
     pub setup_id: String,
     pub payload: serde_json::Value,
     pub source: String,
@@ -373,12 +411,20 @@ fn default_signal_source() -> String {
     "live".to_string()
 }
 
+fn default_include_rollover_sessions() -> bool {
+    true
+}
+
 impl SessionScopeFilter {
     fn is_empty(&self) -> bool {
         self.session_type.is_none()
             && self.session_segment.is_none()
             && self.trading_day_start.is_none()
             && self.trading_day_end.is_none()
+            && self.root_symbol.is_none()
+            && self.contract_symbol.is_none()
+            && self.include_rollover_sessions
+            && !self.continuous_mode
     }
 }
 
@@ -567,6 +613,27 @@ fn analysis_day_for_scope(
     }
 }
 
+fn contract_fields_match_scope(
+    root_symbol: Option<&str>,
+    contract_symbol: Option<&str>,
+    scope: Option<&SessionScopeFilter>,
+) -> bool {
+    let Some(scope) = scope else {
+        return true;
+    };
+    if let Some(filter_root) = scope.root_symbol.as_deref() {
+        if root_symbol.unwrap_or_default() != filter_root {
+            return false;
+        }
+    }
+    if let Some(filter_contract) = scope.contract_symbol.as_deref() {
+        if contract_symbol.unwrap_or_default() != filter_contract {
+            return false;
+        }
+    }
+    true
+}
+
 impl Default for RiskConfigRecord {
     fn default() -> Self {
         Self {
@@ -672,6 +739,9 @@ impl Database {
         }
         if version < 18 {
             self.migrate_v18()?;
+        }
+        if version < 19 {
+            self.migrate_v19()?;
         }
 
         Ok(())
@@ -1574,6 +1644,77 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_memory_followups_session
               ON memory_followups(session_id);
             UPDATE schema_version SET version = 18;
+            ",
+        )?;
+        Ok(())
+    }
+
+    /// V19: contract-aware storage and rollover safety metadata.
+    fn migrate_v19(&self) -> Result<(), DbError> {
+        let alter_statements = [
+            "ALTER TABLE raw_ticks ADD COLUMN root_symbol TEXT NULL",
+            "ALTER TABLE raw_ticks ADD COLUMN contract_symbol TEXT NULL",
+            "ALTER TABLE market_events ADD COLUMN root_symbol TEXT NULL",
+            "ALTER TABLE market_events ADD COLUMN contract_symbol TEXT NULL",
+            "ALTER TABLE session_summaries ADD COLUMN root_symbol TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE session_summaries ADD COLUMN contract_symbol TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE session_summaries ADD COLUMN contract_month TEXT NULL",
+            "ALTER TABLE session_summaries ADD COLUMN symbol_resolution_mode TEXT NOT NULL DEFAULT 'hybrid'",
+            "ALTER TABLE session_summaries ADD COLUMN carry_forward_levels_valid INTEGER NOT NULL DEFAULT 1",
+            "ALTER TABLE session_summaries ADD COLUMN rollover_warning TEXT NULL",
+            "ALTER TABLE prior_day_levels ADD COLUMN root_symbol TEXT NULL",
+            "ALTER TABLE prior_day_levels ADD COLUMN contract_symbol TEXT NULL",
+            "ALTER TABLE playbook_signals ADD COLUMN root_symbol TEXT NULL",
+            "ALTER TABLE playbook_signals ADD COLUMN contract_symbol TEXT NULL",
+            "ALTER TABLE signal_outcomes ADD COLUMN root_symbol TEXT NULL",
+            "ALTER TABLE signal_outcomes ADD COLUMN contract_symbol TEXT NULL",
+            "ALTER TABLE session_volume_curves ADD COLUMN root_symbol TEXT NULL",
+            "ALTER TABLE session_volume_curves ADD COLUMN contract_symbol TEXT NULL",
+            "ALTER TABLE untested_dnps ADD COLUMN contract_symbol TEXT NULL",
+        ];
+        for sql in alter_statements {
+            let _ = self.conn.execute(sql, []);
+        }
+
+        self.conn.execute_batch(
+            "
+            DROP INDEX IF EXISTS ux_raw_ticks_identity;
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_raw_ticks_identity
+              ON raw_ticks(timestamp_ms, price, volume, bid, ask, is_buy, session_date, COALESCE(contract_symbol, ''));
+
+            DROP INDEX IF EXISTS ux_market_events_identity;
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_market_events_identity
+              ON market_events(
+                session_date,
+                timestamp_ms,
+                event_type,
+                COALESCE(level_name, ''),
+                price,
+                COALESCE(direction, ''),
+                COALESCE(sequence_num, -1),
+                COALESCE(contract_symbol, '')
+              );
+
+            CREATE INDEX IF NOT EXISTS idx_raw_ticks_contract_time
+              ON raw_ticks(contract_symbol, session_date, timestamp_ms);
+            CREATE INDEX IF NOT EXISTS idx_market_events_contract_day
+              ON market_events(contract_symbol, trading_day, event_type);
+            CREATE INDEX IF NOT EXISTS idx_session_summaries_contract_day
+              ON session_summaries(contract_symbol, session_date, session_type);
+            CREATE INDEX IF NOT EXISTS idx_session_summaries_root_day
+              ON session_summaries(root_symbol, session_date, session_type);
+            CREATE INDEX IF NOT EXISTS idx_prior_day_levels_contract
+              ON prior_day_levels(contract_symbol, date);
+            CREATE INDEX IF NOT EXISTS idx_signal_outcomes_contract_day
+              ON signal_outcomes(contract_symbol, session_date, setup_id);
+            CREATE INDEX IF NOT EXISTS idx_playbook_signals_contract_day
+              ON playbook_signals(contract_symbol, session_date, setup_id);
+            CREATE INDEX IF NOT EXISTS idx_session_volume_curves_contract
+              ON session_volume_curves(contract_symbol, session_date, session_type);
+            CREATE INDEX IF NOT EXISTS idx_untested_dnps_contract
+              ON untested_dnps(contract_symbol, created_at DESC);
+
+            UPDATE schema_version SET version = 19;
             ",
         )?;
         Ok(())
@@ -3159,16 +3300,40 @@ impl Database {
         dnva_low: Option<f64>,
         dnp: Option<f64>,
     ) -> Result<(), DbError> {
+        self.save_prior_day_full_with_dnva_contract(
+            date, high, low, close, va_high, va_low, poc, dnva_high, dnva_low, dnp, None, None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_prior_day_full_with_dnva_contract(
+        &self,
+        date: &str,
+        high: f64,
+        low: f64,
+        close: f64,
+        va_high: f64,
+        va_low: f64,
+        poc: f64,
+        dnva_high: Option<f64>,
+        dnva_low: Option<f64>,
+        dnp: Option<f64>,
+        root_symbol: Option<&str>,
+        contract_symbol: Option<&str>,
+    ) -> Result<(), DbError> {
         self.conn.execute(
-            "INSERT INTO prior_day_levels (date, high, low, close, va_high, va_low, poc, dnva_high, dnva_low, dnp)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            "INSERT INTO prior_day_levels
+             (date, high, low, close, va_high, va_low, poc, dnva_high, dnva_low, dnp, root_symbol, contract_symbol)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
              ON CONFLICT(date) DO UPDATE SET
                high=excluded.high, low=excluded.low, close=excluded.close,
                va_high=excluded.va_high, va_low=excluded.va_low, poc=excluded.poc,
-               dnva_high=excluded.dnva_high, dnva_low=excluded.dnva_low, dnp=excluded.dnp",
+               dnva_high=excluded.dnva_high, dnva_low=excluded.dnva_low, dnp=excluded.dnp,
+               root_symbol=excluded.root_symbol, contract_symbol=excluded.contract_symbol",
             params![
                 date, high, low, close, va_high, va_low, poc,
                 dnva_high, dnva_low, dnp,
+                root_symbol, contract_symbol,
             ],
         )?;
         Ok(())
@@ -3267,6 +3432,49 @@ impl Database {
         }
     }
 
+    pub fn load_prior_day_reference_scoped(
+        &self,
+        before_date: &str,
+        root_symbol: Option<&str>,
+        contract_symbol: Option<&str>,
+    ) -> Result<Option<PriorDayReference>, DbError> {
+        let mut conditions = vec!["date < ?1".to_string()];
+        let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(before_date.to_string())];
+        if let Some(contract_symbol) = contract_symbol {
+            conditions.push(format!("contract_symbol = ?{}", bind_values.len() + 1));
+            bind_values.push(Box::new(contract_symbol.to_string()));
+        } else if let Some(root_symbol) = root_symbol {
+            conditions.push(format!("root_symbol = ?{}", bind_values.len() + 1));
+            bind_values.push(Box::new(root_symbol.to_string()));
+        }
+        let sql = format!(
+            "SELECT high, low, close, va_high, va_low, poc, dnva_high, dnva_low, dnp, root_symbol, contract_symbol
+             FROM prior_day_levels WHERE {} ORDER BY date DESC LIMIT 1",
+            conditions.join(" AND ")
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+            bind_values.iter().map(|value| value.as_ref()).collect();
+        let mut rows = stmt.query(params_ref.as_slice())?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(PriorDayReference {
+                high: row.get(0)?,
+                low: row.get(1)?,
+                close: row.get(2)?,
+                va_high: row.get(3)?,
+                va_low: row.get(4)?,
+                poc: row.get(5)?,
+                dnva_high: row.get(6)?,
+                dnva_low: row.get(7)?,
+                dnp: row.get(8)?,
+                root_symbol: row.get(9)?,
+                contract_symbol: row.get(10)?,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
     // ------------------------------------------------------------------
     // Backend intelligence storage
     // ------------------------------------------------------------------
@@ -3282,9 +3490,36 @@ impl Database {
         is_buy: bool,
         session_date: &str,
     ) -> Result<(), DbError> {
+        self.insert_raw_tick_with_contract(
+            timestamp_ms,
+            price,
+            volume,
+            bid,
+            ask,
+            is_buy,
+            session_date,
+            None,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_raw_tick_with_contract(
+        &self,
+        timestamp_ms: f64,
+        price: f64,
+        volume: f64,
+        bid: f64,
+        ask: f64,
+        is_buy: bool,
+        session_date: &str,
+        root_symbol: Option<&str>,
+        contract_symbol: Option<&str>,
+    ) -> Result<(), DbError> {
         self.conn.execute(
-            "INSERT OR IGNORE INTO raw_ticks (timestamp_ms, price, volume, bid, ask, is_buy, session_date)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT OR IGNORE INTO raw_ticks
+             (timestamp_ms, price, volume, bid, ask, is_buy, session_date, root_symbol, contract_symbol)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 timestamp_ms,
                 price,
@@ -3292,7 +3527,9 @@ impl Database {
                 bid,
                 ask,
                 i64::from(is_buy),
-                session_date
+                session_date,
+                root_symbol,
+                contract_symbol,
             ],
         )?;
         Ok(())
@@ -3338,6 +3575,8 @@ impl Database {
             signal_id,
             timestamp_ms,
             session_date: session_date_from_timestamp_ms(timestamp_ms),
+            root_symbol: None,
+            contract_symbol: None,
             setup_id: setup_id.to_string(),
             payload: payload.clone(),
             source: "live".to_string(),
@@ -3351,12 +3590,14 @@ impl Database {
     ) -> Result<(), DbError> {
         self.conn.execute(
             "INSERT OR IGNORE INTO playbook_signals
-             (signal_id, timestamp_ms, session_date, setup_id, payload, source, job_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             (signal_id, timestamp_ms, session_date, root_symbol, contract_symbol, setup_id, payload, source, job_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 signal.signal_id,
                 signal.timestamp_ms,
                 signal.session_date,
+                signal.root_symbol,
+                signal.contract_symbol,
                 signal.setup_id,
                 serde_json::to_string(&signal.payload)?,
                 signal.source,
@@ -3457,7 +3698,7 @@ impl Database {
 
     pub fn list_recent_ticks(&self, limit: usize) -> Result<Vec<RawTickRecord>, DbError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, timestamp_ms, price, volume, bid, ask, is_buy, session_date
+            "SELECT id, timestamp_ms, price, volume, bid, ask, is_buy, session_date, root_symbol, contract_symbol
              FROM raw_ticks ORDER BY timestamp_ms DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map([limit as i64], |row| {
@@ -3470,6 +3711,8 @@ impl Database {
                 ask: row.get(5)?,
                 is_buy: row.get::<_, i64>(6)? == 1,
                 session_date: row.get(7)?,
+                root_symbol: row.get(8)?,
+                contract_symbol: row.get(9)?,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -3487,6 +3730,29 @@ impl Database {
         price_low: Option<f64>,
         price_high: Option<f64>,
         session_date: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<RawTickRecord>, DbError> {
+        self.query_ticks_filtered_scoped(
+            start_ms,
+            end_ms,
+            price_low,
+            price_high,
+            session_date,
+            None,
+            None,
+            limit,
+        )
+    }
+
+    pub fn query_ticks_filtered_scoped(
+        &self,
+        start_ms: Option<f64>,
+        end_ms: Option<f64>,
+        price_low: Option<f64>,
+        price_high: Option<f64>,
+        session_date: Option<&str>,
+        root_symbol: Option<&str>,
+        contract_symbol: Option<&str>,
         limit: usize,
     ) -> Result<Vec<RawTickRecord>, DbError> {
         use rusqlite::types::Value;
@@ -3514,6 +3780,14 @@ impl Database {
             p.push(Value::Text(v.to_string()));
             conditions.push(format!("session_date = ?{}", p.len()));
         }
+        if let Some(v) = root_symbol {
+            p.push(Value::Text(v.to_string()));
+            conditions.push(format!("root_symbol = ?{}", p.len()));
+        }
+        if let Some(v) = contract_symbol {
+            p.push(Value::Text(v.to_string()));
+            conditions.push(format!("contract_symbol = ?{}", p.len()));
+        }
         p.push(Value::Integer(limit as i64));
         let limit_idx = p.len();
 
@@ -3531,7 +3805,7 @@ impl Database {
         };
 
         let sql = format!(
-            "SELECT id, timestamp_ms, price, volume, bid, ask, is_buy, session_date \
+            "SELECT id, timestamp_ms, price, volume, bid, ask, is_buy, session_date, root_symbol, contract_symbol \
              FROM raw_ticks {where_clause} ORDER BY timestamp_ms {order} LIMIT ?{limit_idx}"
         );
 
@@ -3546,6 +3820,8 @@ impl Database {
                 ask: row.get(5)?,
                 is_buy: row.get::<_, i64>(6)? == 1,
                 session_date: row.get(7)?,
+                root_symbol: row.get(8)?,
+                contract_symbol: row.get(9)?,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -3557,7 +3833,7 @@ impl Database {
         end_ms: f64,
     ) -> Result<Vec<RawTickRecord>, DbError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, timestamp_ms, price, volume, bid, ask, is_buy, session_date
+            "SELECT id, timestamp_ms, price, volume, bid, ask, is_buy, session_date, root_symbol, contract_symbol
              FROM raw_ticks
              WHERE timestamp_ms >= ?1 AND timestamp_ms < ?2
              ORDER BY timestamp_ms ASC",
@@ -3572,6 +3848,8 @@ impl Database {
                 ask: row.get(5)?,
                 is_buy: row.get::<_, i64>(6)? == 1,
                 session_date: row.get(7)?,
+                root_symbol: row.get(8)?,
+                contract_symbol: row.get(9)?,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -4005,15 +4283,17 @@ impl Database {
     /// Batch-insert raw ticks inside a single transaction.
     pub fn insert_raw_ticks_batch(
         &self,
-        ticks: &[(f64, f64, f64, f64, f64, bool, String)],
+        ticks: &[(f64, f64, f64, f64, f64, bool, String, String, String)],
     ) -> Result<(), DbError> {
         let tx = self.conn.unchecked_transaction()?;
         {
             let mut stmt = tx.prepare_cached(
-                "INSERT OR IGNORE INTO raw_ticks (timestamp_ms, price, volume, bid, ask, is_buy, session_date)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT OR IGNORE INTO raw_ticks
+                 (timestamp_ms, price, volume, bid, ask, is_buy, session_date, root_symbol, contract_symbol)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             )?;
-            for (ts, price, vol, bid, ask, is_buy, session_date) in ticks {
+            for (ts, price, vol, bid, ask, is_buy, session_date, root_symbol, contract_symbol) in ticks
+            {
                 stmt.execute(params![
                     ts,
                     price,
@@ -4021,7 +4301,9 @@ impl Database {
                     bid,
                     ask,
                     i64::from(*is_buy),
-                    session_date
+                    session_date,
+                    root_symbol,
+                    contract_symbol,
                 ])?;
             }
         }
@@ -4246,12 +4528,13 @@ impl Database {
         let summary_end = scope
             .and_then(|s| s.trading_day_end.as_deref())
             .or(end_date);
-        let summaries = self.list_session_summaries(
+        let summaries = self.list_session_summaries_scoped(
             summary_start,
             summary_end,
             None,
             scope.and_then(|s| s.session_type.as_deref()),
             100_000,
+            scope,
         )?;
         for s in summaries {
             total_sessions.insert(s.session_date);
@@ -4326,7 +4609,8 @@ impl Database {
     pub fn upsert_session_summary(&self, s: &SessionSummary) -> Result<(), DbError> {
         self.conn.execute(
             "INSERT INTO session_summaries
-             (session_date, session_type, open_price, high, low, close,
+             (session_date, session_type, root_symbol, contract_symbol, contract_month, symbol_resolution_mode,
+              carry_forward_levels_valid, rollover_warning, open_price, high, low, close,
               poc, vah, val, ib_high, ib_low, ib_range, ib_mid,
               or_high, or_low, day_type, profile_shape, balance_state,
               total_volume, tick_count,
@@ -4334,9 +4618,13 @@ impl Database {
               vwap_close, signal_count, single_prints_direction,
               excess_high, excess_low, poor_high, poor_low, rvol_ratio,
               close_vs_ib_mid, close_vs_vwap, close_vs_poc, snapshot_json)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35,?36,?37)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35,?36,?37,?38,?39,?40,?41,?42,?43)
              ON CONFLICT(session_date, session_type) DO UPDATE SET
-               session_type=excluded.session_type, open_price=excluded.open_price,
+              session_type=excluded.session_type, root_symbol=excluded.root_symbol,
+              contract_symbol=excluded.contract_symbol, contract_month=excluded.contract_month,
+              symbol_resolution_mode=excluded.symbol_resolution_mode,
+              carry_forward_levels_valid=excluded.carry_forward_levels_valid,
+              rollover_warning=excluded.rollover_warning, open_price=excluded.open_price,
                high=excluded.high, low=excluded.low, close=excluded.close,
                poc=excluded.poc, vah=excluded.vah, val=excluded.val,
                ib_high=excluded.ib_high, ib_low=excluded.ib_low, ib_range=excluded.ib_range,
@@ -4354,9 +4642,10 @@ impl Database {
                close_vs_vwap=excluded.close_vs_vwap, close_vs_poc=excluded.close_vs_poc,
                snapshot_json=excluded.snapshot_json",
             params![
-                s.session_date, s.session_type, s.open_price, s.high, s.low, s.close,
-                s.poc, s.vah, s.val, s.ib_high, s.ib_low, s.ib_range, s.ib_mid,
-                s.or_high, s.or_low, s.day_type, s.profile_shape, s.balance_state,
+                s.session_date, s.session_type, s.root_symbol, s.contract_symbol, s.contract_month,
+                s.symbol_resolution_mode, i64::from(s.carry_forward_levels_valid), s.rollover_warning,
+                s.open_price, s.high, s.low, s.close, s.poc, s.vah, s.val, s.ib_high, s.ib_low,
+                s.ib_range, s.ib_mid, s.or_high, s.or_low, s.day_type, s.profile_shape, s.balance_state,
                 s.total_volume, s.tick_count,
                 s.session_delta, s.cumulative_delta, s.dnp, s.dnva_high, s.dnva_low,
                 s.vwap_close, s.signal_count, s.single_prints_direction,
@@ -4619,6 +4908,25 @@ impl Database {
         session_type_filter: Option<&str>,
         limit: usize,
     ) -> Result<Vec<SessionSummary>, DbError> {
+        self.list_session_summaries_scoped(
+            start_date,
+            end_date,
+            day_type_filter,
+            session_type_filter,
+            limit,
+            None,
+        )
+    }
+
+    pub fn list_session_summaries_scoped(
+        &self,
+        start_date: Option<&str>,
+        end_date: Option<&str>,
+        day_type_filter: Option<&str>,
+        session_type_filter: Option<&str>,
+        limit: usize,
+        scope: Option<&SessionScopeFilter>,
+    ) -> Result<Vec<SessionSummary>, DbError> {
         let mut conditions = Vec::new();
         let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 
@@ -4638,6 +4946,19 @@ impl Database {
             conditions.push(format!("session_type = ?{}", bind_values.len() + 1));
             bind_values.push(Box::new(st.to_string()));
         }
+        if let Some(scope) = scope {
+            if let Some(root) = scope.root_symbol.as_deref() {
+                conditions.push(format!("root_symbol = ?{}", bind_values.len() + 1));
+                bind_values.push(Box::new(root.to_string()));
+            }
+            if let Some(contract) = scope.contract_symbol.as_deref() {
+                conditions.push(format!("contract_symbol = ?{}", bind_values.len() + 1));
+                bind_values.push(Box::new(contract.to_string()));
+            }
+            if !scope.include_rollover_sessions {
+                conditions.push("COALESCE(carry_forward_levels_valid, 1) = 1".to_string());
+            }
+        }
 
         let where_clause = if conditions.is_empty() {
             String::new()
@@ -4646,7 +4967,9 @@ impl Database {
         };
 
         let sql = format!(
-            "SELECT session_date, session_type, open_price, high, low, close,
+            "SELECT session_date, session_type, root_symbol, contract_symbol, contract_month,
+                    symbol_resolution_mode, carry_forward_levels_valid, rollover_warning,
+                    open_price, high, low, close,
                     poc, vah, val, ib_high, ib_low, ib_range, ib_mid,
                     or_high, or_low, day_type, profile_shape, balance_state,
                     total_volume, tick_count,
@@ -4667,41 +4990,47 @@ impl Database {
             Ok(SessionSummary {
                 session_date: row.get(0)?,
                 session_type: row.get(1)?,
-                open_price: row.get(2)?,
-                high: row.get(3)?,
-                low: row.get(4)?,
-                close: row.get(5)?,
-                poc: row.get(6)?,
-                vah: row.get(7)?,
-                val: row.get(8)?,
-                ib_high: row.get(9)?,
-                ib_low: row.get(10)?,
-                ib_range: row.get(11)?,
-                ib_mid: row.get(12)?,
-                or_high: row.get(13)?,
-                or_low: row.get(14)?,
-                day_type: row.get::<_, Option<String>>(15)?.unwrap_or_default(),
-                profile_shape: row.get::<_, Option<String>>(16)?.unwrap_or_default(),
-                balance_state: row.get::<_, Option<String>>(17)?.unwrap_or_default(),
-                total_volume: row.get(18)?,
-                tick_count: row.get(19)?,
-                session_delta: row.get(20)?,
-                cumulative_delta: row.get(21)?,
-                dnp: row.get(22)?,
-                dnva_high: row.get(23)?,
-                dnva_low: row.get(24)?,
-                vwap_close: row.get(25)?,
-                signal_count: row.get(26)?,
-                single_prints_direction: row.get::<_, Option<String>>(27)?.unwrap_or_default(),
-                excess_high: row.get::<_, i64>(28)? != 0,
-                excess_low: row.get::<_, i64>(29)? != 0,
-                poor_high: row.get::<_, i64>(30)? != 0,
-                poor_low: row.get::<_, i64>(31)? != 0,
-                rvol_ratio: row.get(32)?,
-                close_vs_ib_mid: row.get::<_, Option<String>>(33)?.unwrap_or_default(),
-                close_vs_vwap: row.get::<_, Option<String>>(34)?.unwrap_or_default(),
-                close_vs_poc: row.get::<_, Option<String>>(35)?.unwrap_or_default(),
-                snapshot_json: row.get(36)?,
+                root_symbol: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                contract_symbol: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                contract_month: row.get(4)?,
+                symbol_resolution_mode: row.get::<_, Option<String>>(5)?.unwrap_or_else(|| "hybrid".to_string()),
+                carry_forward_levels_valid: row.get::<_, i64>(6)? != 0,
+                rollover_warning: row.get(7)?,
+                open_price: row.get(8)?,
+                high: row.get(9)?,
+                low: row.get(10)?,
+                close: row.get(11)?,
+                poc: row.get(12)?,
+                vah: row.get(13)?,
+                val: row.get(14)?,
+                ib_high: row.get(15)?,
+                ib_low: row.get(16)?,
+                ib_range: row.get(17)?,
+                ib_mid: row.get(18)?,
+                or_high: row.get(19)?,
+                or_low: row.get(20)?,
+                day_type: row.get::<_, Option<String>>(21)?.unwrap_or_default(),
+                profile_shape: row.get::<_, Option<String>>(22)?.unwrap_or_default(),
+                balance_state: row.get::<_, Option<String>>(23)?.unwrap_or_default(),
+                total_volume: row.get(24)?,
+                tick_count: row.get(25)?,
+                session_delta: row.get(26)?,
+                cumulative_delta: row.get(27)?,
+                dnp: row.get(28)?,
+                dnva_high: row.get(29)?,
+                dnva_low: row.get(30)?,
+                vwap_close: row.get(31)?,
+                signal_count: row.get(32)?,
+                single_prints_direction: row.get::<_, Option<String>>(33)?.unwrap_or_default(),
+                excess_high: row.get::<_, i64>(34)? != 0,
+                excess_low: row.get::<_, i64>(35)? != 0,
+                poor_high: row.get::<_, i64>(36)? != 0,
+                poor_low: row.get::<_, i64>(37)? != 0,
+                rvol_ratio: row.get(38)?,
+                close_vs_ib_mid: row.get::<_, Option<String>>(39)?.unwrap_or_default(),
+                close_vs_vwap: row.get::<_, Option<String>>(40)?.unwrap_or_default(),
+                close_vs_poc: row.get::<_, Option<String>>(41)?.unwrap_or_default(),
+                snapshot_json: row.get(42)?,
             })
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
@@ -4714,6 +5043,17 @@ impl Database {
         start_date: Option<&str>,
         end_date: Option<&str>,
         session_type_filter: Option<&str>,
+    ) -> Result<Vec<f64>, DbError> {
+        self.metric_values_scoped(column, start_date, end_date, session_type_filter, None)
+    }
+
+    pub fn metric_values_scoped(
+        &self,
+        column: &str,
+        start_date: Option<&str>,
+        end_date: Option<&str>,
+        session_type_filter: Option<&str>,
+        scope: Option<&SessionScopeFilter>,
     ) -> Result<Vec<f64>, DbError> {
         let allowed = [
             "ib_range",
@@ -4757,6 +5097,19 @@ impl Database {
             conditions.push(format!("session_type = ?{}", bind_values.len() + 1));
             bind_values.push(Box::new(st.to_string()));
         }
+        if let Some(scope) = scope {
+            if let Some(root) = scope.root_symbol.as_deref() {
+                conditions.push(format!("root_symbol = ?{}", bind_values.len() + 1));
+                bind_values.push(Box::new(root.to_string()));
+            }
+            if let Some(contract) = scope.contract_symbol.as_deref() {
+                conditions.push(format!("contract_symbol = ?{}", bind_values.len() + 1));
+                bind_values.push(Box::new(contract.to_string()));
+            }
+            if !scope.include_rollover_sessions {
+                conditions.push("COALESCE(carry_forward_levels_valid, 1) = 1".to_string());
+            }
+        }
         let sql = format!(
             "SELECT {column} FROM session_summaries WHERE {} ORDER BY session_date",
             conditions.join(" AND ")
@@ -4776,16 +5129,18 @@ impl Database {
     pub fn insert_signal_outcome(&self, o: &SignalOutcome) -> Result<(), DbError> {
         self.conn.execute(
             "INSERT OR IGNORE INTO signal_outcomes
-             (signal_id, setup_id, setup_name, session_date, source, job_id,
+             (signal_id, setup_id, setup_name, session_date, root_symbol, contract_symbol, source, job_id,
               fired_at_ms, fired_price, target_price, stop_price, outcome, outcome_at_ms,
               max_favorable_excursion, max_adverse_excursion, r_result, time_to_outcome_ms,
               rvol_at_fire, rvol_bucket_at_fire)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
             params![
                 o.signal_id,
                 o.setup_id,
                 o.setup_name,
                 o.session_date,
+                o.root_symbol,
+                o.contract_symbol,
                 o.source,
                 o.job_id,
                 o.fired_at_ms,
@@ -4923,6 +5278,8 @@ impl Database {
                 setup_id: row.get(1)?,
                 setup_name: row.get(2)?,
                 session_date: row.get(3)?,
+                root_symbol: None,
+                contract_symbol: None,
                 source: row.get(4)?,
                 job_id: row.get(5)?,
                 fired_at_ms: row.get(6)?,
@@ -4952,7 +5309,7 @@ impl Database {
         scope: Option<&SessionScopeFilter>,
     ) -> Result<Vec<(String, String, Option<f64>, String)>, DbError> {
         let mut stmt = self.conn.prepare(
-            "SELECT setup_id, session_date, r_result, outcome, fired_at_ms
+            "SELECT setup_id, session_date, r_result, outcome, fired_at_ms, root_symbol, contract_symbol
              FROM signal_outcomes WHERE outcome != 'pending'",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -4962,15 +5319,25 @@ impl Database {
                 row.get::<_, Option<f64>>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, f64>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
             ))
         })?;
         let mut results = Vec::new();
         for row in rows.filter_map(|r| r.ok()) {
-            let (sid, session_date, r_result, outcome, fired_at_ms) = row;
+            let (sid, session_date, r_result, outcome, fired_at_ms, root_symbol, contract_symbol) =
+                row;
             if let Some(filter_id) = setup_id {
                 if sid != filter_id {
                     continue;
                 }
+            }
+            if !contract_fields_match_scope(
+                root_symbol.as_deref(),
+                contract_symbol.as_deref(),
+                scope,
+            ) {
+                continue;
             }
             let Some(analysis_day) = analysis_day_for_scope(&session_date, fired_at_ms, scope)
             else {
@@ -5002,7 +5369,7 @@ impl Database {
         scope: Option<&SessionScopeFilter>,
     ) -> Result<Vec<(f64, Option<f64>, String)>, DbError> {
         let mut stmt = self.conn.prepare(
-            "SELECT setup_id, session_date, r_result, outcome, fired_at_ms, rvol_at_fire
+            "SELECT setup_id, session_date, r_result, outcome, fired_at_ms, rvol_at_fire, root_symbol, contract_symbol
              FROM signal_outcomes
              WHERE outcome != 'pending' AND rvol_at_fire IS NOT NULL",
         )?;
@@ -5014,15 +5381,33 @@ impl Database {
                 row.get::<_, String>(3)?,
                 row.get::<_, f64>(4)?,
                 row.get::<_, f64>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
             ))
         })?;
         let mut results = Vec::new();
         for row in rows.filter_map(|r| r.ok()) {
-            let (sid, session_date, r_result, outcome, fired_at_ms, rvol) = row;
+            let (
+                sid,
+                session_date,
+                r_result,
+                outcome,
+                fired_at_ms,
+                rvol,
+                root_symbol,
+                contract_symbol,
+            ) = row;
             if let Some(filter_id) = setup_id {
                 if sid != filter_id {
                     continue;
                 }
+            }
+            if !contract_fields_match_scope(
+                root_symbol.as_deref(),
+                contract_symbol.as_deref(),
+                scope,
+            ) {
+                continue;
             }
             let Some(analysis_day) = analysis_day_for_scope(&session_date, fired_at_ms, scope)
             else {
@@ -5053,7 +5438,8 @@ impl Database {
     ) -> Result<Vec<SignalOutcomeExcursionRow>, DbError> {
         let mut stmt = self.conn.prepare(
             "SELECT setup_id, setup_name, session_date, fired_at_ms, outcome,
-                    max_favorable_excursion, max_adverse_excursion, time_to_outcome_ms
+                    max_favorable_excursion, max_adverse_excursion, time_to_outcome_ms,
+                    root_symbol, contract_symbol
              FROM signal_outcomes
              WHERE outcome != 'pending'",
         )?;
@@ -5067,16 +5453,36 @@ impl Database {
                 row.get::<_, Option<f64>>(5)?,
                 row.get::<_, Option<f64>>(6)?,
                 row.get::<_, Option<f64>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<String>>(9)?,
             ))
         })?;
 
         let mut results = Vec::new();
         for row in rows.filter_map(|r| r.ok()) {
-            let (sid, setup_name, session_date, fired_at_ms, outcome, mfe, mae, tto_ms) = row;
+            let (
+                sid,
+                setup_name,
+                session_date,
+                fired_at_ms,
+                outcome,
+                mfe,
+                mae,
+                tto_ms,
+                root_symbol,
+                contract_symbol,
+            ) = row;
             if let Some(filter_id) = setup_id {
                 if sid != filter_id {
                     continue;
                 }
+            }
+            if !contract_fields_match_scope(
+                root_symbol.as_deref(),
+                contract_symbol.as_deref(),
+                scope,
+            ) {
+                continue;
             }
             let Some(analysis_day) = analysis_day_for_scope(&session_date, fired_at_ms, scope)
             else {
@@ -5144,7 +5550,7 @@ impl Database {
             format!("WHERE {}", conditions.join(" AND "))
         };
         let sql = format!(
-            "SELECT session_date, fired_at_ms, outcome, r_result
+            "SELECT session_date, fired_at_ms, outcome, r_result, root_symbol, contract_symbol
              FROM signal_outcomes {where_clause}"
         );
         let mut stmt = self.conn.prepare(&sql)?;
@@ -5156,6 +5562,8 @@ impl Database {
                 row.get::<_, f64>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, Option<f64>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
             ))
         })?;
 
@@ -5173,7 +5581,14 @@ impl Database {
         let mut loser_count = 0_i64;
 
         for row in rows.filter_map(|r| r.ok()) {
-            let (session_date, fired_at_ms, outcome, r_result) = row;
+            let (session_date, fired_at_ms, outcome, r_result, root_symbol, contract_symbol) = row;
+            if !contract_fields_match_scope(
+                root_symbol.as_deref(),
+                contract_symbol.as_deref(),
+                scope,
+            ) {
+                continue;
+            }
             let Some(analysis_day) = analysis_day_for_scope(&session_date, fired_at_ms, scope)
             else {
                 continue;
@@ -5284,7 +5699,7 @@ impl Database {
         }
 
         let mut sql = String::from(
-            "SELECT setup_id, setup_name, session_date, fired_at_ms, outcome, r_result
+            "SELECT setup_id, setup_name, session_date, fired_at_ms, outcome, r_result, root_symbol, contract_symbol
              FROM signal_outcomes WHERE 1=1",
         );
         let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -5307,12 +5722,30 @@ impl Database {
                 row.get::<_, f64>(3)?,
                 row.get::<_, String>(4)?,
                 row.get::<_, Option<f64>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
             ))
         })?;
 
         let mut grouped: BTreeMap<String, SetupPerfAgg> = BTreeMap::new();
         for row in rows.filter_map(|r| r.ok()) {
-            let (setup_id, setup_name, session_date, fired_at_ms, outcome, r_result) = row;
+            let (
+                setup_id,
+                setup_name,
+                session_date,
+                fired_at_ms,
+                outcome,
+                r_result,
+                root_symbol,
+                contract_symbol,
+            ) = row;
+            if !contract_fields_match_scope(
+                root_symbol.as_deref(),
+                contract_symbol.as_deref(),
+                scope,
+            ) {
+                continue;
+            }
             let Some(analysis_day) = analysis_day_for_scope(&session_date, fired_at_ms, scope)
             else {
                 continue;
@@ -5488,7 +5921,7 @@ impl Database {
             for outcome in signal_outcomes {
                 self.insert_signal_outcome(outcome)?;
             }
-            self.save_prior_day_full_with_dnva(
+            self.save_prior_day_full_with_dnva_contract(
                 session_date,
                 prior_day.0,
                 prior_day.1,
@@ -5499,6 +5932,8 @@ impl Database {
                 Some(prior_day.6),
                 Some(prior_day.7),
                 Some(prior_day.8),
+                Some(summary.root_symbol.as_str()),
+                Some(summary.contract_symbol.as_str()),
             )?;
             // Track untested DNPs: price did not revisit DNP ± 2 NQ ticks (0.5 pts).
             const DNP_TOLERANCE: f64 = 0.5;
@@ -5539,6 +5974,21 @@ impl Database {
         Ok(self
             .conn
             .query_row("SELECT COUNT(1) FROM session_summaries", [], |r| r.get(0))?)
+    }
+
+    /// Earliest and latest session_date in session_summaries (for coverage reporting).
+    pub fn session_summary_date_range(&self) -> Result<(Option<String>, Option<String>), DbError> {
+        let min_date = self.conn.query_row(
+                "SELECT MIN(session_date) FROM session_summaries",
+                [],
+                |r| r.get::<_, Option<String>>(0),
+            )?;
+        let max_date = self.conn.query_row(
+            "SELECT MAX(session_date) FROM session_summaries",
+            [],
+            |r| r.get::<_, Option<String>>(0),
+        )?;
+        Ok((min_date, max_date))
     }
 
     pub fn insert_historical_job_run(&self, run: &HistoricalJobRun) -> Result<(), DbError> {
@@ -5994,6 +6444,12 @@ mod tests {
         db.upsert_session_summary(&SessionSummary {
             session_date: "2026-03-02".into(),
             session_type: "RTH".into(),
+            root_symbol: "NQ".into(),
+            contract_symbol: "NQH26.CME".into(),
+            contract_month: Some("2026-03".into()),
+            symbol_resolution_mode: "hybrid".into(),
+            carry_forward_levels_valid: true,
+            rollover_warning: None,
             open_price: 21000.0,
             high: 21010.0,
             low: 20990.0,
@@ -6049,6 +6505,8 @@ mod tests {
             signal_id: "live-1".into(),
             timestamp_ms: 1.0,
             session_date: "2026-03-02".into(),
+            root_symbol: Some("NQ".into()),
+            contract_symbol: Some("NQH26.CME".into()),
             setup_id: "setup".into(),
             payload: serde_json::json!({}),
             source: "live".into(),
@@ -6059,6 +6517,8 @@ mod tests {
             signal_id: "backfill-1".into(),
             timestamp_ms: 2.0,
             session_date: "2026-03-02".into(),
+            root_symbol: Some("NQ".into()),
+            contract_symbol: Some("NQH26.CME".into()),
             setup_id: "setup".into(),
             payload: serde_json::json!({}),
             source: "backfill".into(),
@@ -6070,6 +6530,8 @@ mod tests {
             setup_id: "setup".into(),
             setup_name: Some("Setup".into()),
             session_date: "2026-03-02".into(),
+            root_symbol: Some("NQ".into()),
+            contract_symbol: Some("NQH26.CME".into()),
             source: "live".into(),
             job_id: None,
             fired_at_ms: 1.0,
@@ -6091,6 +6553,8 @@ mod tests {
             setup_id: "setup".into(),
             setup_name: Some("Setup".into()),
             session_date: "2026-03-02".into(),
+            root_symbol: Some("NQ".into()),
+            contract_symbol: Some("NQH26.CME".into()),
             source: "backfill".into(),
             job_id: Some("job-1".into()),
             fired_at_ms: 2.0,
@@ -6379,6 +6843,10 @@ mod tests {
             session_segment: Some("Asia".into()),
             trading_day_start: None,
             trading_day_end: None,
+            root_symbol: None,
+            contract_symbol: None,
+            include_rollover_sessions: true,
+            continuous_mode: false,
         };
         let (total, sessions_with, total_sessions) = db
             .count_events_by_type("legacy_scope_test", None, None, Some(&scope))
@@ -6396,6 +6864,8 @@ mod tests {
             setup_id: "s1".into(),
             setup_name: Some("Setup 1".into()),
             session_date: "2026-03-04".into(),
+            root_symbol: Some("NQ".into()),
+            contract_symbol: Some("NQH26.CME".into()),
             source: "live".into(),
             job_id: None,
             fired_at_ms: 1_000.0,
@@ -6417,6 +6887,8 @@ mod tests {
             setup_id: "s1".into(),
             setup_name: Some("Setup 1".into()),
             session_date: "2026-03-04".into(),
+            root_symbol: Some("NQ".into()),
+            contract_symbol: Some("NQH26.CME".into()),
             source: "live".into(),
             job_id: None,
             fired_at_ms: 2_000.0,
@@ -6438,6 +6910,8 @@ mod tests {
             setup_id: "s1".into(),
             setup_name: Some("Setup 1".into()),
             session_date: "2026-03-04".into(),
+            root_symbol: Some("NQ".into()),
+            contract_symbol: Some("NQH26.CME".into()),
             source: "backtest".into(),
             job_id: Some("job-1".into()),
             fired_at_ms: 3_000.0,
@@ -6493,6 +6967,8 @@ mod tests {
                 setup_id: setup_id.into(),
                 setup_name: Some(setup_id.into()),
                 session_date: "2026-03-04".into(),
+                root_symbol: Some("NQ".into()),
+                contract_symbol: Some("NQH26.CME".into()),
                 source: "live".into(),
                 job_id: None,
                 fired_at_ms,
@@ -6570,6 +7046,8 @@ mod tests {
             setup_id: "s-asia".into(),
             setup_name: Some("Asia Setup".into()),
             session_date: "2026-03-03".into(),
+            root_symbol: Some("NQ".into()),
+            contract_symbol: Some("NQH26.CME".into()),
             source: "live".into(),
             job_id: None,
             fired_at_ms: asia_ts,
@@ -6591,6 +7069,8 @@ mod tests {
             setup_id: "s-rth".into(),
             setup_name: Some("RTH Setup".into()),
             session_date: "2026-03-03".into(),
+            root_symbol: Some("NQ".into()),
+            contract_symbol: Some("NQH26.CME".into()),
             source: "live".into(),
             job_id: None,
             fired_at_ms: rth_ts,
@@ -6613,6 +7093,10 @@ mod tests {
             session_segment: Some("Asia".into()),
             trading_day_start: None,
             trading_day_end: None,
+            root_symbol: None,
+            contract_symbol: None,
+            include_rollover_sessions: true,
+            continuous_mode: false,
         };
         let rows = db
             .list_signal_outcomes_for_excursions_filtered(None, None, None, Some(&asia_scope))

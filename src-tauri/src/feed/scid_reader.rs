@@ -1,3 +1,4 @@
+use crate::feed::symbol_resolution::{resolve_contract_metadata, symbol_to_scid_file};
 use crate::feed::{FeedConfig, FeedEvent, TradeSide};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -68,7 +69,13 @@ impl ScidReader {
     }
 
     pub fn from_feed_config(config: &FeedConfig) -> Self {
-        let path = PathBuf::from(&config.sierra_data_dir).join(symbol_to_scid_file(&config.symbol));
+        let contract = resolve_contract_metadata(config);
+        let path = if contract.scid_file_exists {
+            PathBuf::from(&contract.scid_path)
+        } else {
+            PathBuf::from(&config.sierra_data_dir)
+                .join(symbol_to_scid_file(&contract.contract_symbol))
+        };
         Self {
             path,
             price_scale: config.price_scale,
@@ -441,15 +448,6 @@ pub fn parse_record_scaled(record: &[u8], price_scale: f64) -> Option<ScidTick> 
         ask,
         side,
     })
-}
-
-fn symbol_to_scid_file(symbol: &str) -> String {
-    let trimmed = symbol.trim();
-    if trimmed.to_ascii_lowercase().ends_with(".scid") {
-        trimmed.to_string()
-    } else {
-        format!("{trimmed}.scid")
-    }
 }
 
 #[cfg(test)]

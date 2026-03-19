@@ -168,7 +168,7 @@ pub fn conditional_probability(
         .map_err(|e| e.to_string())?;
 
     let summaries = db
-        .list_session_summaries(summary_start, summary_end, None, None, 10_000)
+        .list_session_summaries_scoped(summary_start, summary_end, None, None, 10_000, scope)
         .map_err(|e| e.to_string())?;
 
     let summary_map: std::collections::HashMap<String, &crate::db::SessionSummary> = summaries
@@ -276,7 +276,7 @@ pub fn signal_outcome_conditional(
         .map_err(|e| e.to_string())?;
 
     let summaries = db
-        .list_session_summaries(summary_start, summary_end, None, None, 10_000)
+        .list_session_summaries_scoped(summary_start, summary_end, None, None, 10_000, scope)
         .map_err(|e| e.to_string())?;
 
     let summary_map: std::collections::HashMap<String, &crate::db::SessionSummary> = summaries
@@ -472,11 +472,12 @@ pub fn metric_distribution(
         .and_then(|s| s.trading_day_end.as_deref())
         .or(end_date);
     let values = db
-        .metric_values(
+        .metric_values_scoped(
             metric,
             summary_start,
             summary_end,
             scope.and_then(|s| s.session_type.as_deref()),
+            scope,
         )
         .map_err(|e| e.to_string())?;
     Ok(distribution_from_values(metric, &values))
@@ -548,7 +549,7 @@ pub fn compare_sessions_multi(
     max_results: usize,
 ) -> Result<Vec<serde_json::Value>, String> {
     let summaries = db
-        .list_session_summaries(None, None, None, None, 500)
+        .list_session_summaries_scoped(None, None, None, None, 500, None)
         .map_err(|e| e.to_string())?;
 
     let filtered: Vec<&crate::db::SessionSummary> =
@@ -692,6 +693,8 @@ mod tests {
             setup_id: "s1".into(),
             setup_name: Some("Setup 1".into()),
             session_date: "2026-03-04".into(),
+            root_symbol: Some("NQ".into()),
+            contract_symbol: Some("NQH26.CME".into()),
             source: "live".into(),
             job_id: None,
             fired_at_ms: 1_000.0,
@@ -713,6 +716,8 @@ mod tests {
             setup_id: "s1".into(),
             setup_name: Some("Setup 1".into()),
             session_date: "2026-03-04".into(),
+            root_symbol: Some("NQ".into()),
+            contract_symbol: Some("NQH26.CME".into()),
             source: "live".into(),
             job_id: None,
             fired_at_ms: 3_000.0,

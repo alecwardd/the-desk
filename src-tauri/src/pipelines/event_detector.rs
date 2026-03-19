@@ -72,7 +72,8 @@ fn event_allowed_in_session(
         return true;
     }
     match event_type {
-        "ib_formed" | "or_formed" | "or5_mid_retest" | "ib_extension_hit" | "day_type_change" => {
+        "ib_formed" | "or_formed" | "or5_mid_retest" | "ib_extension_hit" | "day_type_change"
+        | "ib_reentry" | "ib_reentry_hit_mid" | "ib_reentry_full_traverse" => {
             return false;
         }
         _ => {}
@@ -85,6 +86,15 @@ fn event_allowed_in_session(
         return false;
     }
     true
+}
+
+/// Tracks price position relative to IB range.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum IbPosition {
+    Unknown,
+    Inside,
+    Above,
+    Below,
 }
 
 /// Detects structured events by comparing consecutive MarketState snapshots.
@@ -106,6 +116,14 @@ pub struct EventDetector {
     last_event_ts: HashMap<String, f64>,
     sequence_counts: HashMap<String, i32>,
     session_date: String,
+    // IB reentry tracking
+    ib_position: IbPosition,
+    /// Which side price re-entered from: "high" or "low". None when not tracking.
+    ib_reentry_from: Option<String>,
+    ib_reentry_hit_mid: bool,
+    ib_reentry_traversed: bool,
+    /// Max excursion into IB (in points) during active reentry tracking.
+    ib_reentry_max_penetration: f64,
 }
 
 impl Default for EventDetector {
@@ -131,6 +149,11 @@ impl EventDetector {
             last_event_ts: HashMap::new(),
             sequence_counts: HashMap::new(),
             session_date: String::new(),
+            ib_position: IbPosition::Unknown,
+            ib_reentry_from: None,
+            ib_reentry_hit_mid: false,
+            ib_reentry_traversed: false,
+            ib_reentry_max_penetration: 0.0,
         }
     }
 
@@ -176,6 +199,11 @@ impl EventDetector {
         self.last_event_ts.clear();
         self.sequence_counts.clear();
         self.session_date.clear();
+        self.ib_position = IbPosition::Unknown;
+        self.ib_reentry_from = None;
+        self.ib_reentry_hit_mid = false;
+        self.ib_reentry_traversed = false;
+        self.ib_reentry_max_penetration = 0.0;
     }
 
     /// Detect events from the current market state after a trade.
@@ -740,6 +768,245 @@ impl EventDetector {
             }
         }
 
+        // --- IB reentry tracking ---
+        // Only track after IB is formed and we have valid IB levels.
+        if self.ib_formed && state.ib_high > 0.0 && state.ib_low > 0.0 {
+            let ib_high = state.ib_high;
+            let ib_low = state.ib_low;
+            let ib_range = ib_high - ib_low;
+            let mid = (ib_high + ib_low) / 2.0;
+
+            // Determine current position relative to IB
+            let cur_pos = if price > ib_high {
+                IbPosition::Above
+            } else if price < ib_low {
+                IbPosition::Below
+            } else {
+                IbPosition::Inside
+            };
+
+            // Detect reentry: transition from Above/Below → Inside
+            if self.ib_position == IbPosition::Above && cur_pos == IbPosition::Inside {
+                // Price re-entered IB from above (was extended above IB high)
+                let event_key = "ib_reentry";
+                if self.should_emit(event_key, timestamp_ms) {
+                    let seq = self.next_sequence(event_key);
+                    self.push_event_with_context(
+                        state,
+                        session_date,
+                        events,
+                        MarketEvent {
+                            session_date: session_date.to_string(),
+                            timestamp_ms,
+                            event_type: event_key.to_string(),
+                            level_name: Some("ib_high".to_string()),
+                            price,
+                            direction: Some("from_above".to_string()),
+                            sequence_num: Some(seq),
+                            metadata: Some(serde_json::json!({
+                                "reentrySide": "high",
+                                "ibHigh": ib_high,
+                                "ibLow": ib_low,
+                                "ibMid": mid,
+                                "ibRange": ib_range,
+                                "dayType": format!("{:?}", state.day_type),
+                                "sessionDelta": state.session_delta,
+                            })),
+                            session_type: String::new(),
+                            session_segment: String::new(),
+                            trading_day: String::new(),
+                        },
+                    );
+                }
+                self.ib_reentry_from = Some("high".to_string());
+                self.ib_reentry_hit_mid = false;
+                self.ib_reentry_traversed = false;
+                self.ib_reentry_max_penetration = ib_high - price;
+            } else if self.ib_position == IbPosition::Below && cur_pos == IbPosition::Inside {
+                // Price re-entered IB from below (was extended below IB low)
+                let event_key = "ib_reentry";
+                if self.should_emit(event_key, timestamp_ms) {
+                    let seq = self.next_sequence(event_key);
+                    self.push_event_with_context(
+                        state,
+                        session_date,
+                        events,
+                        MarketEvent {
+                            session_date: session_date.to_string(),
+                            timestamp_ms,
+                            event_type: event_key.to_string(),
+                            level_name: Some("ib_low".to_string()),
+                            price,
+                            direction: Some("from_below".to_string()),
+                            sequence_num: Some(seq),
+                            metadata: Some(serde_json::json!({
+                                "reentrySide": "low",
+                                "ibHigh": ib_high,
+                                "ibLow": ib_low,
+                                "ibMid": mid,
+                                "ibRange": ib_range,
+                                "dayType": format!("{:?}", state.day_type),
+                                "sessionDelta": state.session_delta,
+                            })),
+                            session_type: String::new(),
+                            session_segment: String::new(),
+                            trading_day: String::new(),
+                        },
+                    );
+                }
+                self.ib_reentry_from = Some("low".to_string());
+                self.ib_reentry_hit_mid = false;
+                self.ib_reentry_traversed = false;
+                self.ib_reentry_max_penetration = price - ib_low;
+            }
+
+            // Track outcomes during active reentry
+            if let Some(ref side) = self.ib_reentry_from.clone() {
+                match side.as_str() {
+                    "high" => {
+                        // Re-entered from above: tracking travel toward IB low
+                        let penetration = ib_high - price;
+                        if penetration > self.ib_reentry_max_penetration {
+                            self.ib_reentry_max_penetration = penetration;
+                        }
+
+                        // Hit IB mid?
+                        if !self.ib_reentry_hit_mid && price <= mid {
+                            self.ib_reentry_hit_mid = true;
+                            self.push_event_with_context(
+                                state,
+                                session_date,
+                                events,
+                                MarketEvent {
+                                    session_date: session_date.to_string(),
+                                    timestamp_ms,
+                                    event_type: "ib_reentry_hit_mid".to_string(),
+                                    level_name: Some("ib_mid".to_string()),
+                                    price,
+                                    direction: Some("from_above".to_string()),
+                                    sequence_num: None,
+                                    metadata: Some(serde_json::json!({
+                                        "reentrySide": "high",
+                                        "ibMid": mid,
+                                        "ibRange": ib_range,
+                                        "penetrationPoints": self.ib_reentry_max_penetration,
+                                    })),
+                                    session_type: String::new(),
+                                    session_segment: String::new(),
+                                    trading_day: String::new(),
+                                },
+                            );
+                        }
+
+                        // Full traverse to opposite side?
+                        if !self.ib_reentry_traversed && price <= ib_low {
+                            self.ib_reentry_traversed = true;
+                            self.push_event_with_context(
+                                state,
+                                session_date,
+                                events,
+                                MarketEvent {
+                                    session_date: session_date.to_string(),
+                                    timestamp_ms,
+                                    event_type: "ib_reentry_full_traverse".to_string(),
+                                    level_name: Some("ib_low".to_string()),
+                                    price,
+                                    direction: Some("from_above".to_string()),
+                                    sequence_num: None,
+                                    metadata: Some(serde_json::json!({
+                                        "reentrySide": "high",
+                                        "ibRange": ib_range,
+                                        "traversePoints": ib_range,
+                                    })),
+                                    session_type: String::new(),
+                                    session_segment: String::new(),
+                                    trading_day: String::new(),
+                                },
+                            );
+                            // Done tracking — full traverse completed
+                            self.ib_reentry_from = None;
+                        }
+
+                        // Price exited back above IB — reentry failed, stop tracking
+                        if cur_pos == IbPosition::Above {
+                            self.ib_reentry_from = None;
+                        }
+                    }
+                    "low" => {
+                        // Re-entered from below: tracking travel toward IB high
+                        let penetration = price - ib_low;
+                        if penetration > self.ib_reentry_max_penetration {
+                            self.ib_reentry_max_penetration = penetration;
+                        }
+
+                        // Hit IB mid?
+                        if !self.ib_reentry_hit_mid && price >= mid {
+                            self.ib_reentry_hit_mid = true;
+                            self.push_event_with_context(
+                                state,
+                                session_date,
+                                events,
+                                MarketEvent {
+                                    session_date: session_date.to_string(),
+                                    timestamp_ms,
+                                    event_type: "ib_reentry_hit_mid".to_string(),
+                                    level_name: Some("ib_mid".to_string()),
+                                    price,
+                                    direction: Some("from_below".to_string()),
+                                    sequence_num: None,
+                                    metadata: Some(serde_json::json!({
+                                        "reentrySide": "low",
+                                        "ibMid": mid,
+                                        "ibRange": ib_range,
+                                        "penetrationPoints": self.ib_reentry_max_penetration,
+                                    })),
+                                    session_type: String::new(),
+                                    session_segment: String::new(),
+                                    trading_day: String::new(),
+                                },
+                            );
+                        }
+
+                        // Full traverse to opposite side?
+                        if !self.ib_reentry_traversed && price >= ib_high {
+                            self.ib_reentry_traversed = true;
+                            self.push_event_with_context(
+                                state,
+                                session_date,
+                                events,
+                                MarketEvent {
+                                    session_date: session_date.to_string(),
+                                    timestamp_ms,
+                                    event_type: "ib_reentry_full_traverse".to_string(),
+                                    level_name: Some("ib_high".to_string()),
+                                    price,
+                                    direction: Some("from_below".to_string()),
+                                    sequence_num: None,
+                                    metadata: Some(serde_json::json!({
+                                        "reentrySide": "low",
+                                        "ibRange": ib_range,
+                                        "traversePoints": ib_range,
+                                    })),
+                                    session_type: String::new(),
+                                    session_segment: String::new(),
+                                    trading_day: String::new(),
+                                },
+                            );
+                            self.ib_reentry_from = None;
+                        }
+
+                        // Price exited back below IB — reentry failed, stop tracking
+                        if cur_pos == IbPosition::Below {
+                            self.ib_reentry_from = None;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            self.ib_position = cur_pos;
+        }
+
         self.prev_price = price;
     }
 
@@ -889,6 +1156,14 @@ mod tests {
             session_type: "RTH".to_string(),
             session_segment: "None".to_string(),
             trading_day: "2026-02-26".to_string(),
+            root_symbol: "NQ".to_string(),
+            contract_symbol: "NQH26.CME".to_string(),
+            contract_month: Some("2026-03".to_string()),
+            symbol_resolution_mode: "hybrid".to_string(),
+            symbol_resolution_source: "manual_override".to_string(),
+            rollover_warning: None,
+            carry_forward_levels_valid: true,
+            prior_day_contract_symbol: Some("NQH26.CME".to_string()),
             dom_summary: None,
         }
     }
@@ -1064,5 +1339,185 @@ mod tests {
         detector.reset();
         assert!(!detector.ib_formed);
         assert!(detector.sequence_counts.is_empty());
+        assert_eq!(detector.ib_position, IbPosition::Unknown);
+        assert!(detector.ib_reentry_from.is_none());
+    }
+
+    // --- IB reentry tests ---
+
+    /// Helper: walk the detector through IB formation, then position price outside IB.
+    fn setup_outside_ib_high(detector: &mut EventDetector, date: &str) {
+        // IB = 20980..21020, mid = 21000
+        let mut s = base_state();
+        s.last_price = 21000.0;
+        detector.detect(&s, 1000.0, date, 60); // IB forms
+
+        // Move price above IB high
+        s.last_price = 21025.0;
+        detector.detect(&s, 120_000.0, date, 62);
+    }
+
+    fn setup_outside_ib_low(detector: &mut EventDetector, date: &str) {
+        let mut s = base_state();
+        s.last_price = 21000.0;
+        detector.detect(&s, 1000.0, date, 60);
+
+        // Move price below IB low
+        s.last_price = 20975.0;
+        detector.detect(&s, 120_000.0, date, 62);
+    }
+
+    #[test]
+    fn detects_ib_reentry_from_above() {
+        let mut detector = EventDetector::new();
+        let date = "2026-02-26";
+        setup_outside_ib_high(&mut detector, date);
+
+        // Price re-enters IB (drops back below IB high of 21020)
+        let mut s = base_state();
+        s.last_price = 21015.0;
+        let events = detector.detect(&s, 240_000.0, date, 64);
+
+        let reentry = events.iter().find(|e| e.event_type == "ib_reentry");
+        assert!(reentry.is_some(), "should detect IB reentry from above");
+        let re = reentry.unwrap();
+        assert_eq!(re.direction.as_deref(), Some("from_above"));
+        let meta = re.metadata.as_ref().unwrap();
+        assert_eq!(meta["reentrySide"], "high");
+    }
+
+    #[test]
+    fn detects_ib_reentry_from_below() {
+        let mut detector = EventDetector::new();
+        let date = "2026-02-26";
+        setup_outside_ib_low(&mut detector, date);
+
+        // Price re-enters IB (rises back above IB low of 20980)
+        let mut s = base_state();
+        s.last_price = 20985.0;
+        let events = detector.detect(&s, 240_000.0, date, 64);
+
+        let reentry = events.iter().find(|e| e.event_type == "ib_reentry");
+        assert!(reentry.is_some(), "should detect IB reentry from below");
+        assert_eq!(
+            reentry.unwrap().direction.as_deref(),
+            Some("from_below")
+        );
+    }
+
+    #[test]
+    fn detects_ib_reentry_hit_mid_from_above() {
+        let mut detector = EventDetector::new();
+        let date = "2026-02-26";
+        setup_outside_ib_high(&mut detector, date);
+
+        // Re-enter IB
+        let mut s = base_state();
+        s.last_price = 21015.0;
+        detector.detect(&s, 240_000.0, date, 64);
+
+        // Price continues down to IB mid (21000)
+        s.last_price = 20999.0;
+        let events = detector.detect(&s, 300_000.0, date, 65);
+
+        assert!(
+            events.iter().any(|e| e.event_type == "ib_reentry_hit_mid"),
+            "should fire ib_reentry_hit_mid when price reaches IB mid"
+        );
+    }
+
+    #[test]
+    fn detects_ib_reentry_full_traverse_from_above() {
+        let mut detector = EventDetector::new();
+        let date = "2026-02-26";
+        setup_outside_ib_high(&mut detector, date);
+
+        // Re-enter IB
+        let mut s = base_state();
+        s.last_price = 21015.0;
+        detector.detect(&s, 240_000.0, date, 64);
+
+        // Price reaches mid
+        s.last_price = 20999.0;
+        detector.detect(&s, 300_000.0, date, 65);
+
+        // Price traverses to opposite side (IB low = 20980)
+        s.last_price = 20979.0;
+        let events = detector.detect(&s, 360_000.0, date, 66);
+
+        assert!(
+            events
+                .iter()
+                .any(|e| e.event_type == "ib_reentry_full_traverse"),
+            "should fire full traverse when price reaches opposite IB boundary"
+        );
+    }
+
+    #[test]
+    fn ib_reentry_cancelled_when_price_exits_same_side() {
+        let mut detector = EventDetector::new();
+        let date = "2026-02-26";
+        setup_outside_ib_high(&mut detector, date);
+
+        // Re-enter IB
+        let mut s = base_state();
+        s.last_price = 21015.0;
+        detector.detect(&s, 240_000.0, date, 64);
+
+        // Price exits back above IB — reentry failed
+        s.last_price = 21025.0;
+        detector.detect(&s, 300_000.0, date, 65);
+
+        // Price re-enters again — should get a new reentry event (after dedup window)
+        s.last_price = 21015.0;
+        let events = detector.detect(&s, 360_000.0, date, 66);
+        assert!(
+            events.iter().any(|e| e.event_type == "ib_reentry"),
+            "should fire new reentry after previous was cancelled"
+        );
+    }
+
+    #[test]
+    fn no_ib_reentry_before_ib_formed() {
+        let mut detector = EventDetector::new();
+        let date = "2026-02-26";
+
+        // Before minute 60 — IB not formed
+        let mut s = base_state();
+        s.last_price = 21025.0; // above IB high
+        detector.detect(&s, 1000.0, date, 55);
+
+        s.last_price = 21015.0; // back inside IB range
+        let events = detector.detect(&s, 2000.0, date, 56);
+        assert!(
+            !events.iter().any(|e| e.event_type == "ib_reentry"),
+            "should not detect reentry before IB is formed"
+        );
+    }
+
+    #[test]
+    fn ib_reentry_hit_mid_from_below() {
+        let mut detector = EventDetector::new();
+        let date = "2026-02-26";
+        setup_outside_ib_low(&mut detector, date);
+
+        // Re-enter IB
+        let mut s = base_state();
+        s.last_price = 20985.0;
+        detector.detect(&s, 240_000.0, date, 64);
+
+        // Price continues up to IB mid (21000)
+        s.last_price = 21001.0;
+        let events = detector.detect(&s, 300_000.0, date, 65);
+
+        assert!(
+            events.iter().any(|e| e.event_type == "ib_reentry_hit_mid"),
+            "should fire hit_mid when re-entering from below and reaching mid"
+        );
+        let hit_mid = events
+            .iter()
+            .find(|e| e.event_type == "ib_reentry_hit_mid")
+            .unwrap();
+        assert_eq!(hit_mid.direction.as_deref(), Some("from_below"));
     }
 }

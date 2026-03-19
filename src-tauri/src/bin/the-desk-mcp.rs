@@ -25,7 +25,9 @@ use the_desk_backend::depth::{
 use the_desk_backend::feed::scid_reader::{
     parse_record_scaled, ScanControl as ScidScanControl, ScidReader,
 };
-use the_desk_backend::feed::{load_feed_config, load_storage_config, TradeSide};
+use the_desk_backend::feed::{
+    load_feed_config, load_storage_config, resolve_contract_metadata, TradeSide,
+};
 use the_desk_backend::memory::{
     build_memory_brief as memory_build_memory_brief,
     detect_behavioral_patterns as memory_detect_behavioral_patterns,
@@ -548,6 +550,22 @@ struct SessionScopeParams {
     /// Trading-day range end (YYYY-MM-DD, 6 PM ET roll).
     #[serde(alias = "trading_day_end")]
     trading_day_end: Option<String>,
+    /// Filter to a specific root symbol (e.g. NQ) across contract rolls.
+    #[serde(alias = "root_symbol")]
+    root_symbol: Option<String>,
+    /// Filter to a specific contract symbol (e.g. NQM26.CME).
+    #[serde(alias = "contract_symbol")]
+    contract_symbol: Option<String>,
+    /// Include sessions flagged as roll-boundary carry-forward mismatches. Default true.
+    #[serde(alias = "include_rollover_sessions", default = "default_true")]
+    include_rollover_sessions: bool,
+    /// Treat matching root-symbol sessions as a continuous research stream. Default false.
+    #[serde(alias = "continuous_mode", default)]
+    continuous_mode: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn normalize_session_type_param(value: &str) -> Option<&'static str> {
@@ -648,6 +666,10 @@ fn build_session_scope_filter(
         session_segment,
         trading_day_start,
         trading_day_end,
+        root_symbol: params.root_symbol.clone(),
+        contract_symbol: params.contract_symbol.clone(),
+        include_rollover_sessions: params.include_rollover_sessions,
+        continuous_mode: params.continuous_mode,
     };
     if scope.session_type.is_none()
         && scope.session_segment.is_none()
@@ -813,6 +835,10 @@ struct TickQueryParams {
     price_high: Option<f64>,
     /// Filter to a specific trading session date in YYYY-MM-DD format (e.g. "2026-03-04").
     session_date: Option<String>,
+    /// Optional root-symbol filter (e.g. NQ).
+    root_symbol: Option<String>,
+    /// Optional contract-symbol filter (e.g. NQM26.CME).
+    contract_symbol: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -1917,6 +1943,13 @@ impl TheDeskMcp {
                 "sessionType": s.get("sessionType"),
                 "sessionSegment": s.get("sessionSegment"),
                 "tradingDay": s.get("tradingDay"),
+                "rootSymbol": s.get("rootSymbol"),
+                "contractSymbol": s.get("contractSymbol"),
+                "contractMonth": s.get("contractMonth"),
+                "symbolResolutionMode": s.get("symbolResolutionMode"),
+                "symbolResolutionSource": s.get("symbolResolutionSource"),
+                "rolloverWarning": s.get("rolloverWarning"),
+                "carryForwardLevelsValid": s.get("carryForwardLevelsValid"),
                 "isTransition": is_transition,
                 "transitionFrom": transition_from,
                 "transitionTo": transition_to,
@@ -1981,6 +2014,14 @@ impl TheDeskMcp {
                     "sessionType": s.get("sessionType"),
                     "sessionSegment": s.get("sessionSegment"),
                     "tradingDay": s.get("tradingDay"),
+                    "rootSymbol": s.get("rootSymbol"),
+                    "contractSymbol": s.get("contractSymbol"),
+                    "contractMonth": s.get("contractMonth"),
+                    "symbolResolutionMode": s.get("symbolResolutionMode"),
+                    "symbolResolutionSource": s.get("symbolResolutionSource"),
+                    "rolloverWarning": s.get("rolloverWarning"),
+                    "carryForwardLevelsValid": s.get("carryForwardLevelsValid"),
+                    "priorDayContractSymbol": s.get("priorDayContractSymbol"),
                     "priorDayHigh": s.get("priorDayHigh"),
                     "priorDayLow": s.get("priorDayLow"),
                     "priorDayClose": s.get("priorDayClose"),
@@ -4365,12 +4406,14 @@ impl TheDeskMcp {
             || params.price_high.is_some()
             || params.session_date.is_some();
         if has_filters {
-            match db.query_ticks_filtered(
+            match db.query_ticks_filtered_scoped(
                 params.start_time_ms,
                 params.end_time_ms,
                 params.price_low,
                 params.price_high,
                 params.session_date.as_deref(),
+                params.root_symbol.as_deref(),
+                params.contract_symbol.as_deref(),
                 limit,
             ) {
                 Ok(ticks) => Ok(text_result(serde_json::json!({
@@ -4383,6 +4426,8 @@ impl TheDeskMcp {
                         "priceLow": params.price_low,
                         "priceHigh": params.price_high,
                         "sessionDate": params.session_date,
+                        "rootSymbol": params.root_symbol,
+                        "contractSymbol": params.contract_symbol,
                     },
                     "dataAgeMs": compute_data_age(&db)
                 }))),
@@ -4422,6 +4467,7 @@ impl TheDeskMcp {
     )]
     async fn get_feed_health(&self) -> Result<CallToolResult, McpError> {
         let config = load_feed_config();
+        let contract = resolve_contract_metadata(&config);
         let reader = ScidReader::from_feed_config(&config);
         let scid_path = reader.path().to_string_lossy().to_string();
         let meta = std::fs::metadata(reader.path()).ok();
@@ -4444,10 +4490,19 @@ impl TheDeskMcp {
         };
 
         Ok(text_result(serde_json::json!({
+            "rootSymbol": contract.root_symbol,
+            "contractSymbol": contract.contract_symbol,
+            "contractMonth": contract.contract_month,
+            "symbolResolutionMode": contract.symbol_resolution_mode,
+            "symbolResolutionSource": contract.symbol_resolution_source,
+            "configuredSymbol": contract.configured_symbol,
+            "activeSymbolOverride": contract.active_symbol_override,
             "scidPath": scid_path,
             "fileExists": file_exists,
             "fileSizeBytes": file_size_bytes,
             "fileModifiedMs": file_modified_ms,
+            "depthFileCount": contract.depth_file_count,
+            "warnings": contract.warnings,
             "latestDbTickTimestampMs": latest_tick_ms,
             "dbTickCount": tick_count,
             "ingestLagMs": data_age_ms,
@@ -4843,21 +4898,35 @@ impl TheDeskMcp {
             .or(params.end_date.as_deref());
         let db = self.db.lock().map_err(|_| lock_error())?;
         let limit = params.limit.unwrap_or(20) as usize;
-        match db.list_session_summaries(
+        match db.list_session_summaries_scoped(
             start_date,
             end_date,
             params.day_type.as_deref(),
             scope.as_ref().and_then(|s| s.session_type.as_deref()),
             limit,
+            scope.as_ref(),
         ) {
             Ok(sessions) => {
                 let count = sessions.len();
+                let mut previous_contract: Option<String> = None;
                 let summaries: Vec<serde_json::Value> = sessions
                     .into_iter()
                     .map(|s| {
+                        let rollover_boundary = previous_contract
+                            .as_deref()
+                            .map(|prev| prev != s.contract_symbol)
+                            .unwrap_or(false);
+                        previous_contract = Some(s.contract_symbol.clone());
                         serde_json::json!({
                             "sessionDate": s.session_date,
                             "sessionType": s.session_type,
+                            "rootSymbol": s.root_symbol,
+                            "contractSymbol": s.contract_symbol,
+                            "contractMonth": s.contract_month,
+                            "symbolResolutionMode": s.symbol_resolution_mode,
+                            "carryForwardLevelsValid": s.carry_forward_levels_valid,
+                            "rolloverWarning": s.rollover_warning,
+                            "rolloverBoundary": rollover_boundary,
                             "dayType": s.day_type,
                             "ibRange": s.ib_range,
                             "high": s.high, "low": s.low, "close": s.close,
@@ -5671,6 +5740,8 @@ fn process_tick(
                         setup_id: alert.setup_id.clone(),
                         setup_name: Some(alert.setup_name.clone()),
                         session_date: session_date_from_timestamp_ms(timestamp_ms),
+                        root_symbol: Some(snapshot.root_symbol.clone()),
+                        contract_symbol: Some(snapshot.contract_symbol.clone()),
                         source: "live".to_string(),
                         job_id: None,
                         fired_at_ms: timestamp_ms,
@@ -6099,6 +6170,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let poll_ms = config.flush_poll_ms;
         let price_scale = config.price_scale;
         let reader_path = reader.path().to_path_buf();
+        let contract_metadata = resolve_contract_metadata(&config);
 
         tokio::spawn(async move {
             use std::io::{Read, Seek, SeekFrom};
@@ -6108,7 +6180,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut offset: u64 = 0;
             let mut persist_counter: u64 = 0;
             let mut event_buffer = Vec::new();
-            let mut tick_buffer: Vec<(f64, f64, f64, f64, f64, bool, String)> = Vec::new();
+            let mut tick_buffer: Vec<(f64, f64, f64, f64, f64, bool, String, String, String)> =
+                Vec::new();
             let mut last_integrity_check =
                 std::time::Instant::now() - std::time::Duration::from_secs(30);
             // Seed current session and segment from the system clock so we can detect boundaries.
@@ -6306,6 +6379,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             ask,
                             is_buy,
                             session_date,
+                            contract_metadata.root_symbol.clone(),
+                            contract_metadata.contract_symbol.clone(),
                         ));
 
                         if tick_buffer.len() >= 100 {
@@ -6438,6 +6513,12 @@ mod tests {
         SessionSummary {
             session_date: session_date.to_string(),
             session_type: session_type.to_string(),
+            root_symbol: "NQ".to_string(),
+            contract_symbol: "NQH26.CME".to_string(),
+            contract_month: Some("2026-03".to_string()),
+            symbol_resolution_mode: "hybrid".to_string(),
+            carry_forward_levels_valid: true,
+            rollover_warning: None,
             open_price: dnva_low,
             high: dnva_high,
             low: dnva_low,

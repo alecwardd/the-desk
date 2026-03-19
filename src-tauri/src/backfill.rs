@@ -1,4 +1,5 @@
 use crate::db::{Database, ReplaySignalRecord, SessionSummary, SignalOutcome};
+use crate::feed::{load_feed_config, resolve_contract_metadata};
 use crate::feed::scid_reader::{ScanControl, ScidReader};
 use crate::feed::TradeSide;
 use crate::pipelines::{EventDetector, FlowEventEmitter, MarketState, PipelineEngine};
@@ -240,6 +241,12 @@ pub fn summary_from_state(
     SessionSummary {
         session_date: session_date.to_string(),
         session_type: session_type.to_string(),
+        root_symbol: state.root_symbol.clone(),
+        contract_symbol: state.contract_symbol.clone(),
+        contract_month: state.contract_month.clone(),
+        symbol_resolution_mode: state.symbol_resolution_mode.clone(),
+        carry_forward_levels_valid: state.carry_forward_levels_valid,
+        rollover_warning: state.rollover_warning.clone(),
         open_price,
         high: state.session_high,
         low: state.session_low,
@@ -352,8 +359,11 @@ where
         .recent_session_volume_curves("Globex", 20)
         .unwrap_or_default();
 
+    let mut pipeline = PipelineEngine::new();
+    let contract_metadata = resolve_contract_metadata(&load_feed_config());
+    pipeline.set_contract_metadata(contract_metadata.clone());
     let mut state = BackfillRunState {
-        pipeline: PipelineEngine::new(),
+        pipeline,
         rvol_curves,
         globex_rvol_curves,
         progress: BackfillProgress {
@@ -487,16 +497,32 @@ where
                 state.segment_buffers = SegmentBuffers::default();
 
                 if new_session == SessionType::Rth || new_session == SessionType::Globex {
-                    if let Some((h, l, c, va_h, va_l, poc, dnva_h, dnva_l, dnp)) = db
-                        .load_prior_day_full(&current_date)
+                    if let Some(prior_ref) = db
+                        .load_prior_day_reference_scoped(
+                            &current_date,
+                            Some(contract_metadata.root_symbol.as_str()),
+                            Some(contract_metadata.contract_symbol.as_str()),
+                        )
                         .map_err(runtime_err)
                         .map_err(|e| e.to_string())?
                     {
-                        state.pipeline.levels.set_prior_day(h, l, c);
-                        if let (Some(vh), Some(vl), Some(pc)) = (va_h, va_l, poc) {
+                        state
+                            .pipeline
+                            .levels
+                            .set_prior_day(prior_ref.high, prior_ref.low, prior_ref.close);
+                        state.pipeline.levels.set_prior_day_contract_context(
+                            prior_ref.root_symbol.as_deref(),
+                            prior_ref.contract_symbol.as_deref(),
+                            Some(contract_metadata.contract_symbol.as_str()),
+                        );
+                        if let (Some(vh), Some(vl), Some(pc)) =
+                            (prior_ref.va_high, prior_ref.va_low, prior_ref.poc)
+                        {
                             state.pipeline.levels.set_prior_profile(vh, vl, pc);
                         }
-                        if let (Some(dh), Some(dl), Some(dp)) = (dnva_h, dnva_l, dnp) {
+                        if let (Some(dh), Some(dl), Some(dp)) =
+                            (prior_ref.dnva_high, prior_ref.dnva_low, prior_ref.dnp)
+                        {
                             state.pipeline.levels.set_prior_dnva(dh, dl, dp);
                         }
                     }
@@ -602,6 +628,8 @@ where
                                 signal_id: signal_id.clone(),
                                 timestamp_ms: tick.timestamp_ms,
                                 session_date: current_date.clone(),
+                                root_symbol: Some(contract_metadata.root_symbol.clone()),
+                                contract_symbol: Some(contract_metadata.contract_symbol.clone()),
                                 setup_id: alert.setup_id.clone(),
                                 payload: serde_json::to_value(&alert)
                                     .unwrap_or_else(|_| serde_json::json!({})),
@@ -613,6 +641,8 @@ where
                                 setup_id: alert.setup_id.clone(),
                                 setup_name: Some(alert.setup_name.clone()),
                                 session_date: current_date.clone(),
+                                root_symbol: Some(contract_metadata.root_symbol.clone()),
+                                contract_symbol: Some(contract_metadata.contract_symbol.clone()),
                                 source: source.to_string(),
                                 job_id: Some(params.job_id.clone()),
                                 fired_at_ms: tick.timestamp_ms,

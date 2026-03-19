@@ -1,3 +1,4 @@
+use crate::feed::symbol_resolution::resolve_contract_metadata;
 use crate::feed::FeedConfig;
 use crate::feed::TradeSide;
 use crate::session_date_from_timestamp_ms;
@@ -264,7 +265,8 @@ impl DepthReader {
             return Ok(Vec::new());
         }
 
-        let prefix = format!("{}.", config.symbol.to_ascii_lowercase());
+        let contract = resolve_contract_metadata(config);
+        let prefix = format!("{}.", contract.depth_prefix.to_ascii_lowercase());
         let mut out = Vec::new();
         for entry in fs::read_dir(dir)? {
             let entry = entry?;

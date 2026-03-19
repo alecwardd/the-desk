@@ -1275,6 +1275,12 @@ mod tests {
         db.upsert_session_summary(&SessionSummary {
             session_date: "2026-03-04".to_string(),
             session_type: "RTH".to_string(),
+            root_symbol: "NQ".to_string(),
+            contract_symbol: "NQH26.CME".to_string(),
+            contract_month: Some("2026-03".to_string()),
+            symbol_resolution_mode: "hybrid".to_string(),
+            carry_forward_levels_valid: true,
+            rollover_warning: None,
             open_price: 21_000.0,
             high: 21_020.0,
             low: 20_980.0,

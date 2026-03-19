@@ -2,6 +2,9 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 pub mod scid_reader;
+pub mod symbol_resolution;
+
+pub use symbol_resolution::{resolve_contract_metadata, ContractMetadata, SymbolMode};
 
 /// Side of a trade execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,7 +46,14 @@ pub enum FeedEvent {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct FeedConfig {
     pub sierra_data_dir: String,
+    /// Legacy symbol field preserved for backward compatibility.
     pub symbol: String,
+    #[serde(default = "default_base_symbol")]
+    pub base_symbol: String,
+    #[serde(default)]
+    pub symbol_mode: SymbolMode,
+    #[serde(default)]
+    pub active_symbol_override: Option<String>,
     pub flush_poll_ms: u64,
     /// Divisor applied to raw .scid prices. Rithmic stores NQ prices
     /// multiplied by 100 (e.g., 24966.75 → 2496675), so set this to 100.
@@ -55,13 +65,31 @@ fn default_price_scale() -> f64 {
     100.0
 }
 
+fn default_base_symbol() -> String {
+    "NQ".to_string()
+}
+
 impl Default for FeedConfig {
     fn default() -> Self {
         Self {
             sierra_data_dir: "C:\\SierraChart\\Data".to_string(),
             symbol: "NQ".to_string(),
+            base_symbol: default_base_symbol(),
+            symbol_mode: SymbolMode::Hybrid,
+            active_symbol_override: None,
             flush_poll_ms: 1_000,
             price_scale: 100.0,
+        }
+    }
+}
+
+impl FeedConfig {
+    pub fn effective_configured_symbol(&self) -> String {
+        let symbol = self.symbol.trim();
+        if !symbol.is_empty() {
+            symbol.to_string()
+        } else {
+            self.base_symbol.trim().to_string()
         }
     }
 }

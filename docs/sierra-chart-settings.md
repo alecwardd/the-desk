@@ -44,7 +44,10 @@ These Sierra Chart settings correspond to the following `~/.the-desk/config.toml
 ```toml
 [feed]
 sierra_data_dir = "T:\\SierraChart\\Data"
-symbol = "NQH6.CME"          # Update on contract rollover (quarterly)
+base_symbol = "NQ"
+symbol_mode = "hybrid"       # manual | auto | hybrid
+symbol = "NQH6.CME"          # Legacy fallback; still honored
+active_symbol_override = "NQH6.CME" # Set only when you want to pin a contract
 flush_poll_ms = 1000          # How often The Desk checks for new .scid data
 price_scale = 100.0           # Rithmic NQ prices are raw * 100
 ```
@@ -71,8 +74,9 @@ For runtime verification, use MCP tools `get_feed_health` and `validate_data_int
 When NQ rolls to a new quarterly contract:
 
 1. Note the new symbol in Sierra Chart (e.g., `NQH6.CME` → `NQM6.CME`)
-2. Update `symbol` in `~/.the-desk/config.toml`
-3. Rebuild the MCP server: `cd src-tauri && cargo build --release --bin the-desk-mcp`
-4. Restart Cursor or reload the MCP server
+2. If you want to pin the new front month immediately, update `active_symbol_override` in `~/.the-desk/config.toml`
+3. Restart the backend/MCP process so the resolved contract metadata refreshes
+4. Call `get_feed_health` and confirm `contractSymbol`, `symbolResolutionSource`, and `warnings`
+5. Run a historical backfill for the new contract if you want fresh per-contract research coverage
 
 NQ quarterly months: H (Mar), M (Jun), U (Sep), Z (Dec).

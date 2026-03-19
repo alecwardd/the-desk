@@ -80,6 +80,14 @@ pub struct LevelsPipeline {
     pub prior_dnva_low: f64,
     /// Prior RTH session DNP (from prior_day_levels).
     pub prior_dnp: f64,
+    /// Contract that produced the current prior-day references.
+    pub prior_day_contract_symbol: Option<String>,
+    /// Root symbol that produced the current prior-day references.
+    pub prior_day_root_symbol: Option<String>,
+    /// Whether carry-forward prior-day references are safe to trust for the current contract.
+    pub carry_forward_levels_valid: bool,
+    /// Human-readable rollover/carry-forward warning when references cross contracts.
+    pub carry_forward_warning: Option<String>,
     /// Overnight (Globex) session high.
     pub overnight_high: f64,
     /// Overnight (Globex) session low.
@@ -118,6 +126,10 @@ impl Default for LevelsPipeline {
             prior_dnva_high: 0.0,
             prior_dnva_low: 0.0,
             prior_dnp: 0.0,
+            prior_day_contract_symbol: None,
+            prior_day_root_symbol: None,
+            carry_forward_levels_valid: true,
+            carry_forward_warning: None,
             overnight_high: 0.0,
             overnight_low: 0.0,
             session_high: 0.0,
@@ -172,6 +184,30 @@ impl LevelsPipeline {
         self.prior_day_high = high;
         self.prior_day_low = low;
         self.prior_day_close = close;
+    }
+
+    /// Attach contract metadata to the current prior-day references and validate carry-forward use.
+    pub fn set_prior_day_contract_context(
+        &mut self,
+        root_symbol: Option<&str>,
+        prior_contract_symbol: Option<&str>,
+        current_contract_symbol: Option<&str>,
+    ) {
+        self.prior_day_root_symbol = root_symbol.map(ToString::to_string);
+        self.prior_day_contract_symbol = prior_contract_symbol.map(ToString::to_string);
+        self.carry_forward_levels_valid = match (prior_contract_symbol, current_contract_symbol) {
+            (Some(prior), Some(current)) => prior == current,
+            _ => true,
+        };
+        self.carry_forward_warning = if self.carry_forward_levels_valid {
+            None
+        } else {
+            Some(format!(
+                "Prior-day references were computed on {} while the active contract is {}.",
+                prior_contract_symbol.unwrap_or("unknown"),
+                current_contract_symbol.unwrap_or("unknown")
+            ))
+        };
     }
 
     /// Set prior session VA/POC from stored data.

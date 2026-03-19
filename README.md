@@ -149,7 +149,10 @@ Create `~/.the-desk/config.toml`:
 ```toml
 [feed]
 sierra_data_dir = "D:\\SierraChart\\Data"
-symbol = "NQ 03-26"
+base_symbol = "NQ"
+symbol_mode = "hybrid"
+symbol = "NQH26.CME"
+active_symbol_override = "NQH26.CME"
 flush_poll_ms = 1000
 ```
 
@@ -238,9 +241,13 @@ Designed for directional trading with 15-minute to 1-hour holds — not HFT.
 | Table | Purpose | Populated by |
 |-------|---------|-------------|
 | `market_events` | ~30 event types with timestamp, price, metadata | Live EventDetector + backfill |
-| `session_summaries` | End-of-session snapshots (35+ fields) | Live processing + backfill |
+| `session_summaries` | End-of-session snapshots plus contract metadata / rollover safety flags | Live processing + backfill |
 | `signal_outcomes` | MFE/MAE/R-result per playbook signal | Rules engine + manual resolution + replay jobs |
 | `historical_job_runs` | Durable ledger for queued/running/completed historical jobs | `backfill_history` / `run_backtest` |
+
+### Contract Rollover
+
+The Desk now resolves the active futures contract with a hybrid manual-plus-auto policy. `get_feed_health` exposes the resolved `contractSymbol`, whether it came from a manual override or auto-detection, and any rollover warnings. Live snapshots and key-level tools also expose `carryForwardLevelsValid` so prior-day references from an old contract are obvious instead of silent.
 
 ## License
 

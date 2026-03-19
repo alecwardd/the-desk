@@ -261,9 +261,24 @@ This is NOT a backtesting engine in the traditional sense — it does not simula
 
 ### ADR-P06: NQ contract rollover handling
 
-**Impact:** Symbol naming in `.scid` file paths, continuous data across quarters
-**Owner:** _TBD_
-**Deadline:** Before first live deployment near a rollover date
+**Date:** 2026-03-19
+**Status:** Decided
+
+**Context:** Sierra Chart stores quarterly contracts as distinct `.scid` and `.depth` files, while The Desk previously dropped contract identity after ingestion. That made live roll week behavior ambiguous and allowed prior-day references to leak across contracts.
+
+**Decision:** The Desk now uses a hybrid rollover model:
+- `base_symbol` defines the instrument family (for example `NQ`)
+- `symbol_mode` controls how the active contract is resolved: `manual`, `auto`, or `hybrid`
+- `active_symbol_override` pins a contract when the trader wants explicit control
+- resolved contract metadata is propagated through live snapshots, feed health, historical session summaries, raw ticks, and signal outcomes
+- prior-day carry-forward levels are explicitly flagged invalid when they come from a different contract
+- research can filter by `contractSymbol` or `rootSymbol`, while `get_session_history` also surfaces rollover boundaries
+
+**Consequences:**
+- roll week is safer because MCP tools now expose the active contract and warning state directly
+- historical storage keeps per-contract truth for newly ingested data
+- operators can verify the resolver state with `get_feed_health` before trusting prior-session references
+- research continuity across contracts is now explicit instead of silently implicit
 
 ---
 

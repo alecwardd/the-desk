@@ -37,6 +37,7 @@ pub use vwap::VwapPipeline;
 use serde::{Deserialize, Serialize};
 
 use crate::depth::DomSummary;
+use crate::feed::ContractMetadata;
 use crate::{
     classify_session, et_minutes_from_timestamp, tick_time_context_from_timestamp_ms, DeltaSegment,
     SessionType,
@@ -312,6 +313,24 @@ pub struct MarketState {
     pub session_segment: String,
     /// Trading day (YYYY-MM-DD) with a 6:00 PM ET roll.
     pub trading_day: String,
+    /// Root symbol for the active instrument family (e.g. NQ).
+    pub root_symbol: String,
+    /// Resolved active contract symbol (e.g. NQM26.CME).
+    pub contract_symbol: String,
+    /// Contract expiry month in YYYY-MM when available.
+    pub contract_month: Option<String>,
+    /// Configured symbol-resolution mode.
+    pub symbol_resolution_mode: String,
+    /// How the contract was resolved for the active feed.
+    pub symbol_resolution_source: String,
+    /// Roll/carry-forward warning surfaced to MCP callers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rollover_warning: Option<String>,
+    /// Whether prior-day carry-forward levels are safe for the active contract.
+    pub carry_forward_levels_valid: bool,
+    /// Contract symbol used for the current prior-day references, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prior_day_contract_symbol: Option<String>,
     /// Compact delayed DOM summary when historical depth context is available.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dom_summary: Option<DomSummary>,
@@ -337,6 +356,7 @@ pub struct PipelineEngine {
     /// Combined Globex delta (Asia + London) from 6 PM ET. Only accumulates during Globex; resets at 6 PM and 9:30 AM.
     globex_delta: f64,
     dom_summary: Option<DomSummary>,
+    contract_metadata: ContractMetadata,
 }
 
 impl Default for PipelineEngine {
@@ -367,7 +387,18 @@ impl PipelineEngine {
             cumulative_delta: 0.0,
             globex_delta: 0.0,
             dom_summary: None,
+            contract_metadata: ContractMetadata::default(),
         }
+    }
+
+    pub fn set_contract_metadata(&mut self, metadata: ContractMetadata) {
+        let prior_day_contract_symbol = self.levels.prior_day_contract_symbol.clone();
+        self.levels.set_prior_day_contract_context(
+            Some(metadata.root_symbol.as_str()),
+            prior_day_contract_symbol.as_deref(),
+            Some(metadata.contract_symbol.as_str()),
+        );
+        self.contract_metadata = metadata;
     }
 
     /// Reset all pipelines for a new trading session.
@@ -784,6 +815,18 @@ impl PipelineEngine {
             session_type,
             session_segment,
             trading_day,
+            root_symbol: self.contract_metadata.root_symbol.clone(),
+            contract_symbol: self.contract_metadata.contract_symbol.clone(),
+            contract_month: self.contract_metadata.contract_month.clone(),
+            symbol_resolution_mode: self.contract_metadata.symbol_resolution_mode.clone(),
+            symbol_resolution_source: self.contract_metadata.symbol_resolution_source.clone(),
+            rollover_warning: self
+                .levels
+                .carry_forward_warning
+                .clone()
+                .or_else(|| self.contract_metadata.warnings.first().cloned()),
+            carry_forward_levels_valid: self.levels.carry_forward_levels_valid,
+            prior_day_contract_symbol: self.levels.prior_day_contract_symbol.clone(),
             dom_summary: self.dom_summary.clone(),
         }
     }

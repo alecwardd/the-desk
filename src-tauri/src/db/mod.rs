@@ -215,6 +215,8 @@ pub struct RawTickRecord {
     pub contract_symbol: Option<String>,
 }
 
+pub type RawTickBatchRow = (f64, f64, f64, f64, f64, bool, String, String, String);
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DepthEventRecord {
@@ -3439,7 +3441,8 @@ impl Database {
         contract_symbol: Option<&str>,
     ) -> Result<Option<PriorDayReference>, DbError> {
         let mut conditions = vec!["date < ?1".to_string()];
-        let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(before_date.to_string())];
+        let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> =
+            vec![Box::new(before_date.to_string())];
         if let Some(contract_symbol) = contract_symbol {
             conditions.push(format!("contract_symbol = ?{}", bind_values.len() + 1));
             bind_values.push(Box::new(contract_symbol.to_string()));
@@ -3744,6 +3747,7 @@ impl Database {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn query_ticks_filtered_scoped(
         &self,
         start_ms: Option<f64>,
@@ -4281,10 +4285,7 @@ impl Database {
     }
 
     /// Batch-insert raw ticks inside a single transaction.
-    pub fn insert_raw_ticks_batch(
-        &self,
-        ticks: &[(f64, f64, f64, f64, f64, bool, String, String, String)],
-    ) -> Result<(), DbError> {
+    pub fn insert_raw_ticks_batch(&self, ticks: &[RawTickBatchRow]) -> Result<(), DbError> {
         let tx = self.conn.unchecked_transaction()?;
         {
             let mut stmt = tx.prepare_cached(
@@ -4292,7 +4293,8 @@ impl Database {
                  (timestamp_ms, price, volume, bid, ask, is_buy, session_date, root_symbol, contract_symbol)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             )?;
-            for (ts, price, vol, bid, ask, is_buy, session_date, root_symbol, contract_symbol) in ticks
+            for (ts, price, vol, bid, ask, is_buy, session_date, root_symbol, contract_symbol) in
+                ticks
             {
                 stmt.execute(params![
                     ts,
@@ -4993,7 +4995,9 @@ impl Database {
                 root_symbol: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
                 contract_symbol: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
                 contract_month: row.get(4)?,
-                symbol_resolution_mode: row.get::<_, Option<String>>(5)?.unwrap_or_else(|| "hybrid".to_string()),
+                symbol_resolution_mode: row
+                    .get::<_, Option<String>>(5)?
+                    .unwrap_or_else(|| "hybrid".to_string()),
                 carry_forward_levels_valid: row.get::<_, i64>(6)? != 0,
                 rollover_warning: row.get(7)?,
                 open_price: row.get(8)?,
@@ -5978,16 +5982,16 @@ impl Database {
 
     /// Earliest and latest session_date in session_summaries (for coverage reporting).
     pub fn session_summary_date_range(&self) -> Result<(Option<String>, Option<String>), DbError> {
-        let min_date = self.conn.query_row(
-                "SELECT MIN(session_date) FROM session_summaries",
-                [],
-                |r| r.get::<_, Option<String>>(0),
-            )?;
-        let max_date = self.conn.query_row(
-            "SELECT MAX(session_date) FROM session_summaries",
-            [],
-            |r| r.get::<_, Option<String>>(0),
-        )?;
+        let min_date =
+            self.conn
+                .query_row("SELECT MIN(session_date) FROM session_summaries", [], |r| {
+                    r.get::<_, Option<String>>(0)
+                })?;
+        let max_date =
+            self.conn
+                .query_row("SELECT MAX(session_date) FROM session_summaries", [], |r| {
+                    r.get::<_, Option<String>>(0)
+                })?;
         Ok((min_date, max_date))
     }
 

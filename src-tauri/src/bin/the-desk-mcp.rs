@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use the_desk_backend::backfill;
 use the_desk_backend::db::{
     AccountStateRecord, Database, HistoricalJobRun, ImportedFillRecord, JournalEntry,
-    OpenPositionRecord, RiskConfigRecord, SessionRecord, SessionScopeFilter,
+    OpenPositionRecord, RawTickBatchRow, RiskConfigRecord, SessionRecord, SessionScopeFilter,
     SetupPerformanceSortBy, SignalOutcome, TradeImportBatchRecord, TradeRecord, TradeReviewUpdate,
 };
 use the_desk_backend::depth::{
@@ -6180,8 +6180,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut offset: u64 = 0;
             let mut persist_counter: u64 = 0;
             let mut event_buffer = Vec::new();
-            let mut tick_buffer: Vec<(f64, f64, f64, f64, f64, bool, String, String, String)> =
-                Vec::new();
+            let mut tick_buffer: Vec<RawTickBatchRow> = Vec::new();
             let mut last_integrity_check =
                 std::time::Instant::now() - std::time::Duration::from_secs(30);
             // Seed current session and segment from the system clock so we can detect boundaries.

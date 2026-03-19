@@ -275,7 +275,10 @@ fn modified_ms(path: &Path) -> Option<f64> {
 }
 
 fn strip_known_suffixes(symbol: &str) -> String {
-    let trimmed = symbol.trim().trim_end_matches(".scid").trim_end_matches(".SCID");
+    let trimmed = symbol
+        .trim()
+        .trim_end_matches(".scid")
+        .trim_end_matches(".SCID");
     trimmed
         .split('.')
         .next()
@@ -297,7 +300,10 @@ mod tests {
 
     #[test]
     fn infers_contract_month_from_symbol() {
-        assert_eq!(infer_contract_month("NQM26.CME").as_deref(), Some("2026-06"));
+        assert_eq!(
+            infer_contract_month("NQM26.CME").as_deref(),
+            Some("2026-06")
+        );
         assert_eq!(infer_contract_month("ESH6").as_deref(), Some("2026-03"));
         assert_eq!(infer_contract_month("NQ").as_deref(), None);
     }

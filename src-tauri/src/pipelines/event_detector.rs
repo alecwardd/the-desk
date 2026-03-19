@@ -72,8 +72,14 @@ fn event_allowed_in_session(
         return true;
     }
     match event_type {
-        "ib_formed" | "or_formed" | "or5_mid_retest" | "ib_extension_hit" | "day_type_change"
-        | "ib_reentry" | "ib_reentry_hit_mid" | "ib_reentry_full_traverse" => {
+        "ib_formed"
+        | "or_formed"
+        | "or5_mid_retest"
+        | "ib_extension_hit"
+        | "day_type_change"
+        | "ib_reentry"
+        | "ib_reentry_hit_mid"
+        | "ib_reentry_full_traverse" => {
             return false;
         }
         _ => {}
@@ -1399,10 +1405,7 @@ mod tests {
 
         let reentry = events.iter().find(|e| e.event_type == "ib_reentry");
         assert!(reentry.is_some(), "should detect IB reentry from below");
-        assert_eq!(
-            reentry.unwrap().direction.as_deref(),
-            Some("from_below")
-        );
+        assert_eq!(reentry.unwrap().direction.as_deref(), Some("from_below"));
     }
 
     #[test]

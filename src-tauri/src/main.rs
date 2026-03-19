@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use tauri::async_runtime::JoinHandle;
 use tauri::{AppHandle, Emitter, Manager};
-use the_desk_backend::db::Database;
+use the_desk_backend::db::{Database, RawTickBatchRow};
 use the_desk_backend::dom_replay::DomReplayClip;
 use the_desk_backend::dtc::DtcClient;
 use the_desk_backend::feed::scid_reader::ScidReader;
@@ -111,8 +111,7 @@ async fn processing_loop(handle: AppHandle, mut rx: broadcast::Receiver<FeedEven
     let mut current_session_type = SessionType::Unknown;
     let mut current_delta_segment = DeltaSegment::Unknown;
     let feed_contract = resolve_contract_metadata(&load_feed_config());
-    let mut tick_buffer: Vec<(f64, f64, f64, f64, f64, bool, String, String, String)> =
-        Vec::with_capacity(128);
+    let mut tick_buffer: Vec<RawTickBatchRow> = Vec::with_capacity(128);
     let mut event_buffer: Vec<the_desk_backend::pipelines::MarketEvent> = Vec::new();
 
     loop {
@@ -161,20 +160,24 @@ async fn processing_loop(handle: AppHandle, mut rx: broadcast::Receiver<FeedEven
                         }
                         if current_session_type == SessionType::Rth {
                             let date = session_date_from_timestamp_ms(timestamp);
-                            let _ = state.db.lock().await.save_prior_day_full_with_dnva_contract(
-                                &date,
-                                end_state.high,
-                                end_state.low,
-                                end_state.close,
-                                end_state.va_high,
-                                end_state.va_low,
-                                end_state.poc,
-                                Some(end_state.dnva_high),
-                                Some(end_state.dnva_low),
-                                Some(end_state.dnp),
-                                Some(feed_contract.root_symbol.as_str()),
-                                Some(feed_contract.contract_symbol.as_str()),
-                            );
+                            let _ = state
+                                .db
+                                .lock()
+                                .await
+                                .save_prior_day_full_with_dnva_contract(
+                                    &date,
+                                    end_state.high,
+                                    end_state.low,
+                                    end_state.close,
+                                    end_state.va_high,
+                                    end_state.va_low,
+                                    end_state.poc,
+                                    Some(end_state.dnva_high),
+                                    Some(end_state.dnva_low),
+                                    Some(end_state.dnp),
+                                    Some(feed_contract.root_symbol.as_str()),
+                                    Some(feed_contract.contract_symbol.as_str()),
+                                );
                             pipelines.levels.set_prior_day(
                                 end_state.high,
                                 end_state.low,
@@ -565,8 +568,7 @@ fn main() {
         &today,
         Some(feed_contract.root_symbol.as_str()),
         Some(feed_contract.contract_symbol.as_str()),
-    )
-    {
+    ) {
         pipelines
             .levels
             .set_prior_day(prior_ref.high, prior_ref.low, prior_ref.close);
@@ -575,7 +577,8 @@ fn main() {
             prior_ref.contract_symbol.as_deref(),
             Some(feed_contract.contract_symbol.as_str()),
         );
-        if let (Some(vh), Some(vl), Some(pc)) = (prior_ref.va_high, prior_ref.va_low, prior_ref.poc) {
+        if let (Some(vh), Some(vl), Some(pc)) = (prior_ref.va_high, prior_ref.va_low, prior_ref.poc)
+        {
             pipelines.levels.set_prior_profile(vh, vl, pc);
         }
         if let (Some(dh), Some(dl), Some(dp)) =

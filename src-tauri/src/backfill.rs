@@ -1,7 +1,7 @@
 use crate::db::{Database, ReplaySignalRecord, SessionSummary, SignalOutcome};
-use crate::feed::{load_feed_config, resolve_contract_metadata};
 use crate::feed::scid_reader::{ScanControl, ScidReader};
 use crate::feed::TradeSide;
+use crate::feed::{load_feed_config, resolve_contract_metadata};
 use crate::pipelines::{EventDetector, FlowEventEmitter, MarketState, PipelineEngine};
 use crate::rules::{RulesEngine, SetupDefinition};
 use crate::{
@@ -506,10 +506,11 @@ where
                         .map_err(runtime_err)
                         .map_err(|e| e.to_string())?
                     {
-                        state
-                            .pipeline
-                            .levels
-                            .set_prior_day(prior_ref.high, prior_ref.low, prior_ref.close);
+                        state.pipeline.levels.set_prior_day(
+                            prior_ref.high,
+                            prior_ref.low,
+                            prior_ref.close,
+                        );
                         state.pipeline.levels.set_prior_day_contract_context(
                             prior_ref.root_symbol.as_deref(),
                             prior_ref.contract_symbol.as_deref(),

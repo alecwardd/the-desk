@@ -8,7 +8,6 @@ use tauri::async_runtime::JoinHandle;
 use tauri::{AppHandle, Emitter, Manager};
 use the_desk_backend::db::{Database, RawTickBatchRow};
 use the_desk_backend::dom_replay::DomReplayClip;
-use the_desk_backend::dtc::DtcClient;
 use the_desk_backend::feed::scid_reader::ScidReader;
 use the_desk_backend::feed::{load_feed_config, resolve_contract_metadata, FeedEvent, TradeSide};
 use the_desk_backend::outcome_tracker;
@@ -71,7 +70,6 @@ impl Default for DomReplayRuntime {
 }
 
 pub(crate) struct AppState {
-    pub dtc: Mutex<DtcClient>,
     pub pipelines: Mutex<PipelineEngine>,
     pub detector: Mutex<EventDetector>,
     pub flow_emitter: Mutex<FlowEventEmitter>,
@@ -79,7 +77,7 @@ pub(crate) struct AppState {
     pub risk: Mutex<RiskTracker>,
     pub db: Mutex<Database>,
     pub recorder: Mutex<SessionRecorder>,
-    pub dtc_tx: broadcast::Sender<FeedEvent>,
+    pub feed_tx: broadcast::Sender<FeedEvent>,
     pub session_id: Mutex<Option<String>>,
     pub replay: Mutex<ReplayRuntime>,
     pub dom_replay: Mutex<DomReplayRuntime>,
@@ -117,10 +115,10 @@ async fn processing_loop(handle: AppHandle, mut rx: broadcast::Receiver<FeedEven
     loop {
         match rx.recv().await {
             Ok(FeedEvent::Connected) => {
-                handle.emit("dtc-status", "connected").ok();
+                handle.emit("feed-status", "connected").ok();
             }
             Ok(FeedEvent::Disconnected) => {
-                handle.emit("dtc-status", "disconnected").ok();
+                handle.emit("feed-status", "disconnected").ok();
             }
             Ok(FeedEvent::Trade {
                 price,
@@ -520,7 +518,9 @@ async fn processing_loop(handle: AppHandle, mut rx: broadcast::Receiver<FeedEven
                 handle.emit("market-state", &snapshot).ok();
             }
             Ok(FeedEvent::Error { message }) => {
-                handle.emit("dtc-status", &format!("error: {message}")).ok();
+                handle
+                    .emit("feed-status", &format!("error: {message}"))
+                    .ok();
             }
             Err(broadcast::error::RecvError::Lagged(n)) => {
                 eprintln!("Processing loop lagged by {n} messages");
@@ -602,7 +602,6 @@ fn main() {
     }
 
     let state = AppState {
-        dtc: Mutex::new(DtcClient::new(tx.clone())),
         pipelines: Mutex::new(pipelines),
         detector: Mutex::new(EventDetector::new()),
         flow_emitter: Mutex::new(FlowEventEmitter::new()),
@@ -614,7 +613,7 @@ fn main() {
                 .to_string_lossy()
                 .to_string(),
         )),
-        dtc_tx: tx,
+        feed_tx: tx,
         session_id: Mutex::new(None),
         replay: Mutex::new(ReplayRuntime::default()),
         dom_replay: Mutex::new(DomReplayRuntime::default()),
@@ -625,9 +624,7 @@ fn main() {
     tauri::Builder::default()
         .manage(state)
         .invoke_handler(tauri::generate_handler![
-            commands::connect_dtc,
-            commands::disconnect_dtc,
-            commands::dtc_status,
+            commands::feed_status,
             commands::list_setups,
             commands::create_setup,
             commands::update_setup,
@@ -669,7 +666,6 @@ fn main() {
             commands::dom_replay_status,
             commands::list_session_events,
             commands::list_recordings,
-            commands::start_mock_feed,
             commands::start_scid_feed,
             commands::stop_scid_feed,
             commands::set_prior_day_levels,
@@ -757,7 +753,7 @@ fn main() {
                 let (stop_tx, stop_rx) = watch::channel(false);
                 *state.scid_shutdown_tx.lock().await = Some(stop_tx);
                 let task =
-                    reader.spawn_tail_loop(state.dtc_tx.clone(), stop_rx, config.flush_poll_ms);
+                    reader.spawn_tail_loop(state.feed_tx.clone(), stop_rx, config.flush_poll_ms);
                 *state.scid_feed_task.lock().await = Some(task);
                 eprintln!(
                     "Live tail loop started (polling every {}ms)",

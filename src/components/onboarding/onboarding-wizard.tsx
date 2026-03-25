@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { dtcBridge, setupBridge } from "../../lib/tauri-bridge";
+import { feedBridge, setupBridge } from "../../lib/tauri-bridge";
 import type { Setup } from "../../lib/types";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -27,29 +27,17 @@ const STEPS: { key: Step; label: string }[] = [
 
 export function OnboardingWizard({ onComplete, onSkip }: Props) {
   const [step, setStep] = useState<Step>("connection");
-  const [dtcHost, setDtcHost] = useState("127.0.0.1");
-  const [dtcPort, setDtcPort] = useState(11099);
   const [connectionStatus, setConnectionStatus] = useState<string | null>(null);
   const [setupName, setSetupName] = useState("");
   const [createdSetups, setCreatedSetups] = useState<Setup[]>([]);
 
-  async function testConnection() {
-    setConnectionStatus("connecting...");
+  async function startScidFeed() {
+    setConnectionStatus("starting SCID tail...");
     try {
-      await dtcBridge.connect(dtcHost, dtcPort, "NQ");
-      setConnectionStatus("connected");
+      await feedBridge.startScidFeed();
+      setConnectionStatus("SCID feed started — ensure Sierra Chart is writing the .scid file");
     } catch {
-      setConnectionStatus("failed - check host and port");
-    }
-  }
-
-  async function startMock() {
-    setConnectionStatus("starting mock feed...");
-    try {
-      await dtcBridge.startMockFeed();
-      setConnectionStatus("mock feed active");
-    } catch {
-      setConnectionStatus("mock feed failed to start");
+      setConnectionStatus("failed — check ~/.the-desk/config.toml sierra_data_dir and .scid path");
     }
   }
 
@@ -97,38 +85,17 @@ export function OnboardingWizard({ onComplete, onSkip }: Props) {
         {step === "connection" && (
           <div className="flex flex-col gap-4">
             <h3 className="text-base font-semibold text-text-primary">
-              Step 1: Data Connection
+              Step 1: Sierra data files
             </h3>
             <p className="text-sm text-text-secondary">
-              Connect to Sierra Chart via DTC, or start a mock feed for testing.
+              The Desk reads live ticks from Sierra Chart&apos;s <code className="text-xs">.scid</code> file
+              (and optional <code className="text-xs">MarketDepthData/*.depth</code>). Configure{" "}
+              <code className="text-xs">sierra_data_dir</code> in{" "}
+              <code className="text-xs">~/.the-desk/config.toml</code>, then start the tail.
             </p>
 
-            <div className="flex flex-col gap-1.5">
-              <label className="text-sm font-medium text-text-secondary">
-                Host
-              </label>
-              <Input
-                value={dtcHost}
-                onChange={(e) => setDtcHost(e.target.value)}
-              />
-            </div>
-
-            <div className="flex flex-col gap-1.5">
-              <label className="text-sm font-medium text-text-secondary">
-                Port
-              </label>
-              <Input
-                type="number"
-                value={dtcPort}
-                onChange={(e) => setDtcPort(Number(e.target.value))}
-              />
-            </div>
-
             <div className="flex gap-2">
-              <Button onClick={testConnection}>Connect</Button>
-              <Button variant="outline" onClick={startMock}>
-                Use Mock Feed
-              </Button>
+              <Button onClick={startScidFeed}>Start SCID feed</Button>
             </div>
 
             {connectionStatus && (

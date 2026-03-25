@@ -41,7 +41,4 @@ Load a recorded NQ session and replay it through the full system.
 
 ## For Development
 
-If no recordings exist yet, use the mock DTC server to generate synthetic data:
-```bash
-cargo run --bin mock-dtc-server -- --record synthetic-session.zst --duration 3600
-```
+If no recordings exist yet, capture a session from live SCID processing or use DOM replay over stored SQLite data (see `docs/dom-replay.md`).

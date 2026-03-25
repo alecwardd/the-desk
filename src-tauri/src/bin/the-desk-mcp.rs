@@ -10,7 +10,7 @@ use rmcp::{
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use the_desk_backend::backfill;
 use the_desk_backend::db::{
@@ -23,7 +23,8 @@ use the_desk_backend::depth::{
     DepthReader, DomFeatureSnapshot, DomSummary, ScanControl as DepthScanControl,
 };
 use the_desk_backend::feed::scid_reader::{
-    parse_record_scaled, ScanControl as ScidScanControl, ScidReader,
+    parse_record_scaled, scid_tail_offset_after_shrink, ScanControl as ScidScanControl, ScidReader,
+    SCID_RECORD_SIZE,
 };
 use the_desk_backend::feed::{
     load_feed_config, load_storage_config, resolve_contract_metadata, TradeSide,
@@ -56,6 +57,130 @@ const JOB_PROGRESS_RECORD_STEP: usize = 50_000;
 const JOB_PROGRESS_RATE_EMA_ALPHA: f64 = 0.25;
 type DnvaTriple = (f64, f64, f64);
 
+/// Atomics updated by SCID / `.depth` poll tasks for diagnostics and coherent `dataAgeMs` without extra DB locks.
+#[derive(Clone)]
+pub struct McpFeedRuntimeState {
+    pub last_scid_tick_ms_bits: Arc<AtomicU64>,
+    pub last_depth_timestamp_ms_bits: Arc<AtomicU64>,
+    pub scid_tail_offset: Arc<AtomicU64>,
+    pub scid_file_len: Arc<AtomicU64>,
+    pub scid_tail_reset_count: Arc<AtomicU64>,
+    pub scid_last_shrink_len: Arc<AtomicU64>,
+    pub last_scid_poll_wall_ms: Arc<AtomicU64>,
+    pub pipeline_lock_contended: Arc<AtomicBool>,
+}
+
+impl Default for McpFeedRuntimeState {
+    fn default() -> Self {
+        Self {
+            last_scid_tick_ms_bits: Arc::new(AtomicU64::new(0)),
+            last_depth_timestamp_ms_bits: Arc::new(AtomicU64::new(0)),
+            scid_tail_offset: Arc::new(AtomicU64::new(0)),
+            scid_file_len: Arc::new(AtomicU64::new(0)),
+            scid_tail_reset_count: Arc::new(AtomicU64::new(0)),
+            scid_last_shrink_len: Arc::new(AtomicU64::new(0)),
+            last_scid_poll_wall_ms: Arc::new(AtomicU64::new(0)),
+            pipeline_lock_contended: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+fn tick_ms_to_bits(ts: f64) -> u64 {
+    if ts.is_finite() && ts > 0.0 {
+        ts.to_bits()
+    } else {
+        0
+    }
+}
+
+fn tick_ms_from_bits(bits: u64) -> Option<f64> {
+    if bits == 0 {
+        None
+    } else {
+        let v = f64::from_bits(bits);
+        if v.is_finite() && v > 0.0 {
+            Some(v)
+        } else {
+            None
+        }
+    }
+}
+
+/// Coherent live market view for MCP tools (Sierra `.scid` + optional `.depth`).
+struct LiveMarketResolution {
+    snapshot: serde_json::Value,
+    snapshot_source: &'static str,
+    dom_summary: Option<serde_json::Value>,
+    dom_source: &'static str,
+    as_of_timestamp_ms: f64,
+    pipeline_processed_through_ms: Option<f64>,
+    latest_db_tick_timestamp_ms: Option<f64>,
+    latest_depth_timestamp_ms: Option<f64>,
+    data_age_ms: f64,
+    degradation_reason: Option<String>,
+    pipelines_contended: bool,
+    db_contended: bool,
+}
+
+impl LiveMarketResolution {
+    fn freshness_status(&self) -> &'static str {
+        if self.pipelines_contended {
+            return "contended";
+        }
+        if !self.data_age_ms.is_finite() || self.data_age_ms < 0.0 {
+            return "unknown";
+        }
+        if self.data_age_ms <= FRESHNESS_THRESHOLD_MS {
+            "ok"
+        } else {
+            "stale"
+        }
+    }
+}
+
+fn merge_tool_live_metadata(target: &mut serde_json::Value, r: &LiveMarketResolution) {
+    if let Some(obj) = target.as_object_mut() {
+        obj.insert("liveDataSource".to_string(), serde_json::json!("scid"));
+        obj.insert(
+            "snapshotSource".to_string(),
+            serde_json::json!(r.snapshot_source),
+        );
+        obj.insert("domSource".to_string(), serde_json::json!(r.dom_source));
+        obj.insert(
+            "asOfTimestampMs".to_string(),
+            serde_json::json!(r.as_of_timestamp_ms),
+        );
+        obj.insert(
+            "pipelineProcessedThroughMs".to_string(),
+            serde_json::json!(r.pipeline_processed_through_ms),
+        );
+        obj.insert(
+            "latestDbTickTimestampMs".to_string(),
+            serde_json::json!(r.latest_db_tick_timestamp_ms),
+        );
+        obj.insert(
+            "latestDepthTimestampMs".to_string(),
+            serde_json::json!(r.latest_depth_timestamp_ms),
+        );
+        obj.insert("dataAgeMs".to_string(), serde_json::json!(r.data_age_ms));
+        obj.insert(
+            "freshnessStatus".to_string(),
+            serde_json::json!(r.freshness_status()),
+        );
+        if let Some(ref reason) = r.degradation_reason {
+            obj.insert("degradationReason".to_string(), serde_json::json!(reason));
+        }
+        obj.insert(
+            "freshnessThresholdMs".to_string(),
+            serde_json::json!(FRESHNESS_THRESHOLD_MS),
+        );
+        obj.insert(
+            "dbLockContended".to_string(),
+            serde_json::json!(r.db_contended),
+        );
+    }
+}
+
 #[derive(Clone)]
 pub struct TheDeskMcp {
     db: Arc<Mutex<Database>>,
@@ -66,6 +191,7 @@ pub struct TheDeskMcp {
     rules: Arc<Mutex<RulesEngine>>,
     last_bid: Arc<Mutex<f64>>,
     last_ask: Arc<Mutex<f64>>,
+    feed_runtime: Arc<McpFeedRuntimeState>,
     backfill_manager: Arc<AsyncMutex<BackfillManager>>,
     tool_router: ToolRouter<Self>,
 }
@@ -92,13 +218,13 @@ fn lock_error() -> McpError {
     McpError::new(ErrorCode::INTERNAL_ERROR, "database lock poisoned", None)
 }
 
-fn freshness_status(age_ms: f64) -> &'static str {
+fn freshness_status_from_age(age_ms: f64) -> &'static str {
     if age_ms < 0.0 || !age_ms.is_finite() {
         "unknown"
     } else if age_ms <= FRESHNESS_THRESHOLD_MS {
         "ok"
     } else {
-        "warning"
+        "stale"
     }
 }
 
@@ -116,15 +242,17 @@ fn transition_hint(et_minutes: i32) -> Option<(&'static str, &'static str, &'sta
 
 fn text_result(mut json: serde_json::Value) -> CallToolResult {
     if let Some(obj) = json.as_object_mut() {
-        if let Some(age_ms) = obj.get("dataAgeMs").and_then(|v| v.as_f64()) {
-            obj.insert(
-                "freshnessStatus".to_string(),
-                serde_json::json!(freshness_status(age_ms)),
-            );
-            obj.insert(
-                "freshnessThresholdMs".to_string(),
-                serde_json::json!(FRESHNESS_THRESHOLD_MS),
-            );
+        if !obj.contains_key("freshnessStatus") {
+            if let Some(age_ms) = obj.get("dataAgeMs").and_then(|v| v.as_f64()) {
+                obj.insert(
+                    "freshnessStatus".to_string(),
+                    serde_json::json!(freshness_status_from_age(age_ms)),
+                );
+            }
+        }
+        if obj.contains_key("dataAgeMs") || obj.contains_key("freshnessStatus") {
+            obj.entry("freshnessThresholdMs".to_string())
+                .or_insert(serde_json::json!(FRESHNESS_THRESHOLD_MS));
         }
     }
     CallToolResult::success(vec![Content::text(json.to_string())])
@@ -1525,9 +1653,169 @@ impl TheDeskMcp {
             rules: Arc::new(Mutex::new(RulesEngine::default())),
             last_bid: Arc::new(Mutex::new(0.0)),
             last_ask: Arc::new(Mutex::new(0.0)),
+            feed_runtime: Arc::new(McpFeedRuntimeState::default()),
             backfill_manager: Arc::new(AsyncMutex::new(BackfillManager::default())),
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// Single coherent live view: in-memory pipeline when available, else persisted `feature_state`.
+    fn resolve_live_market_view(&self) -> Option<LiveMarketResolution> {
+        let now_ms = chrono::Utc::now().timestamp_millis() as f64;
+        let atomic_ts = tick_ms_from_bits(
+            self.feed_runtime
+                .last_scid_tick_ms_bits
+                .load(Ordering::Acquire),
+        );
+        let depth_atomic = tick_ms_from_bits(
+            self.feed_runtime
+                .last_depth_timestamp_ms_bits
+                .load(Ordering::Acquire),
+        );
+
+        let db_guard = self.db.try_lock();
+        let db_contended = db_guard.is_err();
+        let (latest_db_tick, feature_with_ts, dom_state) = match db_guard {
+            Ok(db) => (
+                db.latest_tick_timestamp_ms().ok().flatten(),
+                db.latest_feature_state_with_timestamp().ok().flatten(),
+                db.latest_dom_feature_state().ok().flatten(),
+            ),
+            Err(_) => (None, None, None),
+        };
+
+        let pipelines_guard = self.pipelines.try_lock();
+        let pipelines_contended = pipelines_guard.is_err();
+        self.feed_runtime
+            .pipeline_lock_contended
+            .store(pipelines_contended, Ordering::Release);
+
+        if let Ok(pipelines) = pipelines_guard {
+            let bid = self.last_bid.lock().ok().map(|g| *g).unwrap_or(0.0);
+            let ask = self.last_ask.lock().ok().map(|g| *g).unwrap_or(0.0);
+            if bid > 0.0 || ask > 0.0 {
+                if let Ok(snap_val) =
+                    serde_json::to_value(pipelines.snapshot(bid.max(1e-9), ask.max(1e-9)))
+                {
+                    let tape_ts = snap_val
+                        .get("tapeLastTradeTimestampMs")
+                        .and_then(|v| v.as_f64())
+                        .filter(|t| t.is_finite() && *t > 0.0);
+                    let as_of = [atomic_ts, tape_ts, latest_db_tick]
+                        .into_iter()
+                        .flatten()
+                        .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                        .unwrap_or(now_ms);
+                    let data_age_ms = (now_ms - as_of).max(0.0);
+
+                    let (dom_summary, dom_source, latest_depth_ts) =
+                        if let Some(ds) = snap_val.get("domSummary") {
+                            if ds.as_object().map(|o| !o.is_empty()).unwrap_or(false) {
+                                let ts = ds.get("timestampMs").and_then(|v| v.as_f64());
+                                (Some(ds.clone()), "depth_live", ts.or(depth_atomic))
+                            } else if let Some((dts, pay)) = dom_state.as_ref() {
+                                (
+                                    pay.get("domSummary").cloned(),
+                                    "persisted_dom_feature_state",
+                                    Some(*dts).or(depth_atomic),
+                                )
+                            } else {
+                                (None, "unavailable", depth_atomic)
+                            }
+                        } else if let Some((dts, pay)) = dom_state.as_ref() {
+                            (
+                                pay.get("domSummary").cloned(),
+                                "persisted_dom_feature_state",
+                                Some(*dts).or(depth_atomic),
+                            )
+                        } else {
+                            (None, "unavailable", depth_atomic)
+                        };
+
+                    return Some(LiveMarketResolution {
+                        snapshot: snap_val,
+                        snapshot_source: "live_pipeline",
+                        dom_summary,
+                        dom_source,
+                        as_of_timestamp_ms: as_of,
+                        pipeline_processed_through_ms: atomic_ts.or(tape_ts),
+                        latest_db_tick_timestamp_ms: latest_db_tick,
+                        latest_depth_timestamp_ms: latest_depth_ts,
+                        data_age_ms,
+                        degradation_reason: None,
+                        pipelines_contended: false,
+                        db_contended,
+                    });
+                }
+            }
+        }
+
+        if let Some((feat_ts, payload)) = feature_with_ts {
+            let as_of = if feat_ts.is_finite() && feat_ts > 0.0 {
+                feat_ts
+            } else {
+                latest_db_tick.unwrap_or(now_ms)
+            };
+            let data_age_ms = (now_ms - as_of).max(0.0);
+            let (dom_summary, dom_source, latest_depth_ts) =
+                if let Some((dts, pay)) = dom_state.as_ref() {
+                    (
+                        pay.get("domSummary").cloned(),
+                        "persisted_dom_feature_state",
+                        Some(*dts).or(depth_atomic),
+                    )
+                } else {
+                    (None, "unavailable", depth_atomic)
+                };
+            let degradation_reason = if pipelines_contended {
+                Some("pipeline_lock_contended; using persisted_feature_state".to_string())
+            } else {
+                None
+            };
+            return Some(LiveMarketResolution {
+                snapshot: payload,
+                snapshot_source: "persisted_feature_state",
+                dom_summary,
+                dom_source,
+                as_of_timestamp_ms: as_of,
+                pipeline_processed_through_ms: atomic_ts,
+                latest_db_tick_timestamp_ms: latest_db_tick,
+                latest_depth_timestamp_ms: latest_depth_ts,
+                data_age_ms,
+                degradation_reason,
+                pipelines_contended,
+                db_contended,
+            });
+        }
+
+        None
+    }
+
+    fn data_age_from_db_or_atomic(&self) -> f64 {
+        let now_ms = chrono::Utc::now().timestamp_millis() as f64;
+        if let Some(ts) = tick_ms_from_bits(
+            self.feed_runtime
+                .last_scid_tick_ms_bits
+                .load(Ordering::Acquire),
+        ) {
+            return (now_ms - ts).max(0.0);
+        }
+        if let Ok(db) = self.db.try_lock() {
+            return compute_data_age(&db);
+        }
+        -1.0
+    }
+
+    /// Snapshot JSON for tools that only need market fields (compare_sessions, etc.).
+    fn current_snapshot_value(&self) -> Option<serde_json::Value> {
+        self.resolve_live_market_view()
+            .map(|r| r.snapshot)
+            .or_else(|| {
+                self.db
+                    .lock()
+                    .ok()
+                    .and_then(|d| d.latest_feature_state().ok().flatten())
+            })
     }
 
     async fn wait_for_job_terminal(&self, job_id: &str) -> Option<HistoricalJobRun> {
@@ -1847,60 +2135,22 @@ impl TheDeskMcp {
         Ok((run, false))
     }
 
-    /// Get a live snapshot from the in-memory pipeline engine.
-    /// Uses try_lock to avoid blocking when backfill/poll holds the lock.
-    fn live_snapshot(&self) -> Option<serde_json::Value> {
-        let pipelines = self.pipelines.try_lock().ok()?;
-        let bid = *self.last_bid.lock().ok()?;
-        let ask = *self.last_ask.lock().ok()?;
-        if bid <= 0.0 && ask <= 0.0 {
-            return None;
-        }
-        let snapshot = pipelines.snapshot(bid, ask);
-        serde_json::to_value(&snapshot).ok()
-    }
-
-    fn try_data_age_ms(&self) -> Option<f64> {
-        let db = self.db.try_lock().ok()?;
-        Some(compute_data_age(&db))
-    }
-
-    fn try_latest_feature_state(&self) -> Option<(serde_json::Value, f64)> {
-        let db = self.db.try_lock().ok()?;
-        let snapshot = db.latest_feature_state().ok().flatten()?;
-        Some((snapshot, compute_data_age(&db)))
-    }
-
-    fn try_latest_dom_feature_state(&self) -> Option<(f64, serde_json::Value)> {
-        let db = self.db.try_lock().ok()?;
-        db.latest_dom_feature_state().ok().flatten()
-    }
-
-    fn snapshot_with_fallback(&self) -> Option<(serde_json::Value, f64, &'static str)> {
-        if let Some(snapshot) = self.live_snapshot() {
-            return Some((
-                snapshot,
-                self.try_data_age_ms().unwrap_or(-1.0),
-                "live_pipeline",
-            ));
-        }
-
-        let (snapshot, data_age_ms) = self.try_latest_feature_state()?;
-        Some((snapshot, data_age_ms, "database"))
-    }
-
     #[tool(
         description = "Current market snapshot: last price, VWAP with 1/2/3 SD bands, TPO value area (high/low/POC), delta neutral value area (DNVA high/low/DNP), session delta, cumulative delta, key levels (prior day H/L/C, prior VA/POC, overnight range, OR, IB), Globex/London opening ranges, and session context (sessionType, sessionSegment, tradingDay), plus tape pace, imbalance count, absorption event count, and average trade size. Prefers live pipeline state; falls back to last persisted snapshot."
     )]
     async fn get_market_snapshot(&self) -> Result<CallToolResult, McpError> {
-        let dom_feature = self.try_latest_dom_feature_state();
-        if let Some((snapshot, data_age_ms, source)) = self.snapshot_with_fallback() {
-            return Ok(text_result(serde_json::json!({
-                "snapshot": snapshot,
-                "domSummary": dom_feature.as_ref().and_then(|(_, p)| p.get("domSummary")).cloned(),
-                "dataAgeMs": data_age_ms,
-                "source": source
-            })));
+        if let Some(r) = self.resolve_live_market_view() {
+            let snap = r.snapshot.clone();
+            let top_dom = r
+                .dom_summary
+                .clone()
+                .or_else(|| snap.get("domSummary").cloned());
+            let mut out = serde_json::json!({
+                "snapshot": snap,
+                "domSummary": top_dom,
+            });
+            merge_tool_live_metadata(&mut out, &r);
+            return Ok(text_result(out));
         }
         Ok(no_data(
             "No market snapshot available yet or database is temporarily busy. Ensure Sierra Chart is running and .scid data is being ingested.",
@@ -1911,35 +2161,26 @@ impl TheDeskMcp {
         description = "Current session context: sessionType (RTH/Globex/Unknown), sessionSegment (Asia/London/None), tradingDay (6 PM ET roll), and data freshness."
     )]
     async fn get_session_context(&self) -> Result<CallToolResult, McpError> {
-        let now_ms = chrono::Utc::now().timestamp_millis() as f64;
-        let data_age_ms = self.try_data_age_ms().unwrap_or(-1.0);
-        let context_ts = if data_age_ms.is_finite() && data_age_ms >= 0.0 {
-            now_ms - data_age_ms
-        } else {
-            now_ms
-        };
-        let et_minutes = et_minutes_from_timestamp(context_ts).unwrap_or(-1);
-        let (is_transition, transition_from, transition_to, transition_phase) =
-            if let Some((from, to, phase)) = transition_hint(et_minutes) {
-                (
-                    true,
-                    serde_json::json!(from),
-                    serde_json::json!(to),
-                    serde_json::json!(phase),
-                )
-            } else {
-                (
-                    false,
-                    serde_json::Value::Null,
-                    serde_json::Value::Null,
-                    serde_json::Value::Null,
-                )
-            };
-        match self
-            .live_snapshot()
-            .or_else(|| self.try_latest_feature_state().map(|(s, _)| s))
-        {
-            Some(s) => Ok(text_result(serde_json::json!({
+        if let Some(r) = self.resolve_live_market_view() {
+            let s = &r.snapshot;
+            let et_minutes = et_minutes_from_timestamp(r.as_of_timestamp_ms).unwrap_or(-1);
+            let (is_transition, transition_from, transition_to, transition_phase) =
+                if let Some((from, to, phase)) = transition_hint(et_minutes) {
+                    (
+                        true,
+                        serde_json::json!(from),
+                        serde_json::json!(to),
+                        serde_json::json!(phase),
+                    )
+                } else {
+                    (
+                        false,
+                        serde_json::Value::Null,
+                        serde_json::Value::Null,
+                        serde_json::Value::Null,
+                    )
+                };
+            let mut out = serde_json::json!({
                 "sessionType": s.get("sessionType"),
                 "sessionSegment": s.get("sessionSegment"),
                 "tradingDay": s.get("tradingDay"),
@@ -1955,18 +2196,20 @@ impl TheDeskMcp {
                 "transitionTo": transition_to,
                 "transitionPhase": transition_phase,
                 "etMinutes": et_minutes,
-                "dataAgeMs": data_age_ms
-            }))),
-            None => Ok(no_data("No session context available")),
+            });
+            merge_tool_live_metadata(&mut out, &r);
+            return Ok(text_result(out));
         }
+        Ok(no_data("No session context available"))
     }
 
     #[tool(
         description = "TPO (Time-Price-Opportunity) profile data: POC (point of control), value area high/low, opening range high/low (first 30 min), initial balance high/low (first 60 min). Use for auction market theory analysis."
     )]
     async fn get_tpo_profile(&self) -> Result<CallToolResult, McpError> {
-        match self.snapshot_with_fallback() {
-            Some((s, data_age_ms, _)) => Ok(text_result(serde_json::json!({
+        if let Some(r) = self.resolve_live_market_view() {
+            let s = &r.snapshot;
+            let mut out = serde_json::json!({
                 "poc": s.get("poc"),
                 "vaHigh": s.get("vaHigh"),
                 "vaLow": s.get("vaLow"),
@@ -1974,18 +2217,20 @@ impl TheDeskMcp {
                 "orLow": s.get("orLow"),
                 "ibHigh": s.get("ibHigh"),
                 "ibLow": s.get("ibLow"),
-                "dataAgeMs": data_age_ms
-            }))),
-            None => Ok(no_data("No TPO data available")),
+            });
+            merge_tool_live_metadata(&mut out, &r);
+            return Ok(text_result(out));
         }
+        Ok(no_data("No TPO data available"))
     }
 
     #[tool(
         description = "Delta profile: segment delta (Asia-only, London-only, or RTH-only), combined Globex delta (Asia+London when in Globex), cumulative delta, DNVA high/low, DNP. Use for inventory and positioning analysis."
     )]
     async fn get_delta_profile(&self) -> Result<CallToolResult, McpError> {
-        match self.snapshot_with_fallback() {
-            Some((s, data_age_ms, _)) => Ok(text_result(serde_json::json!({
+        if let Some(r) = self.resolve_live_market_view() {
+            let s = &r.snapshot;
+            let mut out = serde_json::json!({
                 "sessionDelta": s.get("sessionDelta"),
                 "globexDelta": s.get("globexDelta"),
                 "cumulativeDelta": s.get("cumulativeDelta"),
@@ -1993,97 +2238,96 @@ impl TheDeskMcp {
                 "dnvaLow": s.get("dnvaLow"),
                 "dnp": s.get("dnp"),
                 "sessionSegment": s.get("sessionSegment"),
-                "dataAgeMs": data_age_ms
-            }))),
-            None => Ok(no_data("No delta data available")),
+            });
+            merge_tool_live_metadata(&mut out, &r);
+            return Ok(text_result(out));
         }
+        Ok(no_data("No delta data available"))
     }
 
     #[tool(
         description = "Key reference levels: prior day high/low/close, prior session value area high/low and POC, overnight (Globex) high/low, Globex OR30 and London OR60, and initial balance high/low. Includes sessionType (RTH vs Globex), sessionSegment (Asia/London/None), and tradingDay."
     )]
     async fn get_key_levels(&self) -> Result<CallToolResult, McpError> {
+        let Some(r) = self.resolve_live_market_view() else {
+            return Ok(no_data("No key levels available"));
+        };
+        let s = &r.snapshot;
+        let session_type = s.get("sessionType").and_then(|v| v.as_str());
+        let session_segment = s.get("sessionSegment").and_then(|v| v.as_str());
+        let trading_day = s.get("tradingDay").and_then(|v| v.as_str());
+        let is_globex = session_type == Some("Globex");
+
         let db = self.db.lock().map_err(|_| lock_error())?;
-        match db.latest_feature_state() {
-            Ok(Some(s)) => {
-                let session_type = s.get("sessionType").and_then(|v| v.as_str());
-                let session_segment = s.get("sessionSegment").and_then(|v| v.as_str());
-                let trading_day = s.get("tradingDay").and_then(|v| v.as_str());
-                let is_globex = session_type == Some("Globex");
-                let mut out = serde_json::json!({
-                    "sessionType": s.get("sessionType"),
-                    "sessionSegment": s.get("sessionSegment"),
-                    "tradingDay": s.get("tradingDay"),
-                    "rootSymbol": s.get("rootSymbol"),
-                    "contractSymbol": s.get("contractSymbol"),
-                    "contractMonth": s.get("contractMonth"),
-                    "symbolResolutionMode": s.get("symbolResolutionMode"),
-                    "symbolResolutionSource": s.get("symbolResolutionSource"),
-                    "rolloverWarning": s.get("rolloverWarning"),
-                    "carryForwardLevelsValid": s.get("carryForwardLevelsValid"),
-                    "priorDayContractSymbol": s.get("priorDayContractSymbol"),
-                    "priorDayHigh": s.get("priorDayHigh"),
-                    "priorDayLow": s.get("priorDayLow"),
-                    "priorDayClose": s.get("priorDayClose"),
-                    "priorVaHigh": s.get("priorVaHigh"),
-                    "priorVaLow": s.get("priorVaLow"),
-                    "priorPoc": s.get("priorPoc"),
-                    "priorDnvaHigh": s.get("priorDnvaHigh"),
-                    "priorDnvaLow": s.get("priorDnvaLow"),
-                    "priorDnp": s.get("priorDnp"),
-                    "overnightHigh": s.get("overnightHigh"),
-                    "overnightLow": s.get("overnightLow"),
-                    "globexOr30High": s.get("globexOr30High"),
-                    "globexOr30Low": s.get("globexOr30Low"),
-                    "londonOr60High": s.get("londonOr60High"),
-                    "londonOr60Low": s.get("londonOr60Low"),
-                    "sessionHigh": s.get("sessionHigh"),
-                    "sessionLow": s.get("sessionLow"),
-                    "ibHigh": s.get("ibHigh"),
-                    "ibLow": s.get("ibLow"),
-                    "priorLondonDnvaHigh": serde_json::Value::Null,
-                    "priorLondonDnvaLow": serde_json::Value::Null,
-                    "priorLondonDnp": serde_json::Value::Null,
-                    "priorAsiaDnvaHigh": serde_json::Value::Null,
-                    "priorAsiaDnvaLow": serde_json::Value::Null,
-                    "priorAsiaDnp": serde_json::Value::Null,
-                    "untestedDnps": serde_json::json!([]),
-                    "dataAgeMs": compute_data_age(&db)
-                });
-                if is_globex {
-                    out["sessionScopeNote"] = serde_json::json!("For Globex, use overnightHigh/overnightLow as the session range. sessionHigh, sessionLow, IB, OR, and OR5 are RTH-only and may be zero or from a prior RTH session.");
-                }
-                let (london_dnva, asia_dnva) =
-                    load_contextual_prior_dnva(&db, session_type, session_segment, trading_day);
-                if let Some((h, l, p)) = london_dnva {
-                    out["priorLondonDnvaHigh"] = serde_json::json!(h);
-                    out["priorLondonDnvaLow"] = serde_json::json!(l);
-                    out["priorLondonDnp"] = serde_json::json!(p);
-                }
-                if let Some((h, l, p)) = asia_dnva {
-                    out["priorAsiaDnvaHigh"] = serde_json::json!(h);
-                    out["priorAsiaDnvaLow"] = serde_json::json!(l);
-                    out["priorAsiaDnp"] = serde_json::json!(p);
-                }
-                // Include untested DNPs from prior sessions (price never revisited DNP).
-                if let Ok(untested) = db.load_untested_dnps(10) {
-                    let list: Vec<serde_json::Value> = untested
-                        .into_iter()
-                        .map(|(sd, st, dnp)| {
-                            serde_json::json!({
-                                "sessionDate": sd,
-                                "sessionType": st,
-                                "dnp": dnp
-                            })
-                        })
-                        .collect();
-                    out["untestedDnps"] = serde_json::json!(list);
-                }
-                Ok(text_result(out))
-            }
-            Ok(None) => Ok(no_data("No key levels available")),
-            Err(e) => Err(db_error(e)),
+        let mut out = serde_json::json!({
+            "sessionType": s.get("sessionType"),
+            "sessionSegment": s.get("sessionSegment"),
+            "tradingDay": s.get("tradingDay"),
+            "rootSymbol": s.get("rootSymbol"),
+            "contractSymbol": s.get("contractSymbol"),
+            "contractMonth": s.get("contractMonth"),
+            "symbolResolutionMode": s.get("symbolResolutionMode"),
+            "symbolResolutionSource": s.get("symbolResolutionSource"),
+            "rolloverWarning": s.get("rolloverWarning"),
+            "carryForwardLevelsValid": s.get("carryForwardLevelsValid"),
+            "priorDayContractSymbol": s.get("priorDayContractSymbol"),
+            "priorDayHigh": s.get("priorDayHigh"),
+            "priorDayLow": s.get("priorDayLow"),
+            "priorDayClose": s.get("priorDayClose"),
+            "priorVaHigh": s.get("priorVaHigh"),
+            "priorVaLow": s.get("priorVaLow"),
+            "priorPoc": s.get("priorPoc"),
+            "priorDnvaHigh": s.get("priorDnvaHigh"),
+            "priorDnvaLow": s.get("priorDnvaLow"),
+            "priorDnp": s.get("priorDnp"),
+            "overnightHigh": s.get("overnightHigh"),
+            "overnightLow": s.get("overnightLow"),
+            "globexOr30High": s.get("globexOr30High"),
+            "globexOr30Low": s.get("globexOr30Low"),
+            "londonOr60High": s.get("londonOr60High"),
+            "londonOr60Low": s.get("londonOr60Low"),
+            "sessionHigh": s.get("sessionHigh"),
+            "sessionLow": s.get("sessionLow"),
+            "ibHigh": s.get("ibHigh"),
+            "ibLow": s.get("ibLow"),
+            "priorLondonDnvaHigh": serde_json::Value::Null,
+            "priorLondonDnvaLow": serde_json::Value::Null,
+            "priorLondonDnp": serde_json::Value::Null,
+            "priorAsiaDnvaHigh": serde_json::Value::Null,
+            "priorAsiaDnvaLow": serde_json::Value::Null,
+            "priorAsiaDnp": serde_json::Value::Null,
+            "untestedDnps": serde_json::json!([]),
+        });
+        if is_globex {
+            out["sessionScopeNote"] = serde_json::json!("For Globex, use overnightHigh/overnightLow as the session range. sessionHigh, sessionLow, IB, OR, and OR5 are RTH-only and may be zero or from a prior RTH session.");
         }
+        let (london_dnva, asia_dnva) =
+            load_contextual_prior_dnva(&db, session_type, session_segment, trading_day);
+        if let Some((h, l, p)) = london_dnva {
+            out["priorLondonDnvaHigh"] = serde_json::json!(h);
+            out["priorLondonDnvaLow"] = serde_json::json!(l);
+            out["priorLondonDnp"] = serde_json::json!(p);
+        }
+        if let Some((h, l, p)) = asia_dnva {
+            out["priorAsiaDnvaHigh"] = serde_json::json!(h);
+            out["priorAsiaDnvaLow"] = serde_json::json!(l);
+            out["priorAsiaDnp"] = serde_json::json!(p);
+        }
+        if let Ok(untested) = db.load_untested_dnps(10) {
+            let list: Vec<serde_json::Value> = untested
+                .into_iter()
+                .map(|(sd, st, dnp)| {
+                    serde_json::json!({
+                        "sessionDate": sd,
+                        "sessionType": st,
+                        "dnp": dnp
+                    })
+                })
+                .collect();
+            out["untestedDnps"] = serde_json::json!(list);
+        }
+        merge_tool_live_metadata(&mut out, &r);
+        Ok(text_result(out))
     }
 
     #[tool(
@@ -2091,7 +2335,11 @@ impl TheDeskMcp {
     )]
     async fn get_tape_pace(&self) -> Result<CallToolResult, McpError> {
         let now_ms = chrono::Utc::now().timestamp_millis() as f64;
-        let data_age_ms = self.try_data_age_ms().unwrap_or(-1.0);
+        let live_view = self.resolve_live_market_view();
+        let data_age_ms = live_view
+            .as_ref()
+            .map(|r| r.data_age_ms)
+            .unwrap_or_else(|| self.data_age_from_db_or_atomic());
         // Try live pipeline first for full snapshot including volume/sec and dwell.
         // Use try_lock to avoid blocking when backfill/poll holds the lock.
         if let Ok(pipelines) = self.pipelines.try_lock() {
@@ -2125,16 +2373,20 @@ impl TheDeskMcp {
                 },
                 "currentPrice": if last_price > 0.0 { Some(last_price) } else { None::<f64> },
             });
-            return Ok(text_result(build_tape_pace_response(
-                payload,
-                data_age_ms,
-                true,
-                now_ms,
-            )));
+            let mut out = build_tape_pace_response(payload, data_age_ms, true, now_ms);
+            if let Some(ref r) = live_view {
+                merge_tool_live_metadata(&mut out, r);
+            }
+            return Ok(text_result(out));
         }
         // Fallback to DB
-        match self.try_latest_feature_state() {
-            Some((s, _)) => {
+        match self
+            .db
+            .lock()
+            .ok()
+            .and_then(|d| d.latest_feature_state_with_timestamp().ok().flatten())
+        {
+            Some((_, s)) => {
                 let payload = serde_json::json!({
                     "ticksPerSec5s": s.get("tapePace5s").cloned().unwrap_or(serde_json::Value::Null),
                     "ticksPerSec30s": s.get("tapePace30s").cloned().unwrap_or(serde_json::Value::Null),
@@ -2159,12 +2411,11 @@ impl TheDeskMcp {
                     "dwellAtCurrentPriceMs": s.get("tapeDwellAtCurrentPriceMs").cloned().unwrap_or(serde_json::Value::Null),
                     "currentPrice": s.get("lastPrice").cloned().unwrap_or(serde_json::Value::Null),
                 });
-                Ok(text_result(build_tape_pace_response(
-                    payload,
-                    data_age_ms,
-                    false,
-                    now_ms,
-                )))
+                let mut out = build_tape_pace_response(payload, data_age_ms, false, now_ms);
+                if let Some(ref r) = live_view {
+                    merge_tool_live_metadata(&mut out, r);
+                }
+                Ok(text_result(out))
             }
             None => Ok(no_data("No tape pace data")),
         }
@@ -2937,7 +3188,7 @@ impl TheDeskMcp {
                     "events": events,
                     "count": events.len(),
                     "source": "live_pipeline",
-                    "dataAgeMs": self.try_data_age_ms().unwrap_or(-1.0)
+                    "dataAgeMs": self.data_age_from_db_or_atomic()
                 })));
             }
         }
@@ -4486,10 +4737,21 @@ impl TheDeskMcp {
         let source_state = if !file_exists {
             "missing"
         } else {
-            freshness_status(data_age_ms)
+            freshness_status_from_age(data_age_ms)
         };
 
+        let fr = &self.feed_runtime;
+        let last_scid_tick = tick_ms_from_bits(fr.last_scid_tick_ms_bits.load(Ordering::Acquire));
+        let last_depth_ts =
+            tick_ms_from_bits(fr.last_depth_timestamp_ms_bits.load(Ordering::Acquire));
+        let scid_offset = fr.scid_tail_offset.load(Ordering::Acquire);
+        let scid_len = fr.scid_file_len.load(Ordering::Acquire);
+        let scid_resets = fr.scid_tail_reset_count.load(Ordering::Acquire);
+        let shrink_len = fr.scid_last_shrink_len.load(Ordering::Acquire);
+        let pipeline_contended = fr.pipeline_lock_contended.load(Ordering::Acquire);
+
         Ok(text_result(serde_json::json!({
+            "liveDataSource": "scid",
             "rootSymbol": contract.root_symbol,
             "contractSymbol": contract.contract_symbol,
             "contractMonth": contract.contract_month,
@@ -4507,7 +4769,14 @@ impl TheDeskMcp {
             "dbTickCount": tick_count,
             "ingestLagMs": data_age_ms,
             "sourceState": source_state,
-            "dataAgeMs": data_age_ms
+            "dataAgeMs": data_age_ms,
+            "lastScidTickTimestampMs": last_scid_tick,
+            "lastDepthTimestampMs": last_depth_ts,
+            "scidTailOffsetBytes": scid_offset,
+            "scidFileLenBytes": scid_len,
+            "scidTailResetCount": scid_resets,
+            "scidLastShrinkFileLenBytes": shrink_len,
+            "pipelineLockRecentlyContended": pipeline_contended
         })))
     }
 
@@ -4651,12 +4920,7 @@ impl TheDeskMcp {
         &self,
         Parameters(params): Parameters<CompareSessionsParams>,
     ) -> Result<CallToolResult, McpError> {
-        let snapshot = self.live_snapshot().or_else(|| {
-            self.db
-                .lock()
-                .ok()
-                .and_then(|d| d.latest_feature_state().ok().flatten())
-        });
+        let snapshot = self.current_snapshot_value();
         let ib_range = params.current_ib_range.unwrap_or_else(|| {
             snapshot
                 .as_ref()
@@ -5308,15 +5572,23 @@ impl TheDeskMcp {
                 })
                 .collect();
 
-            return Ok(text_result(serde_json::json!({
+            let session_delta = pipelines.delta.session_delta();
+            drop(pipelines);
+
+            let mut out = serde_json::json!({
                 "price": price,
                 "deltaAtPrice": delta,
                 "confirmsBuy": confirms_buy,
                 "confirmsSell": confirms_sell,
-                "sessionDelta": pipelines.delta.session_delta(),
+                "sessionDelta": session_delta,
                 "topPricesByDelta": top,
-                "dataAgeMs": self.try_data_age_ms().unwrap_or(-1.0)
-            })));
+            });
+            if let Some(r) = self.resolve_live_market_view() {
+                merge_tool_live_metadata(&mut out, &r);
+            } else {
+                out["dataAgeMs"] = serde_json::json!(self.data_age_from_db_or_atomic());
+            }
+            return Ok(text_result(out));
         }
         Ok(no_data(
             "Delta at price requires live pipeline. Pipeline not available.",
@@ -5343,40 +5615,48 @@ impl TheDeskMcp {
             let price = params.price.unwrap_or(pipelines.levels.last_price);
             let price_delta = pipelines.delta.delta_at_price(price);
             let price_confirms = pipelines.delta.delta_confirmation_at_price(price, is_buy);
-            return Ok(text_result(serde_json::json!({
+            let both = session_confirms && price_confirms;
+            drop(pipelines);
+
+            let mut out = serde_json::json!({
                 "sessionDeltaConfirms": session_confirms,
                 "sessionDelta": session_delta,
                 "priceLevelDeltaConfirms": price_confirms,
                 "deltaAtPrice": price_delta,
                 "price": price,
-                "bothConfirm": session_confirms && price_confirms,
+                "bothConfirm": both,
                 "direction": if is_buy { "long" } else { "short" },
-                "dataAgeMs": self.try_data_age_ms().unwrap_or(-1.0)
-            })));
+            });
+            if let Some(r) = self.resolve_live_market_view() {
+                merge_tool_live_metadata(&mut out, &r);
+            } else {
+                out["dataAgeMs"] = serde_json::json!(self.data_age_from_db_or_atomic());
+            }
+            return Ok(text_result(out));
         }
 
         // Fallback: session-level only
-        match self.try_latest_feature_state() {
-            Some((s, data_age_ms)) => {
-                let session_delta = s
-                    .get("sessionDelta")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(0.0);
-                let confirmed = if is_buy {
-                    session_delta > 0.0
-                } else {
-                    session_delta < 0.0
-                };
-                Ok(text_result(serde_json::json!({
-                    "sessionDeltaConfirms": confirmed,
-                    "sessionDelta": session_delta,
-                    "direction": if is_buy { "long" } else { "short" },
-                    "note": "Price-level delta not available (pipeline not live).",
-                    "dataAgeMs": data_age_ms
-                })))
-            }
-            None => Ok(no_data("No delta data available")),
+        if let Some(r) = self.resolve_live_market_view() {
+            let s = &r.snapshot;
+            let session_delta = s
+                .get("sessionDelta")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            let confirmed = if is_buy {
+                session_delta > 0.0
+            } else {
+                session_delta < 0.0
+            };
+            let mut out = serde_json::json!({
+                "sessionDeltaConfirms": confirmed,
+                "sessionDelta": session_delta,
+                "direction": if is_buy { "long" } else { "short" },
+                "note": "Price-level delta not available (pipeline not live).",
+            });
+            merge_tool_live_metadata(&mut out, &r);
+            return Ok(text_result(out));
         }
+        Ok(no_data("No delta data available"))
     }
 
     #[tool(
@@ -5386,10 +5666,14 @@ impl TheDeskMcp {
         &self,
         Parameters(params): Parameters<SetupContextParams>,
     ) -> Result<CallToolResult, McpError> {
+        let r = self.resolve_live_market_view();
+        let snapshot = r.as_ref().map(|v| v.snapshot.clone()).or_else(|| {
+            self.db
+                .lock()
+                .ok()
+                .and_then(|d| d.latest_feature_state().ok().flatten())
+        });
         let db = self.db.lock().map_err(|_| lock_error())?;
-        let snapshot = self
-            .live_snapshot()
-            .or_else(|| db.latest_feature_state().ok().flatten());
         let dom_feature = db.latest_dom_feature_state().ok().flatten();
         let risk = db.load_risk_state().ok().flatten();
         let setup_name = params.setup_name.unwrap_or_default();
@@ -5440,7 +5724,7 @@ impl TheDeskMcp {
             });
         }
 
-        Ok(text_result(serde_json::json!({
+        let mut out = serde_json::json!({
             "setupName": setup_name,
             "marketSnapshot": snapshot,
             "domSummary": dom_feature.as_ref().and_then(|(_, payload)| payload.get("domSummary")).cloned(),
@@ -5448,9 +5732,14 @@ impl TheDeskMcp {
             "recentPullStackSummary": dom_feature.as_ref().and_then(|(_, payload)| payload.get("activity")).cloned(),
             "nearbyLevelReactionContext": nearby_levels,
             "riskState": risk,
-            "dataAgeMs": compute_data_age(&db),
             "guidance": "Your playbook defines this setup. Evaluate all conditions before entry."
-        })))
+        });
+        if let Some(ref res) = r {
+            merge_tool_live_metadata(&mut out, res);
+        } else {
+            out["dataAgeMs"] = serde_json::json!(compute_data_age(&db));
+        }
+        Ok(text_result(out))
     }
 
     #[tool(
@@ -5460,76 +5749,76 @@ impl TheDeskMcp {
         &self,
         Parameters(params): Parameters<ProximityParams>,
     ) -> Result<CallToolResult, McpError> {
-        match self.snapshot_with_fallback() {
-            Some((s, data_age_ms, _)) => {
-                let last_price = s.get("lastPrice").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                let max_ticks = params.max_distance_ticks.unwrap_or(20.0);
+        if let Some(r) = self.resolve_live_market_view() {
+            let s = &r.snapshot;
+            let last_price = s.get("lastPrice").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let max_ticks = params.max_distance_ticks.unwrap_or(20.0);
 
-                let mut levels = Vec::new();
-                let level_keys = [
-                    ("priorDayHigh", "PriorDayHigh"),
-                    ("priorDayLow", "PriorDayLow"),
-                    ("priorDayClose", "PriorDayClose"),
-                    ("priorVaHigh", "PriorVaHigh"),
-                    ("priorVaLow", "PriorVaLow"),
-                    ("priorPoc", "PriorPoc"),
-                    ("overnightHigh", "OvernightHigh"),
-                    ("overnightLow", "OvernightLow"),
-                    ("globexOr30High", "GlobexOr30High"),
-                    ("globexOr30Low", "GlobexOr30Low"),
-                    ("londonOr60High", "LondonOr60High"),
-                    ("londonOr60Low", "LondonOr60Low"),
-                    ("ibHigh", "IbHigh"),
-                    ("ibLow", "IbLow"),
-                    ("orHigh", "OrHigh"),
-                    ("orLow", "OrLow"),
-                    ("or5Mid", "Or5Mid"),
-                    ("poc", "Poc"),
-                    ("vaHigh", "VaHigh"),
-                    ("vaLow", "VaLow"),
-                    ("dnvaHigh", "DnvaHigh"),
-                    ("dnvaLow", "DnvaLow"),
-                    ("dnp", "Dnp"),
-                ];
-                for (key, label) in &level_keys {
-                    if let Some(price) = s.get(*key).and_then(|v| v.as_f64()) {
-                        if price > 0.0 {
-                            let dist = ((last_price - price) / 0.25).abs();
-                            if dist <= max_ticks {
-                                levels.push(serde_json::json!({
-                                    "level": label,
-                                    "price": price,
-                                    "distanceTicks": dist,
-                                }));
-                            }
+            let mut levels = Vec::new();
+            let level_keys = [
+                ("priorDayHigh", "PriorDayHigh"),
+                ("priorDayLow", "PriorDayLow"),
+                ("priorDayClose", "PriorDayClose"),
+                ("priorVaHigh", "PriorVaHigh"),
+                ("priorVaLow", "PriorVaLow"),
+                ("priorPoc", "PriorPoc"),
+                ("overnightHigh", "OvernightHigh"),
+                ("overnightLow", "OvernightLow"),
+                ("globexOr30High", "GlobexOr30High"),
+                ("globexOr30Low", "GlobexOr30Low"),
+                ("londonOr60High", "LondonOr60High"),
+                ("londonOr60Low", "LondonOr60Low"),
+                ("ibHigh", "IbHigh"),
+                ("ibLow", "IbLow"),
+                ("orHigh", "OrHigh"),
+                ("orLow", "OrLow"),
+                ("or5Mid", "Or5Mid"),
+                ("poc", "Poc"),
+                ("vaHigh", "VaHigh"),
+                ("vaLow", "VaLow"),
+                ("dnvaHigh", "DnvaHigh"),
+                ("dnvaLow", "DnvaLow"),
+                ("dnp", "Dnp"),
+            ];
+            for (key, label) in &level_keys {
+                if let Some(price) = s.get(*key).and_then(|v| v.as_f64()) {
+                    if price > 0.0 {
+                        let dist = ((last_price - price) / 0.25).abs();
+                        if dist <= max_ticks {
+                            levels.push(serde_json::json!({
+                                "level": label,
+                                "price": price,
+                                "distanceTicks": dist,
+                            }));
                         }
                     }
                 }
-                levels.sort_by(|a, b| {
-                    let da = a["distanceTicks"].as_f64().unwrap_or(f64::MAX);
-                    let db_val = b["distanceTicks"].as_f64().unwrap_or(f64::MAX);
-                    da.partial_cmp(&db_val).unwrap_or(std::cmp::Ordering::Equal)
-                });
-                let session_type = s
-                    .get("sessionType")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("Unknown");
-                let session_segment = s
-                    .get("sessionSegment")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("None");
-                Ok(text_result(serde_json::json!({
-                    "sessionType": session_type,
-                    "sessionSegment": session_segment,
-                    "tradingDay": s.get("tradingDay"),
-                    "lastPrice": last_price,
-                    "maxDistanceTicks": max_ticks,
-                    "nearbyLevels": levels,
-                    "dataAgeMs": data_age_ms
-                })))
             }
-            None => Ok(no_data("No market data available for proximity report")),
+            levels.sort_by(|a, b| {
+                let da = a["distanceTicks"].as_f64().unwrap_or(f64::MAX);
+                let db_val = b["distanceTicks"].as_f64().unwrap_or(f64::MAX);
+                da.partial_cmp(&db_val).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let session_type = s
+                .get("sessionType")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Unknown");
+            let session_segment = s
+                .get("sessionSegment")
+                .and_then(|v| v.as_str())
+                .unwrap_or("None");
+            let mut out = serde_json::json!({
+                "sessionType": session_type,
+                "sessionSegment": session_segment,
+                "tradingDay": s.get("tradingDay"),
+                "lastPrice": last_price,
+                "maxDistanceTicks": max_ticks,
+                "nearbyLevels": levels,
+            });
+            merge_tool_live_metadata(&mut out, &r);
+            return Ok(text_result(out));
         }
+        Ok(no_data("No market data available for proximity report"))
     }
 
     #[tool(
@@ -5545,10 +5834,18 @@ impl TheDeskMcp {
         let now_ms = chrono::Utc::now().timestamp_millis() as f64;
         let age_ms = last_ts.map(|v| now_ms - v).unwrap_or(f64::INFINITY);
         let stream_fresh = age_ms.is_finite() && age_ms <= FRESHNESS_THRESHOLD_MS;
+        let fr = &self.feed_runtime;
+        let atomic_scid_ts = tick_ms_from_bits(fr.last_scid_tick_ms_bits.load(Ordering::Acquire));
+        let atomic_age_ms = atomic_scid_ts
+            .map(|t| (now_ms - t).max(0.0))
+            .unwrap_or(f64::INFINITY);
+        let stream_fresh_atomic =
+            atomic_age_ms.is_finite() && atomic_age_ms <= FRESHNESS_THRESHOLD_MS;
 
         let mut checks = serde_json::json!({
             "rawTicksPresent": tick_count > 0,
             "streamFresh": stream_fresh,
+            "streamFreshByPipelineAtomic": stream_fresh_atomic,
             "freshnessThresholdMs": FRESHNESS_THRESHOLD_MS,
         });
         let mut invariants_ok = true;
@@ -5559,7 +5856,8 @@ impl TheDeskMcp {
             });
             invariants_ok &= passed;
         }
-        let status = if tick_count == 0 || !stream_fresh || !invariants_ok {
+        let status = if tick_count == 0 || (!stream_fresh && !stream_fresh_atomic) || !invariants_ok
+        {
             "warning"
         } else {
             "ok"
@@ -5567,8 +5865,19 @@ impl TheDeskMcp {
 
         let result = serde_json::json!({
             "status": status,
+            "liveDataSource": "scid",
             "tickCount": tick_count,
             "lastTickAgeMs": if age_ms.is_finite() { age_ms } else { -1.0 },
+            "pipelineAtomicTickAgeMs": if atomic_age_ms.is_finite() {
+                atomic_age_ms
+            } else {
+                -1.0
+            },
+            "scidTailResetCount": fr.scid_tail_reset_count.load(Ordering::Acquire),
+            "pipelineLockRecentlyContended": fr.pipeline_lock_contended.load(Ordering::Acquire),
+            "lastDepthTimestampMs": tick_ms_from_bits(
+                fr.last_depth_timestamp_ms_bits.load(Ordering::Acquire),
+            ),
             "checks": checks
         });
 
@@ -5584,9 +5893,10 @@ impl ServerHandler for TheDeskMcp {
         ServerInfo {
             instructions: Some(
                 "The Desk - AI trading co-pilot backend for NQ futures. \
+                 Live data: Sierra Chart `.scid` ticks plus optional `MarketDepthData` `.depth` files only. \
                  Provides real-time market structure (VWAP, TPO, Delta), \
                  microstructure analytics (tape pace, footprint, absorption), \
-                 and playbook evaluation via Sierra Chart .scid data. \
+                 and playbook evaluation. \
                  All coaching frames as 'your playbook says...' -- never advisory."
                     .into(),
             ),
@@ -5825,6 +6135,7 @@ fn persist_depth_records(
     book: &DepthBook,
     records: &[the_desk_backend::depth::DepthRecord],
     batch_id: &mut i64,
+    feed_rt: &McpFeedRuntimeState,
 ) {
     if records.is_empty() {
         return;
@@ -5915,6 +6226,9 @@ fn persist_depth_records(
             feature.timestamp_ms,
             &feature.dom_summary,
         );
+        feed_rt
+            .last_depth_timestamp_ms_bits
+            .store(tick_ms_to_bits(feature.timestamp_ms), Ordering::Release);
     }
 }
 
@@ -6171,6 +6485,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let price_scale = config.price_scale;
         let reader_path = reader.path().to_path_buf();
         let contract_metadata = resolve_contract_metadata(&config);
+        let feed_rt_bg = Arc::clone(&server.feed_runtime);
 
         tokio::spawn(async move {
             use std::io::{Read, Seek, SeekFrom};
@@ -6178,6 +6493,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let poll = Duration::from_millis(poll_ms.max(250));
             let mut offset: u64 = 0;
+            let mut last_market_tick_ts: f64 = 0.0;
             let mut persist_counter: u64 = 0;
             let mut event_buffer = Vec::new();
             let mut tick_buffer: Vec<RawTickBatchRow> = Vec::new();
@@ -6209,7 +6525,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Err(_) => continue,
                 };
                 let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+                feed_rt_bg.scid_file_len.store(len, Ordering::Release);
+                feed_rt_bg.last_scid_poll_wall_ms.store(
+                    chrono::Utc::now().timestamp_millis() as u64,
+                    Ordering::Release,
+                );
+
+                let hsz = ScidReader::header_size_bytes_for_path(&reader_path).unwrap_or(56);
+
+                if len < offset {
+                    offset = scid_tail_offset_after_shrink(len, hsz);
+                    feed_rt_bg.scid_tail_offset.store(offset, Ordering::Release);
+                    feed_rt_bg
+                        .scid_last_shrink_len
+                        .store(len, Ordering::Release);
+                    feed_rt_bg
+                        .scid_tail_reset_count
+                        .fetch_add(1, Ordering::AcqRel);
+                    eprintln!(
+                        "[the-desk-mcp] SCID file shrank below tail offset; reset offset to {}",
+                        offset
+                    );
+                }
+
+                if offset >= hsz {
+                    let rel = offset - hsz;
+                    if !rel.is_multiple_of(SCID_RECORD_SIZE as u64) {
+                        let new_off = scid_tail_offset_after_shrink(len, hsz);
+                        if new_off != offset {
+                            offset = new_off;
+                            feed_rt_bg
+                                .scid_tail_reset_count
+                                .fetch_add(1, Ordering::AcqRel);
+                            eprintln!(
+                                "[the-desk-mcp] SCID tail offset was not record-aligned; realigned to {}",
+                                offset
+                            );
+                        }
+                    }
+                } else if len >= hsz {
+                    offset = hsz;
+                }
+
                 if len <= offset {
+                    feed_rt_bg.scid_tail_offset.store(offset, Ordering::Release);
                     continue;
                 }
                 if file.seek(SeekFrom::Start(offset)).is_err() {
@@ -6221,6 +6580,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 while file.read_exact(&mut record).is_ok() {
                     offset += 40;
                     if let Some(tick) = parse_record_scaled(&record, price_scale) {
+                        last_market_tick_ts = tick.timestamp_ms;
+                        feed_rt_bg
+                            .last_scid_tick_ms_bits
+                            .store(tick_ms_to_bits(tick.timestamp_ms), Ordering::Release);
                         // Detect session and segment boundaries during live polling
                         if let Some(et_min) = et_minutes_from_timestamp(tick.timestamp_ms) {
                             let new_session = classify_session(et_min);
@@ -6393,6 +6756,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
+                let aligned_end = scid_tail_offset_after_shrink(len, hsz);
+                if offset > aligned_end {
+                    offset = aligned_end;
+                    feed_rt_bg
+                        .scid_tail_reset_count
+                        .fetch_add(1, Ordering::AcqRel);
+                    eprintln!(
+                        "[the-desk-mcp] SCID tail offset past last full record; clipped to {}",
+                        offset
+                    );
+                }
+                feed_rt_bg.scid_tail_offset.store(offset, Ordering::Release);
+
                 // Flush remaining events
                 if !event_buffer.is_empty() {
                     if let Ok(db) = db_bg.lock() {
@@ -6421,11 +6797,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         ) {
                             let bid = if *b > 0.0 { *b } else { 0.0 };
                             let ask = if *a > 0.0 { *a } else { 0.0 };
-                            if bid > 0.0 {
+                            if bid > 0.0
+                                && last_market_tick_ts.is_finite()
+                                && last_market_tick_ts > 0.0
+                            {
                                 let snapshot = p.snapshot(bid, ask);
-                                let ts = chrono::Utc::now().timestamp_millis() as f64;
                                 let _ = db.upsert_feature_state(
-                                    ts,
+                                    last_market_tick_ts,
                                     &serde_json::to_value(&snapshot).unwrap_or_default(),
                                 );
                             }
@@ -6441,6 +6819,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let db_depth = Arc::clone(&server.db);
         let last_bid_depth = Arc::clone(&server.last_bid);
         let last_ask_depth = Arc::clone(&server.last_ask);
+        let feed_depth_rt = Arc::clone(&server.feed_runtime);
 
         tokio::spawn(async move {
             let poll = Duration::from_millis(1_000);
@@ -6479,6 +6858,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 &book,
                                 &new_records,
                                 &mut batch_id,
+                                feed_depth_rt.as_ref(),
                             );
                         }
                     }
@@ -6619,6 +6999,14 @@ mod tests {
             rendered.get("eventTimeLagMs").and_then(|v| v.as_f64()),
             Some(1_000.0)
         );
+    }
+
+    #[test]
+    fn tick_ms_bits_roundtrip_positive() {
+        let t = 1_700_000_000_123.0;
+        assert_eq!(tick_ms_from_bits(tick_ms_to_bits(t)), Some(t));
+        assert_eq!(tick_ms_to_bits(0.0), 0);
+        assert_eq!(tick_ms_from_bits(0), None);
     }
 
     #[test]

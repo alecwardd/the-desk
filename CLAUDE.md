@@ -134,7 +134,7 @@ These terms have precise meanings. Using them incorrectly will produce a broken 
 4. **Ground opinions in data and playbook rules.** Sharing a market read or saying "I like this" / "I'd be cautious here" is encouraged — but always tie it back to what the structure and the trader's rules show. The trader makes the final call.
 5. **Never send raw market data to the Claude API.** Send structured summaries only.
 6. **Never store API keys in code or config files that get committed.** Use `.env` or system keychain.
-7. **Never block the main thread.** Long operations (DTC, LLM API, file I/O) run in background tasks.
+7. **Never block the main thread.** Long operations (feed I/O, LLM API, file I/O) run in background tasks.
 8. **Never recalculate entire profiles from scratch on each tick.** All pipeline math is incremental.
 9. **Never mix RTH and Globex data in the same calculation** without explicit scoping.
 10. **Never skip the rules engine and go directly from pipeline to LLM.** The deterministic layer must always evaluate first.
@@ -148,7 +148,7 @@ Read these before working on related components:
 | Skill | When to Read | Path |
 |-------|-------------|------|
 | Trading Domain | Before implementing any pipeline or playbook logic | `skills/trading-domain/SKILL.md` |
-| DTC Protocol | Before working on the data feed or .scid reader | `skills/dtc-protocol/SKILL.md` |
+| Sierra SCID / feed | Before working on `.scid` tailing, symbol resolution, or `.depth` | `skills/trading-domain/SKILL.md` + `src-tauri/src/feed/` |
 | Compliance | Before writing prompts or marketing text | `skills/compliance-research/SKILL.md` |
 | Tauri Bridge | Before implementing IPC between Rust and React | `skills/tauri-bridge/SKILL.md` |
 
@@ -187,7 +187,6 @@ the-desk/
 │   │   ├── mod.rs                    # FeedEvent, FeedConfig
 │   │   └── scid_reader.rs           # .scid binary file parser
 │   ├── db/mod.rs                     # SQLite schema + operations
-│   ├── dtc/                          # DTC protocol (legacy reference)
 │   ├── risk/mod.rs                   # Risk state tracking
 │   └── recording/mod.rs             # Session recording + replay
 ├── src/                              # React frontend (optional — only when explicitly asked)
@@ -197,7 +196,6 @@ the-desk/
 ├── agents/                           # Cursor agent definitions
 ├── skills/                           # Domain knowledge for agents
 │   ├── trading-domain/SKILL.md       # TPO, delta, PTT methodology
-│   ├── dtc-protocol/                 # DTC + .scid format reference
 │   ├── compliance-research/          # Coaching vs advisory
 │   └── tauri-bridge/                 # IPC patterns
 ├── .cursor/                          # Cursor IDE integration

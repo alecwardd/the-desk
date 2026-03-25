@@ -31,6 +31,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut end_date: Option<String> = None;
     let mut force = false;
     let mut run_rules = false;
+    let mut status_only = false;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -46,6 +47,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--run-rules" | "-r" => {
                 run_rules = true;
             }
+            "--status" => {
+                status_only = true;
+            }
             "--help" | "-h" => {
                 eprintln!(
                     r#"the-desk-backfill — Load historical .scid data into the database
@@ -58,6 +62,7 @@ Options:
   --end, -e DATE      End date (YYYY-MM-DD). Omit for through today.
   --force, -f         Reprocess sessions even if summaries exist.
   --run-rules, -r     Run rules engine to populate signal outcomes (backtest).
+  --status            Show database coverage only (session count and date range). No backfill.
   --help, -h          Show this help.
 
 Examples:
@@ -82,6 +87,25 @@ Config: ~/.the-desk/config.toml (sierra_data_dir, symbol)
         }
     }
 
+    let db_path = data_dir().join("data.db");
+    let db = Database::open(&db_path.to_string_lossy())?;
+
+    if status_only {
+        let count = db.session_summary_count().unwrap_or(0);
+        let (min_date, max_date) = db.session_summary_date_range().unwrap_or((None, None));
+        println!("Database: {}", db_path.display());
+        println!("  Session summaries: {}", count);
+        println!(
+            "  Date range: {} through {}",
+            min_date.as_deref().unwrap_or("—"),
+            max_date.as_deref().unwrap_or("—")
+        );
+        if count > 0 {
+            println!("  Backfill coverage is already in the database for the above range.");
+        }
+        return Ok(());
+    }
+
     let config = load_feed_config();
     let reader = ScidReader::from_feed_config(&config);
 
@@ -91,9 +115,6 @@ Config: ~/.the-desk/config.toml (sierra_data_dir, symbol)
         eprintln!("Default: sierra_data_dir = \"C:\\\\SierraChart\\\\Data\", symbol = \"NQ\"");
         std::process::exit(1);
     }
-
-    let db_path = data_dir().join("data.db");
-    let db = Database::open(&db_path.to_string_lossy())?;
 
     let job_id = uuid::Uuid::new_v4().to_string();
     let cancel_flag = AtomicBool::new(false);

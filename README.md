@@ -122,14 +122,12 @@ the-desk/
 │   ├── db/mod.rs               # SQLite schema + operations
 │   ├── risk/mod.rs             # Risk state tracking
 │   ├── recording/mod.rs        # Session recording + replay
-│   └── dtc/                    # DTC protocol client (legacy)
 ├── skills/                     # Domain knowledge for agents
 │   ├── trading-domain/SKILL.md # TPO, delta, PTT methodology
-│   ├── dtc-protocol/           # DTC protocol reference
 │   ├── compliance-research/    # Coaching vs advisory positioning
 │   └── tauri-bridge/           # IPC patterns
 ├── docs/dom-replay.md          # DOM replay visualizer guide for users and agents
-├── agents/                     # Cursor agent definitions (10 agents)
+├── agents/                     # Cursor agent definitions
 ├── CLAUDE.md                   # Project rules for all agents
 └── AGENT.md                    # Agent workflow instructions
 ```

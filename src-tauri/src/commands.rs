@@ -9,9 +9,8 @@ use the_desk_backend::dom_replay::{
     apply_event_and_frame, build_clip, frame_from_state, seek_cursor_for_timestamp,
     state_at_cursor, DomReplayEventKind, DomReplayLoadResult, DomReplayStatus,
 };
-use the_desk_backend::dtc::{run_mock_dtc_server, TradeSide};
 use the_desk_backend::feed::scid_reader::ScidReader;
-use the_desk_backend::feed::{load_feed_config, FeedEvent};
+use the_desk_backend::feed::{load_feed_config, FeedEvent, TradeSide};
 use the_desk_backend::memory::{
     build_memory_brief, detect_behavioral_patterns, MemoryBrief, MemoryBriefQuery,
 };
@@ -81,39 +80,16 @@ fn anthropic_api_key() -> Result<String, String> {
         })
 }
 
-/// Connect to a DTC server and begin streaming market data for the given symbol.
+/// Return whether the SCID tail task is running (`connected` / `disconnected`).
 #[tauri::command]
-pub async fn connect_dtc(
-    state: State<'_, AppState>,
-    host: String,
-    port: u16,
-    symbol: String,
-) -> Result<(), String> {
-    let mut dtc = state.dtc.lock().await;
-    dtc.start_live_feed(&host, port, &symbol)
-        .await
-        .map_err(|e| e.to_string())
-}
-
-/// Disconnect the active DTC data feed.
-#[tauri::command]
-pub async fn disconnect_dtc(state: State<'_, AppState>) -> Result<(), String> {
-    let mut dtc = state.dtc.lock().await;
-    dtc.disconnect().await.map_err(|e| e.to_string())
-}
-
-/// Return the current DTC connection state as a human-readable string.
-#[tauri::command]
-pub async fn dtc_status(state: State<'_, AppState>) -> Result<String, String> {
-    let dtc = state.dtc.lock().await;
-    let status = match dtc.state() {
-        the_desk_backend::dtc::ConnectionState::Disconnected => "disconnected",
-        the_desk_backend::dtc::ConnectionState::Connecting => "connecting",
-        the_desk_backend::dtc::ConnectionState::EncodingNegotiated => "negotiating",
-        the_desk_backend::dtc::ConnectionState::Authenticated => "authenticated",
-        the_desk_backend::dtc::ConnectionState::Subscribed => "connected",
-    };
-    Ok(status.to_string())
+pub async fn feed_status(state: State<'_, AppState>) -> Result<String, String> {
+    let task = state.scid_feed_task.lock().await;
+    Ok(if task.as_ref().is_some_and(|t| !t.is_finished()) {
+        "connected"
+    } else {
+        "disconnected"
+    }
+    .to_string())
 }
 
 /// List all persisted setup definitions.
@@ -425,7 +401,7 @@ pub async fn start_replay(state: State<'_, AppState>, speed: Option<f64>) -> Res
     let start_index = replay.cursor.min(replay.entries.len().saturating_sub(1));
     let entries = replay.entries.clone();
     let speed = speed.unwrap_or(1.0).clamp(0.25, 8.0);
-    let tx = state.dtc_tx.clone();
+    let tx = state.feed_tx.clone();
     let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
     replay.stop_tx = Some(stop_tx);
     replay.task = Some(tauri::async_runtime::spawn(async move {
@@ -729,25 +705,6 @@ async fn emit_dom_replay_preview(
     Ok(())
 }
 
-/// Start the mock DTC server and auto-connect for development.
-#[tauri::command]
-pub async fn start_mock_feed(state: State<'_, AppState>) -> Result<(), String> {
-    let addr = "127.0.0.1:11099";
-
-    tauri::async_runtime::spawn(async move {
-        if let Err(e) = run_mock_dtc_server(addr).await {
-            eprintln!("Mock server error: {e}");
-        }
-    });
-
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
-    let mut dtc = state.dtc.lock().await;
-    dtc.start_live_feed("127.0.0.1", 11099, "NQ")
-        .await
-        .map_err(|e| e.to_string())
-}
-
 /// Start SCID tail feed using `~/.the-desk/config.toml` feed settings.
 #[tauri::command]
 pub async fn start_scid_feed(state: State<'_, AppState>) -> Result<(), String> {
@@ -769,7 +726,7 @@ pub async fn start_scid_feed(state: State<'_, AppState>) -> Result<(), String> {
     }
 
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
-    let task = reader.spawn_tail_loop(state.dtc_tx.clone(), stop_rx, cfg.flush_poll_ms);
+    let task = reader.spawn_tail_loop(state.feed_tx.clone(), stop_rx, cfg.flush_poll_ms);
     *state.scid_shutdown_tx.lock().await = Some(stop_tx);
     *state.scid_feed_task.lock().await = Some(task);
     Ok(())

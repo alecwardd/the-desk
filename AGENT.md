@@ -59,9 +59,9 @@ When you need specialized help, spawn subagents for these tasks.
 **How:** Use `orchestrator` (defined in `agents/orchestrator.md`). The orchestrator routes to all specialist agents and ensures risk-coach context is present on every interaction. It calls the same MCP tools the specialists use, with its own synthesis logic and a mandatory risk footer on every response.
 **Definition:** `agents/orchestrator.md`
 
-### DTC Protocol Research
-**When:** Working on the DTC client or .scid data parsing
-**How:** Delegate to `dtc-protocol-researcher` (defined in `agents/dtc-protocol-researcher.md`)
+### Sierra data feed (.scid / `.depth`)
+**When:** Working on live ingestion, SCID tailing, symbol resolution, or `MarketDepthData` parsing
+**How:** Read `skills/trading-domain/SKILL.md` for session semantics; inspect `src-tauri/src/feed/scid_reader.rs` and `src-tauri/src/depth/` for formats. Live paths are **Sierra `.scid` + optional `.depth` files only** (no socket DTC client in-tree).
 
 ### Pipeline Verification
 **When:** After implementing or modifying a market structure pipeline

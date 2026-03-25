@@ -9,7 +9,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{sleep, Duration};
 
 const SCID_HEADER_SIZE: usize = 56;
-const SCID_RECORD_SIZE: usize = 40;
+pub const SCID_RECORD_SIZE: usize = 40;
 const SCID_MAGIC: &[u8; 4] = b"SCID";
 const SC_TO_UNIX_EPOCH_US: i64 = 2_209_161_600_000_000;
 
@@ -31,6 +31,17 @@ pub struct ScidTick {
     pub bid: f64,
     pub ask: f64,
     pub side: TradeSide,
+}
+
+/// After a `.scid` file shrinks or rotates, align the read offset to the last full record at EOF.
+pub fn scid_tail_offset_after_shrink(file_len_bytes: u64, header_size_bytes: u64) -> u64 {
+    let rec = SCID_RECORD_SIZE as u64;
+    if file_len_bytes <= header_size_bytes {
+        header_size_bytes
+    } else {
+        let body = file_len_bytes - header_size_bytes;
+        header_size_bytes + (body / rec) * rec
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +95,13 @@ impl ScidReader {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Header size in bytes for a `.scid` file (typically 56).
+    pub fn header_size_bytes_for_path(path: &Path) -> Result<u64, ScidError> {
+        let mut file = File::open(path)?;
+        let h = Self::read_header(&mut file)?;
+        Ok(h.header_size as u64)
     }
 
     fn read_header(file: &mut File) -> Result<ScidHeader, ScidError> {
@@ -365,6 +383,21 @@ impl ScidReader {
                     }
                 };
 
+                // File truncation / rotation: offset past EOF — realign to last full record.
+                if len < offset {
+                    match Self::header_size_bytes_for_path(&path) {
+                        Ok(hsz) => {
+                            offset = scid_tail_offset_after_shrink(len, hsz);
+                        }
+                        Err(_) => {
+                            header_checked = false;
+                            offset = 0;
+                            sleep(poll).await;
+                            continue;
+                        }
+                    }
+                }
+
                 if len <= offset {
                     sleep(poll).await;
                     continue;
@@ -538,5 +571,16 @@ mod tests {
             .estimate_range_records(Some(all[1].timestamp_ms), Some(all[3].timestamp_ms))
             .expect("estimate");
         assert_eq!(estimate, 2);
+    }
+
+    #[test]
+    fn tail_offset_after_shrink_aligns_to_full_records() {
+        let h = 56_u64;
+        let r = SCID_RECORD_SIZE as u64;
+        let len = h + 3 * r;
+        assert_eq!(scid_tail_offset_after_shrink(len, h), len);
+        let one_rec = h + r;
+        assert_eq!(scid_tail_offset_after_shrink(one_rec, h), one_rec);
+        assert_eq!(scid_tail_offset_after_shrink(h, h), h);
     }
 }

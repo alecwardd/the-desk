@@ -27,7 +27,8 @@ export const events = {
   setupAlert: "setup-alert",
   coachingPrompt: "coaching-prompt",
   riskState: "risk-state",
-  dtcStatus: "dtc-status",
+  /** Live SCID / replay feed connection state */
+  feedStatus: "feed-status",
   domReplayFrame: "dom-replay-frame",
 } as const;
 
@@ -39,13 +40,15 @@ export async function subscribe<T>(
   return unlisten;
 }
 
-export const dtcBridge = {
-  connect: (host: string, port: number, symbol: string) =>
-    invoke<void>("connect_dtc", { host, port, symbol }),
-  disconnect: () => invoke<void>("disconnect_dtc"),
-  status: () => invoke<string>("dtc_status"),
-  startMockFeed: () => invoke<void>("start_mock_feed"),
+/** Sierra `.scid` tail via `~/.the-desk/config.toml` (no TCP DTC client). */
+export const feedBridge = {
+  status: () => invoke<string>("feed_status"),
+  startScidFeed: () => invoke<void>("start_scid_feed"),
+  stopScidFeed: () => invoke<void>("stop_scid_feed"),
 };
+
+/** @deprecated Use `feedBridge` — kept for gradual migration */
+export const dtcBridge = feedBridge;
 
 export const setupBridge = {
   list: () => invoke<Setup[]>("list_setups"),
@@ -164,6 +167,6 @@ export type StreamPayloads = {
   [events.setupAlert]: SetupAlert;
   [events.coachingPrompt]: CoachingPrompt;
   [events.riskState]: RiskState;
-  [events.dtcStatus]: string;
+  [events.feedStatus]: string;
   [events.domReplayFrame]: DomReplayFrame;
 };

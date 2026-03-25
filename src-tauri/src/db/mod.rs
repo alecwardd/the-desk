@@ -3931,6 +3931,23 @@ impl Database {
         }
     }
 
+    /// Latest persisted pipeline feature snapshot and its `timestamp_ms` (market time when written).
+    pub fn latest_feature_state_with_timestamp(
+        &self,
+    ) -> Result<Option<(f64, serde_json::Value)>, DbError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT timestamp_ms, payload FROM feature_state WHERE singleton = 1")?;
+        let mut rows = stmt.query([])?;
+        if let Some(row) = rows.next()? {
+            let timestamp_ms: f64 = row.get(0)?;
+            let payload: String = row.get(1)?;
+            Ok(Some((timestamp_ms, serde_json::from_str(&payload)?)))
+        } else {
+            Ok(None)
+        }
+    }
+
     pub fn latest_dom_feature_state(&self) -> Result<Option<(f64, serde_json::Value)>, DbError> {
         let mut stmt = self.conn.prepare(
             "SELECT timestamp_ms, payload

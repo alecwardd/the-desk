@@ -37,6 +37,7 @@ pub struct ContractMetadata {
 struct SymbolCandidate {
     symbol: String,
     modified_ms: f64,
+    path: PathBuf,
 }
 
 pub fn symbol_to_scid_file(symbol: &str) -> String {
@@ -233,6 +234,7 @@ fn discover_scid_candidates(sierra_data_dir: &str, root_symbol: &str) -> Vec<Sym
             Some(SymbolCandidate {
                 symbol: symbol.to_string(),
                 modified_ms,
+                path,
             })
         })
         .collect::<Vec<_>>();
@@ -240,6 +242,11 @@ fn discover_scid_candidates(sierra_data_dir: &str, root_symbol: &str) -> Vec<Sym
         b.modified_ms
             .partial_cmp(&a.modified_ms)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                let sa = fs::metadata(&a.path).map(|m| m.len()).unwrap_or(0);
+                let sb = fs::metadata(&b.path).map(|m| m.len()).unwrap_or(0);
+                sb.cmp(&sa)
+            })
             .then_with(|| a.symbol.cmp(&b.symbol))
     });
     candidates

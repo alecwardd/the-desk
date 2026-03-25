@@ -26,7 +26,7 @@ export function RiskBar({ riskState, riskConfig, connection }: Props) {
       <strong className="text-text-primary text-lg tracking-tight">The Desk</strong>
 
       <div className="flex items-center gap-3">
-        <span className="text-text-secondary text-sm">DTC:</span>
+        <span className="text-text-secondary text-sm">Feed:</span>
         <Badge variant={isConnected ? "default" : "destructive"}>
           {connection}
         </Badge>

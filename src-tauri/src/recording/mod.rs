@@ -64,7 +64,7 @@ impl SessionRecorder {
         self.recording
     }
 
-    /// Set whether recording auto-starts on DTC connect.
+    /// Set whether recording auto-starts when the market feed connects.
     pub fn set_auto_start(&mut self, auto_start: bool) {
         self.auto_start = auto_start;
     }

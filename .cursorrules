@@ -15,7 +15,7 @@ You are working on The Desk, a backend intelligence platform for discretionary N
 1. Read `CLAUDE.md` for full project rules and "Never Do" list
 2. Read the relevant skill in `skills/` for domain knowledge:
    - Pipelines → `skills/trading-domain/SKILL.md`
-   - DTC/.scid → `skills/dtc-protocol/SKILL.md`
+   - Sierra `.scid` / `.depth` → `skills/trading-domain/SKILL.md` + `src-tauri/src/feed/`
    - IPC (Tauri/React) → `skills/tauri-bridge/SKILL.md` — only when explicitly working on desktop app or DOM replay
    - UI copy/prompts → `skills/compliance-research/SKILL.md`
 

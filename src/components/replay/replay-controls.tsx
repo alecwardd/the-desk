@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { dtcBridge, replayBridge, sessionBridge } from "../../lib/tauri-bridge";
+import { feedBridge, replayBridge, sessionBridge } from "../../lib/tauri-bridge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -20,26 +20,26 @@ export function ReplayControls({ onStartReplay, onStopReplay }: Props) {
   const [status, setStatus] = useState<string | null>(null);
   const [recordingPath, setRecordingPath] = useState("");
 
-  async function handleStartMock() {
-    setStatus("Starting mock feed...");
+  async function handleStartScid() {
+    setStatus("Starting SCID feed...");
     try {
-      await dtcBridge.startMockFeed();
-      setStatus("Mock feed active — data is flowing");
+      await feedBridge.startScidFeed();
+      setStatus("SCID tail running");
       setIsPlaying(true);
       onStartReplay();
     } catch {
-      setStatus("Failed to start mock feed");
+      setStatus("Failed to start SCID feed — check config.toml and .scid path");
     }
   }
 
   async function handleStop() {
     try {
-      await dtcBridge.disconnect();
+      await feedBridge.stopScidFeed();
       setIsPlaying(false);
-      setStatus("Feed stopped");
+      setStatus("SCID feed stopped");
       onStopReplay();
     } catch {
-      setStatus("Failed to stop");
+      setStatus("Failed to stop feed");
     }
   }
 
@@ -104,7 +104,7 @@ export function ReplayControls({ onStartReplay, onStopReplay }: Props) {
       <CardContent className="flex flex-col gap-4">
         <div className="flex gap-2">
           {!isPlaying ? (
-            <Button onClick={handleStartMock}>Start Mock Feed</Button>
+            <Button onClick={handleStartScid}>Start SCID Feed</Button>
           ) : (
             <Button variant="destructive" onClick={handleStop}>
               Stop Feed

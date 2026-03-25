@@ -259,7 +259,7 @@ export default function App() {
         {appStatus && <p className="text-text-secondary text-sm">{appStatus}</p>}
         {connection !== "connected" && (
           <p className="text-text-secondary text-sm">
-            Data feed not connected. Start a feed in Onboarding or Replay controls.
+            SCID feed not connected. Start the tail from Onboarding, Replay controls, or Settings (ensure Sierra Chart is writing the `.scid` file).
           </p>
         )}
       </CardContent>
@@ -451,9 +451,7 @@ function SettingsPanel() {
     noTradeZones: [] as unknown[],
     maxDailyLossDollars: null as number | null,
   });
-  const [dtcHost, setDtcHost] = useState("127.0.0.1");
-  const [dtcPort, setDtcPort] = useState(11099);
-  const [symbol, setSymbol] = useState("NQ");
+  const [feedNote, setFeedNote] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
 
   useEffect(() => {
@@ -483,25 +481,30 @@ function SettingsPanel() {
     }
   }
 
+  async function handleStartScid() {
+    try {
+      const { feedBridge } = await import("./lib/tauri-bridge");
+      await feedBridge.startScidFeed();
+      setFeedNote("SCID tail started.");
+    } catch {
+      setFeedNote("Could not start — check ~/.the-desk/config.toml and the .scid path.");
+    }
+  }
+
   return (
     <div className="w-full max-w-lg space-y-4">
       <Card>
         <CardContent className="p-4 space-y-3">
-          <h3 className="text-text-primary font-semibold">Connection</h3>
-          <div className="grid grid-cols-3 gap-2">
-            <div className="flex flex-col gap-1">
-              <label className="text-xs text-text-secondary">Host</label>
-              <Input value={dtcHost} onChange={(e) => setDtcHost(e.target.value)} />
-            </div>
-            <div className="flex flex-col gap-1">
-              <label className="text-xs text-text-secondary">Port</label>
-              <Input type="number" value={dtcPort} onChange={(e) => setDtcPort(Number(e.target.value))} />
-            </div>
-            <div className="flex flex-col gap-1">
-              <label className="text-xs text-text-secondary">Symbol</label>
-              <Input value={symbol} onChange={(e) => setSymbol(e.target.value)} />
-            </div>
-          </div>
+          <h3 className="text-text-primary font-semibold">Data feed</h3>
+          <p className="text-xs text-text-secondary">
+            Configure <code className="text-[11px]">sierra_data_dir</code> and symbol mode in{" "}
+            <code className="text-[11px]">~/.the-desk/config.toml</code>. Live ticks come from Sierra{" "}
+            <code className="text-[11px]">.scid</code> files (optional <code className="text-[11px]">.depth</code> for DOM).
+          </p>
+          <Button variant="outline" size="sm" onClick={handleStartScid}>
+            Start SCID tail
+          </Button>
+          {feedNote ? <p className="text-xs text-text-secondary">{feedNote}</p> : null}
         </CardContent>
       </Card>
 

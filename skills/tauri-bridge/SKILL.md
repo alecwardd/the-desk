@@ -15,7 +15,7 @@ Reference for implementing the Rust ↔ React communication layer in The Desk.
 ┌──────────────────────────┐     ┌──────────────────────────┐
 │  Rust Backend (src-tauri) │     │  React Frontend (src/)   │
 │                          │     │                          │
-│  DTC Client              │     │  Dashboard               │
+│  SCID / .depth feed      │     │  Dashboard               │
 │  Market Pipelines        │◄═══►│  Coaching Panel           │
 │  Rules Engine            │ IPC │  Playbook Builder         │
 │  Risk Tracker            │     │  Replay Controls          │
@@ -69,12 +69,13 @@ Register in `main.rs`:
 fn main() {
     tauri::Builder::default()
         .manage(Database::new("~/.the-desk/data.db").unwrap())
-        .manage(DtcClient::new())
         .invoke_handler(tauri::generate_handler![
             get_setups,
             create_setup,
             update_risk_config,
-            connect_dtc,
+            feed_status,
+            start_scid_feed,
+            stop_scid_feed,
             start_session,
             stop_session,
             import_trades,
@@ -89,7 +90,7 @@ fn main() {
 ```typescript
 // src/lib/tauri-bridge.ts
 import { invoke } from '@tauri-apps/api/core';
-import type { Setup, RiskConfig, DtcStatus } from './types';
+import type { Setup, RiskConfig } from './types';
 
 export const playbook = {
   getSetups: () => invoke<Setup[]>('get_setups'),
@@ -103,10 +104,10 @@ export const risk = {
   updateConfig: (config: RiskConfig) => invoke<void>('update_risk_config', { config }),
 };
 
-export const dtc = {
-  connect: (host: string, port: number) => invoke<void>('connect_dtc', { host, port }),
-  disconnect: () => invoke<void>('disconnect_dtc'),
-  status: () => invoke<DtcStatus>('dtc_status'),
+export const feedBridge = {
+  status: () => invoke<string>('feed_status'),
+  startScidFeed: () => invoke<void>('start_scid_feed'),
+  stopScidFeed: () => invoke<void>('stop_scid_feed'),
 };
 
 export const session = {
@@ -119,7 +120,7 @@ export const session = {
 ### Key Rules for Commands
 
 1. **Always return `Result<T, String>`** from Rust commands. Tauri requires this for error handling across the IPC boundary.
-2. **Use `State<'_, T>`** to access managed state (database, DTC client, etc.).
+2. **Use `State<'_, T>`** to access managed state (database, pipelines, feed channel, etc.).
 3. **Keep commands thin** — they should delegate to service modules, not contain business logic.
 4. **Parameter names in TypeScript must match Rust** — Tauri maps by name, not position. Use `{ setup }` not `setup` in the invoke call.
 5. **Async by default** — commands that touch the database or network should be async to avoid blocking the main thread.
@@ -187,7 +188,11 @@ fn emit_risk_state(app: &AppHandle, state: &RiskState) {
 }
 
 fn emit_connection_status(app: &AppHandle, connected: bool) {
-    app.emit("dtc-status", connected).ok();
+    app.emit(
+        "feed-status",
+        if connected { "connected" } else { "disconnected" },
+    )
+    .ok();
 }
 ```
 
@@ -265,7 +270,7 @@ export function useRiskState() {
 The most important data flow in The Desk:
 
 ```
-DTC Trades ──> Pipelines ──> Aggregated State ──> Throttled Emit ──> React UI
+Feed (SCID / replay) ──> Pipelines ──> Aggregated State ──> Throttled Emit ──> React UI
                    │
                    ├──> Rules Engine ──> Alert ──> LLM ──> Coaching Emit ──> React UI
                    │
@@ -278,7 +283,7 @@ DTC Trades ──> Pipelines ──> Aggregated State ──> Throttled Emit ─
 // Main processing loop (runs in a background tokio task)
 async fn processing_loop(
     app: AppHandle,
-    mut dtc_rx: broadcast::Receiver<DtcEvent>,
+    mut feed_rx: broadcast::Receiver<FeedEvent>,
     pipelines: Arc<Mutex<Pipelines>>,
     rules_engine: Arc<RulesEngine>,
     risk_tracker: Arc<Mutex<RiskTracker>>,
@@ -287,8 +292,8 @@ async fn processing_loop(
     let emit_interval = Duration::from_millis(250); // 4 Hz UI updates
 
     loop {
-        match dtc_rx.recv().await {
-            Ok(DtcEvent::Trade { price, volume, side, timestamp, .. }) => {
+        match feed_rx.recv().await {
+            Ok(FeedEvent::Trade { price, volume, side, timestamp, .. }) => {
                 // Update all pipelines (fast, deterministic)
                 let mut pipes = pipelines.lock().await;
                 pipes.vwap.add_trade(price, volume);
@@ -314,7 +319,7 @@ async fn processing_loop(
                     last_emit = Instant::now();
                 }
             }
-            Ok(DtcEvent::Disconnected) => {
+            Ok(FeedEvent::Disconnected) => {
                 emit_connection_status(&app, false);
             }
             _ => {}
@@ -333,7 +338,7 @@ async fn processing_loop(
 // Shared state managed by Tauri
 pub struct AppState {
     pub db: Database,
-    pub dtc_client: Mutex<DtcClient>,
+    pub feed_tx: broadcast::Sender<FeedEvent>,
     pub pipelines: Mutex<Pipelines>,
     pub rules_engine: RulesEngine,  // Read-only after setup (playbook changes require rebuild)
     pub risk_tracker: Mutex<RiskTracker>,
@@ -348,7 +353,7 @@ AppState (React Context)
 ├── marketState (from 'market-state' events)
 ├── riskState (from 'risk-state' events)
 ├── coachingPrompts (from 'coaching-prompt' events, append-only log)
-├── connectionStatus (from 'dtc-status' events)
+├── connectionStatus (from 'feed-status' events)
 ├── activeSetups (loaded via command at startup, updated on playbook changes)
 └── sessionInfo (current session metadata)
 ```
@@ -361,7 +366,7 @@ Use React Context for global state (market, risk, connection) and local state fo
 
 1. **Serialization mismatch.** Rust structs must derive `Serialize` exactly matching the TypeScript types. Use `#[serde(rename_all = "camelCase")]` to match JS naming conventions.
 
-2. **Blocking the main thread.** Long-running Rust operations (DTC connection, LLM API calls) must run in background tokio tasks, never in a command handler.
+2. **Blocking the main thread.** Long-running Rust operations (feed I/O, LLM API calls) must run in background tokio tasks, never in a command handler.
 
 3. **Event flooding.** Emitting on every trade tick will freeze the React UI. Always throttle to ≤4 Hz for UI updates.
 
@@ -385,7 +390,7 @@ src/
 │   ├── useMarketState.ts     // market-state event listener
 │   ├── useCoachingPrompts.ts // coaching-prompt event listener
 │   ├── useRiskState.ts       // risk-state event listener
-│   └── useConnection.ts      // dtc-status event listener
+│   └── useConnection.ts      // feed-status event listener
 ├── context/
 │   └── AppContext.tsx         // Combines all hooks into global context
 └── components/

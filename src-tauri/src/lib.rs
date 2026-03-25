@@ -2,7 +2,6 @@ pub mod backfill;
 pub mod db;
 pub mod depth;
 pub mod dom_replay;
-pub mod dtc;
 pub mod feed;
 pub mod memory;
 pub mod outcome_tracker;
@@ -102,13 +101,19 @@ pub fn classify_session_segment(et_minutes: i32, session_type: SessionType) -> S
     }
 }
 
-/// Convert a Unix timestamp (milliseconds) to ET minutes-from-midnight.
+/// Convert a Unix timestamp to ET minutes-from-midnight.
+/// Sierra `.scid` ticks use **epoch milliseconds**. Values in the seconds range are still accepted
+/// for backward compatibility with older test fixtures.
 pub fn et_minutes_from_timestamp(timestamp_ms: f64) -> Option<i32> {
-    let ts = timestamp_ms as i64;
-    Utc.timestamp_millis_opt(ts).single().map(|utc| {
-        let et = utc.with_timezone(&Eastern);
-        (et.hour() as i32 * 60) + et.minute() as i32
-    })
+    let dt_utc = if timestamp_ms > 1_000_000_000_000.0 {
+        Utc.timestamp_millis_opt(timestamp_ms as i64).single()
+    } else if timestamp_ms > 1_000_000_000.0 {
+        Utc.timestamp_opt(timestamp_ms as i64, 0).single()
+    } else {
+        None
+    }?;
+    let et = dt_utc.with_timezone(&Eastern);
+    Some((et.hour() as i32 * 60) + et.minute() as i32)
 }
 
 /// Compute the session minute relative to RTH open (09:30 ET = minute 0).

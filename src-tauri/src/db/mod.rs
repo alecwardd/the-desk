@@ -639,13 +639,13 @@ fn contract_fields_match_scope(
 impl Default for RiskConfigRecord {
     fn default() -> Self {
         Self {
-            r_value_points: 50.0,
-            r_value_dollars: 250.0,
+            r_value_points: 80.0,
+            r_value_dollars: 400.0,
             max_daily_loss_r: 3.0,
             max_consecutive_losses: 3,
             max_trades_per_session: Some(8),
             no_trade_zones: Vec::new(),
-            max_daily_loss_dollars: Some(750.0),
+            max_daily_loss_dollars: Some(1200.0),
         }
     }
 }
@@ -4023,6 +4023,77 @@ impl Database {
         Ok(out)
     }
 
+    pub fn query_dom_feature_snapshots_for_trading_day(
+        &self,
+        trading_day: &str,
+        limit: usize,
+    ) -> Result<Vec<(f64, serde_json::Value)>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT timestamp_ms, payload
+             FROM dom_feature_snapshots
+             WHERE trading_day = ?1
+             ORDER BY timestamp_ms ASC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![trading_day, limit as i64], |row| {
+            Ok((row.get::<_, f64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (timestamp_ms, payload) = row?;
+            out.push((timestamp_ms, serde_json::from_str(&payload)?));
+        }
+        Ok(out)
+    }
+
+    pub fn list_dom_feature_snapshots_for_research(
+        &self,
+        start_date: Option<&str>,
+        end_date: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<(String, f64, serde_json::Value)>, DbError> {
+        use rusqlite::types::Value;
+
+        let mut conditions = Vec::<String>::new();
+        let mut params_vec = Vec::<Value>::new();
+        if let Some(start_date) = start_date {
+            params_vec.push(Value::Text(start_date.to_string()));
+            conditions.push(format!("trading_day >= ?{}", params_vec.len()));
+        }
+        if let Some(end_date) = end_date {
+            params_vec.push(Value::Text(end_date.to_string()));
+            conditions.push(format!("trading_day <= ?{}", params_vec.len()));
+        }
+        params_vec.push(Value::Integer(limit as i64));
+        let where_clause = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", conditions.join(" AND "))
+        };
+        let sql = format!(
+            "SELECT trading_day, timestamp_ms, payload
+             FROM dom_feature_snapshots
+             {where_clause}
+             ORDER BY timestamp_ms ASC
+             LIMIT ?{}",
+            params_vec.len()
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(params_vec), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, f64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (trading_day, timestamp_ms, payload) = row?;
+            out.push((trading_day, timestamp_ms, serde_json::from_str(&payload)?));
+        }
+        Ok(out)
+    }
+
     pub fn query_depth_events(
         &self,
         start_ms: Option<f64>,
@@ -4257,6 +4328,96 @@ impl Database {
             }))
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn list_market_events_for_research(
+        &self,
+        event_type: &str,
+        start_date: Option<&str>,
+        end_date: Option<&str>,
+        scope: Option<&SessionScopeFilter>,
+        limit: usize,
+    ) -> Result<Vec<serde_json::Value>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT timestamp_ms, event_type, level_name, price, direction, metadata_json,
+                    session_date, session_type, session_segment, trading_day, root_symbol, contract_symbol
+             FROM market_events WHERE event_type = ?1
+             ORDER BY timestamp_ms ASC",
+        )?;
+        let rows = stmt.query_map([event_type], |row| {
+            let metadata_str: Option<String> = row.get(5)?;
+            let metadata: serde_json::Value = metadata_str
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_else(|| serde_json::json!({}));
+            Ok((
+                row.get::<_, f64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, f64>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                metadata,
+                row.get::<_, String>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<String>>(9)?,
+                row.get::<_, Option<String>>(10)?,
+                row.get::<_, Option<String>>(11)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows.filter_map(|r| r.ok()) {
+            let (
+                timestamp_ms,
+                actual_event_type,
+                level_name,
+                price,
+                direction,
+                metadata,
+                session_date,
+                session_type,
+                session_segment,
+                trading_day,
+                root_symbol,
+                contract_symbol,
+            ) = row;
+            if !contract_fields_match_scope(
+                root_symbol.as_deref(),
+                contract_symbol.as_deref(),
+                scope,
+            ) {
+                continue;
+            }
+            let Some(analysis_day) = analysis_day_for_scope(&session_date, timestamp_ms, scope)
+            else {
+                continue;
+            };
+            if let Some(sd) = start_date {
+                if analysis_day.as_str() < sd {
+                    continue;
+                }
+            }
+            if let Some(ed) = end_date {
+                if analysis_day.as_str() > ed {
+                    continue;
+                }
+            }
+            out.push(serde_json::json!({
+                "timestampMs": timestamp_ms,
+                "eventType": actual_event_type,
+                "levelName": level_name,
+                "price": price,
+                "direction": direction,
+                "metadata": metadata,
+                "sessionDate": session_date,
+                "sessionType": session_type,
+                "sessionSegment": session_segment,
+                "tradingDay": trading_day.unwrap_or(analysis_day),
+            }));
+            if out.len() >= limit {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     pub fn latest_microstructure_snapshot(&self) -> Result<Option<serde_json::Value>, DbError> {
@@ -5377,6 +5538,79 @@ impl Database {
             results.push((sid, analysis_day, r_result, outcome));
         }
         Ok(results)
+    }
+
+    pub fn list_signal_outcomes_with_context(
+        &self,
+        setup_id: Option<&str>,
+        start_date: Option<&str>,
+        end_date: Option<&str>,
+        scope: Option<&SessionScopeFilter>,
+    ) -> Result<Vec<SignalOutcome>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT signal_id, setup_id, setup_name, session_date, root_symbol, contract_symbol,
+                    source, job_id, fired_at_ms, fired_price, target_price, stop_price, outcome,
+                    outcome_at_ms, max_favorable_excursion, max_adverse_excursion, r_result,
+                    time_to_outcome_ms, rvol_at_fire, rvol_bucket_at_fire
+             FROM signal_outcomes WHERE outcome != 'pending'",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(SignalOutcome {
+                signal_id: row.get(0)?,
+                setup_id: row.get(1)?,
+                setup_name: row.get(2)?,
+                session_date: row.get(3)?,
+                root_symbol: row.get(4)?,
+                contract_symbol: row.get(5)?,
+                source: row.get(6)?,
+                job_id: row.get(7)?,
+                fired_at_ms: row.get(8)?,
+                fired_price: row.get(9)?,
+                target_price: row.get(10)?,
+                stop_price: row.get(11)?,
+                outcome: row.get(12)?,
+                outcome_at_ms: row.get(13)?,
+                max_favorable_excursion: row.get(14)?,
+                max_adverse_excursion: row.get(15)?,
+                r_result: row.get(16)?,
+                time_to_outcome_ms: row.get(17)?,
+                rvol_at_fire: row.get(18)?,
+                rvol_bucket_at_fire: row.get(19)?,
+            })
+        })?;
+
+        let mut out = Vec::new();
+        for outcome in rows.filter_map(|r| r.ok()) {
+            if let Some(filter_id) = setup_id {
+                if outcome.setup_id != filter_id {
+                    continue;
+                }
+            }
+            if !contract_fields_match_scope(
+                outcome.root_symbol.as_deref(),
+                outcome.contract_symbol.as_deref(),
+                scope,
+            ) {
+                continue;
+            }
+            let Some(analysis_day) =
+                analysis_day_for_scope(&outcome.session_date, outcome.fired_at_ms, scope)
+            else {
+                continue;
+            };
+            if let Some(sd) = start_date {
+                if analysis_day.as_str() < sd {
+                    continue;
+                }
+            }
+            if let Some(ed) = end_date {
+                if analysis_day.as_str() > ed {
+                    continue;
+                }
+            }
+            out.push(outcome);
+        }
+        Ok(out)
     }
 
     /// List resolved signal outcomes with RVOL-at-fire context for regime analysis.

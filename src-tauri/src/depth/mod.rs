@@ -15,6 +15,9 @@ const DEPTH_MAGIC: &[u8; 4] = b"SCDD";
 const SC_TO_UNIX_EPOCH_US: i64 = 2_209_161_600_000_000;
 const NQ_TICK_SIZE: f64 = 0.25;
 const CLEAR_SEARCH_CHUNK_RECORDS: usize = 16_384;
+pub const DOM_SHORT_HORIZON_MS: f64 = 15_000.0;
+pub const DOM_MEDIUM_HORIZON_MS: f64 = 60_000.0;
+pub const DOM_NARRATIVE_HORIZON_MS: f64 = 300_000.0;
 
 #[derive(Debug, Error)]
 pub enum DepthError {
@@ -167,6 +170,49 @@ pub struct DomSummary {
     pub stack_bias: f64,
     pub pull_stack_bias: f64,
     pub liquidity_bias: String,
+    pub short_horizon_bias: String,
+    pub medium_horizon_bias: String,
+    pub current_bias_duration_ms: f64,
+    pub time_in_bid_support_ms: f64,
+    pub time_in_ask_resistance_ms: f64,
+    pub time_balanced_ms: f64,
+    pub bias_flip_count: u64,
+    pub flip_count_last_60s: u64,
+    pub flip_rate_per_minute: f64,
+    pub bias_persistence: f64,
+    pub near_touch_depth_volatility: Option<f64>,
+    pub refill_rate: Option<f64>,
+    pub touch_level_churn_per_minute: f64,
+    pub session_strength_percentile: Option<f64>,
+    pub context_confidence: String,
+    pub liquidity_narrative: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct DomNarrativeStats {
+    pub window_start_ms: f64,
+    pub window_end_ms: f64,
+    pub sample_count: usize,
+    pub dominant_bias: String,
+    pub short_horizon_bias: String,
+    pub medium_horizon_bias: String,
+    pub current_bias_duration_ms: f64,
+    pub time_in_bid_support_ms: f64,
+    pub time_in_ask_resistance_ms: f64,
+    pub time_balanced_ms: f64,
+    pub bias_flip_count: u64,
+    pub flip_count_last_60s: u64,
+    pub flip_rate_per_minute: f64,
+    pub bias_persistence: f64,
+    pub avg_pull_stack_bias: f64,
+    pub avg_near_touch_depth_ratio: Option<f64>,
+    pub near_touch_depth_volatility: Option<f64>,
+    pub session_strength_percentile: Option<f64>,
+    pub refill_rate: Option<f64>,
+    pub touch_level_churn_per_minute: f64,
+    pub context_confidence: String,
+    pub liquidity_narrative: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -177,6 +223,353 @@ pub struct DomFeatureSnapshot {
     pub session_date: String,
     pub dom_summary: DomSummary,
     pub activity: PullStackActivitySummary,
+}
+
+fn classify_liquidity_bias(depth_ratio: Option<f64>, pull_stack_bias: f64) -> String {
+    let depth_ratio = depth_ratio.unwrap_or(1.0);
+    let depth_favors_bid = depth_ratio > 1.2;
+    let depth_favors_ask = depth_ratio < 0.8;
+    let behavior_favors_bid = pull_stack_bias > 25.0;
+    let behavior_favors_ask = pull_stack_bias < -25.0;
+
+    if (behavior_favors_bid && !depth_favors_ask) || (depth_favors_bid && !behavior_favors_ask) {
+        "bid_support".to_string()
+    } else if (behavior_favors_ask && !depth_favors_bid)
+        || (depth_favors_ask && !behavior_favors_bid)
+    {
+        "ask_resistance".to_string()
+    } else {
+        "balanced".to_string()
+    }
+}
+
+fn mean(values: &[f64]) -> Option<f64> {
+    if values.is_empty() {
+        None
+    } else {
+        Some(values.iter().sum::<f64>() / values.len() as f64)
+    }
+}
+
+fn stddev(values: &[f64]) -> Option<f64> {
+    let avg = mean(values)?;
+    let variance = values.iter().map(|v| (v - avg).powi(2)).sum::<f64>() / values.len() as f64;
+    Some(variance.sqrt())
+}
+
+fn duration_by_bias(
+    summaries: &[DomSummary],
+    window_start_ms: f64,
+    window_end_ms: f64,
+) -> (f64, f64, f64, u64) {
+    if summaries.is_empty() || window_end_ms <= window_start_ms {
+        return (0.0, 0.0, 0.0, 0);
+    }
+
+    let mut bid_support_ms = 0.0;
+    let mut ask_resistance_ms = 0.0;
+    let mut balanced_ms = 0.0;
+    let mut flip_count = 0_u64;
+    let mut current_bias = summaries[0].liquidity_bias.as_str();
+    let mut segment_start_ms = window_start_ms;
+
+    for summary in summaries.iter().skip(1) {
+        let ts = summary.timestamp_ms.min(window_end_ms);
+        if ts > segment_start_ms {
+            match current_bias {
+                "bid_support" => bid_support_ms += ts - segment_start_ms,
+                "ask_resistance" => ask_resistance_ms += ts - segment_start_ms,
+                _ => balanced_ms += ts - segment_start_ms,
+            }
+            segment_start_ms = ts;
+        }
+        if summary.liquidity_bias != current_bias {
+            flip_count += 1;
+            current_bias = summary.liquidity_bias.as_str();
+        }
+    }
+
+    if window_end_ms > segment_start_ms {
+        match current_bias {
+            "bid_support" => bid_support_ms += window_end_ms - segment_start_ms,
+            "ask_resistance" => ask_resistance_ms += window_end_ms - segment_start_ms,
+            _ => balanced_ms += window_end_ms - segment_start_ms,
+        }
+    }
+
+    (bid_support_ms, ask_resistance_ms, balanced_ms, flip_count)
+}
+
+fn current_bias_duration_ms(summaries: &[DomSummary]) -> f64 {
+    let Some(current) = summaries.last() else {
+        return 0.0;
+    };
+    let mut run_start_ms = current.timestamp_ms;
+    for idx in (1..summaries.len()).rev() {
+        if summaries[idx - 1].liquidity_bias != current.liquidity_bias {
+            break;
+        }
+        run_start_ms = summaries[idx - 1].timestamp_ms;
+    }
+    (current.timestamp_ms - run_start_ms).max(0.0)
+}
+
+fn summarize_window_bias(
+    summaries: &[DomSummary],
+    window_start_ms: f64,
+    window_end_ms: f64,
+) -> String {
+    let window: Vec<&DomSummary> = summaries
+        .iter()
+        .filter(|summary| {
+            summary.timestamp_ms >= window_start_ms && summary.timestamp_ms <= window_end_ms
+        })
+        .collect();
+    if window.is_empty() {
+        return "balanced".to_string();
+    }
+    let avg_pull_stack_bias = window
+        .iter()
+        .map(|summary| summary.pull_stack_bias)
+        .sum::<f64>()
+        / window.len() as f64;
+    let avg_depth_ratio = mean(
+        &window
+            .iter()
+            .filter_map(|summary| summary.near_touch_depth_ratio)
+            .collect::<Vec<_>>(),
+    );
+    classify_liquidity_bias(avg_depth_ratio, avg_pull_stack_bias)
+}
+
+fn percentile_rank(reference: &[DomSummary], current_abs_bias: f64) -> Option<f64> {
+    if reference.is_empty() {
+        return None;
+    }
+    let mut sorted: Vec<f64> = reference
+        .iter()
+        .map(|summary| summary.pull_stack_bias.abs())
+        .collect();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let below_or_equal = sorted
+        .iter()
+        .filter(|value| **value <= current_abs_bias)
+        .count();
+    Some(below_or_equal as f64 / sorted.len() as f64 * 100.0)
+}
+
+fn refill_rate(activity: &PullStackActivitySummary) -> Option<f64> {
+    let removed = activity.bid.removed_quantity + activity.ask.removed_quantity;
+    let stacked = activity.bid.stacked_quantity + activity.ask.stacked_quantity;
+    if removed <= 0.0 {
+        None
+    } else {
+        Some(stacked / removed)
+    }
+}
+
+fn touch_level_churn_per_minute(activity: &PullStackActivitySummary) -> f64 {
+    let total_events = activity.bid.add_events
+        + activity.bid.modify_up_events
+        + activity.bid.modify_down_events
+        + activity.bid.delete_events
+        + activity.ask.add_events
+        + activity.ask.modify_up_events
+        + activity.ask.modify_down_events
+        + activity.ask.delete_events;
+    let window_ms = (activity.end_time_ms - activity.start_time_ms).max(1.0);
+    total_events as f64 / (window_ms / 60_000.0)
+}
+
+fn confidence_label(
+    sample_count: usize,
+    current_activity: Option<&PullStackActivitySummary>,
+) -> String {
+    let has_activity = current_activity
+        .map(|activity| activity.record_count > 0 || activity.batch_count > 0)
+        .unwrap_or(false);
+    if sample_count >= 20 && has_activity {
+        "high".to_string()
+    } else if sample_count >= 8 {
+        "medium".to_string()
+    } else {
+        "low".to_string()
+    }
+}
+
+fn describe_liquidity_narrative(
+    dominant_bias: &str,
+    short_horizon_bias: &str,
+    medium_horizon_bias: &str,
+    current_bias_duration_ms: f64,
+    flip_count_last_60s: u64,
+) -> String {
+    let bias_label = match dominant_bias {
+        "bid_support" => "latest book favors bids",
+        "ask_resistance" => "latest book favors offers",
+        _ => "latest book is balanced",
+    };
+    let duration_seconds = (current_bias_duration_ms / 1_000.0).round();
+    if flip_count_last_60s >= 3 {
+        format!(
+            "{bias_label}, but the liquidity picture is unstable: the bias has only persisted for about {duration_seconds:.0}s and has flipped {flip_count_last_60s} times over the last minute."
+        )
+    } else if short_horizon_bias != medium_horizon_bias {
+        format!(
+            "{bias_label}, but the short-term read is diverging from the medium window ({short_horizon_bias} vs {medium_horizon_bias}), so support looks more transitional than durable."
+        )
+    } else if current_bias_duration_ms < 10_000.0 {
+        format!(
+            "{bias_label}, but it has only been in place for about {duration_seconds:.0}s, so treat it as flashing liquidity until it persists."
+        )
+    } else {
+        format!(
+            "{bias_label}, and the short and medium windows are aligned ({short_horizon_bias}), which is more consistent with durable liquidity than a brief flash."
+        )
+    }
+}
+
+pub fn summarize_dom_narrative(
+    recent_summaries: &[DomSummary],
+    session_reference: Option<&[DomSummary]>,
+    current_activity: Option<&PullStackActivitySummary>,
+) -> DomNarrativeStats {
+    if recent_summaries.is_empty() {
+        return DomNarrativeStats::default();
+    }
+
+    let mut summaries = recent_summaries.to_vec();
+    summaries.sort_by(|a, b| {
+        a.timestamp_ms
+            .partial_cmp(&b.timestamp_ms)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let current = summaries.last().cloned().unwrap_or_default();
+    let window_start_ms = summaries
+        .first()
+        .map(|summary| summary.timestamp_ms)
+        .unwrap_or(current.timestamp_ms);
+    let window_end_ms = current.timestamp_ms;
+    let total_window_ms = (window_end_ms - window_start_ms).max(1.0);
+    let (time_in_bid_support_ms, time_in_ask_resistance_ms, time_balanced_ms, bias_flip_count) =
+        duration_by_bias(&summaries, window_start_ms, window_end_ms);
+    let (_, _, _, flip_count_last_60s) = duration_by_bias(
+        &summaries,
+        (window_end_ms - DOM_MEDIUM_HORIZON_MS).max(window_start_ms),
+        window_end_ms,
+    );
+
+    let dominant_bias = if time_in_bid_support_ms >= time_in_ask_resistance_ms
+        && time_in_bid_support_ms >= time_balanced_ms
+    {
+        "bid_support".to_string()
+    } else if time_in_ask_resistance_ms >= time_balanced_ms {
+        "ask_resistance".to_string()
+    } else {
+        "balanced".to_string()
+    };
+    let short_horizon_bias = summarize_window_bias(
+        &summaries,
+        (window_end_ms - DOM_SHORT_HORIZON_MS).max(window_start_ms),
+        window_end_ms,
+    );
+    let medium_horizon_bias = summarize_window_bias(
+        &summaries,
+        (window_end_ms - DOM_MEDIUM_HORIZON_MS).max(window_start_ms),
+        window_end_ms,
+    );
+    let current_bias_duration_ms = current_bias_duration_ms(&summaries);
+    let avg_pull_stack_bias = mean(
+        &summaries
+            .iter()
+            .map(|summary| summary.pull_stack_bias)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap_or(0.0);
+    let avg_near_touch_depth_ratio = mean(
+        &summaries
+            .iter()
+            .filter_map(|summary| summary.near_touch_depth_ratio)
+            .collect::<Vec<_>>(),
+    );
+    let near_touch_depth_volatility = stddev(
+        &summaries
+            .iter()
+            .filter_map(|summary| summary.near_touch_depth_ratio)
+            .collect::<Vec<_>>(),
+    );
+    let bias_persistence = match current.liquidity_bias.as_str() {
+        "bid_support" => time_in_bid_support_ms / total_window_ms,
+        "ask_resistance" => time_in_ask_resistance_ms / total_window_ms,
+        _ => time_balanced_ms / total_window_ms,
+    };
+    let session_strength_percentile = session_reference
+        .and_then(|reference| percentile_rank(reference, current.pull_stack_bias.abs()));
+    let refill_rate = current_activity.and_then(refill_rate);
+    let touch_level_churn_per_minute = current_activity
+        .map(touch_level_churn_per_minute)
+        .unwrap_or_default();
+    let context_confidence = confidence_label(summaries.len(), current_activity);
+    let liquidity_narrative = describe_liquidity_narrative(
+        &dominant_bias,
+        &short_horizon_bias,
+        &medium_horizon_bias,
+        current_bias_duration_ms,
+        flip_count_last_60s,
+    );
+
+    DomNarrativeStats {
+        window_start_ms,
+        window_end_ms,
+        sample_count: summaries.len(),
+        dominant_bias,
+        short_horizon_bias,
+        medium_horizon_bias,
+        current_bias_duration_ms,
+        time_in_bid_support_ms,
+        time_in_ask_resistance_ms,
+        time_balanced_ms,
+        bias_flip_count,
+        flip_count_last_60s,
+        flip_rate_per_minute: bias_flip_count as f64 / (total_window_ms / 60_000.0),
+        bias_persistence,
+        avg_pull_stack_bias,
+        avg_near_touch_depth_ratio,
+        near_touch_depth_volatility,
+        session_strength_percentile,
+        refill_rate,
+        touch_level_churn_per_minute,
+        context_confidence,
+        liquidity_narrative,
+    }
+}
+
+pub fn enrich_dom_summary(
+    summary: &mut DomSummary,
+    current_activity: Option<&PullStackActivitySummary>,
+    recent_summaries: &[DomSummary],
+    session_reference: Option<&[DomSummary]>,
+) {
+    let mut history = recent_summaries.to_vec();
+    history.push(summary.clone());
+    let stats = summarize_dom_narrative(&history, session_reference, current_activity);
+    summary.short_horizon_bias = stats.short_horizon_bias;
+    summary.medium_horizon_bias = stats.medium_horizon_bias;
+    summary.current_bias_duration_ms = stats.current_bias_duration_ms;
+    summary.time_in_bid_support_ms = stats.time_in_bid_support_ms;
+    summary.time_in_ask_resistance_ms = stats.time_in_ask_resistance_ms;
+    summary.time_balanced_ms = stats.time_balanced_ms;
+    summary.bias_flip_count = stats.bias_flip_count;
+    summary.flip_count_last_60s = stats.flip_count_last_60s;
+    summary.flip_rate_per_minute = stats.flip_rate_per_minute;
+    summary.bias_persistence = stats.bias_persistence;
+    summary.near_touch_depth_volatility = stats.near_touch_depth_volatility;
+    summary.refill_rate = stats.refill_rate;
+    summary.touch_level_churn_per_minute = stats.touch_level_churn_per_minute;
+    summary.session_strength_percentile = stats.session_strength_percentile;
+    summary.context_confidence = stats.context_confidence;
+    summary.liquidity_narrative = stats.liquidity_narrative;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -986,25 +1379,7 @@ pub fn build_dom_summary(
     };
     let pull_stack_bias = (activity.bid.stacked_quantity - activity.bid.estimated_pulled_quantity)
         - (activity.ask.stacked_quantity - activity.ask.estimated_pulled_quantity);
-    let depth_ratio = near_touch_depth_ratio.unwrap_or(1.0);
-    let depth_favors_bid = depth_ratio > 1.2;
-    let depth_favors_ask = depth_ratio < 0.8;
-    let behavior_favors_bid = pull_stack_bias > 25.0;
-    let behavior_favors_ask = pull_stack_bias < -25.0;
-
-    // Both signals must agree, or one must signal while the other is neutral.
-    // If they contradict (depth says bid, behavior says ask), classify as balanced.
-    let liquidity_bias = if (behavior_favors_bid && !depth_favors_ask)
-        || (depth_favors_bid && !behavior_favors_ask)
-    {
-        "bid_support".to_string()
-    } else if (behavior_favors_ask && !depth_favors_bid)
-        || (depth_favors_ask && !behavior_favors_bid)
-    {
-        "ask_resistance".to_string()
-    } else {
-        "balanced".to_string()
-    };
+    let liquidity_bias = classify_liquidity_bias(near_touch_depth_ratio, pull_stack_bias);
 
     DomSummary {
         source_file: snapshot.source_file.clone(),
@@ -1021,6 +1396,24 @@ pub fn build_dom_summary(
         stack_bias,
         pull_stack_bias,
         liquidity_bias,
+        short_horizon_bias: "balanced".to_string(),
+        medium_horizon_bias: "balanced".to_string(),
+        current_bias_duration_ms: 0.0,
+        time_in_bid_support_ms: 0.0,
+        time_in_ask_resistance_ms: 0.0,
+        time_balanced_ms: 0.0,
+        bias_flip_count: 0,
+        flip_count_last_60s: 0,
+        flip_rate_per_minute: 0.0,
+        bias_persistence: 0.0,
+        near_touch_depth_volatility: None,
+        refill_rate: None,
+        touch_level_churn_per_minute: 0.0,
+        session_strength_percentile: None,
+        context_confidence: "low".to_string(),
+        liquidity_narrative:
+            "Latest DOM context is available, but persistence has not been established yet."
+                .to_string(),
     }
 }
 
@@ -1331,6 +1724,36 @@ mod tests {
         assert_eq!(summary.near_touch_bid_depth, 20.0);
         assert_eq!(summary.near_touch_ask_depth, 16.0);
         assert_eq!(summary.liquidity_bias, "bid_support");
+        assert_eq!(summary.short_horizon_bias, "balanced");
+        assert_eq!(summary.context_confidence, "low");
+    }
+
+    #[test]
+    fn summarize_dom_narrative_detects_flashing_support() {
+        let mut summaries = Vec::new();
+        for (idx, (bias, pull_stack_bias, ratio)) in [
+            ("balanced", 0.0, Some(1.0)),
+            ("bid_support", 80.0, Some(1.3)),
+            ("ask_resistance", -38.0, Some(0.7)),
+            ("bid_support", 90.0, Some(1.25)),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            summaries.push(DomSummary {
+                timestamp_ms: 1_000.0 + idx as f64 * 5_000.0,
+                liquidity_bias: bias.to_string(),
+                pull_stack_bias,
+                near_touch_depth_ratio: ratio,
+                ..DomSummary::default()
+            });
+        }
+
+        let stats = summarize_dom_narrative(&summaries, None, None);
+        assert_eq!(stats.short_horizon_bias, "bid_support");
+        assert_eq!(stats.medium_horizon_bias, "bid_support");
+        assert!(stats.flip_count_last_60s >= 2);
+        assert!(stats.liquidity_narrative.contains("flipped"));
     }
 
     #[test]

@@ -7,7 +7,7 @@ use rmcp::{
     transport::stdio,
     ErrorData as McpError, ServerHandler, ServiceExt,
 };
-use schemars::JsonSchema;
+use schemars::{json_schema, JsonSchema, Schema, SchemaGenerator};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -19,8 +19,10 @@ use the_desk_backend::db::{
     SetupPerformanceSortBy, SignalOutcome, TradeImportBatchRecord, TradeRecord, TradeReviewUpdate,
 };
 use the_desk_backend::depth::{
-    aggregate_trade_volume_by_level, build_dom_feature_snapshot, build_dom_summary, DepthBook,
-    DepthReader, DomFeatureSnapshot, DomSummary, ScanControl as DepthScanControl,
+    aggregate_trade_volume_by_level, build_dom_feature_snapshot, build_dom_summary,
+    enrich_dom_summary, summarize_dom_narrative, DepthBook, DepthReader, DomFeatureSnapshot,
+    DomSummary, PullStackActivitySummary, ScanControl as DepthScanControl,
+    DOM_NARRATIVE_HORIZON_MS,
 };
 use the_desk_backend::feed::scid_reader::{
     parse_record_scaled, scid_tail_offset_after_shrink, ScanControl as ScidScanControl, ScidReader,
@@ -56,6 +58,24 @@ const JOB_PROGRESS_PERSIST_INTERVAL_MS: f64 = 1_000.0;
 const JOB_PROGRESS_RECORD_STEP: usize = 50_000;
 const JOB_PROGRESS_RATE_EMA_ALPHA: f64 = 0.25;
 type DnvaTriple = (f64, f64, f64);
+
+/// MCP clients (e.g. Cursor) may reject `tools/list` when `serde_json::Value` becomes JSON Schema
+/// boolean `true`. Use explicit object schemas instead.
+fn schemars_loose_object(_: &mut SchemaGenerator) -> Schema {
+    json_schema!({
+        "type": "object",
+        "additionalProperties": true
+    })
+}
+
+fn schemars_optional_loose_object(_: &mut SchemaGenerator) -> Schema {
+    json_schema!({
+        "anyOf": [
+            { "type": "null" },
+            { "type": "object", "additionalProperties": true }
+        ]
+    })
+}
 
 /// Atomics updated by SCID / `.depth` poll tasks for diagnostics and coherent `dataAgeMs` without extra DB locks.
 #[derive(Clone)]
@@ -610,6 +630,26 @@ fn compute_dom_feature_for_window(
     Ok((feature, snapshot))
 }
 
+fn dom_summary_from_payload(payload: &serde_json::Value) -> Option<DomSummary> {
+    payload
+        .get("domSummary")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+}
+
+fn activity_from_payload(payload: &serde_json::Value) -> Option<PullStackActivitySummary> {
+    payload
+        .get("activity")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+}
+
+fn dom_summaries_from_rows(rows: &[(f64, serde_json::Value)]) -> Vec<DomSummary> {
+    rows.iter()
+        .filter_map(|(_, payload)| dom_summary_from_payload(payload))
+        .collect()
+}
+
 fn merge_dom_summary_into_snapshot(
     snapshot: Option<serde_json::Value>,
     dom_summary: &DomSummary,
@@ -808,6 +848,19 @@ fn build_session_scope_filter(
     } else {
         Ok(Some(scope))
     }
+}
+
+fn parse_scope_value(
+    scope: Option<serde_json::Value>,
+) -> Result<Option<SessionScopeFilter>, McpError> {
+    let Some(scope) = scope else {
+        return Ok(None);
+    };
+    let parsed: SessionScopeFilter = serde_json::from_value(scope)
+        .map_err(|e| invalid_params_error(format!("invalid scope payload: {e}")))?;
+    validate_ymd_opt("tradingDayStart", parsed.trading_day_start.as_deref())?;
+    validate_ymd_opt("tradingDayEnd", parsed.trading_day_end.as_deref())?;
+    Ok(Some(parsed))
 }
 
 fn parse_setup_perf_sort(sort_by: Option<&str>) -> Result<SetupPerformanceSortBy, McpError> {
@@ -1047,6 +1100,7 @@ struct DomWindowParams {
     price_low: Option<f64>,
     price_high: Option<f64>,
     limit: Option<usize>,
+    include_aggregate: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -1066,6 +1120,49 @@ struct ExplainBookReactionParams {
     start_time_ms: Option<f64>,
     end_time_ms: Option<f64>,
     radius_ticks: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct DomRegimeSummaryParams {
+    timestamp_ms: Option<f64>,
+    start_time_ms: Option<f64>,
+    end_time_ms: Option<f64>,
+    window_ms: Option<f64>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct DomBehaviorFrequencyParams {
+    behavior: String,
+    min_duration_ms: Option<f64>,
+    start_date: Option<String>,
+    end_date: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct DomBehaviorConditionalParams {
+    behavior: String,
+    setup_id: Option<String>,
+    min_duration_ms: Option<f64>,
+    start_date: Option<String>,
+    end_date: Option<String>,
+    #[schemars(schema_with = "schemars_optional_loose_object")]
+    scope: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct DomReactionAtLevelsParams {
+    event_type: String,
+    behavior: String,
+    min_duration_ms: Option<f64>,
+    start_date: Option<String>,
+    end_date: Option<String>,
+    #[schemars(schema_with = "schemars_optional_loose_object")]
+    scope: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -1521,8 +1618,10 @@ struct SaveAgentInsightParams {
     setup_id: Option<String>,
     category: String,
     summary: String,
+    #[schemars(schema_with = "schemars_loose_object")]
     evidence: serde_json::Value,
     tags: Option<Vec<String>>,
+    #[schemars(schema_with = "schemars_optional_loose_object")]
     scope: Option<serde_json::Value>,
     confidence: Option<f64>,
     salience: Option<f64>,
@@ -1584,6 +1683,7 @@ struct CreateMemoryFollowupParams {
     title: String,
     detail: Option<String>,
     tags: Option<Vec<String>>,
+    #[schemars(schema_with = "schemars_optional_loose_object")]
     due_context: Option<serde_json::Value>,
 }
 
@@ -2741,6 +2841,20 @@ impl TheDeskMcp {
             }
         }
 
+        let narrative_summaries = dom_summaries_from_rows(&snapshots);
+        let session_reference = if let Some((latest_ts, _)) = snapshots.last() {
+            let db = self.db.lock().map_err(|_| lock_error())?;
+            let rows = db
+                .query_dom_feature_snapshots_for_trading_day(
+                    &trading_day_from_timestamp_ms(*latest_ts),
+                    50_000,
+                )
+                .map_err(db_error)?;
+            Some(dom_summaries_from_rows(&rows))
+        } else {
+            None
+        };
+
         for (_, payload) in &mut snapshots {
             if let Some(activity) = payload.get_mut("activity").and_then(|v| v.as_object_mut()) {
                 for key in ["topPullLevels", "topStackLevels"] {
@@ -2765,6 +2879,19 @@ impl TheDeskMcp {
         }
 
         let latest = snapshots.last().map(|(_, payload)| payload.clone());
+        let aggregate =
+            if params.include_aggregate.unwrap_or(true) && !narrative_summaries.is_empty() {
+                Some(
+                    serde_json::to_value(summarize_dom_narrative(
+                        &narrative_summaries,
+                        session_reference.as_deref(),
+                        None,
+                    ))
+                    .unwrap_or_default(),
+                )
+            } else {
+                None
+            };
         Ok(text_result(serde_json::json!({
             "windowStartMs": params.start_time_ms,
             "windowEndMs": params.end_time_ms,
@@ -2774,6 +2901,7 @@ impl TheDeskMcp {
                 "payload": payload
             })).collect::<Vec<_>>(),
             "latest": latest,
+            "aggregate": aggregate,
             "source": if latest.is_some() { "dom_feature_snapshots" } else { "none" }
         })))
     }
@@ -2854,14 +2982,77 @@ impl TheDeskMcp {
                 }
             })
             .sum();
-        let dom_summary = feature
+        let recent_rows = {
+            let db = self.db.lock().map_err(|_| lock_error())?;
+            db.query_dom_feature_snapshots(
+                Some((params.timestamp_ms - DOM_NARRATIVE_HORIZON_MS).max(0.0)),
+                Some(params.timestamp_ms),
+                512,
+            )
+            .map_err(db_error)?
+        };
+        let mut dom_feature_payload = feature.map(|(_, payload)| payload);
+        let mut dom_summary_struct = dom_feature_payload
             .as_ref()
-            .and_then(|(_, payload)| payload.get("domSummary"))
-            .cloned();
-        let activity = feature
+            .and_then(dom_summary_from_payload);
+        let activity_struct = dom_feature_payload.as_ref().and_then(activity_from_payload);
+        let mut session_reference_summaries: Option<Vec<DomSummary>> = None;
+        if let Some(summary) = dom_summary_struct.as_mut() {
+            let recent_summaries: Vec<DomSummary> = dom_summaries_from_rows(&recent_rows)
+                .into_iter()
+                .filter(|row| row.timestamp_ms < summary.timestamp_ms - 0.001)
+                .collect();
+            let session_rows = {
+                let db = self.db.lock().map_err(|_| lock_error())?;
+                db.query_dom_feature_snapshots_for_trading_day(
+                    &trading_day_from_timestamp_ms(summary.timestamp_ms),
+                    50_000,
+                )
+                .unwrap_or_default()
+            };
+            let session_reference = if session_rows.is_empty() {
+                None
+            } else {
+                Some(dom_summaries_from_rows(&session_rows))
+            };
+            session_reference_summaries = session_reference.clone();
+            enrich_dom_summary(
+                summary,
+                activity_struct.as_ref(),
+                &recent_summaries,
+                session_reference.as_deref(),
+            );
+            if let Some(payload) = dom_feature_payload
+                .as_mut()
+                .and_then(|value| value.as_object_mut())
+            {
+                payload.insert(
+                    "domSummary".to_string(),
+                    serde_json::to_value(summary.clone()).unwrap_or_default(),
+                );
+            }
+        }
+        let dom_summary = dom_summary_struct
             .as_ref()
-            .and_then(|(_, payload)| payload.get("activity"))
-            .cloned();
+            .and_then(|summary| serde_json::to_value(summary).ok());
+        let activity = activity_struct
+            .as_ref()
+            .and_then(|summary| serde_json::to_value(summary).ok());
+        let dom_regime_summary = if let Some(summary) = dom_summary_struct.as_ref() {
+            let mut history = dom_summaries_from_rows(&recent_rows);
+            history.retain(|row| row.timestamp_ms < summary.timestamp_ms - 0.001);
+            history.push(summary.clone());
+            Some(
+                serde_json::to_value(summarize_dom_narrative(
+                    &history,
+                    session_reference_summaries.as_deref(),
+                    activity_struct.as_ref(),
+                ))
+                .unwrap_or_default(),
+            )
+        } else {
+            None
+        };
         let aggressive_buyers = net_delta > 0.0
             && dom_summary
                 .as_ref()
@@ -2881,9 +3072,10 @@ impl TheDeskMcp {
             "timestampMs": params.timestamp_ms,
             "windowMs": window_ms,
             "domSnapshot": dom_snapshot.map(|(_, payload)| payload),
-            "domFeature": feature.map(|(_, payload)| payload),
+            "domFeature": dom_feature_payload,
             "domSummary": dom_summary,
             "activity": activity,
+            "domRegimeSummary": dom_regime_summary,
             "tape": {
                 "tickCount": ticks.len(),
                 "totalVolume": total_volume,
@@ -3124,6 +3316,150 @@ impl TheDeskMcp {
             "topStackLevel": top_stack,
             "explanation": explanation,
         })))
+    }
+
+    #[tool(
+        description = "Summarize delayed DOM behavior over a window so agents can tell whether liquidity has been persistent, flashing, or flipping. Returns time-in-state, flip counts, persistence, confidence, and a narrative summary."
+    )]
+    async fn get_dom_regime_summary(
+        &self,
+        Parameters(params): Parameters<DomRegimeSummaryParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let end_time_ms = if let Some(end) = params.end_time_ms.or(params.timestamp_ms) {
+            end
+        } else {
+            let db = self.db.lock().map_err(|_| lock_error())?;
+            db.latest_dom_feature_state()
+                .map_err(db_error)?
+                .map(|(timestamp_ms, _)| timestamp_ms)
+                .ok_or_else(|| {
+                    invalid_params_error(
+                        "timestampMs or endTimeMs is required when no DOM history is present",
+                    )
+                })?
+        };
+        let window_ms = params
+            .window_ms
+            .unwrap_or(DOM_NARRATIVE_HORIZON_MS)
+            .clamp(5_000.0, 1_800_000.0);
+        let start_time_ms = params.start_time_ms.unwrap_or(end_time_ms - window_ms);
+        validate_time_window(start_time_ms, end_time_ms)?;
+        let limit = params.limit.unwrap_or(512).clamp(1, 5_000);
+
+        let rows = {
+            let db = self.db.lock().map_err(|_| lock_error())?;
+            db.query_dom_feature_snapshots(Some(start_time_ms), Some(end_time_ms), limit)
+                .map_err(db_error)?
+        };
+        let summaries = dom_summaries_from_rows(&rows);
+        if summaries.is_empty() {
+            return Ok(no_data(
+                "No DOM feature snapshots available for the requested window",
+            ));
+        }
+        let latest_payload = rows.last().map(|(_, payload)| payload.clone());
+        let latest_activity = latest_payload.as_ref().and_then(activity_from_payload);
+        let session_reference = {
+            let db = self.db.lock().map_err(|_| lock_error())?;
+            let day = trading_day_from_timestamp_ms(end_time_ms);
+            let session_rows = db
+                .query_dom_feature_snapshots_for_trading_day(&day, 50_000)
+                .map_err(db_error)?;
+            let parsed = dom_summaries_from_rows(&session_rows);
+            if parsed.is_empty() {
+                None
+            } else {
+                Some(parsed)
+            }
+        };
+        let regime = summarize_dom_narrative(
+            &summaries,
+            session_reference.as_deref(),
+            latest_activity.as_ref(),
+        );
+
+        Ok(text_result(serde_json::json!({
+            "window": { "startTimeMs": start_time_ms, "endTimeMs": end_time_ms, "windowMs": window_ms },
+            "regime": regime,
+            "latestSummary": latest_payload.as_ref().and_then(dom_summary_from_payload),
+            "latestActivity": latest_activity,
+            "sampleCount": summaries.len(),
+        })))
+    }
+
+    #[tool(
+        description = "Historical frequency of DOM behaviors such as persisted bid support, ask resistance, liquidity flips, pulling acceleration, or stacking acceleration. Uses persisted DOM feature snapshots."
+    )]
+    async fn query_dom_behavior_frequency(
+        &self,
+        Parameters(params): Parameters<DomBehaviorFrequencyParams>,
+    ) -> Result<CallToolResult, McpError> {
+        validate_ymd_opt("startDate", params.start_date.as_deref())?;
+        validate_ymd_opt("endDate", params.end_date.as_deref())?;
+        let db = self.db.lock().map_err(|_| lock_error())?;
+        let result = research::dom_behavior_frequency(
+            &db,
+            &params.behavior,
+            params.min_duration_ms.unwrap_or(15_000.0),
+            params.start_date.as_deref(),
+            params.end_date.as_deref(),
+        )
+        .map_err(db_error)?;
+        Ok(text_result(
+            serde_json::to_value(result).unwrap_or_default(),
+        ))
+    }
+
+    #[tool(
+        description = "Historical setup outcome context when a DOM behavior was present near signal fire. Answers questions like whether persistent bid support improved setup follow-through."
+    )]
+    async fn query_dom_behavior_conditional(
+        &self,
+        Parameters(params): Parameters<DomBehaviorConditionalParams>,
+    ) -> Result<CallToolResult, McpError> {
+        validate_ymd_opt("startDate", params.start_date.as_deref())?;
+        validate_ymd_opt("endDate", params.end_date.as_deref())?;
+        let scope = parse_scope_value(params.scope)?;
+        let db = self.db.lock().map_err(|_| lock_error())?;
+        let result = research::dom_behavior_conditional(
+            &db,
+            &params.behavior,
+            params.setup_id.as_deref(),
+            params.min_duration_ms.unwrap_or(15_000.0),
+            params.start_date.as_deref(),
+            params.end_date.as_deref(),
+            scope.as_ref(),
+        )
+        .map_err(db_error)?;
+        Ok(text_result(
+            serde_json::to_value(result).unwrap_or_default(),
+        ))
+    }
+
+    #[tool(
+        description = "Historical DOM behavior around a specific event type or level interaction. Helps answer whether persisted support, flips, or pulling acceleration commonly accompanied a class of market events."
+    )]
+    async fn query_dom_reaction_at_levels(
+        &self,
+        Parameters(params): Parameters<DomReactionAtLevelsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        validate_ymd_opt("startDate", params.start_date.as_deref())?;
+        validate_ymd_opt("endDate", params.end_date.as_deref())?;
+        let scope = parse_scope_value(params.scope)?;
+        let db = self.db.lock().map_err(|_| lock_error())?;
+        let result = research::dom_reaction_at_levels(
+            &db,
+            &params.event_type,
+            &params.behavior,
+            params.min_duration_ms.unwrap_or(15_000.0),
+            params.start_date.as_deref(),
+            params.end_date.as_deref(),
+            scope.as_ref(),
+        )
+        .map_err(db_error)?;
+        Ok(text_result(
+            serde_json::to_value(result).unwrap_or_default(),
+        ))
     }
 
     #[tool(
@@ -6159,7 +6495,7 @@ fn persist_depth_records(
         );
 
         let feature_window_start = (last_record.timestamp_ms - 60_000.0).max(0.0);
-        let feature = {
+        let mut feature = {
             let config = load_feed_config();
             aggregate_window_trades(&config, feature_window_start, last_record.timestamp_ms)
                 .ok()
@@ -6208,6 +6544,24 @@ fn persist_depth_records(
                     },
                 })
         };
+        let recent_summary_rows = db
+            .query_dom_feature_snapshots(
+                Some((last_record.timestamp_ms - DOM_NARRATIVE_HORIZON_MS).max(0.0)),
+                Some((last_record.timestamp_ms - 0.001).max(0.0)),
+                512,
+            )
+            .unwrap_or_default();
+        let recent_summaries = dom_summaries_from_rows(&recent_summary_rows);
+        let session_rows = db
+            .query_dom_feature_snapshots_for_trading_day(&trading_day, 50_000)
+            .unwrap_or_default();
+        let session_summaries = dom_summaries_from_rows(&session_rows);
+        enrich_dom_summary(
+            &mut feature.dom_summary,
+            Some(&feature.activity),
+            &recent_summaries,
+            Some(&session_summaries),
+        );
         let feature_json = serde_json::to_value(&feature).unwrap_or_default();
         let _ = db.insert_dom_feature_snapshot(
             &source_file,
@@ -7108,6 +7462,7 @@ mod tests {
                 price_low: None,
                 price_high: None,
                 limit: Some(10),
+                include_aggregate: Some(true),
             }))
             .await
             .expect("tool call");

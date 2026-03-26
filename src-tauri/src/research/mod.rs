@@ -1,5 +1,6 @@
 use crate::db::Database;
 use crate::db::SessionScopeFilter;
+use crate::depth::DomSummary;
 use serde::{Deserialize, Serialize};
 
 /// Result of a frequency query: "How often does event X happen?"
@@ -42,6 +43,43 @@ pub struct DistributionResult {
     pub p25: f64,
     pub p75: f64,
     pub p90: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DomBehaviorFrequencyResult {
+    pub behavior: String,
+    pub total_occurrences: i64,
+    pub sessions_with_behavior: i64,
+    pub total_sessions: i64,
+    pub per_session_avg: f64,
+    pub pct_sessions_with_behavior: f64,
+    pub avg_bias_duration_ms: f64,
+    pub avg_flip_count_last_60s: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DomBehaviorConditionalResult {
+    pub behavior: String,
+    pub setup_id: Option<String>,
+    pub sample_count: i64,
+    pub total_outcomes: i64,
+    pub win_rate: f64,
+    pub avg_r: f64,
+    pub avg_bias_duration_ms: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DomReactionAtLevelsResult {
+    pub event_type: String,
+    pub behavior: String,
+    pub sample_count: i64,
+    pub matched_count: i64,
+    pub match_rate: f64,
+    pub avg_bias_duration_ms: f64,
+    pub avg_pull_stack_bias: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -107,6 +145,208 @@ fn distribution_from_values(metric: &str, values: &[f64]) -> DistributionResult 
         p75: percentile(75.0),
         p90: percentile(90.0),
     }
+}
+
+fn mean(values: &[f64]) -> Option<f64> {
+    if values.is_empty() {
+        None
+    } else {
+        Some(values.iter().sum::<f64>() / values.len() as f64)
+    }
+}
+
+fn parse_dom_summary(value: &serde_json::Value) -> Option<DomSummary> {
+    value
+        .get("domSummary")
+        .cloned()
+        .and_then(|summary| serde_json::from_value(summary).ok())
+}
+
+fn dom_behavior_matches(summary: &DomSummary, behavior: &str, min_duration_ms: f64) -> bool {
+    match behavior {
+        "bid_support_persisted" => {
+            summary.liquidity_bias == "bid_support"
+                && summary.current_bias_duration_ms >= min_duration_ms
+        }
+        "ask_resistance_persisted" => {
+            summary.liquidity_bias == "ask_resistance"
+                && summary.current_bias_duration_ms >= min_duration_ms
+        }
+        "liquidity_flip" => summary.flip_count_last_60s >= 2,
+        "pulling_acceleration" => {
+            summary.bid_pull_rate.max(summary.ask_pull_rate) >= 0.65
+                && summary.touch_level_churn_per_minute >= 20.0
+        }
+        "stacking_acceleration" => {
+            summary.stack_bias.abs() >= 0.35
+                && summary.touch_level_churn_per_minute >= 20.0
+                && summary.refill_rate.unwrap_or(0.0) >= 1.0
+        }
+        _ => false,
+    }
+}
+
+pub fn dom_behavior_frequency(
+    db: &Database,
+    behavior: &str,
+    min_duration_ms: f64,
+    start_date: Option<&str>,
+    end_date: Option<&str>,
+) -> Result<DomBehaviorFrequencyResult, String> {
+    let rows = db
+        .list_dom_feature_snapshots_for_research(start_date, end_date, 200_000)
+        .map_err(|e| e.to_string())?;
+    let total_sessions = db
+        .list_session_summaries_scoped(start_date, end_date, None, None, 10_000, None)
+        .map_err(|e| e.to_string())?
+        .len() as i64;
+
+    let mut total_occurrences = 0_i64;
+    let mut sessions_with_behavior = std::collections::BTreeSet::new();
+    let mut durations = Vec::new();
+    let mut flips = Vec::new();
+    for (trading_day, _timestamp_ms, payload) in rows {
+        let Some(summary) = parse_dom_summary(&payload) else {
+            continue;
+        };
+        if dom_behavior_matches(&summary, behavior, min_duration_ms) {
+            total_occurrences += 1;
+            sessions_with_behavior.insert(trading_day);
+            durations.push(summary.current_bias_duration_ms);
+            flips.push(summary.flip_count_last_60s as f64);
+        }
+    }
+
+    let sessions_with = sessions_with_behavior.len() as i64;
+    let per_session_avg = if total_sessions > 0 {
+        total_occurrences as f64 / total_sessions as f64
+    } else {
+        0.0
+    };
+    let pct_sessions_with_behavior = if total_sessions > 0 {
+        sessions_with as f64 / total_sessions as f64 * 100.0
+    } else {
+        0.0
+    };
+
+    Ok(DomBehaviorFrequencyResult {
+        behavior: behavior.to_string(),
+        total_occurrences,
+        sessions_with_behavior: sessions_with,
+        total_sessions,
+        per_session_avg,
+        pct_sessions_with_behavior,
+        avg_bias_duration_ms: mean(&durations).unwrap_or(0.0),
+        avg_flip_count_last_60s: mean(&flips).unwrap_or(0.0),
+    })
+}
+
+pub fn dom_behavior_conditional(
+    db: &Database,
+    behavior: &str,
+    setup_id: Option<&str>,
+    min_duration_ms: f64,
+    start_date: Option<&str>,
+    end_date: Option<&str>,
+    scope: Option<&SessionScopeFilter>,
+) -> Result<DomBehaviorConditionalResult, String> {
+    let outcomes = db
+        .list_signal_outcomes_with_context(setup_id, start_date, end_date, scope)
+        .map_err(|e| e.to_string())?;
+
+    let mut matched = 0_i64;
+    let mut wins = 0_i64;
+    let mut r_values = Vec::new();
+    let mut durations = Vec::new();
+
+    for outcome in &outcomes {
+        let Some((_, payload)) = db
+            .get_dom_feature_near(outcome.fired_at_ms)
+            .map_err(|e| e.to_string())?
+        else {
+            continue;
+        };
+        let Some(summary) = parse_dom_summary(&payload) else {
+            continue;
+        };
+        if !dom_behavior_matches(&summary, behavior, min_duration_ms) {
+            continue;
+        }
+        matched += 1;
+        durations.push(summary.current_bias_duration_ms);
+        if let Some(r) = outcome.r_result {
+            r_values.push(r);
+            if r > 0.0 {
+                wins += 1;
+            }
+        }
+    }
+
+    Ok(DomBehaviorConditionalResult {
+        behavior: behavior.to_string(),
+        setup_id: setup_id.map(|value| value.to_string()),
+        sample_count: matched,
+        total_outcomes: outcomes.len() as i64,
+        win_rate: if matched > 0 {
+            wins as f64 / matched as f64
+        } else {
+            0.0
+        },
+        avg_r: mean(&r_values).unwrap_or(0.0),
+        avg_bias_duration_ms: mean(&durations).unwrap_or(0.0),
+    })
+}
+
+pub fn dom_reaction_at_levels(
+    db: &Database,
+    event_type: &str,
+    behavior: &str,
+    min_duration_ms: f64,
+    start_date: Option<&str>,
+    end_date: Option<&str>,
+    scope: Option<&SessionScopeFilter>,
+) -> Result<DomReactionAtLevelsResult, String> {
+    let events = db
+        .list_market_events_for_research(event_type, start_date, end_date, scope, 100_000)
+        .map_err(|e| e.to_string())?;
+
+    let mut matched_count = 0_i64;
+    let mut durations = Vec::new();
+    let mut pull_stack_biases = Vec::new();
+    for event in &events {
+        let Some(timestamp_ms) = event.get("timestampMs").and_then(|value| value.as_f64()) else {
+            continue;
+        };
+        let Some((_, payload)) = db
+            .get_dom_feature_near(timestamp_ms)
+            .map_err(|e| e.to_string())?
+        else {
+            continue;
+        };
+        let Some(summary) = parse_dom_summary(&payload) else {
+            continue;
+        };
+        if dom_behavior_matches(&summary, behavior, min_duration_ms) {
+            matched_count += 1;
+            durations.push(summary.current_bias_duration_ms);
+            pull_stack_biases.push(summary.pull_stack_bias);
+        }
+    }
+
+    let sample_count = events.len() as i64;
+    Ok(DomReactionAtLevelsResult {
+        event_type: event_type.to_string(),
+        behavior: behavior.to_string(),
+        sample_count,
+        matched_count,
+        match_rate: if sample_count > 0 {
+            matched_count as f64 / sample_count as f64
+        } else {
+            0.0
+        },
+        avg_bias_duration_ms: mean(&durations).unwrap_or(0.0),
+        avg_pull_stack_bias: mean(&pull_stack_biases).unwrap_or(0.0),
+    })
 }
 
 /// "How often does event X happen per session?"

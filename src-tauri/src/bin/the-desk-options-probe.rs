@@ -37,7 +37,7 @@ Optional [options] block:
   [options]
   enabled = true
   convexvalue_probe_root = "SPX"
-  convexvalue_probe_params = ["gxoi", "gxvolm", "gamma", "oi", "volm_bs", "volm", "value_bs"]
+  convexvalue_probe_params = ["gxoi", "gxvolm", "gamma", "oi", "oi_ch", "volm_bs", "volm", "value_bs", "vomma", "volm_5m", "spread"]
   convexvalue_probe_exps = [1, 2, 3]
   convexvalue_probe_range = 0.10
   convexvalue_email_env = "CONVEXVALUE_EMAIL"

@@ -2597,7 +2597,7 @@ impl TheDeskMcp {
     }
 
     #[tool(
-        description = "Top SPX/options gamma concentration strikes from ConvexValue, with call/put breakdown, open interest, volume bias, expiration coverage, and cache metadata. Use for pre-session context like 'where are the likely gamma walls?'"
+        description = "Top SPX/options gamma concentration strikes from ConvexValue, with call/put breakdown, open interest, OI change, volume bias, vomma, recent 5m volume, avg spread, expiration coverage, and cache metadata. Use for pre-session context like 'where are the likely gamma walls?' or 'where is new positioning opening today?'"
     )]
     async fn get_gamma_levels(
         &self,
@@ -2624,8 +2624,11 @@ impl TheDeskMcp {
             "optionsContextSummary": {
                 "aggregateGxoi": snapshot.context.aggregate_gxoi,
                 "aggregateDxoi": snapshot.context.aggregate_dxoi,
+                "callGxoi": snapshot.context.call_gxoi,
+                "putGxoi": snapshot.context.put_gxoi,
                 "putCallRatio": snapshot.context.put_call_ratio,
                 "flowDirection": snapshot.context.flow_direction,
+                "volTermSpread": snapshot.context.vol_term_spread,
             },
             "cache": options_cache_metadata(&snapshot, refreshed),
         });
@@ -2633,7 +2636,7 @@ impl TheDeskMcp {
     }
 
     #[tool(
-        description = "Aggregate ConvexValue options regime context: underlying price/change, aggregate gxoi/dxoi, put-call ratio, flow direction, vanna/charm regime, and cache metadata. Use when an agent needs broad options positioning context rather than per-strike detail."
+        description = "Aggregate ConvexValue options regime context: underlying price/change, aggregate gxoi/dxoi, call/put gxoi/dxoi splits, put-call ratio, flow decomposition (flowratio, call/put value/volume bias), vol surface (front/back IV, term spread), premium flow (value bought/sold), vanna/charm regime, and cache metadata. Use when an agent needs broad options positioning context rather than per-strike detail."
     )]
     async fn get_options_context(
         &self,

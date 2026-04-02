@@ -67,14 +67,18 @@ fn default_convexvalue_probe_params() -> Vec<String> {
         "gxvolm",
         "gamma",
         "oi",
+        "oi_ch",
         "volm_bs",
         "volm",
         "value_bs",
         "dxoi",
         "vanna",
+        "vomma",
         "charm",
         "volatility",
         "delta",
+        "volm_5m",
+        "spread",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -97,6 +101,23 @@ fn default_convexvalue_context_params() -> Vec<String> {
         "put_volume",
         "option_volume",
         "volatility",
+        // flow decomposition
+        "flowratio",
+        "value_call_bs",
+        "value_put_bs",
+        "volm_call_bs",
+        "volm_put_bs",
+        // exposure splits
+        "call_gxoi",
+        "put_gxoi",
+        "call_dxoi",
+        "put_dxoi",
+        // vol surface
+        "front_volatility",
+        "back_volatility",
+        // premium flow
+        "value_buy",
+        "value_sell",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -346,9 +367,15 @@ pub struct GammaLevel {
     pub total_gxvolm: f64,
     pub call_open_interest: f64,
     pub put_open_interest: f64,
+    pub total_oi_change: f64,
+    pub call_oi_change: f64,
+    pub put_oi_change: f64,
     pub total_volume: f64,
     pub net_volume_bias: f64,
     pub net_value_bias: f64,
+    pub total_vomma: f64,
+    pub total_volm_5m: f64,
+    pub avg_spread: f64,
     pub total_contracts_seen: usize,
     pub expiration_count: usize,
 }
@@ -384,6 +411,25 @@ pub struct OptionsContextReport {
     pub put_volume: Option<f64>,
     pub option_volume: Option<f64>,
     pub implied_volatility: Option<f64>,
+    // flow decomposition
+    pub flow_ratio: Option<f64>,
+    pub value_call_bs: Option<f64>,
+    pub value_put_bs: Option<f64>,
+    pub volm_call_bs: Option<f64>,
+    pub volm_put_bs: Option<f64>,
+    // exposure splits
+    pub call_gxoi: Option<f64>,
+    pub put_gxoi: Option<f64>,
+    pub call_dxoi: Option<f64>,
+    pub put_dxoi: Option<f64>,
+    // vol surface
+    pub front_volatility: Option<f64>,
+    pub back_volatility: Option<f64>,
+    pub vol_term_spread: Option<f64>,
+    // premium flow
+    pub value_buy: Option<f64>,
+    pub value_sell: Option<f64>,
+    // regimes
     pub gamma_regime: Option<String>,
     pub dex_regime: Option<String>,
     pub vanna_regime: Option<String>,
@@ -440,15 +486,27 @@ struct GammaAccumulator {
     total_gxvolm: f64,
     call_open_interest: f64,
     put_open_interest: f64,
+    total_oi_change: f64,
+    call_oi_change: f64,
+    put_oi_change: f64,
     total_volume: f64,
     net_volume_bias: f64,
     net_value_bias: f64,
+    total_vomma: f64,
+    total_volm_5m: f64,
+    spread_sum: f64,
+    spread_count: usize,
     total_contracts_seen: usize,
     expirations: HashSet<i64>,
 }
 
 impl GammaAccumulator {
     fn into_level(self) -> GammaLevel {
+        let avg_spread = if self.spread_count > 0 {
+            self.spread_sum / self.spread_count as f64
+        } else {
+            0.0
+        };
         GammaLevel {
             strike: self.strike,
             total_gxoi: self.total_gxoi,
@@ -457,9 +515,15 @@ impl GammaAccumulator {
             total_gxvolm: self.total_gxvolm,
             call_open_interest: self.call_open_interest,
             put_open_interest: self.put_open_interest,
+            total_oi_change: self.total_oi_change,
+            call_oi_change: self.call_oi_change,
+            put_oi_change: self.put_oi_change,
             total_volume: self.total_volume,
             net_volume_bias: self.net_volume_bias,
             net_value_bias: self.net_value_bias,
+            total_vomma: self.total_vomma,
+            total_volm_5m: self.total_volm_5m,
+            avg_spread,
             total_contracts_seen: self.total_contracts_seen,
             expiration_count: self.expirations.len(),
         }
@@ -689,17 +753,28 @@ pub fn build_gamma_levels_report(
         entry.total_volume += row.value("volm");
         entry.net_volume_bias += row.value("volm_bs");
         entry.net_value_bias += row.value("value_bs");
+        entry.total_vomma += row.value("vomma");
+        entry.total_volm_5m += row.value("volm_5m");
+        let spread = row.value("spread");
+        if spread > 0.0 {
+            entry.spread_sum += spread;
+            entry.spread_count += 1;
+        }
         entry.total_contracts_seen += 1;
         entry.expirations.insert(row.expiration);
 
+        let oi_ch = row.value("oi_ch");
+        entry.total_oi_change += oi_ch;
         match row.option_kind {
             OptionKind::Call => {
                 entry.call_gxoi += row.value("gxoi");
                 entry.call_open_interest += row.value("oi");
+                entry.call_oi_change += oi_ch;
             }
             OptionKind::Put => {
                 entry.put_gxoi += row.value("gxoi");
                 entry.put_open_interest += row.value("oi");
+                entry.put_oi_change += oi_ch;
             }
         }
     }
@@ -758,6 +833,13 @@ pub fn build_options_context_report(
     let net_value_bias = row.value("value_bs");
     let net_volume_bias = row.value("volm_bs");
 
+    let front_vol = row.value("front_volatility");
+    let back_vol = row.value("back_volatility");
+    let vol_term_spread = match (front_vol, back_vol) {
+        (Some(f), Some(b)) => Some(f - b),
+        _ => None,
+    };
+
     Ok(OptionsContextReport {
         root: row.symbol.clone(),
         requested_params: requested_params.to_vec(),
@@ -775,6 +857,25 @@ pub fn build_options_context_report(
         put_volume: row.value("put_volume"),
         option_volume: row.value("option_volume"),
         implied_volatility: row.value("volatility"),
+        // flow decomposition
+        flow_ratio: row.value("flowratio"),
+        value_call_bs: row.value("value_call_bs"),
+        value_put_bs: row.value("value_put_bs"),
+        volm_call_bs: row.value("volm_call_bs"),
+        volm_put_bs: row.value("volm_put_bs"),
+        // exposure splits
+        call_gxoi: row.value("call_gxoi"),
+        put_gxoi: row.value("put_gxoi"),
+        call_dxoi: row.value("call_dxoi"),
+        put_dxoi: row.value("put_dxoi"),
+        // vol surface
+        front_volatility: front_vol,
+        back_volatility: back_vol,
+        vol_term_spread,
+        // premium flow
+        value_buy: row.value("value_buy"),
+        value_sell: row.value("value_sell"),
+        // regimes
         gamma_regime: regime_from_sign(row.value("gxoi")),
         dex_regime: regime_from_sign(row.value("dxoi")),
         vanna_regime: regime_from_sign(row.value("vannaxoi")),
@@ -783,6 +884,7 @@ pub fn build_options_context_report(
         notes: vec![
             "Aggregate gxoi/dxoi/vannaxoi/charmxoi are returned directly by ConvexValue.".to_string(),
             "flowDirection is inferred from flownet first, then value_bs, then volm_bs when flownet is missing.".to_string(),
+            "volTermSpread = frontVolatility - backVolatility; positive means front-month IV elevated (near-term fear).".to_string(),
         ],
     })
 }
@@ -894,13 +996,18 @@ mod tests {
 
     #[test]
     fn ranks_gamma_levels_by_total_gxoi() {
+        // params: gxoi, gxvolm, oi, oi_ch, volm_bs, volm, value_bs, vomma, volm_5m, spread
         let params = vec![
             "gxoi".to_string(),
             "gxvolm".to_string(),
             "oi".to_string(),
+            "oi_ch".to_string(),
             "volm_bs".to_string(),
             "volm".to_string(),
             "value_bs".to_string(),
+            "vomma".to_string(),
+            "volm_5m".to_string(),
+            "spread".to_string(),
         ];
         let raw = json!({
             "data": [
@@ -911,13 +1018,13 @@ mod tests {
                             [
                                 [
                                     5200.0,
-                                    ["C1", 1200.0, 18.0, 500.0, 12.0, 50.0, 2000.0],
-                                    ["P1", 900.0, 10.0, 430.0, -6.0, 40.0, -1000.0]
+                                    ["C1", 1200.0, 18.0, 500.0, 30.0, 12.0, 50.0, 2000.0, 5.5, 20.0, 1.20],
+                                    ["P1", 900.0, 10.0, 430.0, -15.0, -6.0, 40.0, -1000.0, 3.2, 10.0, 1.50]
                                 ],
                                 [
                                     5300.0,
-                                    ["C2", 200.0, 8.0, 110.0, 3.0, 10.0, 300.0],
-                                    ["P2", 150.0, 7.0, 95.0, -2.0, 8.0, -250.0]
+                                    ["C2", 200.0, 8.0, 110.0, 5.0, 3.0, 10.0, 300.0, 1.1, 4.0, 2.00],
+                                    ["P2", 150.0, 7.0, 95.0, -3.0, -2.0, 8.0, -250.0, 0.8, 3.0, 2.30]
                                 ]
                             ]
                         ]
@@ -929,12 +1036,17 @@ mod tests {
         let rows = parse_chain_rows(&raw, &params).expect("rows");
         let report = build_gamma_levels_report("SPX", &params, &rows, Some(2));
         assert_eq!(report.top_gamma_concentration_levels.len(), 2);
-        assert_eq!(report.top_gamma_concentration_levels[0].strike, 5200.0);
-        assert_eq!(report.top_gamma_concentration_levels[0].total_gxoi, 2100.0);
-        assert_eq!(
-            report.top_gamma_concentration_levels[0].net_volume_bias,
-            6.0
-        );
+        let top = &report.top_gamma_concentration_levels[0];
+        assert_eq!(top.strike, 5200.0);
+        assert_eq!(top.total_gxoi, 2100.0);
+        assert_eq!(top.net_volume_bias, 6.0);
+        // new fields
+        assert_eq!(top.total_oi_change, 15.0); // 30 + (-15)
+        assert_eq!(top.call_oi_change, 30.0);
+        assert_eq!(top.put_oi_change, -15.0);
+        assert!((top.total_vomma - 8.7).abs() < 0.01); // 5.5 + 3.2
+        assert!((top.total_volm_5m - 30.0).abs() < 0.01); // 20 + 10
+        assert!((top.avg_spread - 1.35).abs() < 0.01); // (1.20 + 1.50) / 2
     }
 
     #[test]
@@ -970,6 +1082,17 @@ mod tests {
             "flownet".to_string(),
             "vannaxoi".to_string(),
             "charmxoi".to_string(),
+            "flowratio".to_string(),
+            "value_call_bs".to_string(),
+            "value_put_bs".to_string(),
+            "call_gxoi".to_string(),
+            "put_gxoi".to_string(),
+            "call_dxoi".to_string(),
+            "put_dxoi".to_string(),
+            "front_volatility".to_string(),
+            "back_volatility".to_string(),
+            "value_buy".to_string(),
+            "value_sell".to_string(),
         ];
         let rows = vec![ConvexUnderlyingRow {
             symbol: "SPX".to_string(),
@@ -981,6 +1104,17 @@ mod tests {
                 ("flownet".to_string(), Some(-250_000.0)),
                 ("vannaxoi".to_string(), Some(450.0)),
                 ("charmxoi".to_string(), Some(-75.0)),
+                ("flowratio".to_string(), Some(0.85)),
+                ("value_call_bs".to_string(), Some(120_000.0)),
+                ("value_put_bs".to_string(), Some(-180_000.0)),
+                ("call_gxoi".to_string(), Some(-50.0)),
+                ("put_gxoi".to_string(), Some(-95.0)),
+                ("call_dxoi".to_string(), Some(6000.0)),
+                ("put_dxoi".to_string(), Some(3988.0)),
+                ("front_volatility".to_string(), Some(22.5)),
+                ("back_volatility".to_string(), Some(19.8)),
+                ("value_buy".to_string(), Some(500_000.0)),
+                ("value_sell".to_string(), Some(750_000.0)),
             ]),
         }];
 
@@ -989,5 +1123,18 @@ mod tests {
         assert_eq!(report.dex_regime.as_deref(), Some("positive"));
         assert_eq!(report.flow_direction.as_deref(), Some("net_selling"));
         assert_eq!(report.put_call_ratio, Some(1.12));
+        // new fields
+        assert_eq!(report.flow_ratio, Some(0.85));
+        assert_eq!(report.value_call_bs, Some(120_000.0));
+        assert_eq!(report.value_put_bs, Some(-180_000.0));
+        assert_eq!(report.call_gxoi, Some(-50.0));
+        assert_eq!(report.put_gxoi, Some(-95.0));
+        assert_eq!(report.call_dxoi, Some(6000.0));
+        assert_eq!(report.put_dxoi, Some(3988.0));
+        assert_eq!(report.front_volatility, Some(22.5));
+        assert_eq!(report.back_volatility, Some(19.8));
+        assert!((report.vol_term_spread.unwrap() - 2.7).abs() < 0.01);
+        assert_eq!(report.value_buy, Some(500_000.0));
+        assert_eq!(report.value_sell, Some(750_000.0));
     }
 }

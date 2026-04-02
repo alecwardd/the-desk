@@ -252,6 +252,41 @@ impl ScidReader {
         Ok(stats)
     }
 
+    /// First and last trade timestamps in the `.scid` file (by record order).
+    ///
+    /// Returns `(None, None)` if the file has no records after the header.
+    pub fn file_timestamp_bounds(&self) -> Result<(Option<f64>, Option<f64>), ScidError> {
+        let mut file = File::open(&self.path)?;
+        let header = Self::read_header(&mut file)?;
+        let data_start = header.header_size as u64;
+        let file_len = file.metadata()?.len();
+        if file_len <= data_start {
+            return Ok((None, None));
+        }
+        let total_records = (file_len - data_start) / SCID_RECORD_SIZE as u64;
+        if total_records == 0 {
+            return Ok((None, None));
+        }
+
+        let mut record = [0_u8; SCID_RECORD_SIZE];
+        file.seek(SeekFrom::Start(data_start))?;
+        let first_ts = if file.read_exact(&mut record).is_ok() {
+            self.parse_record(&record).map(|t| t.timestamp_ms)
+        } else {
+            None
+        };
+
+        let last_offset = data_start + (total_records.saturating_sub(1)) * SCID_RECORD_SIZE as u64;
+        file.seek(SeekFrom::Start(last_offset))?;
+        let last_ts = if file.read_exact(&mut record).is_ok() {
+            self.parse_record(&record).map(|t| t.timestamp_ms)
+        } else {
+            None
+        };
+
+        Ok((first_ts, last_ts))
+    }
+
     pub fn estimate_range_records(
         &self,
         start_ms: Option<f64>,
@@ -520,6 +555,17 @@ mod tests {
         assert_eq!(ticks.len(), 2);
         assert_eq!(ticks[0].price, 21000.0);
         assert!(matches!(ticks[0].side, TradeSide::Buy));
+    }
+
+    #[test]
+    fn file_timestamp_bounds_first_and_last() {
+        let mut file = NamedTempFile::new().expect("temp");
+        write_scid(&mut file, &[21000.0, 21000.25, 21000.5]);
+        let reader = ScidReader::new(file.path());
+        let (lo, hi) = reader.file_timestamp_bounds().expect("bounds");
+        let ticks = reader.read_bulk().expect("read");
+        assert_eq!(lo, Some(ticks[0].timestamp_ms));
+        assert_eq!(hi, Some(ticks[2].timestamp_ms));
     }
 
     #[test]

@@ -4,12 +4,14 @@ pub mod depth;
 pub mod dom_replay;
 pub mod feed;
 pub mod memory;
+pub mod options;
 pub mod outcome_tracker;
 pub mod pipelines;
 pub mod recording;
 pub mod research;
 pub mod risk;
 pub mod rules;
+pub mod scid_tick_ingest;
 pub mod templates;
 
 use chrono::{Datelike, TimeZone, Timelike, Utc};

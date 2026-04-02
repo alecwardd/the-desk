@@ -37,6 +37,9 @@ use the_desk_backend::memory::{
     save_agent_insight as memory_save_agent_insight, AgentInsightQuery, BehavioralPatternQuery,
     MemoryBriefQuery, MemoryFollowupRecord, SaveAgentInsightInput,
 };
+use the_desk_backend::options::{
+    fetch_options_snapshot, load_options_config, OptionsCredentials, OptionsSnapshot,
+};
 use the_desk_backend::outcome_tracker;
 use the_desk_backend::pipelines::{
     EventDetector, FlowEventEmitter, PipelineEngine, PriorSessionData, RvolPipeline,
@@ -44,6 +47,7 @@ use the_desk_backend::pipelines::{
 use the_desk_backend::research;
 use the_desk_backend::risk::{RiskConfig, RiskState, RiskTracker};
 use the_desk_backend::rules::RulesEngine;
+use the_desk_backend::scid_tick_ingest::{self, TickIngestParams};
 use the_desk_backend::{
     classify_delta_segment, classify_session, et_minutes_from_timestamp, globex_open_ms,
     minute_of_session_from_timestamp, session_date_from_timestamp_ms,
@@ -213,6 +217,7 @@ pub struct TheDeskMcp {
     last_ask: Arc<Mutex<f64>>,
     feed_runtime: Arc<McpFeedRuntimeState>,
     backfill_manager: Arc<AsyncMutex<BackfillManager>>,
+    options_cache: Arc<AsyncMutex<OptionsSnapshotCache>>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -228,6 +233,11 @@ struct BackfillManager {
     active_job_id: Option<String>,
     last_job_id: Option<String>,
     jobs: HashMap<String, InMemoryJobState>,
+}
+
+#[derive(Debug, Default)]
+struct OptionsSnapshotCache {
+    snapshot: Option<OptionsSnapshot>,
 }
 
 fn db_error(e: impl std::fmt::Display) -> McpError {
@@ -553,6 +563,39 @@ fn build_tape_pace_response(
 
 fn invalid_params_error(msg: impl Into<String>) -> McpError {
     McpError::new(ErrorCode::INVALID_PARAMS, msg.into(), None)
+}
+
+fn normalize_options_root(
+    requested_root: Option<&str>,
+    default_root: &str,
+) -> Result<String, McpError> {
+    let root = requested_root
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(default_root)
+        .trim()
+        .to_uppercase();
+    if root.is_empty() {
+        return Err(invalid_params_error("root must not be empty"));
+    }
+    Ok(root)
+}
+
+fn normalize_options_exps(requested_exps: Option<Vec<u32>>, default_exps: &[u32]) -> Vec<u32> {
+    let mut exps = requested_exps.unwrap_or_else(|| default_exps.to_vec());
+    exps.sort_unstable();
+    exps.dedup();
+    exps
+}
+
+fn options_cache_metadata(snapshot: &OptionsSnapshot, refreshed: bool) -> serde_json::Value {
+    let now_ms = Utc::now().timestamp_millis() as f64;
+    serde_json::json!({
+        "fetchedAtMs": snapshot.fetched_at_ms,
+        "snapshotAgeMs": snapshot.age_ms(now_ms),
+        "cacheTtlMs": snapshot.cache_ttl_ms,
+        "cacheStatus": if refreshed { "refreshed" } else { "hit" },
+    })
 }
 
 fn validate_time_window(start_time_ms: f64, end_time_ms: f64) -> Result<(), McpError> {
@@ -1001,6 +1044,45 @@ struct LimitParams {
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct OptionsSnapshotParams {
+    /// Optional root symbol. Defaults to [options].convexvalue_probe_root.
+    root: Option<String>,
+    /// Optional expiration selectors accepted by ConvexValue.
+    exps: Option<Vec<u32>>,
+    /// Optional spot-relative range filter (for example 0.10 for +/-10%).
+    range: Option<f64>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct GammaLevelsParams {
+    /// Optional root symbol. Defaults to [options].convexvalue_probe_root.
+    root: Option<String>,
+    /// Optional expiration selectors accepted by ConvexValue.
+    exps: Option<Vec<u32>>,
+    /// Optional spot-relative range filter (for example 0.10 for +/-10%).
+    range: Option<f64>,
+    /// Maximum number of strikes to return (default 12, max 50).
+    top: Option<u64>,
+    /// Force a network refresh instead of serving a warm cache hit.
+    force_refresh: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct OptionsContextParams {
+    /// Optional root symbol. Defaults to [options].convexvalue_probe_root.
+    root: Option<String>,
+    /// Optional expiration selectors accepted by ConvexValue.
+    exps: Option<Vec<u32>>,
+    /// Optional spot-relative range filter (for example 0.10 for +/-10%).
+    range: Option<f64>,
+    /// Force a network refresh instead of serving a warm cache hit.
+    force_refresh: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 struct TickQueryParams {
     /// Maximum number of ticks to return (default 200, max 2000). When a time range is set,
     /// results are returned in ascending chronological order; otherwise most-recent first.
@@ -1295,6 +1377,31 @@ struct BackfillParams {
 struct BackfillStatusParams {
     #[serde(alias = "job_id")]
     job_id: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct RawTickIngestGapParams {
+    /// Optional start of clip window (YYYY-MM-DD, ET midnight).
+    #[serde(alias = "start_date")]
+    start_date: Option<String>,
+    /// Optional end of clip window (YYYY-MM-DD, exclusive at next midnight).
+    #[serde(alias = "end_date")]
+    end_date: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct IngestRawTicksParams {
+    #[serde(alias = "start_date")]
+    start_date: Option<String>,
+    #[serde(alias = "end_date")]
+    end_date: Option<String>,
+    /// When true (default), only SCID windows missing from raw_ticks for this contract.
+    #[serde(alias = "only_gaps")]
+    only_gaps: Option<bool>,
+    #[serde(alias = "wait_for_completion")]
+    wait_for_completion: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1755,8 +1862,67 @@ impl TheDeskMcp {
             last_ask: Arc::new(Mutex::new(0.0)),
             feed_runtime: Arc::new(McpFeedRuntimeState::default()),
             backfill_manager: Arc::new(AsyncMutex::new(BackfillManager::default())),
+            options_cache: Arc::new(AsyncMutex::new(OptionsSnapshotCache::default())),
             tool_router: Self::tool_router(),
         }
+    }
+
+    async fn get_or_refresh_options_snapshot(
+        &self,
+        root: Option<&str>,
+        exps: Option<Vec<u32>>,
+        range: Option<f64>,
+        force_refresh: bool,
+    ) -> Result<(OptionsSnapshot, bool), McpError> {
+        let config = load_options_config();
+        if !config.enabled {
+            return Err(invalid_params_error(
+                "options integration is disabled; set [options].enabled = true in ~/.the-desk/config.toml",
+            ));
+        }
+
+        let root = normalize_options_root(root, &config.convexvalue_probe_root)?;
+        let exps = normalize_options_exps(exps, &config.convexvalue_probe_exps);
+        let range = range.or(config.convexvalue_probe_range);
+        let now_ms = Utc::now().timestamp_millis() as f64;
+
+        {
+            let cache = self.options_cache.lock().await;
+            if !force_refresh {
+                if let Some(snapshot) = &cache.snapshot {
+                    if snapshot.matches_request(
+                        &root,
+                        &exps,
+                        range,
+                        &config.convexvalue_probe_params,
+                        &config.convexvalue_context_params,
+                    ) && snapshot.is_fresh(now_ms)
+                    {
+                        return Ok((snapshot.clone(), false));
+                    }
+                }
+            }
+        }
+
+        let credentials = OptionsCredentials::from_env(&config)
+            .map_err(|e| invalid_params_error(e.to_string()))?;
+        let snapshot = fetch_options_snapshot(
+            &config,
+            &credentials,
+            &root,
+            if exps.is_empty() {
+                None
+            } else {
+                Some(exps.as_slice())
+            },
+            range,
+        )
+        .await
+        .map_err(db_error)?;
+
+        let mut cache = self.options_cache.lock().await;
+        cache.snapshot = Some(snapshot.clone());
+        Ok((snapshot, true))
     }
 
     /// Single coherent live view: in-memory pipeline when available, else persisted `feature_state`.
@@ -2427,6 +2593,106 @@ impl TheDeskMcp {
             out["untestedDnps"] = serde_json::json!(list);
         }
         merge_tool_live_metadata(&mut out, &r);
+        Ok(text_result(out))
+    }
+
+    #[tool(
+        description = "Top SPX/options gamma concentration strikes from ConvexValue, with call/put breakdown, open interest, volume bias, expiration coverage, and cache metadata. Use for pre-session context like 'where are the likely gamma walls?'"
+    )]
+    async fn get_gamma_levels(
+        &self,
+        Parameters(params): Parameters<GammaLevelsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let top_n = params.top.unwrap_or(12).clamp(1, 50) as usize;
+        let (snapshot, refreshed) = self
+            .get_or_refresh_options_snapshot(
+                params.root.as_deref(),
+                params.exps.clone(),
+                params.range,
+                params.force_refresh.unwrap_or(false),
+            )
+            .await?;
+        let mut report = snapshot.gamma_levels.clone();
+        report
+            .top_gamma_concentration_levels
+            .truncate(top_n.min(report.top_gamma_concentration_levels.len()));
+        let out = serde_json::json!({
+            "root": snapshot.root,
+            "requestedExpirations": snapshot.requested_exps,
+            "requestedRange": snapshot.requested_range,
+            "report": report,
+            "optionsContextSummary": {
+                "aggregateGxoi": snapshot.context.aggregate_gxoi,
+                "aggregateDxoi": snapshot.context.aggregate_dxoi,
+                "putCallRatio": snapshot.context.put_call_ratio,
+                "flowDirection": snapshot.context.flow_direction,
+            },
+            "cache": options_cache_metadata(&snapshot, refreshed),
+        });
+        Ok(text_result(out))
+    }
+
+    #[tool(
+        description = "Aggregate ConvexValue options regime context: underlying price/change, aggregate gxoi/dxoi, put-call ratio, flow direction, vanna/charm regime, and cache metadata. Use when an agent needs broad options positioning context rather than per-strike detail."
+    )]
+    async fn get_options_context(
+        &self,
+        Parameters(params): Parameters<OptionsContextParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let (snapshot, refreshed) = self
+            .get_or_refresh_options_snapshot(
+                params.root.as_deref(),
+                params.exps.clone(),
+                params.range,
+                params.force_refresh.unwrap_or(false),
+            )
+            .await?;
+        let out = serde_json::json!({
+            "root": snapshot.root,
+            "requestedExpirations": snapshot.requested_exps,
+            "requestedRange": snapshot.requested_range,
+            "context": snapshot.context,
+            "topGammaStrikes": snapshot
+                .gamma_levels
+                .top_gamma_concentration_levels
+                .iter()
+                .take(3)
+                .cloned()
+                .collect::<Vec<_>>(),
+            "cache": options_cache_metadata(&snapshot, refreshed),
+        });
+        Ok(text_result(out))
+    }
+
+    #[tool(
+        description = "Force-refresh the cached ConvexValue snapshot used by get_gamma_levels and get_options_context, then return the fresh options context plus a gamma-level preview."
+    )]
+    async fn refresh_options_snapshot(
+        &self,
+        Parameters(params): Parameters<OptionsSnapshotParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let (snapshot, refreshed) = self
+            .get_or_refresh_options_snapshot(
+                params.root.as_deref(),
+                params.exps,
+                params.range,
+                true,
+            )
+            .await?;
+        let out = serde_json::json!({
+            "root": snapshot.root,
+            "requestedExpirations": snapshot.requested_exps,
+            "requestedRange": snapshot.requested_range,
+            "context": snapshot.context,
+            "gammaLevelsPreview": snapshot
+                .gamma_levels
+                .top_gamma_concentration_levels
+                .iter()
+                .take(5)
+                .cloned()
+                .collect::<Vec<_>>(),
+            "cache": options_cache_metadata(&snapshot, refreshed),
+        });
         Ok(text_result(out))
     }
 
@@ -5140,6 +5406,130 @@ impl TheDeskMcp {
             }
         }
         Ok(text_result(historical_job_response(&run, already_running)))
+    }
+
+    #[tool(
+        description = "Report raw_ticks DB coverage vs the active .scid file for the configured contract: SCID first/last timestamps, DB min/max tick times, session_summary date span, and missing ranges (prefix/suffix only — internal tape holes are not detected). Optional startDate/endDate (YYYY-MM-DD) clip."
+    )]
+    async fn get_raw_tick_ingest_gaps(
+        &self,
+        Parameters(params): Parameters<RawTickIngestGapParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let config = load_feed_config();
+        let contract = resolve_contract_metadata(&config);
+        let reader = ScidReader::from_feed_config(&config);
+        if !reader.path().exists() {
+            return Ok(no_data(
+                "SCID file not found. Ensure Sierra Chart data path is configured in ~/.the-desk/config.toml",
+            ));
+        }
+        let db = self.db.lock().map_err(|_| lock_error())?;
+        let report = scid_tick_ingest::analyze_tick_ingest_gaps(
+            &reader,
+            &db,
+            &contract,
+            params.start_date.as_deref(),
+            params.end_date.as_deref(),
+        )
+        .map_err(db_error)?;
+        Ok(text_result(
+            serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({})),
+        ))
+    }
+
+    #[tool(
+        description = "Load trades from the Sierra .scid file into SQLite raw_ticks using INSERT OR IGNORE. Default onlyGaps=true fills prefix/suffix gaps vs existing rows for the current contract; onlyGaps=false scans the full date clip. Separate from backfill_history (which replays pipelines / session summaries without persisting raw ticks). Large ingests: set waitForCompletion=false to avoid MCP timeouts (check dbTickCount via get_session_summary)."
+    )]
+    async fn ingest_raw_ticks_from_scid(
+        &self,
+        Parameters(params): Parameters<IngestRawTicksParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let config = load_feed_config();
+        let reader = ScidReader::from_feed_config(&config);
+        if !reader.path().exists() {
+            return Ok(no_data(
+                "SCID file not found. Ensure Sierra Chart data path is configured in ~/.the-desk/config.toml",
+            ));
+        }
+        let only_gaps = params.only_gaps.unwrap_or(true);
+        let wait = params.wait_for_completion.unwrap_or(true);
+        let start_date = params.start_date.clone();
+        let end_date = params.end_date.clone();
+
+        if wait {
+            let db_path = Arc::clone(&self.db_path);
+            let out = tokio::task::spawn_blocking(move || {
+                let config = load_feed_config();
+                let contract = resolve_contract_metadata(&config);
+                let reader = ScidReader::from_feed_config(&config);
+                let db = Database::open(db_path.as_str()).map_err(|e| e.to_string())?;
+                scid_tick_ingest::run_tick_ingest(
+                    &reader,
+                    &db,
+                    &contract,
+                    TickIngestParams {
+                        start_date: start_date.as_deref(),
+                        end_date: end_date.as_deref(),
+                        only_gaps,
+                    },
+                )
+                .map_err(|e| e.to_string())
+            })
+            .await
+            .map_err(|e| db_error(format!("ingest task join: {e}")))?
+            .map_err(db_error)?;
+            let (report, ingest) = out;
+            return Ok(text_result(serde_json::json!({
+                "gapReport": report,
+                "ingest": ingest,
+                "onlyGaps": only_gaps,
+            })));
+        }
+
+        let db_path = Arc::clone(&self.db_path);
+        tokio::task::spawn(async move {
+            let res = tokio::task::spawn_blocking(move || {
+                let config = load_feed_config();
+                let contract = resolve_contract_metadata(&config);
+                let reader = ScidReader::from_feed_config(&config);
+                let db = match Database::open(db_path.as_str()) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        eprintln!("[the-desk-mcp] ingest_raw_ticks_from_scid: open db failed: {e}");
+                        return;
+                    }
+                };
+                match scid_tick_ingest::run_tick_ingest(
+                    &reader,
+                    &db,
+                    &contract,
+                    TickIngestParams {
+                        start_date: start_date.as_deref(),
+                        end_date: end_date.as_deref(),
+                        only_gaps,
+                    },
+                ) {
+                    Ok((rep, ing)) => {
+                        eprintln!(
+                            "[the-desk-mcp] ingest_raw_ticks_from_scid finished: gaps={} scanned={} submitted={}",
+                            rep.gaps.len(),
+                            ing.as_ref().map(|i| i.scid_records_scanned).unwrap_or(0),
+                            ing.as_ref().map(|i| i.ticks_submitted_to_insert).unwrap_or(0),
+                        );
+                    }
+                    Err(e) => eprintln!("[the-desk-mcp] ingest_raw_ticks_from_scid failed: {e}"),
+                }
+            })
+            .await;
+            if let Err(e) = res {
+                eprintln!("[the-desk-mcp] ingest_raw_ticks_from_scid task: {e}");
+            }
+        });
+        Ok(text_result(serde_json::json!({
+            "status": "started",
+            "onlyGaps": only_gaps,
+            "message": "Ingest running in background; use get_raw_tick_ingest_gaps or get_session_summary to verify dbTickCount.",
+        })))
     }
 
     #[tool(

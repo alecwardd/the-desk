@@ -4442,6 +4442,69 @@ impl Database {
         Ok(ts)
     }
 
+    /// Min/max timestamp and count for `raw_ticks` for a contract inside `[start_ms, end_ms_exclusive)`.
+    pub fn raw_ticks_time_bounds_for_contract_in_range(
+        &self,
+        contract_symbol: &str,
+        start_ms: f64,
+        end_ms_exclusive: f64,
+    ) -> Result<(Option<f64>, Option<f64>, i64), DbError> {
+        if contract_symbol.is_empty() {
+            return self
+                .conn
+                .query_row(
+                    "SELECT MIN(timestamp_ms), MAX(timestamp_ms), COUNT(1) FROM raw_ticks \
+                 WHERE timestamp_ms >= ?1 AND timestamp_ms < ?2",
+                    params![start_ms, end_ms_exclusive],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .map_err(DbError::Sqlite);
+        }
+        self.conn
+            .query_row(
+                "SELECT MIN(timestamp_ms), MAX(timestamp_ms), COUNT(1) FROM raw_ticks \
+                 WHERE contract_symbol = ?1 AND timestamp_ms >= ?2 AND timestamp_ms < ?3",
+                params![contract_symbol, start_ms, end_ms_exclusive],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .map_err(DbError::Sqlite)
+    }
+
+    /// Min/max timestamp and row count for `raw_ticks` scoped to a contract (e.g. `NQM6.CME`).
+    ///
+    /// Empty contract string is treated as “no filter” (whole table).
+    pub fn raw_ticks_time_bounds_for_contract(
+        &self,
+        contract_symbol: &str,
+    ) -> Result<(Option<f64>, Option<f64>, i64), DbError> {
+        if contract_symbol.is_empty() {
+            return self.raw_ticks_time_bounds_unscoped();
+        }
+        let row = self.conn.query_row(
+            "SELECT MIN(timestamp_ms), MAX(timestamp_ms), COUNT(1) FROM raw_ticks WHERE contract_symbol = ?1",
+            params![contract_symbol],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        );
+        match row {
+            Ok(t) => Ok(t),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok((None, None, 0)),
+            Err(e) => Err(DbError::Sqlite(e)),
+        }
+    }
+
+    /// Min/max over all `raw_ticks` regardless of contract.
+    pub fn raw_ticks_time_bounds_unscoped(
+        &self,
+    ) -> Result<(Option<f64>, Option<f64>, i64), DbError> {
+        self.conn
+            .query_row(
+                "SELECT MIN(timestamp_ms), MAX(timestamp_ms), COUNT(1) FROM raw_ticks",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .map_err(DbError::Sqlite)
+    }
+
     pub fn count_playbook_signals(&self) -> Result<i64, DbError> {
         Ok(self
             .conn

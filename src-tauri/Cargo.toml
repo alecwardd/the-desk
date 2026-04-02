@@ -8,7 +8,7 @@ default-run = "the-desk-backend"
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
 bytes = "1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "cookies"] }
 rmcp = { version = "0.16", features = ["server", "macros", "transport-io"] }
 rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
 schemars = "1"

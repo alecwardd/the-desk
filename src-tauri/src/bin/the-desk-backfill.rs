@@ -1,7 +1,7 @@
 //! One-shot binary to run a historical backfill job.
 //!
-//! Loads .scid data into the database (session summaries, market events, signal outcomes).
-//! Use this to populate the research database before weekend analysis.
+//! Loads .scid data into the database: session summaries / events via the research backfill,
+//! or raw tick rows via `--ingest-ticks`. Use this to populate the research database before analysis.
 //!
 //! Run:
 //!   cargo run --bin the-desk-backfill                    # All available data
@@ -12,9 +12,13 @@
 
 use std::sync::atomic::AtomicBool;
 
+use serde_json::json;
 use the_desk_backend::backfill::{self, BackfillJobParams, HistoricalJobType};
 use the_desk_backend::db::Database;
-use the_desk_backend::feed::{load_feed_config, scid_reader::ScidReader};
+use the_desk_backend::feed::{
+    load_feed_config, resolve_contract_metadata, scid_reader::ScidReader,
+};
+use the_desk_backend::scid_tick_ingest::{self, TickIngestParams};
 
 fn data_dir() -> std::path::PathBuf {
     let home = std::env::var("USERPROFILE")
@@ -32,6 +36,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut force = false;
     let mut run_rules = false;
     let mut status_only = false;
+    let mut tick_gaps_only = false;
+    let mut ingest_ticks = false;
+    let mut full_clip_ingest = false;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -50,6 +57,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--status" => {
                 status_only = true;
             }
+            "--tick-gaps" => {
+                tick_gaps_only = true;
+            }
+            "--ingest-ticks" => {
+                ingest_ticks = true;
+            }
+            "--full-clip" => {
+                full_clip_ingest = true;
+            }
             "--help" | "-h" => {
                 eprintln!(
                     r#"the-desk-backfill — Load historical .scid data into the database
@@ -63,6 +79,9 @@ Options:
   --force, -f         Reprocess sessions even if summaries exist.
   --run-rules, -r     Run rules engine to populate signal outcomes (backtest).
   --status            Show database coverage only (session count and date range). No backfill.
+  --tick-gaps         Print raw_ticks vs .scid gap analysis (prefix/suffix only). No backfill.
+  --ingest-ticks      Insert missing .scid trades into raw_ticks (INSERT OR IGNORE).
+  --full-clip         With --ingest-ticks: scan full date clip, not only DB gaps.
   --help, -h          Show this help.
 
 Examples:
@@ -74,6 +93,10 @@ Examples:
 
   # Force reprocess this week
   the-desk-backfill --start 2025-03-03 --end 2025-03-06 --force
+
+  # Show missing raw tick windows vs SCID, then fill them
+  the-desk-backfill --tick-gaps
+  the-desk-backfill --ingest-ticks --start 2026-03-29 --end 2026-03-31
 
 Config: ~/.the-desk/config.toml (sierra_data_dir, symbol)
 "#
@@ -114,6 +137,38 @@ Config: ~/.the-desk/config.toml (sierra_data_dir, symbol)
         eprintln!("Ensure Sierra Chart data path is configured in ~/.the-desk/config.toml");
         eprintln!("Default: sierra_data_dir = \"C:\\\\SierraChart\\\\Data\", symbol = \"NQ\"");
         std::process::exit(1);
+    }
+
+    let contract = resolve_contract_metadata(&config);
+
+    if tick_gaps_only {
+        let report = scid_tick_ingest::analyze_tick_ingest_gaps(
+            &reader,
+            &db,
+            &contract,
+            start_date.as_deref(),
+            end_date.as_deref(),
+        )?;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    if ingest_ticks {
+        let (report, ingest) = scid_tick_ingest::run_tick_ingest(
+            &reader,
+            &db,
+            &contract,
+            TickIngestParams {
+                start_date: start_date.as_deref(),
+                end_date: end_date.as_deref(),
+                only_gaps: !full_clip_ingest,
+            },
+        )?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({ "gapReport": report, "ingest": ingest }))?
+        );
+        return Ok(());
     }
 
     let job_id = uuid::Uuid::new_v4().to_string();

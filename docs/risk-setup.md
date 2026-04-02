@@ -17,9 +17,8 @@ Call `save_account_state` with your current values:
 ```json
 {
   "lastBalanceDollars": 50000,
-  "lucidDailyLossDollars": 750,
+  "lucidDailyLossDollars": 1200,
   "lucidAccountSizeDollars": 50000,
-  "profitTargetPerCycle": 2000,
   "openPositions": [
     {
       "direction": "short",
@@ -32,9 +31,8 @@ Call `save_account_state` with your current values:
 ```
 
 - **lastBalanceDollars** — current account balance  
-- **lucidDailyLossDollars** — Lucid daily loss limit (e.g. $750)  
+- **lucidDailyLossDollars** — Lucid daily loss limit (e.g. $1,200)  
 - **lucidAccountSizeDollars** — account size for R derivation  
-- **profitTargetPerCycle** — Lucid profit target per cycle (e.g. $2,000)  
 - **openPositions** — any open positions not yet closed  
 
 ### 2. Save risk config (optional)
@@ -43,16 +41,16 @@ Call `save_risk_config` to persist custom limits. Omit fields to keep defaults:
 
 ```json
 {
-  "rValuePoints": 50,
-  "rValueDollars": 250,
+  "rValuePoints": 80,
+  "rValueDollars": 400,
   "maxDailyLossR": 3,
   "maxConsecutiveLosses": 3,
   "maxTradesPerSession": 8,
-  "maxDailyLossDollars": 750
+  "maxDailyLossDollars": 1200
 }
 ```
 
-Defaults: R = 50 pts / $250, max 3R daily loss, 3-loss circuit breaker, 8 trades/session.
+Defaults: R = 80 pts / $400, max 3R daily loss ($1,200), 3-loss circuit breaker, 8 trades/session.
 
 ### 3. Initialize risk state
 
@@ -66,7 +64,7 @@ No parameters required.
 cargo run --bin the-desk-init-risk
 ```
 
-This writes default risk config (R=50pts/$250, max 3R daily, 3-loss circuit breaker) and creates the initial risk state row. Uses the same database as MCP and Tauri (`~/.the-desk/data.db`).
+This writes default risk config (R=80pts/$400, max 3R daily = $1,200, 3-loss circuit breaker) and creates the initial risk state row. Uses the same database as MCP and Tauri (`~/.the-desk/data.db`).
 
 ## R Derivation
 
@@ -77,7 +75,17 @@ R_dollars = lucid_daily_loss_dollars / max_daily_loss_r
 R_points  = R_dollars / 5.00   (NQ: $5 per point per MNQ contract)
 ```
 
-Example: $750 daily loss, 3R max → R = $250 = 50 NQ points.
+Example: $1,200 daily loss, 3R max → R = $400 = 80 NQ points.
+
+## Lucid Direct Payout Rules
+
+The current account-specific payout rules are:
+
+- 20% consistency before payout
+- At least 5 profitable trading days before payout
+- End-of-day drawdown framing via LucidScale
+
+Those payout-cycle metrics are currently prompt-managed for the risk coach rather than persisted in the SQLite risk tables, so confirm them manually when payout eligibility matters.
 
 ## Tauri App
 

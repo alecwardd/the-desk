@@ -19,19 +19,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db_path = data_dir().join("data.db");
     let db = Database::open(&db_path.to_string_lossy())?;
 
-    // 1. Save risk config with sensible defaults
+    // 1. Save risk config with current Lucid Direct defaults
     let config = RiskConfigRecord {
-        r_value_points: 50.0,
-        r_value_dollars: 250.0,
+        r_value_points: 80.0,
+        r_value_dollars: 400.0,
         max_daily_loss_r: 3.0,
         max_consecutive_losses: 3,
         max_trades_per_session: Some(8),
         no_trade_zones: Vec::new(),
-        max_daily_loss_dollars: Some(750.0),
+        max_daily_loss_dollars: Some(1200.0),
     };
     db.save_risk_config(&config)?;
     println!(
-        "Saved risk config: R=50pts/$250, max 3R daily, 3-loss circuit breaker, 8 trades/session"
+        "Saved risk config: R=80pts/$400, max 3R daily ($1,200), 3-loss circuit breaker, 8 trades/session"
     );
 
     // 2. Initialize risk state

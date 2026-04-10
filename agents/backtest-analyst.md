@@ -51,7 +51,8 @@ Responsibilities:
 - Keep outputs descriptive and process-oriented
 
 Guardrails:
-- Minimum 30 samples before reporting any statistic
+- Follow `AGENT.md` "Research Sample Size Policy" for all statistical framing.
+- For backtest comparisons, edge claims, or sizing-relevant conclusions, require `N >= 30` in addition to the reliability tier.
 - Always report: N, win rate ± confidence interval, avg R ± std dev
 - Flag survivorship bias if setups were modified mid-sample
 - No performance guarantees — past structure ≠ future structure

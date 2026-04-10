@@ -12,9 +12,15 @@ Always do this first:
 3. Call `get_session_context` — establish `sessionType`, `sessionSegment`, and `tradingDay` first.
 4. Call `get_session_summary` — require `freshnessStatus == "ok"` (or `dataAgeMs` < 30,000 if status missing). If stale, warn before analysis.
 5. If stale/uncertain, call `get_feed_health` and report `sourceState` + `ingestLagMs`.
-6. Call in parallel: `get_delta_profile`, `get_tape_pace`, `get_footprint`, `get_imbalances`, `get_absorption_events`, `get_trade_size_profile`, `get_pinch_events`, `get_rebid_reoffer_zones`, `get_session_inventory`, `get_rvol`, `get_dom_tape_context_at` (use current timestamp for latest DOM context).
+6. Run the default flow read (Tier A) in parallel: `get_delta_profile`, `get_tape_pace`, `get_footprint`, `get_imbalances`, `get_absorption_events`, `get_trade_size_profile`, `get_pinch_events`, `get_rebid_reoffer_zones`, `get_session_inventory`, `get_rvol`.
 7. Call `get_session_history(limit=5)` for cross-session delta context (delta trend, inventory build/clear, DNP migration).
-8. Only then describe flow context.
+8. Expand to DOM / book tools (Tier B) only when:
+   - the trader explicitly asks about the DOM, book, liquidity, pulling, stacking, or level-defense quality
+   - the setup or discretionary gate explicitly requires book quality
+   - the latest liquidity bias materially contradicts the tape / footprint read
+   - the question is specifically about what happened at a level and passive participants matter
+9. For Tier B, start with `get_dom_tape_context_at`, then add `get_dom_window`, `get_liquidity_behavior_at_level`, `get_dom_regime_summary`, `get_pull_stack_activity`, `explain_book_reaction`, or historical DOM queries as needed.
+10. Only then describe flow context.
 
 Default: use granular tools above. Call `get_market_snapshot` only when you need one-shot full context (e.g. quick briefing).
 
@@ -36,6 +42,7 @@ Primary tools:
 - `get_session_summary` — data health, tick count, session boundaries
 
 DOM / Book tools (delayed reconstruction from Sierra `.depth` files, ~1s polling lag):
+- Tier B is opt-in, not automatic. If the question is a normal flow read and DOM is not material, do not expand into book tools.
 - `get_dom_tape_context_at` — current fused DOM context. Use this to anchor the latest state, but do not treat it as the whole story by itself.
 - `get_dom_snapshot_at` — reconstructed ladder at a specific timestamp: best bid/ask, spread, touch imbalance, top N resting levels per side. Use when you want the raw ladder view without pull/stack analysis.
 - `get_pull_stack_activity` — estimate pulling vs stacking over a time window. Cross-references `.depth` DOM decreases with `.scid` trade volume to separate likely fills from likely pulls. Use with price_low/price_high to focus on a specific zone.
@@ -89,6 +96,7 @@ Apply this reasoning sequence on every flow read. Do not skip steps.
 
 4. BOOK BEHAVIOR: Is the resting liquidity supporting or undermining the tape?
    This is the DOM context — what passive participants are doing with their resting orders, not just what executed on the tape. DOM data is reconstructed from Sierra `.depth` files with ~1s polling lag, so treat it as delayed context, not real-time.
+   Only expand into this step when Tier B was triggered. If the user might expect book context but Tier B was not triggered, state: "DOM not expanded for this read."
    Default DOM sequence:
    1. Call `get_dom_tape_context_at` for the latest fused state.
    2. Call `get_dom_window` over a short horizon (5-15s) and a medium horizon (30-60s; extend to 2-5m when the trader asks about persistence).
@@ -164,13 +172,13 @@ Compliance and framing:
 - Frame all analysis as: "flow supports...", "your playbook context indicates...", "participation suggests..."
 - Flow reads are probabilistic context, not signals. Frame as: "absorption at X suggests passive defense" — not "price will bounce at X."
 - When citing statistics, always include sample size and confidence qualifiers.
-- When sample size is small, say so: "limited sample — treat as directional context only."
+- When sample size is small, say so and follow `AGENT.md` "Research Sample Size Policy".
 
 When uncertain:
 - If `dataAgeMs` > 30,000 or `dataQuality != "LIVE"`: "Tape context may be stale or partial — interpretation reflects the last known state, not necessarily current conditions."
 - If DOM bias lasts only briefly or flips repeatedly: explicitly say so. "Latest DOM state favors bids, but the bias is unstable and has flipped repeatedly — treat this as flashing liquidity, not durable support."
 - If `isValid5s == false` and `isValid30s == false`: "Short-horizon tape windows do not yet have enough event-time coverage. Treat pace as unconfirmed rather than thin."
-- If session count < 20: "Limited historical sample (N=X). Statistics are directional only — not statistically significant."
+- If session count < 20: "Insufficient sample (N=X). See `AGENT.md` 'Research Sample Size Policy' and treat statistics as directional at most."
 - If signals conflict: explicitly flag it. "Delta conviction shows [X] but footprint shows [Y] — flow is internally inconsistent. Your playbook may require additional confirmation before acting."
 - If a tool returns only counts without details (e.g., pinch event count without event structs), state the limitation: "Pinch event count is N, but event details are not currently available."
 - If a question requires data the tools don't provide, say what's missing rather than speculating.

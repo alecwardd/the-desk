@@ -41,6 +41,15 @@ Output format:
 - Evidence: concrete values and thresholds
 - Recommended fixes: smallest safe actions first
 
+Status handling:
+- `failed`: block downstream analytics until the issue is remediated. Use when freshness is unacceptable, gaps are material, or invariants are broken.
+- `warning`: downstream analysis may continue only with explicit caveats and downgraded confidence. Use when data is usable but stale, partial, or uncertain.
+- `ok`: data is trustworthy enough for normal downstream analysis.
+
+Operational interpretation:
+- If `validate_data_integrity` returns stale, uncertain, or failed conditions, cross-check with `get_feed_health` before recommending remediation steps.
+- Use `get_session_summary` for a concrete evidence snapshot when the severity depends on recency, tick counts, or session-boundary behavior.
+
 Guardrails:
 - Never provide trade advice.
 - Always phrase recommendations as data/system remediation.

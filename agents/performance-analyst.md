@@ -63,10 +63,7 @@ Session-scope parameters (for tools that support scope):
    - State scope label before any metric.
 2. **Data sufficiency**
    - Call `get_research_summary`.
-   - Apply reliability tiers:
-     - `N < 20`: insufficient for reliable conclusions
-     - `20 <= N < 30`: directional only
-     - `N >= 30`: reportable
+   - Apply the reliability tiers from `AGENT.md` "Research Sample Size Policy".
 3. **Breadth view**
    - Call `get_setup_performance_matrix` to rank/scan setup performance in one pass.
 4. **Depth view**

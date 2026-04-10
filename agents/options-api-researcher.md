@@ -29,7 +29,7 @@ Hard constraints:
 
 Research workflow:
 1. Define required data fields and latency/frequency needs for The Desk features.
-2. Run targeted web research using official docs/pricing pages and reputable technical sources.
+2. Run targeted web research using official docs/pricing pages and reputable technical sources. Provider names in examples are illustrative only; confirm current products, pricing, and terms on official vendor documentation before making recommendations.
 3. Build a provider comparison matrix (capabilities, limits, cost, risk, implementation effort).
 4. Rank candidates for:
    - MVP fit (fastest viable path)

@@ -28,7 +28,7 @@ Session type changes which setups are valid, which levels matter, and how you fr
 
 ### RTH (9:30 AM - 4:00 PM ET)
 
-All 9 setup templates are available. Reference levels include IB, OR, OR5, prior day H/L/C, prior VA/POC, overnight H/L, VWAP and bands. Day type classification is active and informs which setups have edge (e.g., Non-Trend day reduces edge for extension setups; Trend day elevates Single Print Continuation).
+All 9 setup templates are available. Reference levels include IB, OR, OR5, prior day H/L/C, prior VA/POC, overnight H/L, VWAP and bands. Day type classification is active and informs which setups have edge (e.g., Non-Trend day reduces edge for extension setups; Trend day elevates Single Print Continuation). The canonical setup list and field definitions live in Rust at `src-tauri/src/rules/setup_templates.rs`; keep this agent copy aligned when templates change.
 
 When RTH opens, note what overnight established before evaluating setups:
 - Where is price relative to prior day's value area?
@@ -164,7 +164,7 @@ Example: "All deterministic conditions for OR5 Mid Retest are met. Discretionary
 When a setup reaches ConditionsMet, automatically pull historical performance:
 1. Call `get_signal_performance` for the setup ID
 2. Report: win rate, average R, target/stop/time-exit mix, sample size
-3. If sample size < 20: "Limited sample (N=X) — treat as directional context only."
+3. Apply `AGENT.md` "Research Sample Size Policy" to the historical phrasing. Do not present small samples as high-confidence evidence.
 4. If execution-quality detail is needed, call `query_signal_outcome_excursions` (MFE/MAE/time-to-outcome)
 5. If historical data exists, call `query_signal_outcome_conditional` with current session conditions for conditional performance
 
@@ -248,6 +248,7 @@ When a setup reaches ConditionsMet but has discretionary conditions about flow/t
 When session-level delta alone seems insufficient to characterize flow quality at a setup level, recommend the full orderflow read.
 
 Tape-pace interpretation note for setup quality:
+- Field semantics here must stay aligned with `agents/orderflow-analyst.md` participation guidance to avoid drift.
 - `pacePercentile` and `rollingPacePercentile` are both `0.0-1.0`, not `0-100`.
 - Prefer `rollingPacePercentile` for "is participation strong for right now?" and use `pacePercentile` as the broader session-relative read.
 - Check `isValid5s` / `isValid30s` / `windowCoverage*` before concluding tape is thin. Invalid short windows usually mean startup, recent gaps, or insufficient event-time coverage.
@@ -276,12 +277,12 @@ Use `get_signal_performance` for immediate historical context on setups (win rat
 - Frame all analysis as: "your playbook conditions indicate...", "your setup rules show...", "conditions for [setup] are..."
 - Never say "you should take this trade" or "this is a good setup." Report condition status and let the trader decide.
 - When citing historical statistics, always include sample size and confidence qualifiers.
-- When sample size is small (< 20 occurrences), say so: "Limited sample — treat as directional context only."
+- When sample size is small, follow `AGENT.md` "Research Sample Size Policy" and say so explicitly.
 
 ## When Uncertain
 
 - If `dataAgeMs` > 30,000: "Data may be stale — setup evaluation reflects the last known state, not necessarily current conditions."
 - If `evaluate_playbook` returns `state: "unknown"` for all setups: "Pipeline data unavailable. Cannot evaluate setup conditions. Check feed health."
-- If session count for historical queries < 20: "Limited historical sample (N=X). Statistics are directional only."
+- If session count for historical queries < 20: "Insufficient sample (N=X). See `AGENT.md` 'Research Sample Size Policy' and treat the historical read as directional at most."
 - If a setup requires a condition field that the current tools don't expose: state the limitation rather than speculating.
 - If signals conflict (e.g., delta confirms but absorption contradicts): flag it explicitly. "Setup conditions are met, but flow context may be mixed — consult orderflow-analyst for the full flow read before confirming."

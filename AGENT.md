@@ -156,6 +156,62 @@ If the task touches the DOM visualizer, historical ladder playback, or replay UI
 
 ---
 
+## Lucid Direct Context
+
+Use this as the canonical source for shared Lucid Direct account facts referenced by agent definitions.
+
+### Account framing
+
+- **Account stage:** Lucid Direct
+- **Typical account size:** $50,000
+- **Working daily loss limit:** $1,200 unless the trader updates it
+- **Drawdown model:** End-of-day; LucidScale references 60% of peak end-of-day balance
+- **Payout gates:** 20% consistency and at least 5 profitable trading days
+
+### Risk framing
+
+- Protect the end-of-day balance. Late-session giveback matters more than headline intraday P&L because LucidScale references peak EOD balance.
+- Preserve payout eligibility. Avoid oversized outlier days that break consistency.
+- Do not use evaluation pass-target framing for Direct accounts.
+- If payout-cycle metrics are not available from tools, ask the trader to confirm them. Do not invent payout progress or eligibility.
+
+### Dynamic R calculation
+
+R is derived from current Lucid parameters and must never be hard-coded:
+
+```text
+R_dollars = lucid_daily_loss_dollars / max_daily_loss_r
+R_points  = R_dollars / 5.00
+```
+
+For NQ/MNQ, use $5.00 per point per MNQ contract when converting dollars to points.
+
+At $50,000 balance with a $1,200 daily loss limit and 3R max daily loss:
+- `R_dollars = 1200 / 3 = 400`
+- `R_points = 400 / 5 = 80`
+
+As Lucid parameters change, agents must recalculate and report the new R.
+
+---
+
+## Research Sample Size Policy
+
+Use this as the canonical policy whenever any agent cites historical, backtest, setup-performance, or conditional statistics.
+
+| Sample size | Reliability label | Allowed framing |
+|-------------|-------------------|-----------------|
+| `N < 20` | Insufficient | Only mention with explicit "insufficient sample" language. Treat as directional context at most, not a reliable conclusion. |
+| `20 <= N < 30` | Directional | May report with caveats, but do not use high-confidence wording. |
+| `N >= 30` | Reportable | Safe to report as a meaningful statistic, while still including `N` and any relevant caveats. |
+
+Rules:
+- Always include `N` with any statistic.
+- Confidence intervals, standard deviation, percentiles, or similar uncertainty measures are additive. They do not replace the reliability tier.
+- If the sample is mixed across incompatible scopes (for example RTH and Globex combined without explicit labeling), downgrade confidence and state the scope limitation.
+- If the question asks for strong edge claims, comparisons, or sizing implications, prefer `N >= 30` even when smaller samples can still be discussed directionally.
+
+---
+
 ## MCP Tools Reference
 
 The MCP server (`src/bin/the-desk-mcp.rs`) exposes 54 tools across 11 categories.

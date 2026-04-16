@@ -79,9 +79,13 @@ pub struct ScidReader {
 
 impl ScidReader {
     pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self::with_price_scale(path, 1.0)
+    }
+
+    pub fn with_price_scale(path: impl Into<PathBuf>, price_scale: f64) -> Self {
         Self {
             path: path.into(),
-            price_scale: 1.0,
+            price_scale,
         }
     }
 
@@ -93,10 +97,7 @@ impl ScidReader {
             PathBuf::from(&config.sierra_data_dir)
                 .join(symbol_to_scid_file(&contract.contract_symbol))
         };
-        Self {
-            path,
-            price_scale: config.price_scale,
-        }
+        Self::with_price_scale(path, config.price_scale)
     }
 
     pub fn path(&self) -> &Path {
@@ -485,13 +486,12 @@ impl ScidReader {
         mut stop_rx: watch::Receiver<bool>,
         poll_ms: u64,
     ) -> JoinHandle<()> {
-        let path = self.path.clone();
-        let price_scale = self.price_scale;
+        let reader = self.clone();
         tokio::spawn(async move {
             let _ = tx.send(FeedEvent::Connected);
 
-            let mut offset: u64 = 0;
-            let mut header_checked = false;
+            let mut offset: u64 =
+                ScidReader::header_size_bytes_for_path(reader.path()).unwrap_or(0);
             let poll = Duration::from_millis(poll_ms.max(100));
 
             loop {
@@ -500,84 +500,30 @@ impl ScidReader {
                     break;
                 }
 
-                let mut file = match File::open(&path) {
-                    Ok(f) => f,
+                match reader.read_bulk_from_offset(offset) {
+                    Ok(batch) => {
+                        offset = batch.next_offset;
+                        for tick in batch.ticks {
+                            let _ = tx.send(FeedEvent::Quote {
+                                symbol_id: 1,
+                                bid: tick.bid,
+                                ask: tick.ask,
+                                bid_size: 0.0,
+                                ask_size: 0.0,
+                                timestamp: tick.timestamp_ms,
+                            });
+                            let _ = tx.send(FeedEvent::Trade {
+                                symbol_id: 1,
+                                price: tick.price,
+                                volume: tick.volume,
+                                side: tick.side,
+                                timestamp: tick.timestamp_ms,
+                            });
+                        }
+                    }
                     Err(err) => {
                         let _ = tx.send(FeedEvent::Error {
-                            message: format!("scid open failed: {err}"),
-                        });
-                        sleep(poll).await;
-                        continue;
-                    }
-                };
-
-                if !header_checked {
-                    match Self::read_header(&mut file) {
-                        Ok(h) => {
-                            offset = h.header_size as u64;
-                            header_checked = true;
-                        }
-                        Err(err) => {
-                            let _ = tx.send(FeedEvent::Error {
-                                message: err.to_string(),
-                            });
-                            sleep(poll).await;
-                            continue;
-                        }
-                    }
-                }
-
-                let len = match file.metadata() {
-                    Ok(m) => m.len(),
-                    Err(_) => {
-                        sleep(poll).await;
-                        continue;
-                    }
-                };
-
-                // File truncation / rotation: offset past EOF — realign to last full record.
-                if len < offset {
-                    match Self::header_size_bytes_for_path(&path) {
-                        Ok(hsz) => {
-                            offset = scid_tail_offset_after_shrink(len, hsz);
-                        }
-                        Err(_) => {
-                            header_checked = false;
-                            offset = 0;
-                            sleep(poll).await;
-                            continue;
-                        }
-                    }
-                }
-
-                if len <= offset {
-                    sleep(poll).await;
-                    continue;
-                }
-
-                if file.seek(SeekFrom::Start(offset)).is_err() {
-                    sleep(poll).await;
-                    continue;
-                }
-
-                let mut record = [0_u8; SCID_RECORD_SIZE];
-                while file.read_exact(&mut record).is_ok() {
-                    offset = offset.saturating_add(SCID_RECORD_SIZE as u64);
-                    if let Some(tick) = parse_record_scaled(&record, price_scale) {
-                        let _ = tx.send(FeedEvent::Quote {
-                            symbol_id: 1,
-                            bid: tick.bid,
-                            ask: tick.ask,
-                            bid_size: 0.0,
-                            ask_size: 0.0,
-                            timestamp: tick.timestamp_ms,
-                        });
-                        let _ = tx.send(FeedEvent::Trade {
-                            symbol_id: 1,
-                            price: tick.price,
-                            volume: tick.volume,
-                            side: tick.side,
-                            timestamp: tick.timestamp_ms,
+                            message: format!("scid tail read failed: {err}"),
                         });
                     }
                 }
@@ -755,6 +701,69 @@ mod tests {
         let one_rec = h + r;
         assert_eq!(scid_tail_offset_after_shrink(one_rec, h), one_rec);
         assert_eq!(scid_tail_offset_after_shrink(h, h), h);
+    }
+
+    #[test]
+    fn read_bulk_from_offset_handles_start_middle_eof_and_misaligned_offsets() {
+        let mut file = NamedTempFile::new().expect("temp");
+        write_scid(&mut file, &[21000.0, 21000.25, 21000.5, 21000.75]);
+        let reader = ScidReader::new(file.path());
+        let header_size = reader.current_aligned_end_offset().expect("end offset")
+            - (SCID_RECORD_SIZE as u64 * 4);
+        let record = SCID_RECORD_SIZE as u64;
+
+        let full = reader
+            .read_bulk_from_offset(header_size)
+            .expect("full from header");
+        assert_eq!(full.ticks.len(), 4);
+        assert_eq!(full.ticks[0].price, 21000.0);
+
+        let middle = reader
+            .read_bulk_from_offset(header_size + 2 * record)
+            .expect("middle");
+        assert_eq!(middle.ticks.len(), 2);
+        assert_eq!(middle.ticks[0].price, 21000.5);
+
+        let misaligned = reader
+            .read_bulk_from_offset(header_size + record + 7)
+            .expect("misaligned");
+        assert_eq!(misaligned.ticks.len(), 3);
+        assert_eq!(misaligned.ticks[0].price, 21000.25);
+
+        let eof = reader
+            .read_bulk_from_offset(header_size + 8 * record)
+            .expect("eof");
+        assert!(eof.ticks.is_empty());
+        assert_eq!(eof.next_offset, full.next_offset);
+    }
+
+    #[test]
+    fn parse_record_scaled_matches_reader_price_scaling() {
+        let mut record = [0_u8; SCID_RECORD_SIZE];
+        let timestamp_ms = 1_700_000_000_123.0_f64;
+        let sc_us = SC_TO_UNIX_EPOCH_US + (timestamp_ms * 1_000.0).round() as i64;
+        record[0..8].copy_from_slice(&sc_us.to_le_bytes());
+        record[12..16].copy_from_slice(&(2_100_050.0_f32).to_le_bytes());
+        record[16..20].copy_from_slice(&(2_100_000.0_f32).to_le_bytes());
+        record[20..24].copy_from_slice(&(2_100_025.0_f32).to_le_bytes());
+        record[24..28].copy_from_slice(&(1_u32).to_le_bytes());
+        record[28..32].copy_from_slice(&(3_u32).to_le_bytes());
+        record[32..36].copy_from_slice(&(1_u32).to_le_bytes());
+        record[36..40].copy_from_slice(&(2_u32).to_le_bytes());
+
+        let reader = ScidReader {
+            path: std::path::PathBuf::new(),
+            price_scale: 100.0,
+        };
+        let via_reader = reader.parse_record(&record).expect("reader parse");
+        let via_helper = parse_record_scaled(&record, 100.0).expect("scaled helper parse");
+
+        assert_eq!(via_reader.timestamp_ms, via_helper.timestamp_ms);
+        assert_eq!(via_reader.price, via_helper.price);
+        assert_eq!(via_reader.bid, via_helper.bid);
+        assert_eq!(via_reader.ask, via_helper.ask);
+        assert_eq!(via_reader.volume, via_helper.volume);
+        assert!(matches!(via_helper.side, TradeSide::Buy));
     }
 
     #[test]

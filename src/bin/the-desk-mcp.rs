@@ -20,12 +20,12 @@ use the_desk_backend::db::{
 };
 use the_desk_backend::depth::{
     aggregate_trade_volume_by_level, build_dom_feature_snapshot, build_dom_summary,
-    enrich_dom_summary, summarize_dom_narrative, DepthBook, DepthReader, DomFeatureSnapshot,
-    DomSummary, PullStackActivitySummary, ScanControl as DepthScanControl,
+    enrich_dom_summary, summarize_dom_narrative, DepthBook, DepthCommand, DepthReader,
+    DomFeatureSnapshot, DomSummary, PullStackActivitySummary, ScanControl as DepthScanControl,
     DOM_NARRATIVE_HORIZON_MS,
 };
 use the_desk_backend::feed::scid_reader::{
-    parse_record_scaled, scid_tail_offset_after_shrink, ScanControl as ScidScanControl, ScidReader,
+    scid_tail_offset_after_shrink, ScanControl as ScidScanControl, ScidReader, ScidTick,
     SCID_RECORD_SIZE,
 };
 use the_desk_backend::feed::{
@@ -6959,87 +6959,218 @@ fn persist_feature_state_after_dom_summary(
     }
 }
 
+#[derive(Debug, Default)]
+struct DepthPollWorkerState {
+    active_path: Option<std::path::PathBuf>,
+    offset: u64,
+    batch_id: i64,
+    book: DepthBook,
+}
+
+#[derive(Debug)]
+struct DepthPersistWork {
+    source_file: String,
+    trading_day: String,
+    last_record_timestamp_ms: f64,
+    records: Vec<the_desk_backend::depth::DepthRecord>,
+    snapshot: the_desk_backend::depth::DomSnapshot,
+    feature: DomFeatureSnapshot,
+    batch_id: i64,
+}
+
+fn default_depth_feature_snapshot(
+    snapshot: &the_desk_backend::depth::DomSnapshot,
+    source_file: &str,
+    records: &[the_desk_backend::depth::DepthRecord],
+    feature_window_start: f64,
+    batch_end_ms: f64,
+) -> DomFeatureSnapshot {
+    let fallback_activity = PullStackActivitySummary {
+        source_file: source_file.to_string(),
+        start_time_ms: feature_window_start,
+        end_time_ms: batch_end_ms,
+        session_date: snapshot.session_date.clone(),
+        record_count: records.len(),
+        batch_count: records.iter().filter(|r| r.end_of_batch).count(),
+        bid: Default::default(),
+        ask: Default::default(),
+        top_pull_levels: Vec::new(),
+        top_stack_levels: Vec::new(),
+    };
+    DomFeatureSnapshot {
+        source_file: source_file.to_string(),
+        timestamp_ms: snapshot.snapshot_timestamp_ms,
+        session_date: snapshot.session_date.clone(),
+        dom_summary: build_dom_summary(snapshot, &fallback_activity),
+        activity: fallback_activity,
+    }
+}
+
+fn build_depth_feature_snapshot(
+    reader: &DepthReader,
+    snapshot: &the_desk_backend::depth::DomSnapshot,
+    source_file: &str,
+    records: &[the_desk_backend::depth::DepthRecord],
+    batch_end_ms: f64,
+) -> DomFeatureSnapshot {
+    let feature_window_start = (batch_end_ms - 60_000.0).max(0.0);
+    let config = load_feed_config();
+    aggregate_window_trades(&config, feature_window_start, batch_end_ms)
+        .ok()
+        .and_then(|trades| {
+            reader
+                .summarize_window(feature_window_start, batch_end_ms, &trades, None, None)
+                .ok()
+        })
+        .map(|activity| build_dom_feature_snapshot(snapshot, activity))
+        .unwrap_or_else(|| {
+            default_depth_feature_snapshot(
+                snapshot,
+                source_file,
+                records,
+                feature_window_start,
+                batch_end_ms,
+            )
+        })
+}
+
+fn recover_depth_state_after_shrink(
+    reader: &DepthReader,
+    state: &mut DepthPollWorkerState,
+) -> Result<Option<DepthPersistWork>, String> {
+    let mut recovery_offset = reader.data_start_offset();
+    let mut recovery_records = Vec::<the_desk_backend::depth::DepthRecord>::new();
+    reader
+        .scan_new_records(&mut recovery_offset, |record| {
+            recovery_records.push(record);
+            Ok(DepthScanControl::Continue)
+        })
+        .map_err(|e| e.to_string())?;
+
+    state.offset = recovery_offset;
+    if recovery_records.is_empty() {
+        state.book = DepthBook::default();
+        return Ok(None);
+    }
+
+    let contains_clear = recovery_records
+        .iter()
+        .any(|record| record.command == DepthCommand::ClearBook);
+    let mut rebuilt_book = if contains_clear {
+        DepthBook::default()
+    } else {
+        state.book.clone()
+    };
+    for record in &recovery_records {
+        rebuilt_book.apply(record);
+    }
+    state.book = rebuilt_book.clone();
+
+    let last_record = recovery_records
+        .last()
+        .expect("recovery_records not empty after guard");
+    let source_file = reader.path().to_string_lossy().to_string();
+    let trading_day = session_date_from_timestamp_ms(last_record.timestamp_ms);
+    let snapshot = rebuilt_book.snapshot(&source_file, last_record.timestamp_ms, 10);
+    let feature = build_depth_feature_snapshot(
+        reader,
+        &snapshot,
+        &source_file,
+        &recovery_records,
+        last_record.timestamp_ms,
+    );
+
+    Ok(Some(DepthPersistWork {
+        source_file,
+        trading_day,
+        last_record_timestamp_ms: last_record.timestamp_ms,
+        records: Vec::new(),
+        snapshot,
+        feature,
+        batch_id: state.batch_id,
+    }))
+}
+
+fn compute_depth_poll_step(
+    state: &mut DepthPollWorkerState,
+) -> Result<Option<DepthPersistWork>, String> {
+    let Some(reader) = latest_depth_reader().map_err(|e| e.to_string())? else {
+        return Ok(None);
+    };
+
+    if state.active_path.as_deref() != Some(reader.path()) {
+        state.active_path = Some(reader.path().to_path_buf());
+        state.offset = reader.data_start_offset();
+        state.batch_id = 0;
+        state.book = DepthBook::default();
+    } else {
+        let file_len = reader.file_len().map_err(|e| e.to_string())?;
+        if file_len < state.offset {
+            return recover_depth_state_after_shrink(&reader, state);
+        }
+    }
+
+    let mut new_records = Vec::<the_desk_backend::depth::DepthRecord>::new();
+    reader
+        .scan_new_records(&mut state.offset, |record| {
+            state.book.apply(&record);
+            new_records.push(record);
+            Ok(DepthScanControl::Continue)
+        })
+        .map_err(|e| e.to_string())?;
+
+    if new_records.is_empty() {
+        return Ok(None);
+    }
+
+    let Some(last_record) = new_records.last() else {
+        return Ok(None);
+    };
+    let source_file = reader.path().to_string_lossy().to_string();
+    let trading_day = session_date_from_timestamp_ms(last_record.timestamp_ms);
+    let snapshot = state
+        .book
+        .snapshot(&source_file, last_record.timestamp_ms, 10);
+    let feature = build_depth_feature_snapshot(
+        &reader,
+        &snapshot,
+        &source_file,
+        &new_records,
+        last_record.timestamp_ms,
+    );
+
+    Ok(Some(DepthPersistWork {
+        source_file,
+        trading_day,
+        last_record_timestamp_ms: last_record.timestamp_ms,
+        records: new_records,
+        snapshot,
+        feature,
+        batch_id: state.batch_id,
+    }))
+}
+
 #[allow(clippy::too_many_arguments)]
-fn persist_depth_records(
+fn apply_depth_persist_work(
     db: &Arc<Mutex<Database>>,
     pipelines: &Arc<Mutex<PipelineEngine>>,
     last_bid: &Arc<Mutex<f64>>,
     last_ask: &Arc<Mutex<f64>>,
-    reader: &DepthReader,
-    book: &DepthBook,
-    records: &[the_desk_backend::depth::DepthRecord],
-    batch_id: &mut i64,
+    mut work: DepthPersistWork,
     feed_rt: &McpFeedRuntimeState,
-) {
-    if records.is_empty() {
-        return;
-    }
-    let Some(last_record) = records.last() else {
-        return;
-    };
-    let source_file = reader.path().to_string_lossy().to_string();
-    let trading_day = session_date_from_timestamp_ms(last_record.timestamp_ms);
-    let snapshot = book.snapshot(&source_file, last_record.timestamp_ms, 10);
-    let feature_window_start = (last_record.timestamp_ms - 60_000.0).max(0.0);
-    let mut feature = {
-        let config = load_feed_config();
-        aggregate_window_trades(&config, feature_window_start, last_record.timestamp_ms)
-            .ok()
-            .and_then(|trades| {
-                reader
-                    .summarize_window(
-                        feature_window_start,
-                        last_record.timestamp_ms,
-                        &trades,
-                        None,
-                        None,
-                    )
-                    .ok()
-            })
-            .map(|activity| build_dom_feature_snapshot(&snapshot, activity))
-            .unwrap_or_else(|| DomFeatureSnapshot {
-                source_file: source_file.clone(),
-                timestamp_ms: snapshot.snapshot_timestamp_ms,
-                session_date: snapshot.session_date.clone(),
-                dom_summary: build_dom_summary(
-                    &snapshot,
-                    &the_desk_backend::depth::PullStackActivitySummary {
-                        source_file: source_file.clone(),
-                        start_time_ms: feature_window_start,
-                        end_time_ms: last_record.timestamp_ms,
-                        session_date: snapshot.session_date.clone(),
-                        record_count: records.len(),
-                        batch_count: records.iter().filter(|r| r.end_of_batch).count(),
-                        bid: Default::default(),
-                        ask: Default::default(),
-                        top_pull_levels: Vec::new(),
-                        top_stack_levels: Vec::new(),
-                    },
-                ),
-                activity: the_desk_backend::depth::PullStackActivitySummary {
-                    source_file: source_file.clone(),
-                    start_time_ms: feature_window_start,
-                    end_time_ms: last_record.timestamp_ms,
-                    session_date: snapshot.session_date.clone(),
-                    record_count: records.len(),
-                    batch_count: records.iter().filter(|r| r.end_of_batch).count(),
-                    bid: Default::default(),
-                    ask: Default::default(),
-                    top_pull_levels: Vec::new(),
-                    top_stack_levels: Vec::new(),
-                },
-            })
-    };
-
+) -> i64 {
+    let mut next_batch_id = work.batch_id;
     if let Ok(mut d) = db.lock() {
-        if let Ok(next_batch_id) = d.insert_depth_events_batch(&source_file, records, *batch_id) {
-            *batch_id = next_batch_id;
+        if let Ok(next_batch) =
+            d.insert_depth_events_batch(&work.source_file, &work.records, work.batch_id)
+        {
+            next_batch_id = next_batch;
         }
-        let snapshot_json = serde_json::to_value(&snapshot).unwrap_or_default();
+        let snapshot_json = serde_json::to_value(&work.snapshot).unwrap_or_default();
         let _ = d.insert_dom_snapshot(
-            &source_file,
-            last_record.timestamp_ms,
-            &trading_day,
+            &work.source_file,
+            work.last_record_timestamp_ms,
+            &work.trading_day,
             &snapshot_json,
         );
     }
@@ -7047,12 +7178,12 @@ fn persist_depth_records(
     let (recent_summary_rows, session_rows) = if let Ok(d) = db.lock() {
         (
             d.query_dom_feature_snapshots(
-                Some((last_record.timestamp_ms - DOM_NARRATIVE_HORIZON_MS).max(0.0)),
-                Some((last_record.timestamp_ms - 0.001).max(0.0)),
+                Some((work.last_record_timestamp_ms - DOM_NARRATIVE_HORIZON_MS).max(0.0)),
+                Some((work.last_record_timestamp_ms - 0.001).max(0.0)),
                 512,
             )
             .unwrap_or_default(),
-            d.query_dom_feature_snapshots_for_trading_day(&trading_day, 50_000)
+            d.query_dom_feature_snapshots_for_trading_day(&work.trading_day, 50_000)
                 .unwrap_or_default(),
         )
     } else {
@@ -7062,24 +7193,24 @@ fn persist_depth_records(
     let recent_summaries = dom_summaries_from_rows(&recent_summary_rows);
     let session_summaries = dom_summaries_from_rows(&session_rows);
     enrich_dom_summary(
-        &mut feature.dom_summary,
-        Some(&feature.activity),
+        &mut work.feature.dom_summary,
+        Some(&work.feature.activity),
         &recent_summaries,
         Some(&session_summaries),
     );
-    let feature_json = serde_json::to_value(&feature).unwrap_or_default();
+    let feature_json = serde_json::to_value(&work.feature).unwrap_or_default();
 
     if let Ok(d) = db.lock() {
         let _ = d.insert_dom_feature_snapshot(
-            &source_file,
-            feature.timestamp_ms,
-            &trading_day,
+            &work.source_file,
+            work.feature.timestamp_ms,
+            &work.trading_day,
             &feature_json,
         );
     }
 
     if let Ok(mut pl) = pipelines.lock() {
-        pl.set_dom_summary(Some(feature.dom_summary.clone()));
+        pl.set_dom_summary(Some(work.feature.dom_summary.clone()));
     }
 
     persist_feature_state_after_dom_summary(
@@ -7087,13 +7218,15 @@ fn persist_depth_records(
         pipelines,
         last_bid,
         last_ask,
-        feature.timestamp_ms,
-        &feature.dom_summary,
+        work.feature.timestamp_ms,
+        &work.feature.dom_summary,
     );
 
-    feed_rt
-        .last_depth_timestamp_ms_bits
-        .store(tick_ms_to_bits(feature.timestamp_ms), Ordering::Release);
+    feed_rt.last_depth_timestamp_ms_bits.store(
+        tick_ms_to_bits(work.feature.timestamp_ms),
+        Ordering::Release,
+    );
+    next_batch_id
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -7104,6 +7237,63 @@ struct StartupWarmReplayResult {
 
 fn safe_scid_data_offset(reader: &ScidReader) -> u64 {
     ScidReader::header_size_bytes_for_path(reader.path()).unwrap_or(56)
+}
+
+#[derive(Debug)]
+struct ScidPollReadStep {
+    requested_offset: u64,
+    start_offset: u64,
+    next_offset: u64,
+    file_len: u64,
+    ticks: Vec<ScidTick>,
+}
+
+impl ScidPollReadStep {
+    fn was_realigned(&self) -> bool {
+        self.start_offset != self.requested_offset
+    }
+
+    fn was_shrink_reset(&self) -> bool {
+        self.file_len < self.requested_offset
+    }
+}
+
+fn read_scid_poll_step(
+    reader: &ScidReader,
+    requested_offset: u64,
+) -> Result<ScidPollReadStep, String> {
+    let header_size =
+        ScidReader::header_size_bytes_for_path(reader.path()).map_err(|e| e.to_string())?;
+    let file_len = std::fs::metadata(reader.path())
+        .map_err(|e| e.to_string())?
+        .len();
+    let aligned_end = scid_tail_offset_after_shrink(file_len, header_size);
+
+    let mut start_offset = requested_offset;
+    if file_len < start_offset {
+        start_offset = aligned_end;
+    } else if start_offset >= header_size {
+        let rel = start_offset - header_size;
+        if !rel.is_multiple_of(SCID_RECORD_SIZE as u64) {
+            start_offset =
+                scid_tail_offset_after_shrink(start_offset, header_size).min(aligned_end);
+        }
+    } else {
+        // Below header: resume from first record (header_size is valid even if file is shorter).
+        start_offset = header_size;
+    }
+
+    let batch = reader
+        .read_bulk_from_offset(start_offset)
+        .map_err(|e| e.to_string())?;
+
+    Ok(ScidPollReadStep {
+        requested_offset,
+        start_offset,
+        next_offset: batch.next_offset,
+        file_len,
+        ticks: batch.ticks,
+    })
 }
 
 /// Warm-replay SCID ticks into the live pipeline up to a pre-captured cutover offset.
@@ -7395,23 +7585,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let reader_startup = reader.clone();
 
         tokio::spawn(async move {
-            let since = globex_open_ms(2);
-            let requested_cutover_offset = reader_startup
-                .current_aligned_end_offset()
-                .unwrap_or(safe_scid_data_offset(&reader_startup));
-            eprintln!(
-                "[the-desk-mcp] Backfilling from {} up to cutover offset {} ...",
-                reader_startup.path().display(),
-                requested_cutover_offset
-            );
-            let startup = run_startup_warm_replay(
-                &reader_startup,
-                &pipelines_startup,
-                &flow_emitter_startup,
-                &db_startup,
-                since,
-                requested_cutover_offset,
-            );
+            let fallback_cutover_offset = safe_scid_data_offset(&reader_startup);
+            let startup = tokio::task::spawn_blocking(move || {
+                let since = globex_open_ms(2);
+                let requested_cutover_offset = reader_startup
+                    .current_aligned_end_offset()
+                    .unwrap_or(safe_scid_data_offset(&reader_startup));
+                eprintln!(
+                    "[the-desk-mcp] Backfilling from {} up to cutover offset {} ...",
+                    reader_startup.path().display(),
+                    requested_cutover_offset
+                );
+                run_startup_warm_replay(
+                    &reader_startup,
+                    &pipelines_startup,
+                    &flow_emitter_startup,
+                    &db_startup,
+                    since,
+                    requested_cutover_offset,
+                )
+            })
+            .await
+            .unwrap_or_else(|err| {
+                eprintln!("[the-desk-mcp] startup warm replay task failed: {err}");
+                StartupWarmReplayResult {
+                    cutover_offset: fallback_cutover_offset,
+                    applied_tick_count: 0,
+                }
+            });
             eprintln!(
                 "[the-desk-mcp] Startup SCID cutover: offset={}, warm_ticks_applied={}",
                 startup.cutover_offset, startup.applied_tick_count
@@ -7443,7 +7644,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let feed_rt_bg = Arc::clone(&server.feed_runtime);
 
         tokio::spawn(async move {
-            use std::io::{Read, Seek, SeekFrom};
             use tokio::time::{sleep, Duration};
 
             let poll = Duration::from_millis(poll_ms.max(250));
@@ -7467,9 +7667,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Err(_) => safe_scid_data_offset(&ScidReader::new(reader_path.clone())),
                 }
             } else {
-                ScidReader::new(reader_path.clone())
-                    .current_aligned_end_offset()
-                    .unwrap_or(56)
+                let reader_for_offset =
+                    ScidReader::with_price_scale(reader_path.clone(), price_scale);
+                tokio::task::spawn_blocking(move || {
+                    reader_for_offset
+                        .current_aligned_end_offset()
+                        .unwrap_or(safe_scid_data_offset(&reader_for_offset))
+                })
+                .await
+                .unwrap_or_else(|_| safe_scid_data_offset(&ScidReader::new(reader_path.clone())))
             };
             feed_rt_bg.scid_tail_offset.store(offset, Ordering::Release);
 
@@ -7487,283 +7693,255 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     last_integrity_check = std::time::Instant::now();
                 }
 
-                let mut file = match std::fs::File::open(&reader_path) {
-                    Ok(f) => f,
-                    Err(_) => continue,
+                let reader_for_step =
+                    ScidReader::with_price_scale(reader_path.clone(), price_scale);
+                let step = match tokio::task::spawn_blocking(move || {
+                    read_scid_poll_step(&reader_for_step, offset)
+                })
+                .await
+                {
+                    Ok(Ok(step)) => step,
+                    Ok(Err(err)) => {
+                        eprintln!("[the-desk-mcp] SCID poll step error: {err}");
+                        continue;
+                    }
+                    Err(err) => {
+                        eprintln!("[the-desk-mcp] SCID poll task failed: {err}");
+                        continue;
+                    }
                 };
-                let len = file.metadata().map(|m| m.len()).unwrap_or(0);
-                feed_rt_bg.scid_file_len.store(len, Ordering::Release);
+                feed_rt_bg
+                    .scid_file_len
+                    .store(step.file_len, Ordering::Release);
                 feed_rt_bg.last_scid_poll_wall_ms.store(
                     chrono::Utc::now().timestamp_millis() as u64,
                     Ordering::Release,
                 );
 
-                let hsz = ScidReader::header_size_bytes_for_path(&reader_path).unwrap_or(56);
-
-                if len < offset {
-                    offset = scid_tail_offset_after_shrink(len, hsz);
-                    feed_rt_bg.scid_tail_offset.store(offset, Ordering::Release);
-                    feed_rt_bg
-                        .scid_last_shrink_len
-                        .store(len, Ordering::Release);
+                if step.was_realigned() {
                     feed_rt_bg
                         .scid_tail_reset_count
                         .fetch_add(1, Ordering::AcqRel);
-                    eprintln!(
-                        "[the-desk-mcp] SCID file shrank below tail offset; reset offset to {}",
-                        offset
-                    );
-                }
-
-                if offset >= hsz {
-                    let rel = offset - hsz;
-                    if !rel.is_multiple_of(SCID_RECORD_SIZE as u64) {
-                        let new_off = scid_tail_offset_after_shrink(len, hsz);
-                        if new_off != offset {
-                            offset = new_off;
-                            feed_rt_bg
-                                .scid_tail_reset_count
-                                .fetch_add(1, Ordering::AcqRel);
-                            eprintln!(
-                                "[the-desk-mcp] SCID tail offset was not record-aligned; realigned to {}",
-                                offset
-                            );
-                        }
-                    }
-                } else if len >= hsz {
-                    offset = hsz;
-                }
-
-                if len <= offset {
-                    feed_rt_bg.scid_tail_offset.store(offset, Ordering::Release);
-                    continue;
-                }
-                if file.seek(SeekFrom::Start(offset)).is_err() {
-                    continue;
-                }
-
-                let mut record = [0_u8; 40];
-                let mut ticks_this_poll = 0u64;
-                while file.read_exact(&mut record).is_ok() {
-                    offset += 40;
-                    if let Some(tick) = parse_record_scaled(&record, price_scale) {
-                        last_market_tick_ts = tick.timestamp_ms;
+                    if step.was_shrink_reset() {
                         feed_rt_bg
-                            .last_scid_tick_ms_bits
-                            .store(tick_ms_to_bits(tick.timestamp_ms), Ordering::Release);
-                        // Detect session and segment boundaries during live polling
-                        if let Some(et_min) = et_minutes_from_timestamp(tick.timestamp_ms) {
-                            let new_session = classify_session(et_min);
-                            let new_segment = classify_delta_segment(et_min);
+                            .scid_last_shrink_len
+                            .store(step.file_len, Ordering::Release);
+                        eprintln!(
+                            "[the-desk-mcp] SCID file shrank below tail offset; reset offset to {}",
+                            step.start_offset
+                        );
+                    } else {
+                        eprintln!(
+                            "[the-desk-mcp] SCID tail offset was not record-aligned; realigned to {}",
+                            step.start_offset
+                        );
+                    }
+                }
+                offset = step.next_offset;
+                feed_rt_bg.scid_tail_offset.store(offset, Ordering::Release);
 
-                            if new_session != current_session
-                                && current_session != SessionType::Unknown
-                                && new_session != SessionType::Unknown
-                            {
-                                // Match startup warm-backfill: never hold `pipelines` while waiting on
-                                // `db` (and never hold `db` while waiting on `pipelines`) so the depth
-                                // worker cannot deadlock with this path.
-                                let end_state = if current_session == SessionType::Rth {
-                                    pipelines_bg.lock().ok().map(|p| p.session_end_state())
-                                } else {
-                                    None
-                                };
-                                let date = session_date_from_timestamp_ms(tick.timestamp_ms);
-                                let today_str = session_date_from_timestamp_ms(tick.timestamp_ms);
+                let mut ticks_this_poll = 0u64;
+                for tick in &step.ticks {
+                    last_market_tick_ts = tick.timestamp_ms;
+                    feed_rt_bg
+                        .last_scid_tick_ms_bits
+                        .store(tick_ms_to_bits(tick.timestamp_ms), Ordering::Release);
+                    // Detect session and segment boundaries during live polling
+                    if let Some(et_min) = et_minutes_from_timestamp(tick.timestamp_ms) {
+                        let new_session = classify_session(et_min);
+                        let new_segment = classify_delta_segment(et_min);
 
-                                if let Some(ref es) = end_state {
-                                    if let Ok(db) = db_bg.lock() {
-                                        let _ = db.save_prior_day_full_with_dnva(
-                                            &date,
-                                            es.high,
-                                            es.low,
-                                            es.close,
-                                            es.va_high,
-                                            es.va_low,
-                                            es.poc,
-                                            Some(es.dnva_high),
-                                            Some(es.dnva_low),
-                                            Some(es.dnp),
-                                        );
-                                    }
-                                }
+                        if new_session != current_session
+                            && current_session != SessionType::Unknown
+                            && new_session != SessionType::Unknown
+                        {
+                            // Match startup warm-backfill: never hold `pipelines` while waiting on
+                            // `db` (and never hold `db` while waiting on `pipelines`) so the depth
+                            // worker cannot deadlock with this path.
+                            let end_state = if current_session == SessionType::Rth {
+                                pipelines_bg.lock().ok().map(|p| p.session_end_state())
+                            } else {
+                                None
+                            };
+                            let date = session_date_from_timestamp_ms(tick.timestamp_ms);
+                            let today_str = session_date_from_timestamp_ms(tick.timestamp_ms);
 
-                                let prior = {
-                                    if let Ok(db) = db_bg.lock() {
-                                        db.load_prior_day_full(&today_str)
-                                    } else {
-                                        Ok(None)
-                                    }
-                                };
-
-                                if let Ok(mut p) = pipelines_bg.lock() {
-                                    p.reset_session_with_type(new_session == SessionType::Globex);
-                                    if new_session == SessionType::Rth
-                                        || new_session == SessionType::Globex
-                                    {
-                                        if let Ok(Some((
-                                            h,
-                                            l,
-                                            c,
-                                            va_h,
-                                            va_l,
-                                            poc,
-                                            dnva_h,
-                                            dnva_l,
-                                            dnp,
-                                        ))) = prior
-                                        {
-                                            p.levels.set_prior_day(h, l, c);
-                                            if let (Some(vh), Some(vl), Some(pc)) =
-                                                (va_h, va_l, poc)
-                                            {
-                                                p.levels.set_prior_profile(vh, vl, pc);
-                                            }
-                                            if let (Some(dh), Some(dl), Some(dp)) =
-                                                (dnva_h, dnva_l, dnp)
-                                            {
-                                                p.levels.set_prior_dnva(dh, dl, dp);
-                                            }
-                                        }
-                                    }
-                                }
-
-                                let inv_session_type = if new_session == SessionType::Rth {
-                                    "RTH"
-                                } else if new_segment == DeltaSegment::Asia {
-                                    "Asia"
-                                } else {
-                                    "London"
-                                };
-
-                                let prior_inv: Vec<PriorSessionData> = if let Ok(db) = db_bg.lock()
-                                {
-                                    if let Ok(summaries) = db.list_session_summaries(
-                                        None,
-                                        None,
-                                        None,
-                                        Some(inv_session_type),
-                                        5,
-                                    ) {
-                                        summaries
-                                            .into_iter()
-                                            .filter(|s| {
-                                                s.dnva_high > 0.0 && s.dnva_low > 0.0 && s.dnp > 0.0
-                                            })
-                                            .map(|s| PriorSessionData {
-                                                final_delta: s.session_delta,
-                                                dnva_high: s.dnva_high,
-                                                dnva_low: s.dnva_low,
-                                                dnp: s.dnp,
-                                            })
-                                            .collect()
-                                    } else {
-                                        Vec::new()
-                                    }
-                                } else {
-                                    Vec::new()
-                                };
-
-                                if let Ok(mut p) = pipelines_bg.lock() {
-                                    p.session_inventory.load_prior_sessions(prior_inv);
-                                }
-
-                                eprintln!(
-                                    "[the-desk-mcp] Live boundary: {:?} → {:?}",
-                                    current_session, new_session
-                                );
-                                if let Ok(mut det) = detector_bg.lock() {
-                                    det.reset();
-                                }
-                                if let Ok(mut fe) = flow_emitter_bg.lock() {
-                                    fe.reset();
-                                }
-                            } else if new_segment != current_delta_segment
-                                && current_delta_segment != DeltaSegment::Unknown
-                                && new_segment != DeltaSegment::Unknown
-                            {
-                                if let Ok(mut p) = pipelines_bg.lock() {
-                                    p.reset_segment(new_segment);
-                                    eprintln!(
-                                        "[the-desk-mcp] Segment boundary: {:?} → {:?}",
-                                        current_delta_segment, new_segment
+                            if let Some(ref es) = end_state {
+                                if let Ok(db) = db_bg.lock() {
+                                    let _ = db.save_prior_day_full_with_dnva(
+                                        &date,
+                                        es.high,
+                                        es.low,
+                                        es.close,
+                                        es.va_high,
+                                        es.va_low,
+                                        es.poc,
+                                        Some(es.dnva_high),
+                                        Some(es.dnva_low),
+                                        Some(es.dnp),
                                     );
                                 }
                             }
 
-                            if new_session != SessionType::Unknown {
-                                current_session = new_session;
+                            let prior = {
+                                if let Ok(db) = db_bg.lock() {
+                                    db.load_prior_day_full(&today_str)
+                                } else {
+                                    Ok(None)
+                                }
+                            };
+
+                            if let Ok(mut p) = pipelines_bg.lock() {
+                                p.reset_session_with_type(new_session == SessionType::Globex);
+                                if new_session == SessionType::Rth
+                                    || new_session == SessionType::Globex
+                                {
+                                    if let Ok(Some((
+                                        h,
+                                        l,
+                                        c,
+                                        va_h,
+                                        va_l,
+                                        poc,
+                                        dnva_h,
+                                        dnva_l,
+                                        dnp,
+                                    ))) = prior
+                                    {
+                                        p.levels.set_prior_day(h, l, c);
+                                        if let (Some(vh), Some(vl), Some(pc)) = (va_h, va_l, poc) {
+                                            p.levels.set_prior_profile(vh, vl, pc);
+                                        }
+                                        if let (Some(dh), Some(dl), Some(dp)) =
+                                            (dnva_h, dnva_l, dnp)
+                                        {
+                                            p.levels.set_prior_dnva(dh, dl, dp);
+                                        }
+                                    }
+                                }
                             }
-                            if new_segment != DeltaSegment::Unknown {
-                                current_delta_segment = new_segment;
+
+                            let inv_session_type = if new_session == SessionType::Rth {
+                                "RTH"
+                            } else if new_segment == DeltaSegment::Asia {
+                                "Asia"
+                            } else {
+                                "London"
+                            };
+
+                            let prior_inv: Vec<PriorSessionData> = if let Ok(db) = db_bg.lock() {
+                                if let Ok(summaries) = db.list_session_summaries(
+                                    None,
+                                    None,
+                                    None,
+                                    Some(inv_session_type),
+                                    5,
+                                ) {
+                                    summaries
+                                        .into_iter()
+                                        .filter(|s| {
+                                            s.dnva_high > 0.0 && s.dnva_low > 0.0 && s.dnp > 0.0
+                                        })
+                                        .map(|s| PriorSessionData {
+                                            final_delta: s.session_delta,
+                                            dnva_high: s.dnva_high,
+                                            dnva_low: s.dnva_low,
+                                            dnp: s.dnp,
+                                        })
+                                        .collect()
+                                } else {
+                                    Vec::new()
+                                }
+                            } else {
+                                Vec::new()
+                            };
+
+                            if let Ok(mut p) = pipelines_bg.lock() {
+                                p.session_inventory.load_prior_sessions(prior_inv);
+                            }
+
+                            eprintln!(
+                                "[the-desk-mcp] Live boundary: {:?} → {:?}",
+                                current_session, new_session
+                            );
+                            if let Ok(mut det) = detector_bg.lock() {
+                                det.reset();
+                            }
+                            if let Ok(mut fe) = flow_emitter_bg.lock() {
+                                fe.reset();
+                            }
+                        } else if new_segment != current_delta_segment
+                            && current_delta_segment != DeltaSegment::Unknown
+                            && new_segment != DeltaSegment::Unknown
+                        {
+                            if let Ok(mut p) = pipelines_bg.lock() {
+                                p.reset_segment(new_segment);
+                                eprintln!(
+                                    "[the-desk-mcp] Segment boundary: {:?} → {:?}",
+                                    current_delta_segment, new_segment
+                                );
                             }
                         }
 
-                        let is_buy = matches!(tick.side, TradeSide::Buy);
-                        process_tick(
-                            &pipelines_bg,
-                            &detector_bg,
-                            &flow_emitter_bg,
-                            &rules_bg,
-                            &playbook_cache_bg,
-                            &db_bg,
-                            &last_bid_bg,
-                            &last_ask_bg,
-                            tick.price,
-                            tick.volume,
-                            is_buy,
-                            tick.timestamp_ms,
-                            tick.bid,
-                            tick.ask,
-                            &mut event_buffer,
-                        );
-
-                        let bid = if tick.bid > 0.0 {
-                            tick.bid
-                        } else {
-                            tick.price - 0.25
-                        };
-                        let ask = if tick.ask > 0.0 {
-                            tick.ask
-                        } else {
-                            tick.price + 0.25
-                        };
-                        let session_date = session_date_from_timestamp_ms(tick.timestamp_ms);
-                        tick_buffer.push((
-                            tick.timestamp_ms,
-                            tick.price,
-                            tick.volume,
-                            bid,
-                            ask,
-                            is_buy,
-                            session_date,
-                            contract_metadata.root_symbol.clone(),
-                            contract_metadata.contract_symbol.clone(),
-                        ));
-
-                        if tick_buffer.len() >= 100 {
-                            if let Ok(db) = db_bg.lock() {
-                                let _ = db.insert_raw_ticks_batch(&tick_buffer);
-                            }
-                            tick_buffer.clear();
+                        if new_session != SessionType::Unknown {
+                            current_session = new_session;
                         }
-
-                        ticks_this_poll += 1;
+                        if new_segment != DeltaSegment::Unknown {
+                            current_delta_segment = new_segment;
+                        }
                     }
-                }
 
-                let aligned_end = scid_tail_offset_after_shrink(len, hsz);
-                if offset > aligned_end {
-                    offset = aligned_end;
-                    feed_rt_bg
-                        .scid_tail_reset_count
-                        .fetch_add(1, Ordering::AcqRel);
-                    eprintln!(
-                        "[the-desk-mcp] SCID tail offset past last full record; clipped to {}",
-                        offset
+                    let is_buy = matches!(tick.side, TradeSide::Buy);
+                    process_tick(
+                        &pipelines_bg,
+                        &detector_bg,
+                        &flow_emitter_bg,
+                        &rules_bg,
+                        &playbook_cache_bg,
+                        &db_bg,
+                        &last_bid_bg,
+                        &last_ask_bg,
+                        tick.price,
+                        tick.volume,
+                        is_buy,
+                        tick.timestamp_ms,
+                        tick.bid,
+                        tick.ask,
+                        &mut event_buffer,
                     );
+
+                    let bid = if tick.bid > 0.0 {
+                        tick.bid
+                    } else {
+                        tick.price - 0.25
+                    };
+                    let ask = if tick.ask > 0.0 {
+                        tick.ask
+                    } else {
+                        tick.price + 0.25
+                    };
+                    let session_date = session_date_from_timestamp_ms(tick.timestamp_ms);
+                    tick_buffer.push((
+                        tick.timestamp_ms,
+                        tick.price,
+                        tick.volume,
+                        bid,
+                        ask,
+                        is_buy,
+                        session_date,
+                        contract_metadata.root_symbol.clone(),
+                        contract_metadata.contract_symbol.clone(),
+                    ));
+
+                    if tick_buffer.len() >= 100 {
+                        if let Ok(db) = db_bg.lock() {
+                            let _ = db.insert_raw_ticks_batch(&tick_buffer);
+                        }
+                        tick_buffer.clear();
+                    }
+
+                    ticks_this_poll += 1;
                 }
-                feed_rt_bg.scid_tail_offset.store(offset, Ordering::Release);
 
                 // Flush remaining events
                 if !event_buffer.is_empty() {
@@ -7810,45 +7988,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         tokio::spawn(async move {
             let poll = Duration::from_millis(1_000);
-            let mut active_path: Option<std::path::PathBuf> = None;
-            let mut offset = 0_u64;
-            let mut batch_id = 0_i64;
-            let mut book = DepthBook::default();
+            let mut state = DepthPollWorkerState::default();
 
             loop {
-                let Some(reader) = latest_depth_reader().ok().flatten() else {
-                    sleep(poll).await;
-                    continue;
-                };
+                let state_for_step = state;
+                let step = tokio::task::spawn_blocking(move || {
+                    let mut next_state = state_for_step;
+                    let work = compute_depth_poll_step(&mut next_state);
+                    (next_state, work)
+                })
+                .await;
 
-                if active_path.as_deref() != Some(reader.path()) {
-                    active_path = Some(reader.path().to_path_buf());
-                    offset = reader.data_start_offset();
-                    batch_id = 0;
-                    book = DepthBook::default();
-                }
-
-                let mut new_records = Vec::<the_desk_backend::depth::DepthRecord>::new();
-                match reader.scan_new_records(&mut offset, |record| {
-                    book.apply(&record);
-                    new_records.push(record);
-                    Ok(DepthScanControl::Continue)
-                }) {
-                    Ok(_) => {
-                        if !new_records.is_empty() {
-                            persist_depth_records(
-                                &db_depth,
-                                &pipelines_depth,
-                                &last_bid_depth,
-                                &last_ask_depth,
-                                &reader,
-                                &book,
-                                &new_records,
-                                &mut batch_id,
-                                feed_depth_rt.as_ref(),
-                            );
-                        }
+                let (next_state, work) = match step {
+                    Ok(output) => output,
+                    Err(err) => {
+                        eprintln!("[the-desk-mcp] Depth poll task failed: {err}");
+                        state = DepthPollWorkerState::default();
+                        sleep(poll).await;
+                        continue;
                     }
+                };
+                state = next_state;
+
+                match work {
+                    Ok(Some(work)) => {
+                        state.batch_id = apply_depth_persist_work(
+                            &db_depth,
+                            &pipelines_depth,
+                            &last_bid_depth,
+                            &last_ask_depth,
+                            work,
+                            feed_depth_rt.as_ref(),
+                        );
+                    }
+                    Ok(None) => {}
                     Err(err) => {
                         eprintln!("[the-desk-mcp] Depth worker error: {err}");
                     }
@@ -7868,7 +8041,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
     use std::io::Write;
-    use tempfile::NamedTempFile;
+    use std::path::Path;
+    use tempfile::{tempdir, NamedTempFile};
     use the_desk_backend::db::SessionSummary;
 
     fn summary_row(
@@ -7960,6 +8134,30 @@ mod tests {
         file.write_all(&rec).expect("record");
     }
 
+    fn append_scid_record_with_scale(
+        file: &mut NamedTempFile,
+        price: f64,
+        timestamp_ms: f64,
+        price_scale: f64,
+    ) {
+        const SC_TO_UNIX_EPOCH_US_TEST: i64 = 2_209_161_600_000_000;
+        let mut rec = [0_u8; SCID_RECORD_SIZE];
+        let unix_us = (timestamp_ms * 1_000.0).round() as i64;
+        let sc_us = SC_TO_UNIX_EPOCH_US_TEST + unix_us;
+        let raw_price = (price * price_scale) as f32;
+        let raw_bid = ((price - 0.25) * price_scale) as f32;
+        let raw_ask = ((price + 0.25) * price_scale) as f32;
+        rec[0..8].copy_from_slice(&sc_us.to_le_bytes());
+        rec[12..16].copy_from_slice(&raw_ask.to_le_bytes());
+        rec[16..20].copy_from_slice(&raw_bid.to_le_bytes());
+        rec[20..24].copy_from_slice(&raw_price.to_le_bytes());
+        rec[24..28].copy_from_slice(&(1_u32).to_le_bytes());
+        rec[28..32].copy_from_slice(&(2_u32).to_le_bytes());
+        rec[32..36].copy_from_slice(&(0_u32).to_le_bytes());
+        rec[36..40].copy_from_slice(&(2_u32).to_le_bytes());
+        file.write_all(&rec).expect("scaled record");
+    }
+
     fn append_scid_sequence(file: &mut NamedTempFile, start_idx: usize, prices: &[f32]) {
         let base_ts_ms = Utc
             .with_ymd_and_hms(2026, 3, 5, 15, 0, 0)
@@ -7971,6 +8169,84 @@ mod tests {
             append_scid_record(file, *price, ts_ms);
         }
         file.flush().expect("flush");
+    }
+
+    fn append_scid_scaled_sequence(
+        file: &mut NamedTempFile,
+        start_idx: usize,
+        prices: &[f64],
+        price_scale: f64,
+    ) {
+        let base_ts_ms = Utc
+            .with_ymd_and_hms(2026, 3, 5, 15, 0, 0)
+            .single()
+            .expect("base timestamp")
+            .timestamp_millis() as f64;
+        for (idx, price) in prices.iter().enumerate() {
+            let ts_ms = base_ts_ms + (start_idx + idx) as f64;
+            append_scid_record_with_scale(file, *price, ts_ms, price_scale);
+        }
+        file.flush().expect("flush");
+    }
+
+    fn write_test_depth_file(path: &Path, records: &[(i64, u8, u8, u16, f32, u32)]) {
+        const DEPTH_HEADER_SIZE_TEST: usize = 64;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"SCDD");
+        bytes.extend_from_slice(&(DEPTH_HEADER_SIZE_TEST as u32).to_le_bytes());
+        bytes.extend_from_slice(&(24_u32).to_le_bytes());
+        bytes.extend_from_slice(&1_u32.to_le_bytes());
+        bytes.extend_from_slice(&[0_u8; DEPTH_HEADER_SIZE_TEST - 16]);
+        for (dt, cmd, flags, num_orders, price, qty) in records {
+            bytes.extend_from_slice(&dt.to_le_bytes());
+            bytes.push(*cmd);
+            bytes.push(*flags);
+            bytes.extend_from_slice(&num_orders.to_le_bytes());
+            bytes.extend_from_slice(&price.to_le_bytes());
+            bytes.extend_from_slice(&qty.to_le_bytes());
+            bytes.extend_from_slice(&0_u32.to_le_bytes());
+        }
+        std::fs::write(path, bytes).expect("write depth");
+    }
+
+    fn unix_ms_to_sc_depth(ms: i64) -> i64 {
+        ms * 1_000 + 2_209_161_600_000_000
+    }
+
+    #[test]
+    fn scid_poll_step_reads_new_ticks_once_from_resume_offset() {
+        let mut file = NamedTempFile::new().expect("temp");
+        write_scid_header(&mut file);
+        append_scid_sequence(&mut file, 0, &[21000.0, 21000.25, 21000.5]);
+        let reader = ScidReader::new(file.path());
+
+        let first = read_scid_poll_step(&reader, safe_scid_data_offset(&reader)).expect("first");
+        append_scid_sequence(&mut file, 3, &[21000.75, 21001.0]);
+        let second = read_scid_poll_step(&reader, first.next_offset).expect("second");
+
+        assert_eq!(first.ticks.len(), 3);
+        assert_eq!(first.ticks[0].price, 21000.0);
+        assert_eq!(second.ticks.len(), 2);
+        assert_eq!(second.ticks[0].price, 21000.75);
+        assert!(second.next_offset > first.next_offset);
+    }
+
+    #[test]
+    fn scid_poll_step_preserves_configured_price_scale() {
+        let mut file = NamedTempFile::new().expect("temp");
+        write_scid_header(&mut file);
+        append_scid_record_with_scale(&mut file, 21000.0, 1_700_000_000_000.0, 100.0);
+        append_scid_record_with_scale(&mut file, 21000.25, 1_700_000_000_001.0, 100.0);
+        file.flush().expect("flush");
+
+        let reader = ScidReader::with_price_scale(file.path(), 100.0);
+        let batch = read_scid_poll_step(&reader, safe_scid_data_offset(&reader)).expect("step");
+
+        assert_eq!(batch.ticks.len(), 2);
+        assert!((batch.ticks[0].price - 21000.0).abs() < 1e-9);
+        assert!((batch.ticks[1].price - 21000.25).abs() < 1e-9);
+        assert!((batch.ticks[0].ask - 21000.25).abs() < 1e-9);
+        assert!((batch.ticks[0].bid - 20999.75).abs() < 1e-9);
     }
 
     #[test]
@@ -8353,6 +8629,96 @@ mod tests {
         assert!((snapshot.vwap - 21000.5).abs() < 1e-9);
         assert_eq!(snapshot.session_low, 21000.0);
         assert_eq!(snapshot.session_high, 21001.0);
+    }
+
+    #[test]
+    fn startup_cutover_and_live_resume_preserve_scaled_prices() {
+        let server = test_server();
+        let mut file = NamedTempFile::new().expect("temp");
+        write_scid_header(&mut file);
+        append_scid_scaled_sequence(&mut file, 0, &[21000.0, 21000.25, 21000.5], 100.0);
+
+        let reader = ScidReader::with_price_scale(file.path(), 100.0);
+        let since = Utc
+            .with_ymd_and_hms(2026, 3, 5, 15, 0, 0)
+            .single()
+            .expect("since timestamp")
+            .timestamp_millis() as f64;
+        let cutover = reader.current_aligned_end_offset().expect("cutover");
+
+        append_scid_scaled_sequence(&mut file, 3, &[21000.75, 21001.0], 100.0);
+
+        let warm = run_startup_warm_replay(
+            &reader,
+            &server.pipelines,
+            &server.flow_emitter,
+            &server.db,
+            since,
+            cutover,
+        );
+        let live = read_scid_poll_step(&reader, warm.cutover_offset).expect("live step");
+
+        assert_eq!(warm.applied_tick_count, 3);
+        assert_eq!(live.ticks.len(), 2);
+        assert!((live.ticks[0].price - 21000.75).abs() < 1e-9);
+        assert!((live.ticks[1].price - 21001.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn depth_shrink_recovery_preserves_previous_book_when_fragment_has_no_clear() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("NQ.depth");
+        write_test_depth_file(
+            &path,
+            &[
+                (unix_ms_to_sc_depth(1_000), 1, 0, 0, 0.0, 0),
+                (unix_ms_to_sc_depth(1_000), 2, 0, 1, 100.0, 10),
+                (unix_ms_to_sc_depth(1_000), 2, 0, 1, 99.75, 5),
+                (unix_ms_to_sc_depth(1_000), 3, 0, 1, 100.25, 7),
+            ],
+        );
+
+        let reader = DepthReader::new(&path, 1.0);
+        let mut state = DepthPollWorkerState {
+            active_path: Some(path.clone()),
+            offset: reader.current_aligned_end_offset().expect("aligned end"),
+            batch_id: 12,
+            book: DepthBook::default(),
+        };
+        for record in reader.read_bulk().expect("read bulk") {
+            state.book.apply(&record);
+        }
+
+        write_test_depth_file(&path, &[(unix_ms_to_sc_depth(2_000), 4, 0, 1, 100.0, 8)]);
+
+        let work = recover_depth_state_after_shrink(&reader, &mut state)
+            .expect("recover")
+            .expect("work");
+
+        let snapshot = work.snapshot;
+        assert!(work.records.is_empty());
+        assert_eq!(
+            state.offset,
+            reader.current_aligned_end_offset().expect("aligned end")
+        );
+        assert_eq!(snapshot.best_bid, Some(100.0));
+        assert_eq!(snapshot.best_ask, Some(100.25));
+        assert_eq!(
+            snapshot
+                .bids
+                .iter()
+                .find(|level| (level.price - 100.0).abs() < 1e-9)
+                .map(|level| level.quantity),
+            Some(8)
+        );
+        assert_eq!(
+            snapshot
+                .bids
+                .iter()
+                .find(|level| (level.price - 99.75).abs() < 1e-9)
+                .map(|level| level.quantity),
+            Some(5)
+        );
     }
 
     #[test]

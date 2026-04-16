@@ -636,6 +636,19 @@ impl DepthReader {
         Ok(std::fs::metadata(&self.path)?.len())
     }
 
+    /// Current aligned EOF offset rounded down to the last full depth record.
+    pub fn current_aligned_end_offset(&self) -> Result<u64, DepthError> {
+        let len = self.file_len()?;
+        let data_start = self.data_start_offset();
+        if len <= data_start {
+            Ok(data_start)
+        } else {
+            let record_size = DEPTH_RECORD_SIZE as u64;
+            let body_len = len - data_start;
+            Ok(data_start + (body_len / record_size) * record_size)
+        }
+    }
+
     /// Read all depth records in the file.
     pub fn read_bulk(&self) -> Result<Vec<DepthRecord>, DepthError> {
         self.read_bulk_since(None)
@@ -1655,6 +1668,93 @@ mod tests {
             })
             .expect("second scan");
         assert_eq!(second_pass, vec![2_000.0, 2_100.0]);
+    }
+
+    fn manual_feed_config_for_dir(data_dir: &Path) -> crate::feed::FeedConfig {
+        crate::feed::FeedConfig {
+            sierra_data_dir: data_dir.to_string_lossy().to_string(),
+            symbol: "NQM26.CME".to_string(),
+            base_symbol: "NQ".to_string(),
+            symbol_mode: crate::feed::symbol_resolution::SymbolMode::Manual,
+            active_symbol_override: None,
+            flush_poll_ms: 1_000,
+            price_scale: 1.0,
+        }
+    }
+
+    #[test]
+    fn list_symbol_depth_files_uses_resolved_contract_prefix() {
+        let dir = tempdir().expect("tempdir");
+        let market_depth_dir = dir.path().join("MarketDepthData");
+        std::fs::create_dir_all(&market_depth_dir).expect("create depth dir");
+        let path_one = market_depth_dir.join("NQM26.CME.2026-03-05.depth");
+        let path_two = market_depth_dir.join("NQM26.CME.2026-03-06.depth");
+        let other = market_depth_dir.join("ESM26.CME.2026-03-05.depth");
+        write_test_depth_file(
+            &path_one,
+            &[
+                (unix_ms_to_sc(1_000), 1, 0, 0, 0.0, 0),
+                (unix_ms_to_sc(2_000), 2, 0, 1, 100.0, 10),
+            ],
+        );
+        write_test_depth_file(
+            &path_two,
+            &[
+                (unix_ms_to_sc(3_000), 1, 0, 0, 0.0, 0),
+                (unix_ms_to_sc(4_000), 2, 1, 1, 101.0, 12),
+            ],
+        );
+        write_test_depth_file(
+            &other,
+            &[
+                (unix_ms_to_sc(1_000), 1, 0, 0, 0.0, 0),
+                (unix_ms_to_sc(2_000), 2, 0, 1, 99.0, 5),
+            ],
+        );
+
+        let config = manual_feed_config_for_dir(dir.path());
+        let files = DepthReader::list_symbol_depth_files(&config).expect("list depth files");
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0], path_one);
+        assert_eq!(files[1], path_two);
+    }
+
+    #[test]
+    fn find_file_for_timestamp_prefers_containing_depth_file() {
+        let dir = tempdir().expect("tempdir");
+        let market_depth_dir = dir.path().join("MarketDepthData");
+        std::fs::create_dir_all(&market_depth_dir).expect("create depth dir");
+        let path_one = market_depth_dir.join("NQM26.CME.2026-03-05.depth");
+        let path_two = market_depth_dir.join("NQM26.CME.2026-03-06.depth");
+        write_test_depth_file(
+            &path_one,
+            &[
+                (unix_ms_to_sc(1_000), 1, 0, 0, 0.0, 0),
+                (unix_ms_to_sc(2_000), 2, 0, 1, 100.0, 10),
+            ],
+        );
+        write_test_depth_file(
+            &path_two,
+            &[
+                (unix_ms_to_sc(3_000), 1, 0, 0, 0.0, 0),
+                (unix_ms_to_sc(4_000), 2, 1, 1, 101.0, 12),
+            ],
+        );
+
+        let config = manual_feed_config_for_dir(dir.path());
+        let contains_first = DepthReader::find_file_for_timestamp(&config, 1_500.0)
+            .expect("find first")
+            .expect("file");
+        let contains_second = DepthReader::find_file_for_timestamp(&config, 3_500.0)
+            .expect("find second")
+            .expect("file");
+        let closest = DepthReader::find_file_for_timestamp(&config, 4_500.0)
+            .expect("find closest")
+            .expect("file");
+
+        assert_eq!(contains_first, path_one);
+        assert_eq!(contains_second, path_two);
+        assert_eq!(closest, path_two);
     }
 
     #[test]

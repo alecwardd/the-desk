@@ -1,8 +1,8 @@
 use crate::depth::DepthRecord;
 use crate::memory::{
     AgentInsightQuery, AgentInsightRecord, BehavioralPatternQuery, BehavioralPatternRecord,
-    MemoryFollowupQuery, MemoryFollowupRecord, INSIGHT_DISMISSED, INSIGHT_PINNED,
-    INSIGHT_SUPERSEDED,
+    MemoryFollowupQuery, MemoryFollowupRecord, MemoryMaintenanceState, INSIGHT_DISMISSED,
+    INSIGHT_PINNED, INSIGHT_SUPERSEDED,
 };
 use crate::pipelines::event_detector::MarketEvent;
 use crate::risk::RiskState;
@@ -744,6 +744,9 @@ impl Database {
         }
         if version < 19 {
             self.migrate_v19()?;
+        }
+        if version < 20 {
+            self.migrate_v20()?;
         }
 
         Ok(())
@@ -1717,6 +1720,36 @@ impl Database {
               ON untested_dnps(contract_symbol, created_at DESC);
 
             UPDATE schema_version SET version = 19;
+            ",
+        )?;
+        Ok(())
+    }
+
+    /// V20: explicit memory maintenance freshness state for read-only briefing tools.
+    fn migrate_v20(&self) -> Result<(), DbError> {
+        self.conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS memory_maintenance_state (
+              singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+              patterns_last_refreshed_at_ms REAL NULL,
+              insights_lifecycle_last_refreshed_at_ms REAL NULL,
+              patterns_dirty INTEGER NOT NULL DEFAULT 1,
+              insights_lifecycle_dirty INTEGER NOT NULL DEFAULT 1,
+              dirty_since_ms REAL NULL,
+              dirty_reasons_json TEXT NOT NULL DEFAULT '[]',
+              last_refresh_reason TEXT NULL
+            );
+            INSERT OR IGNORE INTO memory_maintenance_state (
+              singleton,
+              patterns_last_refreshed_at_ms,
+              insights_lifecycle_last_refreshed_at_ms,
+              patterns_dirty,
+              insights_lifecycle_dirty,
+              dirty_since_ms,
+              dirty_reasons_json,
+              last_refresh_reason
+            ) VALUES (1, NULL, NULL, 1, 1, NULL, '[]', NULL);
+            UPDATE schema_version SET version = 20;
             ",
         )?;
         Ok(())
@@ -2905,6 +2938,53 @@ impl Database {
         Ok(items)
     }
 
+    pub fn get_memory_maintenance_state(&self) -> Result<MemoryMaintenanceState, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT patterns_last_refreshed_at_ms, insights_lifecycle_last_refreshed_at_ms,
+                    patterns_dirty, insights_lifecycle_dirty, dirty_since_ms,
+                    dirty_reasons_json, last_refresh_reason
+             FROM memory_maintenance_state
+             WHERE singleton = 1",
+        )?;
+        let mut rows = stmt.query([])?;
+        if let Some(row) = rows.next()? {
+            Ok(Self::memory_maintenance_state_from_row(row)?)
+        } else {
+            Ok(MemoryMaintenanceState::default())
+        }
+    }
+
+    pub fn upsert_memory_maintenance_state(
+        &self,
+        state: &MemoryMaintenanceState,
+    ) -> Result<(), DbError> {
+        self.conn.execute(
+            "INSERT INTO memory_maintenance_state (
+                singleton, patterns_last_refreshed_at_ms, insights_lifecycle_last_refreshed_at_ms,
+                patterns_dirty, insights_lifecycle_dirty, dirty_since_ms, dirty_reasons_json,
+                last_refresh_reason
+            ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ON CONFLICT(singleton) DO UPDATE SET
+                patterns_last_refreshed_at_ms = excluded.patterns_last_refreshed_at_ms,
+                insights_lifecycle_last_refreshed_at_ms = excluded.insights_lifecycle_last_refreshed_at_ms,
+                patterns_dirty = excluded.patterns_dirty,
+                insights_lifecycle_dirty = excluded.insights_lifecycle_dirty,
+                dirty_since_ms = excluded.dirty_since_ms,
+                dirty_reasons_json = excluded.dirty_reasons_json,
+                last_refresh_reason = excluded.last_refresh_reason",
+            params![
+                state.patterns_last_refreshed_at_ms,
+                state.insights_lifecycle_last_refreshed_at_ms,
+                i64::from(state.patterns_dirty),
+                i64::from(state.insights_lifecycle_dirty),
+                state.dirty_since_ms,
+                serde_json::to_string(&state.dirty_reasons)?,
+                state.last_refresh_reason.clone(),
+            ],
+        )?;
+        Ok(())
+    }
+
     fn agent_insight_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentInsightRecord> {
         Ok(AgentInsightRecord {
             id: row.get(0)?,
@@ -2989,6 +3069,32 @@ impl Database {
                 .ok()
                 .and_then(|value| serde_json::from_str(&value).ok())
                 .unwrap_or_else(|| serde_json::json!({})),
+        })
+    }
+
+    fn memory_maintenance_state_from_row(
+        row: &rusqlite::Row<'_>,
+    ) -> rusqlite::Result<MemoryMaintenanceState> {
+        let patterns_last_refreshed_at_ms: Option<f64> = row.get(0)?;
+        let insights_lifecycle_last_refreshed_at_ms: Option<f64> = row.get(1)?;
+        let patterns_dirty = row.get::<_, i64>(2)? != 0;
+        let insights_lifecycle_dirty = row.get::<_, i64>(3)? != 0;
+        Ok(MemoryMaintenanceState {
+            patterns_last_refreshed_at_ms,
+            insights_lifecycle_last_refreshed_at_ms,
+            patterns_dirty,
+            insights_lifecycle_dirty,
+            dirty_since_ms: row.get(4)?,
+            dirty_reasons: row
+                .get::<_, String>(5)
+                .ok()
+                .and_then(|value| serde_json::from_str(&value).ok())
+                .unwrap_or_default(),
+            last_refresh_reason: row.get(6)?,
+            refresh_suggested: patterns_dirty
+                || insights_lifecycle_dirty
+                || patterns_last_refreshed_at_ms.is_none()
+                || insights_lifecycle_last_refreshed_at_ms.is_none(),
         })
     }
 

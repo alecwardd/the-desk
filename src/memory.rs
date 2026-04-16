@@ -134,6 +134,10 @@ pub struct MemoryBriefQuery {
     pub time_bucket: Option<String>,
     pub pre_session_note: Option<String>,
     pub limit: Option<usize>,
+    pub include_recent_sessions: Option<bool>,
+    pub include_patterns: Option<bool>,
+    pub include_insights: Option<bool>,
+    pub include_followups: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -150,6 +154,50 @@ pub struct MemorySessionSnapshot {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct MemoryMaintenanceState {
+    pub patterns_last_refreshed_at_ms: Option<f64>,
+    pub insights_lifecycle_last_refreshed_at_ms: Option<f64>,
+    pub patterns_dirty: bool,
+    pub insights_lifecycle_dirty: bool,
+    pub dirty_since_ms: Option<f64>,
+    pub dirty_reasons: Vec<String>,
+    pub last_refresh_reason: Option<String>,
+    pub refresh_suggested: bool,
+}
+
+impl Default for MemoryMaintenanceState {
+    fn default() -> Self {
+        Self {
+            patterns_last_refreshed_at_ms: None,
+            insights_lifecycle_last_refreshed_at_ms: None,
+            patterns_dirty: true,
+            insights_lifecycle_dirty: true,
+            dirty_since_ms: None,
+            dirty_reasons: Vec::new(),
+            last_refresh_reason: None,
+            refresh_suggested: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryRefreshOptions {
+    pub refresh_patterns: bool,
+    pub refresh_insight_lifecycle: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryRefreshResult {
+    pub refreshed_at_ms: f64,
+    pub stale_insights_updated: usize,
+    pub patterns: Vec<BehavioralPatternRecord>,
+    pub maintenance: MemoryMaintenanceState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MemoryBrief {
     pub recent_sessions: Vec<MemorySessionSnapshot>,
     pub patterns: Vec<BehavioralPatternRecord>,
@@ -158,6 +206,7 @@ pub struct MemoryBrief {
     pub summary: serde_json::Value,
     pub pre_session_note: Option<String>,
     pub retrieval_context: serde_json::Value,
+    pub memory_maintenance: MemoryMaintenanceState,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -186,6 +235,97 @@ fn scope_value(scope: &serde_json::Value, key: &str) -> Option<String> {
 
 fn clamp_unit(value: Option<f64>, default: f64) -> f64 {
     value.unwrap_or(default).clamp(0.0, 1.0)
+}
+
+fn normalize_memory_maintenance_state(mut state: MemoryMaintenanceState) -> MemoryMaintenanceState {
+    let mut dirty_reasons = std::mem::take(&mut state.dirty_reasons);
+    let mut deduped = Vec::with_capacity(dirty_reasons.len());
+    for reason in dirty_reasons.drain(..) {
+        let trimmed = reason.trim();
+        if trimmed.is_empty() || deduped.iter().any(|existing| existing == trimmed) {
+            continue;
+        }
+        deduped.push(trimmed.to_string());
+    }
+    if deduped.len() > 8 {
+        let keep_from = deduped.len() - 8;
+        deduped.drain(0..keep_from);
+    }
+    state.dirty_reasons = deduped;
+    if !state.patterns_dirty && !state.insights_lifecycle_dirty {
+        state.dirty_since_ms = None;
+        state.dirty_reasons.clear();
+    }
+    state.refresh_suggested = state.patterns_dirty
+        || state.insights_lifecycle_dirty
+        || state.patterns_last_refreshed_at_ms.is_none()
+        || state.insights_lifecycle_last_refreshed_at_ms.is_none();
+    state
+}
+
+fn load_memory_maintenance_state(db: &Database) -> Result<MemoryMaintenanceState, MemoryError> {
+    Ok(normalize_memory_maintenance_state(
+        db.get_memory_maintenance_state()?,
+    ))
+}
+
+fn persist_memory_maintenance_state(
+    db: &Database,
+    state: MemoryMaintenanceState,
+) -> Result<MemoryMaintenanceState, MemoryError> {
+    let normalized = normalize_memory_maintenance_state(state);
+    db.upsert_memory_maintenance_state(&normalized)?;
+    Ok(normalized)
+}
+
+fn set_memory_maintenance_fresh(
+    db: &Database,
+    patterns_refreshed_at_ms: Option<f64>,
+    insights_lifecycle_refreshed_at_ms: Option<f64>,
+    reason: Option<&str>,
+) -> Result<MemoryMaintenanceState, MemoryError> {
+    let mut state = load_memory_maintenance_state(db)?;
+    if let Some(timestamp_ms) = patterns_refreshed_at_ms {
+        state.patterns_last_refreshed_at_ms = Some(timestamp_ms);
+        state.patterns_dirty = false;
+    }
+    if let Some(timestamp_ms) = insights_lifecycle_refreshed_at_ms {
+        state.insights_lifecycle_last_refreshed_at_ms = Some(timestamp_ms);
+        state.insights_lifecycle_dirty = false;
+    }
+    if let Some(reason) = reason.map(str::trim).filter(|reason| !reason.is_empty()) {
+        state.last_refresh_reason = Some(reason.to_string());
+    }
+    persist_memory_maintenance_state(db, state)
+}
+
+pub fn mark_memory_dirty(
+    db: &Database,
+    patterns_dirty: bool,
+    insights_lifecycle_dirty: bool,
+    reason: &str,
+) -> Result<MemoryMaintenanceState, MemoryError> {
+    let now_ms = Utc::now().timestamp_millis() as f64;
+    let mut state = load_memory_maintenance_state(db)?;
+    if patterns_dirty {
+        state.patterns_dirty = true;
+    }
+    if insights_lifecycle_dirty {
+        state.insights_lifecycle_dirty = true;
+    }
+    if (patterns_dirty || insights_lifecycle_dirty) && state.dirty_since_ms.is_none() {
+        state.dirty_since_ms = Some(now_ms);
+    }
+    let trimmed = reason.trim();
+    if !trimmed.is_empty()
+        && !state
+            .dirty_reasons
+            .iter()
+            .any(|existing| existing == trimmed)
+    {
+        state.dirty_reasons.push(trimmed.to_string());
+    }
+    persist_memory_maintenance_state(db, state)
 }
 
 pub fn time_bucket_from_timestamp_ms(timestamp_ms: f64) -> String {
@@ -460,12 +600,13 @@ fn build_recent_session_snapshots(
     Ok(snapshots)
 }
 
-pub fn refresh_insight_lifecycle(db: &Database, now_ms: f64) -> Result<(), MemoryError> {
+pub fn refresh_insight_lifecycle(db: &Database, now_ms: f64) -> Result<usize, MemoryError> {
     let sessions = db.list_sessions(500)?;
     let insights = db.list_agent_insights(&AgentInsightQuery {
         limit: Some(1000),
         ..AgentInsightQuery::default()
     })?;
+    let mut stale_updates = 0usize;
     for insight in insights {
         if matches!(
             insight.status.as_str(),
@@ -485,9 +626,11 @@ pub fn refresh_insight_lifecycle(db: &Database, now_ms: f64) -> Result<(), Memor
         };
         if should_stale {
             db.update_agent_insight_status(&insight.id, INSIGHT_STALE, now_ms)?;
+            stale_updates += 1;
         }
     }
-    Ok(())
+    set_memory_maintenance_fresh(db, None, Some(now_ms), Some("refresh_insight_lifecycle"))?;
+    Ok(stale_updates)
 }
 
 pub fn save_agent_insight(
@@ -896,7 +1039,42 @@ pub fn detect_behavioral_patterns(
     for pattern in &patterns {
         db.upsert_behavioral_pattern(pattern)?;
     }
+    set_memory_maintenance_fresh(db, Some(now_ms), None, Some("detect_behavioral_patterns"))?;
     Ok(patterns)
+}
+
+pub fn refresh_memory_state(
+    db: &Database,
+    options: MemoryRefreshOptions,
+    reason: Option<&str>,
+) -> Result<MemoryRefreshResult, MemoryError> {
+    let now_ms = Utc::now().timestamp_millis() as f64;
+    let stale_insights_updated = if options.refresh_insight_lifecycle {
+        refresh_insight_lifecycle(db, now_ms)?
+    } else {
+        0
+    };
+    let patterns = if options.refresh_patterns {
+        detect_behavioral_patterns(db)?
+    } else {
+        Vec::new()
+    };
+    let maintenance = if options.refresh_patterns || options.refresh_insight_lifecycle {
+        set_memory_maintenance_fresh(
+            db,
+            options.refresh_patterns.then_some(now_ms),
+            options.refresh_insight_lifecycle.then_some(now_ms),
+            reason,
+        )?
+    } else {
+        load_memory_maintenance_state(db)?
+    };
+    Ok(MemoryRefreshResult {
+        refreshed_at_ms: now_ms,
+        stale_insights_updated,
+        patterns,
+        maintenance,
+    })
 }
 
 pub fn build_memory_brief(
@@ -904,8 +1082,11 @@ pub fn build_memory_brief(
     query: MemoryBriefQuery,
 ) -> Result<MemoryBrief, MemoryError> {
     let now_ms = Utc::now().timestamp_millis() as f64;
-    refresh_insight_lifecycle(db, now_ms)?;
     let limit = query.limit.unwrap_or(5).max(1);
+    let include_recent_sessions = query.include_recent_sessions.unwrap_or(true);
+    let include_patterns = query.include_patterns.unwrap_or(true);
+    let include_insights = query.include_insights.unwrap_or(true);
+    let include_followups = query.include_followups.unwrap_or(true);
     let current_context = if let Some(session_id) = &query.session_id {
         db.get_session(session_id)?
             .map(|session| {
@@ -946,98 +1127,121 @@ pub fn build_memory_brief(
         .clone()
         .or_else(|| scope_value(&current_context, "timeBucket"));
 
-    let mut patterns = db.list_behavioral_patterns(&BehavioralPatternQuery {
-        setup_id: query.setup_id.clone(),
-        active_only: Some(true),
-        limit: Some(50),
-        ..BehavioralPatternQuery::default()
-    })?;
-    patterns.sort_by(|a, b| {
-        pattern_rank(
-            b,
-            query.setup_id.as_deref(),
-            session_type.as_deref(),
-            session_segment.as_deref(),
-            query.day_type.as_deref(),
-            time_bucket.as_deref(),
-        )
-        .partial_cmp(&pattern_rank(
-            a,
-            query.setup_id.as_deref(),
-            session_type.as_deref(),
-            session_segment.as_deref(),
-            query.day_type.as_deref(),
-            time_bucket.as_deref(),
-        ))
-        .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    patterns.truncate(limit);
+    let mut patterns = if include_patterns {
+        db.list_behavioral_patterns(&BehavioralPatternQuery {
+            setup_id: query.setup_id.clone(),
+            active_only: Some(true),
+            limit: Some(50),
+            ..BehavioralPatternQuery::default()
+        })?
+    } else {
+        Vec::new()
+    };
+    if include_patterns {
+        patterns.sort_by(|a, b| {
+            pattern_rank(
+                b,
+                query.setup_id.as_deref(),
+                session_type.as_deref(),
+                session_segment.as_deref(),
+                query.day_type.as_deref(),
+                time_bucket.as_deref(),
+            )
+            .partial_cmp(&pattern_rank(
+                a,
+                query.setup_id.as_deref(),
+                session_type.as_deref(),
+                session_segment.as_deref(),
+                query.day_type.as_deref(),
+                time_bucket.as_deref(),
+            ))
+            .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        patterns.truncate(limit);
+    }
 
-    let mut insights = db.list_agent_insights(&AgentInsightQuery {
-        setup_id: query.setup_id.clone(),
-        statuses: Some(vec![
-            INSIGHT_PINNED.to_string(),
-            INSIGHT_VALIDATED.to_string(),
-            INSIGHT_CANDIDATE.to_string(),
-        ]),
-        limit: Some(100),
-        ..AgentInsightQuery::default()
-    })?;
-    insights.retain(|insight| active_recall_status(&insight.status));
-    insights.sort_by(|a, b| {
-        insight_rank(
-            b,
-            query.setup_id.as_deref(),
-            session_type.as_deref(),
-            session_segment.as_deref(),
-            query.day_type.as_deref(),
-            time_bucket.as_deref(),
-            now_ms,
-        )
-        .partial_cmp(&insight_rank(
-            a,
-            query.setup_id.as_deref(),
-            session_type.as_deref(),
-            session_segment.as_deref(),
-            query.day_type.as_deref(),
-            time_bucket.as_deref(),
-            now_ms,
-        ))
-        .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    insights.truncate(limit);
+    let mut insights = if include_insights {
+        db.list_agent_insights(&AgentInsightQuery {
+            setup_id: query.setup_id.clone(),
+            statuses: Some(vec![
+                INSIGHT_PINNED.to_string(),
+                INSIGHT_VALIDATED.to_string(),
+                INSIGHT_CANDIDATE.to_string(),
+            ]),
+            limit: Some(100),
+            ..AgentInsightQuery::default()
+        })?
+    } else {
+        Vec::new()
+    };
+    if include_insights {
+        insights.retain(|insight| active_recall_status(&insight.status));
+        insights.sort_by(|a, b| {
+            insight_rank(
+                b,
+                query.setup_id.as_deref(),
+                session_type.as_deref(),
+                session_segment.as_deref(),
+                query.day_type.as_deref(),
+                time_bucket.as_deref(),
+                now_ms,
+            )
+            .partial_cmp(&insight_rank(
+                a,
+                query.setup_id.as_deref(),
+                session_type.as_deref(),
+                session_segment.as_deref(),
+                query.day_type.as_deref(),
+                time_bucket.as_deref(),
+                now_ms,
+            ))
+            .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        insights.truncate(limit);
+    }
 
-    let mut followups = db.list_memory_followups(&MemoryFollowupQuery {
-        status: Some(FOLLOWUP_OPEN.to_string()),
-        session_id: query.session_id.clone(),
-        setup_id: query.setup_id.clone(),
-        limit: Some(50),
-        ..MemoryFollowupQuery::default()
-    })?;
-    followups.sort_by(|a, b| {
-        followup_rank(
-            b,
-            query.setup_id.as_deref(),
-            query.session_id.as_deref(),
-            session_type.as_deref(),
-            session_segment.as_deref(),
-            query.day_type.as_deref(),
-            time_bucket.as_deref(),
-        )
-        .partial_cmp(&followup_rank(
-            a,
-            query.setup_id.as_deref(),
-            query.session_id.as_deref(),
-            session_type.as_deref(),
-            session_segment.as_deref(),
-            query.day_type.as_deref(),
-            time_bucket.as_deref(),
-        ))
-        .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    followups.truncate(limit);
+    let mut followups = if include_followups {
+        db.list_memory_followups(&MemoryFollowupQuery {
+            status: Some(FOLLOWUP_OPEN.to_string()),
+            session_id: query.session_id.clone(),
+            setup_id: query.setup_id.clone(),
+            limit: Some(50),
+            ..MemoryFollowupQuery::default()
+        })?
+    } else {
+        Vec::new()
+    };
+    if include_followups {
+        followups.sort_by(|a, b| {
+            followup_rank(
+                b,
+                query.setup_id.as_deref(),
+                query.session_id.as_deref(),
+                session_type.as_deref(),
+                session_segment.as_deref(),
+                query.day_type.as_deref(),
+                time_bucket.as_deref(),
+            )
+            .partial_cmp(&followup_rank(
+                a,
+                query.setup_id.as_deref(),
+                query.session_id.as_deref(),
+                session_type.as_deref(),
+                session_segment.as_deref(),
+                query.day_type.as_deref(),
+                time_bucket.as_deref(),
+            ))
+            .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        followups.truncate(limit);
+    }
 
-    let recent_sessions = build_recent_session_snapshots(db, limit.min(5))?;
+    let recent_sessions = if include_recent_sessions {
+        build_recent_session_snapshots(db, limit.min(5))?
+    } else {
+        Vec::new()
+    };
+    let memory_maintenance = load_memory_maintenance_state(db)?;
     let pre_session_note = if let Some(pre_session_note) = query.pre_session_note {
         Some(pre_session_note)
     } else if let Some(session_id) = &query.session_id {
@@ -1053,6 +1257,13 @@ pub fn build_memory_brief(
         "followupCount": followups.len(),
         "topPatternType": patterns.first().map(|pattern| pattern.pattern_type.clone()),
         "topInsightStatus": insights.first().map(|insight| insight.status.clone()),
+        "requestedSections": {
+            "recentSessions": include_recent_sessions,
+            "patterns": include_patterns,
+            "insights": include_insights,
+            "followups": include_followups,
+        },
+        "refreshSuggested": memory_maintenance.refresh_suggested,
     });
 
     Ok(MemoryBrief {
@@ -1070,7 +1281,12 @@ pub fn build_memory_brief(
             "sessionSegment": session_segment,
             "dayType": query.day_type,
             "timeBucket": time_bucket,
+            "includeRecentSessions": include_recent_sessions,
+            "includePatterns": include_patterns,
+            "includeInsights": include_insights,
+            "includeFollowups": include_followups,
         }),
+        memory_maintenance,
     })
 }
 
@@ -1325,5 +1541,160 @@ mod tests {
         assert!(patterns
             .iter()
             .any(|pattern| pattern.pattern_type == "mistake_tag_frequency"));
+    }
+
+    #[test]
+    fn build_memory_brief_is_read_only_and_reports_refresh_state() {
+        let db = test_db();
+        seed_session(&db, "s1", "2026-03-04", 1_000.0);
+        db.upsert_agent_insight(&AgentInsightRecord {
+            id: "candidate-1".to_string(),
+            created_at_ms: 1.0,
+            updated_at_ms: 1.0,
+            session_id: Some("s1".to_string()),
+            trade_id: None,
+            setup_id: None,
+            category: "behavioral".to_string(),
+            status: INSIGHT_CANDIDATE.to_string(),
+            summary: "forces late entries".to_string(),
+            evidence: json!({"sample": 1}),
+            tags: Vec::new(),
+            scope: json!({}),
+            confidence: 0.5,
+            salience: 0.5,
+            times_surfaced: 0,
+            last_surfaced_ms: None,
+            superseded_by: None,
+            source: "agent".to_string(),
+            helpful_count: 0,
+            irrelevant_count: 0,
+            wrong_count: 0,
+        })
+        .expect("seed insight");
+        mark_memory_dirty(&db, true, true, "seeded_test_state").expect("dirty");
+
+        let brief = build_memory_brief(
+            &db,
+            MemoryBriefQuery {
+                intent: "weekly_review".to_string(),
+                limit: Some(3),
+                ..MemoryBriefQuery::default()
+            },
+        )
+        .expect("brief");
+
+        let loaded = db
+            .get_agent_insight("candidate-1")
+            .expect("get")
+            .expect("exists");
+        assert_eq!(loaded.status, INSIGHT_CANDIDATE);
+        assert!(brief.memory_maintenance.refresh_suggested);
+        assert!(brief.memory_maintenance.patterns_dirty);
+        assert!(brief.memory_maintenance.insights_lifecycle_dirty);
+    }
+
+    #[test]
+    fn refresh_memory_state_clears_dirty_flags_and_honors_section_flags() {
+        let db = test_db();
+        seed_session(&db, "s1", "2026-03-04", 1_000.0);
+        seed_setup(&db, "or5");
+        db.upsert_trade(&TradeRecord {
+            id: "t1".to_string(),
+            session_id: Some("s1".to_string()),
+            setup_id: Some("or5".to_string()),
+            instrument: None,
+            trade_account: None,
+            entry_time: 1_000.0,
+            entry_price: 21_000.0,
+            exit_time: Some(2_000.0),
+            exit_price: Some(21_010.0),
+            direction: "long".to_string(),
+            size: 1,
+            max_open_size: None,
+            stop_price: None,
+            target_prices: Vec::new(),
+            result_r: Some(1.0),
+            gross_points: Some(10.0),
+            planned: true,
+            rules_followed: Some(true),
+            emotional_state: Some("Calm".to_string()),
+            thesis: None,
+            review_tags: Vec::new(),
+            mistake_tags: vec!["late_entry".to_string()],
+            entry_fill_count: 1,
+            exit_fill_count: 1,
+            import_batch_id: None,
+            notes: String::new(),
+            source: "manual".to_string(),
+        })
+        .expect("trade");
+        db.upsert_trade(&TradeRecord {
+            id: "t2".to_string(),
+            session_id: Some("s1".to_string()),
+            setup_id: Some("or5".to_string()),
+            instrument: None,
+            trade_account: None,
+            entry_time: 1_500.0,
+            entry_price: 21_000.0,
+            exit_time: Some(2_500.0),
+            exit_price: Some(20_995.0),
+            direction: "long".to_string(),
+            size: 1,
+            max_open_size: None,
+            stop_price: None,
+            target_prices: Vec::new(),
+            result_r: Some(-0.5),
+            gross_points: Some(-5.0),
+            planned: true,
+            rules_followed: Some(false),
+            emotional_state: Some("Calm".to_string()),
+            thesis: None,
+            review_tags: Vec::new(),
+            mistake_tags: vec!["late_entry".to_string()],
+            entry_fill_count: 1,
+            exit_fill_count: 1,
+            import_batch_id: None,
+            notes: String::new(),
+            source: "manual".to_string(),
+        })
+        .expect("trade2");
+        mark_memory_dirty(&db, true, true, "trade_import").expect("dirty");
+
+        let refresh = refresh_memory_state(
+            &db,
+            MemoryRefreshOptions {
+                refresh_patterns: true,
+                refresh_insight_lifecycle: true,
+            },
+            Some("manual_refresh"),
+        )
+        .expect("refresh");
+        assert!(!refresh.maintenance.patterns_dirty);
+        assert!(!refresh.maintenance.insights_lifecycle_dirty);
+        assert_eq!(
+            refresh.maintenance.last_refresh_reason.as_deref(),
+            Some("manual_refresh")
+        );
+        assert!(refresh.maintenance.patterns_last_refreshed_at_ms.is_some());
+        assert!(refresh
+            .patterns
+            .iter()
+            .any(|pattern| pattern.pattern_type == "win_rate_by_setup"));
+
+        let brief = build_memory_brief(
+            &db,
+            MemoryBriefQuery {
+                intent: "setup_check".to_string(),
+                setup_id: Some("or5".to_string()),
+                include_recent_sessions: Some(false),
+                include_followups: Some(false),
+                limit: Some(3),
+                ..MemoryBriefQuery::default()
+            },
+        )
+        .expect("brief");
+        assert!(brief.recent_sessions.is_empty());
+        assert!(brief.followups.is_empty());
+        assert!(!brief.memory_maintenance.refresh_suggested);
     }
 }

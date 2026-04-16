@@ -34,8 +34,9 @@ use the_desk_backend::feed::{
 use the_desk_backend::memory::{
     build_memory_brief as memory_build_memory_brief,
     detect_behavioral_patterns as memory_detect_behavioral_patterns,
+    mark_memory_dirty as memory_mark_dirty, refresh_memory_state as memory_refresh_state,
     save_agent_insight as memory_save_agent_insight, AgentInsightQuery, BehavioralPatternQuery,
-    MemoryBriefQuery, MemoryFollowupRecord, SaveAgentInsightInput,
+    MemoryBriefQuery, MemoryFollowupRecord, MemoryRefreshOptions, SaveAgentInsightInput,
 };
 use the_desk_backend::options::{
     fetch_options_snapshot, load_options_config, OptionsCredentials, OptionsSnapshot,
@@ -1848,6 +1849,19 @@ struct MemoryBriefParams {
     time_bucket: Option<String>,
     pre_session_note: Option<String>,
     limit: Option<u64>,
+    include_recent_sessions: Option<bool>,
+    include_patterns: Option<bool>,
+    include_insights: Option<bool>,
+    include_followups: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct RefreshMemoryStateParams {
+    refresh_patterns: Option<bool>,
+    refresh_insight_lifecycle: Option<bool>,
+    include_patterns: Option<bool>,
+    reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, serde::Serialize, JsonSchema)]
@@ -4211,9 +4225,12 @@ impl TheDeskMcp {
             pre_session_note: params.pre_session_note,
         };
         db.upsert_session(&session).map_err(db_error)?;
+        let memory_maintenance =
+            memory_mark_dirty(&db, false, true, "start_trading_session").map_err(db_error)?;
         Ok(text_result(serde_json::json!({
             "started": true,
-            "session": session
+            "session": session,
+            "memoryMaintenance": memory_maintenance
         })))
     }
 
@@ -4310,9 +4327,12 @@ impl TheDeskMcp {
             source: params.source.unwrap_or_else(|| "manual_chat".to_string()),
         };
         db.upsert_trade(&trade).map_err(db_error)?;
+        let memory_maintenance =
+            memory_mark_dirty(&db, true, false, "upsert_trade_entry").map_err(db_error)?;
         Ok(text_result(serde_json::json!({
             "saved": true,
-            "trade": trade
+            "trade": trade,
+            "memoryMaintenance": memory_maintenance
         })))
     }
 
@@ -4368,11 +4388,14 @@ impl TheDeskMcp {
             self.playbook_cache.set_risk_at_limit(new_state.at_limit);
             updated_risk_state = Some(new_state);
         }
+        let memory_maintenance =
+            memory_mark_dirty(&db, true, false, "close_trade_entry").map_err(db_error)?;
 
         Ok(text_result(serde_json::json!({
             "closed": true,
             "trade": trade,
-            "updatedRiskState": updated_risk_state
+            "updatedRiskState": updated_risk_state,
+            "memoryMaintenance": memory_maintenance
         })))
     }
 
@@ -4398,9 +4421,12 @@ impl TheDeskMcp {
         )
         .map_err(db_error)?;
         let trade = db.get_trade(&params.id).map_err(db_error)?;
+        let memory_maintenance =
+            memory_mark_dirty(&db, true, false, "review_trade_entry").map_err(db_error)?;
         Ok(text_result(serde_json::json!({
             "updated": true,
-            "trade": trade
+            "trade": trade,
+            "memoryMaintenance": memory_maintenance
         })))
     }
 
@@ -4684,8 +4710,10 @@ impl TheDeskMcp {
             },
         )
         .map_err(|e| invalid_params_error(e.to_string()))?;
+        let memory_maintenance = db.get_memory_maintenance_state().map_err(db_error)?;
         Ok(text_result(serde_json::json!({
-            "agentInsight": record
+            "agentInsight": record,
+            "memoryMaintenance": memory_maintenance
         })))
     }
 
@@ -4763,9 +4791,49 @@ impl TheDeskMcp {
     async fn detect_behavioral_patterns(&self) -> Result<CallToolResult, McpError> {
         let db = self.db.lock().map_err(|_| lock_error())?;
         let patterns = memory_detect_behavioral_patterns(&db).map_err(db_error)?;
+        let memory_maintenance = db.get_memory_maintenance_state().map_err(db_error)?;
         Ok(text_result(serde_json::json!({
             "patterns": patterns,
-            "count": patterns.len()
+            "count": patterns.len(),
+            "memoryMaintenance": memory_maintenance
+        })))
+    }
+
+    #[tool(
+        description = "Explicitly refresh memory maintenance state without coupling recomputation to read requests. Can refresh behavioral patterns, insight lifecycle status, or both."
+    )]
+    async fn refresh_memory_state(
+        &self,
+        Parameters(params): Parameters<RefreshMemoryStateParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let refresh_patterns = params.refresh_patterns.unwrap_or(true);
+        let refresh_insight_lifecycle = params.refresh_insight_lifecycle.unwrap_or(true);
+        if !refresh_patterns && !refresh_insight_lifecycle {
+            return Err(invalid_params_error(
+                "at least one refresh target must be enabled",
+            ));
+        }
+        let include_patterns = params.include_patterns.unwrap_or(false);
+        let db = self.db.lock().map_err(|_| lock_error())?;
+        let refresh = memory_refresh_state(
+            &db,
+            MemoryRefreshOptions {
+                refresh_patterns,
+                refresh_insight_lifecycle,
+            },
+            params.reason.as_deref(),
+        )
+        .map_err(db_error)?;
+        Ok(text_result(serde_json::json!({
+            "refreshedAtMs": refresh.refreshed_at_ms,
+            "staleInsightsUpdated": refresh.stale_insights_updated,
+            "patternCount": refresh.patterns.len(),
+            "patterns": if include_patterns {
+                serde_json::json!(refresh.patterns)
+            } else {
+                serde_json::json!(null)
+            },
+            "memoryMaintenance": refresh.maintenance
         })))
     }
 
@@ -4855,7 +4923,6 @@ impl TheDeskMcp {
         Parameters(params): Parameters<MemoryBriefParams>,
     ) -> Result<CallToolResult, McpError> {
         let db = self.db.lock().map_err(|_| lock_error())?;
-        let _ = memory_detect_behavioral_patterns(&db);
         let brief = memory_build_memory_brief(
             &db,
             MemoryBriefQuery {
@@ -4870,6 +4937,10 @@ impl TheDeskMcp {
                 time_bucket: params.time_bucket,
                 pre_session_note: params.pre_session_note,
                 limit: params.limit.map(|limit| limit.min(10) as usize),
+                include_recent_sessions: params.include_recent_sessions,
+                include_patterns: params.include_patterns,
+                include_insights: params.include_insights,
+                include_followups: params.include_followups,
             },
         )
         .map_err(db_error)?;
@@ -4884,7 +4955,6 @@ impl TheDeskMcp {
         Parameters(params): Parameters<MemoryBriefParams>,
     ) -> Result<CallToolResult, McpError> {
         let db = self.db.lock().map_err(|_| lock_error())?;
-        let _ = memory_detect_behavioral_patterns(&db);
         let memory_brief = memory_build_memory_brief(
             &db,
             MemoryBriefQuery {
@@ -4897,6 +4967,10 @@ impl TheDeskMcp {
                 time_bucket: params.time_bucket,
                 pre_session_note: params.pre_session_note,
                 limit: params.limit.map(|limit| limit.min(10) as usize),
+                include_recent_sessions: params.include_recent_sessions,
+                include_patterns: params.include_patterns,
+                include_insights: params.include_insights,
+                include_followups: params.include_followups,
             },
         )
         .map_err(db_error)?;
@@ -5208,6 +5282,8 @@ impl TheDeskMcp {
             }
             imported_trades.push(trade);
         }
+        let memory_maintenance =
+            memory_mark_dirty(&db, true, true, "import_trade_fills").map_err(db_error)?;
 
         Ok(text_result(serde_json::json!({
             "imported": true,
@@ -5215,7 +5291,8 @@ impl TheDeskMcp {
             "sessionId": session_id,
             "skippedDuplicates": skipped_duplicates,
             "createdTradeCount": imported_trades.len(),
-            "trades": imported_trades
+            "trades": imported_trades,
+            "memoryMaintenance": memory_maintenance
         })))
     }
 
@@ -5283,6 +5360,8 @@ impl TheDeskMcp {
         let new_state = tracker.state();
         db.save_risk_state(&new_state).map_err(db_error)?;
         self.playbook_cache.set_risk_at_limit(new_state.at_limit);
+        let memory_maintenance =
+            memory_mark_dirty(&db, true, false, "record_trade_result").map_err(db_error)?;
 
         Ok(text_result(serde_json::json!({
             "recorded": true,
@@ -5295,6 +5374,7 @@ impl TheDeskMcp {
             "dailyPnlR": new_state.daily_pnl_r,
             "drawdownR": new_state.drawdown_r,
             "tradeCount": new_state.trade_count,
+            "memoryMaintenance": memory_maintenance,
         })))
     }
 

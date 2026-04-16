@@ -37,7 +37,9 @@ On every interaction where risk context is relevant:
 | `get_setup_context` | Full trade context with risk embedded |
 | `get_market_snapshot` | Market structure for risk context |
 | `get_session_context` | Session classification context (RTH vs Globex, Asia vs London, trading day) |
-| `get_pre_session_briefing` | Carry-forward ranked memory at session start (recent sessions, patterns, insights, follow-ups) |
+| `get_pre_session_briefing` | Carry-forward ranked memory at session start (recent sessions, patterns, insights, follow-ups). When SQLite memory maintenance is dirty, performs one bounded `refresh_memory_state` before building the brief unless `skipMemoryRefreshIfDirty: true`. Check `memoryAutoRefreshed` on the response. |
+| `refresh_memory_state` | Refreshes behavioral patterns and/or insight lifecycle; use before `get_memory_brief` when `memoryMaintenance.refreshSuggested` is true or after trade/review/import writes in the same flow |
+| `get_memory_brief` | Ranked memory by intent; read-only — pair with `refresh_memory_state` when ranked output must reflect recent mutations |
 | `get_session_review_context` | Session-end review bundle for post-trade discipline review |
 | `review_trade_entry` | Save structured trade review fields after a trade is complete |
 | `save_journal_entry` | Save freeform session or carry-forward notes |
@@ -53,7 +55,7 @@ On every interaction where risk context is relevant:
 When the trader indicates they are starting a session ("Starting my session", "Brief me", first interaction of the day):
 
 1. Call `get_account_state` immediately.
-2. Call `get_pre_session_briefing`.
+2. Call `get_pre_session_briefing` (auto-refreshes stale ranked memory when maintenance is dirty unless you pass `skipMemoryRefreshIfDirty: true` — use that only for intentional read-only benchmarking).
 3. Report: "Last time your balance was $X,XXX (updated [date]). What is your current account balance?"
 4. Ask: "Do you have any open positions that weren't discussed in this chat?"
 5. Once the trader replies, call `save_account_state` with confirmed values.
@@ -143,7 +145,7 @@ When discussing a proposed trade:
 3. Call `save_account_state` with the new position added to `open_positions`.
 
 ### When the trader reports closing a trade:
-1. Call `record_trade_result` with: direction, size, entry_price, exit_price, result_r, setup_id.
+1. Call `record_trade_result` with: direction, size, entry_price, exit_price, result_r, setup_id. The response includes `memoryMaintenance` — if you will call `get_memory_brief` later in the same flow, call `refresh_memory_state` first when `memoryMaintenance.refreshSuggested` is true.
 2. Call `get_risk_state` for updated state.
 3. Report:
    - Trade result: "[+/-X]R"
@@ -153,15 +155,16 @@ When discussing a proposed trade:
    - If consecutive_losses hit circuit breaker: trigger hard stop
    - If drawdown crossed 2R threshold: trigger half-size mode
 4. Call `save_account_state` to remove the closed position from `open_positions`.
-5. If the trader wants a review, call `review_trade_entry` to store planned/rules-followed/emotional-state/thesis/tags and then surface the updated review.
+5. If the trader wants a review, call `review_trade_entry` to store planned/rules-followed/emotional-state/thesis/tags and then surface the updated review. If you will call `get_memory_brief` afterward in the same flow, call `refresh_memory_state` first so ranked memory reflects the review.
 
 ### Session-End Review
 
 When the trader is done for the session:
 1. Call `get_session_review_context`.
-2. Call `get_memory_brief(intent="trade_review")` to retrieve carry-forward memory and open follow-ups.
-3. Summarize discipline outcomes: planned vs unplanned, rules followed vs broken, emotional-state patterns.
-4. Save a carry-forward note with `save_journal_entry`, `save_agent_insight`, or `create_memory_followup` if the trader articulates a specific next-session focus.
+2. If you used `record_trade_result`, `review_trade_entry`, or `import_trade_fills` earlier in this debrief, or any recent response showed `memoryMaintenance.refreshSuggested: true`, call `refresh_memory_state` before the memory brief.
+3. Call `get_memory_brief(intent="trade_review")` to retrieve carry-forward memory and open follow-ups.
+4. Summarize discipline outcomes: planned vs unplanned, rules followed vs broken, emotional-state patterns.
+5. Save a carry-forward note with `save_journal_entry`, `save_agent_insight`, or `create_memory_followup` if the trader articulates a specific next-session focus.
 
 ## Lucid Integration (Lucid Direct)
 

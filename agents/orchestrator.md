@@ -209,7 +209,7 @@ Full parallel sweep:
 - `get_day_type`
 - `get_key_levels`, `get_proximity_report` (structural levels)
 - `get_session_history(limit=5)` (multi-session context)
-- `get_pre_session_briefing` (ranked carry-forward memory: recent sessions, patterns, insights, follow-ups)
+- `get_pre_session_briefing` (ranked carry-forward memory: recent sessions, patterns, insights, follow-ups; auto-runs one bounded `refresh_memory_state` when SQLite memory maintenance is dirty unless `skipMemoryRefreshIfDirty: true`; response includes `memoryAutoRefreshed`)
 - `get_dom_tape_context_at` (DOM liquidity context)
 
 Execute the risk-coach session-start protocol:
@@ -238,7 +238,7 @@ Full parallel sweep:
 - `get_rvol`, `get_tape_pace` (overnight participation)
 - `get_key_levels`, `get_proximity_report` (prior RTH carry-forward + overnight references)
 - `get_session_history(limit=5)` (multi-session context)
-- `get_pre_session_briefing` (ranked carry-forward memory: recent sessions, patterns, insights, follow-ups)
+- `get_pre_session_briefing` (ranked carry-forward memory: recent sessions, patterns, insights, follow-ups; auto-runs one bounded `refresh_memory_state` when SQLite memory maintenance is dirty unless `skipMemoryRefreshIfDirty: true`; response includes `memoryAutoRefreshed`)
 - `evaluate_playbook` (valid-vs-dormant setup framing in Globex)
 
 Globex synthesis requirements:
@@ -254,12 +254,15 @@ Risk output: **Full session-start protocol.**
 
 Primary intent: `session_review`.
 
+**Memory maintenance:** `get_memory_brief` is read-only. Before it, call `refresh_memory_state` when ranked memory must reflect changes from this debrief flow or earlier in the conversation — for example after `record_trade_result`, `review_trade_entry`, or `import_trade_fills`, or when any recent tool payload showed `memoryMaintenance.refreshSuggested: true`.
+
 Route behavior:
 1. Call `get_session_review_context` for the target or latest open session.
-2. Call `get_memory_brief(intent="trade_review")` for ranked carry-forward memory and open follow-ups.
-3. Call `query_journal_patterns` for repeated discipline patterns and mistake tags.
-4. For broader historical drill-down, pair with `performance` routing and `get_session_history(limit=20)`.
-5. If the trader wants to log or edit notes, use `save_journal_entry`, `review_trade_entry`, `save_agent_insight`, and `create_memory_followup`.
+2. Call `refresh_memory_state` when the condition above applies; otherwise skip.
+3. Call `get_memory_brief(intent="trade_review")` for ranked carry-forward memory and open follow-ups.
+4. Call `query_journal_patterns` for repeated discipline patterns and mistake tags.
+5. For broader historical drill-down, pair with `performance` routing and `get_session_history(limit=20)`.
+6. If the trader wants to log or edit notes, use `save_journal_entry`, `review_trade_entry`, `save_agent_insight`, and `create_memory_followup`.
 
 Report:
 - Session trade summary and gross points
@@ -307,7 +310,7 @@ The agent already has market context from baseline calls (`get_market_snapshot`,
 
 **Insight lifecycle:**
 - New insights start as `candidate` status
-- `get_memory_brief` surfaces them ranked by salience
+- `get_memory_brief` surfaces them ranked by salience (call `refresh_memory_state` first when maintenance is dirty — see Session Review / Journal above)
 - Trader feedback (helpful/irrelevant/wrong) via `acknowledge_agent_insight` adjusts future ranking
 - Insights that prove consistently helpful get promoted to `validated`
 

@@ -267,8 +267,9 @@ The MCP server (`src/bin/the-desk-mcp.rs`) exposes 54 tools across 11 categories
 | | `cancel_backfill` | Cancel in-flight backfill/backtest job |
 | | `get_backtest_results` | Retrieve stored backtest runs with metrics |
 | | `compare_backtests` | Compare two or more backtest runs side-by-side |
-| **Memory** | `get_memory_brief` | Ranked carry-forward memory by intent (session_start, setup_check, trade_review, weekly_review) |
-| | `get_pre_session_briefing` | Memory brief + account + risk state for session start |
+| **Memory** | `get_memory_brief` | Ranked carry-forward memory by intent (session_start, setup_check, trade_review, weekly_review). Read-only — call `refresh_memory_state` first when `memoryMaintenance.refreshSuggested` is true or after memory-affecting writes (trades, reviews, imports) in the same flow. |
+| | `get_pre_session_briefing` | Memory brief + account + risk state for session start. When maintenance is dirty, performs one bounded `refresh_memory_state` (patterns + insight lifecycle) before building the brief unless `skipMemoryRefreshIfDirty` is true. Response includes `memoryAutoRefreshed`. |
+| | `refresh_memory_state` | Explicit refresh of behavioral patterns and/or insight lifecycle; clears dirty flags. Use before `get_memory_brief` when ranked memory must reflect recent journal or trade changes. |
 | | `save_agent_insight` | Persist LLM-authored insight (candidate/validated lifecycle) |
 | | `recall_agent_insights` | Query insights by category, setup, status |
 | | `acknowledge_agent_insight` | Mark insight surfaced/helpful/irrelevant/wrong/pin |
@@ -282,14 +283,14 @@ The MCP server (`src/bin/the-desk-mcp.rs`) exposes 54 tools across 11 categories
 
 | Agent | Primary context | Key tools |
 |-------|------------------|-----------|
-| **orchestrator** | Both — routes by intent | All; routes `historical_research` to backtest-analyst. Memory: `get_pre_session_briefing`, `get_memory_brief`, `save_agent_insight`, `recall_agent_insights`, `acknowledge_agent_insight`, `create_memory_followup`, `resolve_memory_followup`, `detect_behavioral_patterns`, `get_behavioral_patterns` |
+| **orchestrator** | Both — routes by intent | All; routes `historical_research` to backtest-analyst. Memory: `get_pre_session_briefing`, `refresh_memory_state`, `get_memory_brief`, `save_agent_insight`, `recall_agent_insights`, `acknowledge_agent_insight`, `create_memory_followup`, `resolve_memory_followup`, `detect_behavioral_patterns`, `get_behavioral_patterns` |
 | **market-structure-analyst** | Live + historical | Live: `get_tpo_profile`, `get_key_levels`, `get_day_type`, `get_rvol`, `get_delta_profile`. Historical: `query_event_frequency`, `query_conditional`, `query_distribution`, `compare_sessions`, `get_session_history`, `get_research_summary` |
 | **orderflow-analyst** | Live + historical | Live: `get_delta_profile`, `get_tape_pace`, `get_footprint`, `get_imbalances`, `get_absorption_events`, DOM tools. Historical: same research tools as market-structure |
 | **levels-analyst** | Live + historical | Live: `get_key_levels`, `get_proximity_report`, `get_or5_status`. Historical: `query_event_frequency`, `query_conditional`, `compare_sessions`, `get_session_history` |
 | **playbook-evaluator** | Live only | `evaluate_playbook`, `get_setup_context`, `get_market_snapshot`, `get_key_levels`, `get_proximity_report` |
 | **backtest-analyst** | Historical only | `backfill_history`, `run_backtest`, `get_backfill_status`, `get_backtest_results`, `compare_backtests`, `compare_sessions`, `get_session_history`, `get_research_summary`, all `query_*` research tools |
 | **performance-analyst** | Historical only | `get_setup_performance_matrix`, `get_signal_performance`, `query_signal_outcome_*`, `query_distribution`, `query_conditional`, `get_session_history`, `get_research_summary` |
-| **risk-coach** | Live | `get_risk_state`, `get_risk_config`, `get_account_state`, `get_kelly_position_size`, `record_trade_result`, `save_account_state`, `init_risk_state` |
+| **risk-coach** | Live | `get_risk_state`, `get_risk_config`, `get_account_state`, `get_kelly_position_size`, `record_trade_result`, `save_account_state`, `init_risk_state`, `get_pre_session_briefing`, `refresh_memory_state`, `get_memory_brief`, `get_session_review_context`, `review_trade_entry` |
 | **data-integrity-validator** | Both | `validate_data_integrity`, `get_feed_health`, `get_session_summary` |
 
 ### Event Types for `query_event_frequency`

@@ -1853,6 +1853,9 @@ struct MemoryBriefParams {
     include_patterns: Option<bool>,
     include_insights: Option<bool>,
     include_followups: Option<bool>,
+    /// When true, `get_pre_session_briefing` skips the bounded automatic
+    /// `refresh_memory_state` pass even if memory maintenance is dirty.
+    skip_memory_refresh_if_dirty: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -4948,13 +4951,27 @@ impl TheDeskMcp {
     }
 
     #[tool(
-        description = "Build a session-start memory packet that merges the ranked memory brief with current account and risk context."
+        description = "Build a session-start memory packet that merges the ranked memory brief with current account and risk context. When persisted memory maintenance is dirty (`memoryMaintenance.refreshSuggested`), runs a single bounded `refresh_memory_state` (patterns + insight lifecycle) before building the brief unless `skipMemoryRefreshIfDirty` is true."
     )]
     async fn get_pre_session_briefing(
         &self,
         Parameters(params): Parameters<MemoryBriefParams>,
     ) -> Result<CallToolResult, McpError> {
         let db = self.db.lock().map_err(|_| lock_error())?;
+        let mut memory_auto_refreshed = false;
+        let maintenance = db.get_memory_maintenance_state().map_err(db_error)?;
+        if maintenance.refresh_suggested && !params.skip_memory_refresh_if_dirty.unwrap_or(false) {
+            memory_refresh_state(
+                &db,
+                MemoryRefreshOptions {
+                    refresh_patterns: true,
+                    refresh_insight_lifecycle: true,
+                },
+                Some("get_pre_session_briefing"),
+            )
+            .map_err(db_error)?;
+            memory_auto_refreshed = true;
+        }
         let memory_brief = memory_build_memory_brief(
             &db,
             MemoryBriefQuery {
@@ -4979,7 +4996,8 @@ impl TheDeskMcp {
         Ok(text_result(serde_json::json!({
             "memoryBrief": memory_brief,
             "accountState": account_state,
-            "riskState": risk_state
+            "riskState": risk_state,
+            "memoryAutoRefreshed": memory_auto_refreshed
         })))
     }
 

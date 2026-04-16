@@ -9,7 +9,7 @@ use crate::risk::RiskState;
 use crate::rules::SetupDefinition;
 use crate::tick_time_context_from_timestamp_ms;
 use crate::trading_day_from_timestamp_ms;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, Row};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
@@ -1726,6 +1726,78 @@ impl Database {
     // Setup CRUD
     // ------------------------------------------------------------------
 
+    fn decode_setup_row(row: &Row<'_>) -> rusqlite::Result<SetupDefinition> {
+        let conditions_str: String = row.get(4)?;
+        let conditions: Vec<String> = serde_json::from_str(&conditions_str).unwrap_or_default();
+        let entry_logic: serde_json::Value = row
+            .get::<_, String>(8)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or(serde_json::json!({}));
+        let stop_logic: serde_json::Value = row
+            .get::<_, String>(9)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or(serde_json::json!({}));
+        let targets: Vec<serde_json::Value> = row
+            .get::<_, String>(10)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        let position_sizing: serde_json::Value = row
+            .get::<_, String>(11)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or(serde_json::json!({}));
+        let market_context: serde_json::Value = row
+            .get::<_, String>(12)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or(serde_json::json!({}));
+        let invalidation: Vec<serde_json::Value> = row
+            .get::<_, String>(13)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        let backtest_results: serde_json::Value = row
+            .get::<_, String>(14)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or(serde_json::json!({}));
+        let context_backtest: Vec<serde_json::Value> = row
+            .get::<_, String>(15)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        let discretionary: Vec<String> = row
+            .get::<_, String>(16)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        let template_source: Option<String> = row.get(17).ok().flatten();
+
+        Ok(SetupDefinition {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            description: row.get(2)?,
+            active: row.get::<_, i64>(3)? == 1,
+            conditions,
+            min_delta: row.get(5)?,
+            require_above_vwap: row.get::<_, i64>(6)? == 1,
+            duplicate_suppression_ms: row.get::<_, i64>(7)? as u64,
+            entry_logic,
+            stop_logic,
+            targets,
+            position_sizing,
+            market_context,
+            invalidation,
+            backtest_results,
+            context_backtest_results: context_backtest,
+            discretionary_conditions: discretionary,
+            template_source,
+        })
+    }
+
     pub fn upsert_setup(&self, setup: &SetupDefinition) -> Result<(), DbError> {
         let conditions_json =
             serde_json::to_string(&setup.conditions).unwrap_or_else(|_| "[]".to_string());
@@ -1796,78 +1868,32 @@ impl Database {
                     context_backtest_results, discretionary_conditions, template_source
              FROM setups",
         )?;
-        let rows = stmt.query_map([], |row| {
-            let conditions_str: String = row.get(4)?;
-            let conditions: Vec<String> = serde_json::from_str(&conditions_str).unwrap_or_default();
-            let entry_logic: serde_json::Value = row
-                .get::<_, String>(8)
-                .ok()
-                .and_then(|s| serde_json::from_str(&s).ok())
-                .unwrap_or(serde_json::json!({}));
-            let stop_logic: serde_json::Value = row
-                .get::<_, String>(9)
-                .ok()
-                .and_then(|s| serde_json::from_str(&s).ok())
-                .unwrap_or(serde_json::json!({}));
-            let targets: Vec<serde_json::Value> = row
-                .get::<_, String>(10)
-                .ok()
-                .and_then(|s| serde_json::from_str(&s).ok())
-                .unwrap_or_default();
-            let position_sizing: serde_json::Value = row
-                .get::<_, String>(11)
-                .ok()
-                .and_then(|s| serde_json::from_str(&s).ok())
-                .unwrap_or(serde_json::json!({}));
-            let market_context: serde_json::Value = row
-                .get::<_, String>(12)
-                .ok()
-                .and_then(|s| serde_json::from_str(&s).ok())
-                .unwrap_or(serde_json::json!({}));
-            let invalidation: Vec<serde_json::Value> = row
-                .get::<_, String>(13)
-                .ok()
-                .and_then(|s| serde_json::from_str(&s).ok())
-                .unwrap_or_default();
-            let backtest_results: serde_json::Value = row
-                .get::<_, String>(14)
-                .ok()
-                .and_then(|s| serde_json::from_str(&s).ok())
-                .unwrap_or(serde_json::json!({}));
-            let context_backtest: Vec<serde_json::Value> = row
-                .get::<_, String>(15)
-                .ok()
-                .and_then(|s| serde_json::from_str(&s).ok())
-                .unwrap_or_default();
-            let discretionary: Vec<String> = row
-                .get::<_, String>(16)
-                .ok()
-                .and_then(|s| serde_json::from_str(&s).ok())
-                .unwrap_or_default();
-            let template_source: Option<String> = row.get(17).ok().flatten();
-
-            Ok(SetupDefinition {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                description: row.get(2)?,
-                active: row.get::<_, i64>(3)? == 1,
-                conditions,
-                min_delta: row.get(5)?,
-                require_above_vwap: row.get::<_, i64>(6)? == 1,
-                duplicate_suppression_ms: row.get::<_, i64>(7)? as u64,
-                entry_logic,
-                stop_logic,
-                targets,
-                position_sizing,
-                market_context,
-                invalidation,
-                backtest_results,
-                context_backtest_results: context_backtest,
-                discretionary_conditions: discretionary,
-                template_source,
-            })
-        })?;
+        let rows = stmt.query_map([], Self::decode_setup_row)?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn list_active_setups(&self) -> Result<Vec<SetupDefinition>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, description, active, conditions, min_delta,
+                    require_above_vwap, duplicate_suppression_ms,
+                    entry_logic, stop_logic, targets, position_sizing,
+                    market_context, invalidation, backtest_results,
+                    context_backtest_results, discretionary_conditions, template_source
+             FROM setups
+             WHERE active = 1",
+        )?;
+        let rows = stmt.query_map([], Self::decode_setup_row)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Load active setup definitions and the current risk gate used by live rules evaluation.
+    pub fn load_playbook_runtime_seed(&self) -> Result<(Vec<SetupDefinition>, bool), DbError> {
+        let active_setups = self.list_active_setups()?;
+        let risk_at_limit = self
+            .load_risk_state()?
+            .map(|state| state.at_limit)
+            .unwrap_or(false);
+        Ok((active_setups, risk_at_limit))
     }
 
     pub fn delete_setup(&self, id: &str) -> Result<(), DbError> {
@@ -1885,8 +1911,22 @@ impl Database {
     }
 
     pub fn get_setup(&self, id: &str) -> Result<Option<SetupDefinition>, DbError> {
-        let setups = self.list_setups()?;
-        Ok(setups.into_iter().find(|s| s.id == id))
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, description, active, conditions, min_delta,
+                    require_above_vwap, duplicate_suppression_ms,
+                    entry_logic, stop_logic, targets, position_sizing,
+                    market_context, invalidation, backtest_results,
+                    context_backtest_results, discretionary_conditions, template_source
+             FROM setups
+             WHERE id = ?1
+             LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(Self::decode_setup_row(row)?))
+        } else {
+            Ok(None)
+        }
     }
 
     // ------------------------------------------------------------------
@@ -6527,6 +6567,65 @@ mod tests {
         assert!(!setups[0].active);
         db.delete_setup("s1").expect("delete");
         assert!(db.list_setups().expect("list").is_empty());
+    }
+
+    #[test]
+    fn active_setup_queries_filter_and_lookup_specific_rows() {
+        let db = test_db();
+        db.upsert_setup(&SetupDefinition {
+            id: "active_setup".to_string(),
+            name: "Active".to_string(),
+            active: true,
+            ..Default::default()
+        })
+        .expect("insert active setup");
+        db.upsert_setup(&SetupDefinition {
+            id: "inactive_setup".to_string(),
+            name: "Inactive".to_string(),
+            active: false,
+            ..Default::default()
+        })
+        .expect("insert inactive setup");
+
+        let active = db.list_active_setups().expect("list active");
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].id, "active_setup");
+
+        let inactive = db
+            .get_setup("inactive_setup")
+            .expect("get setup")
+            .expect("inactive row exists");
+        assert_eq!(inactive.id, "inactive_setup");
+        assert!(!inactive.active);
+    }
+
+    #[test]
+    fn playbook_runtime_seed_filters_inactive_and_loads_risk_gate() {
+        let db = test_db();
+        db.upsert_setup(&SetupDefinition {
+            id: "active_setup".to_string(),
+            name: "Active".to_string(),
+            active: true,
+            ..Default::default()
+        })
+        .expect("insert active setup");
+        db.upsert_setup(&SetupDefinition {
+            id: "inactive_setup".to_string(),
+            name: "Inactive".to_string(),
+            active: false,
+            ..Default::default()
+        })
+        .expect("insert inactive setup");
+        db.save_risk_state(&RiskState {
+            at_limit: true,
+            ..Default::default()
+        })
+        .expect("save risk state");
+
+        let (setups, risk_at_limit) = db.load_playbook_runtime_seed().expect("runtime seed");
+        assert_eq!(setups.len(), 1);
+        assert_eq!(setups[0].id, "active_setup");
+        assert!(risk_at_limit);
     }
 
     #[test]

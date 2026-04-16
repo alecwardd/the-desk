@@ -11,7 +11,7 @@ use schemars::{json_schema, JsonSchema, Schema, SchemaGenerator};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use the_desk_backend::backfill;
 use the_desk_backend::db::{
     AccountStateRecord, Database, HistoricalJobRun, ImportedFillRecord, JournalEntry,
@@ -46,7 +46,7 @@ use the_desk_backend::pipelines::{
 };
 use the_desk_backend::research;
 use the_desk_backend::risk::{RiskConfig, RiskState, RiskTracker};
-use the_desk_backend::rules::RulesEngine;
+use the_desk_backend::rules::{RulesEngine, SetupDefinition};
 use the_desk_backend::scid_tick_ingest::{self, TickIngestParams};
 use the_desk_backend::{
     classify_delta_segment, classify_session, et_minutes_from_timestamp, globex_open_ms,
@@ -216,6 +216,7 @@ pub struct TheDeskMcp {
     last_bid: Arc<Mutex<f64>>,
     last_ask: Arc<Mutex<f64>>,
     feed_runtime: Arc<McpFeedRuntimeState>,
+    playbook_cache: Arc<PlaybookRuntimeCache>,
     backfill_manager: Arc<AsyncMutex<BackfillManager>>,
     options_cache: Arc<AsyncMutex<OptionsSnapshotCache>>,
     tool_router: ToolRouter<Self>,
@@ -238,6 +239,40 @@ struct BackfillManager {
 #[derive(Debug, Default)]
 struct OptionsSnapshotCache {
     snapshot: Option<OptionsSnapshot>,
+}
+
+#[derive(Debug, Default)]
+struct PlaybookRuntimeCache {
+    active_setups: RwLock<Arc<Vec<SetupDefinition>>>,
+    risk_at_limit: AtomicBool,
+}
+
+impl PlaybookRuntimeCache {
+    fn snapshot(&self) -> (Arc<Vec<SetupDefinition>>, bool) {
+        let setups = match self.active_setups.read() {
+            Ok(guard) => Arc::clone(&guard),
+            Err(poisoned) => Arc::clone(&poisoned.into_inner()),
+        };
+        let risk_at_limit = self.risk_at_limit.load(Ordering::Acquire);
+        (setups, risk_at_limit)
+    }
+
+    fn replace_active_setups(&self, setups: Vec<SetupDefinition>) {
+        let replacement = Arc::new(setups);
+        match self.active_setups.write() {
+            Ok(mut guard) => {
+                *guard = replacement;
+            }
+            Err(poisoned) => {
+                let mut guard = poisoned.into_inner();
+                *guard = replacement;
+            }
+        }
+    }
+
+    fn set_risk_at_limit(&self, at_limit: bool) {
+        self.risk_at_limit.store(at_limit, Ordering::Release);
+    }
 }
 
 fn db_error(e: impl std::fmt::Display) -> McpError {
@@ -1861,10 +1896,29 @@ impl TheDeskMcp {
             last_bid: Arc::new(Mutex::new(0.0)),
             last_ask: Arc::new(Mutex::new(0.0)),
             feed_runtime: Arc::new(McpFeedRuntimeState::default()),
+            playbook_cache: Arc::new(PlaybookRuntimeCache::default()),
             backfill_manager: Arc::new(AsyncMutex::new(BackfillManager::default())),
             options_cache: Arc::new(AsyncMutex::new(OptionsSnapshotCache::default())),
             tool_router: Self::tool_router(),
         }
+    }
+
+    fn refresh_playbook_setups_from_db(
+        &self,
+        db: &Database,
+    ) -> Result<bool, the_desk_backend::db::DbError> {
+        let (active_setups, risk_at_limit) = db.load_playbook_runtime_seed()?;
+        self.playbook_cache.replace_active_setups(active_setups);
+        Ok(risk_at_limit)
+    }
+
+    fn hydrate_playbook_runtime_cache(&self) -> Result<(), McpError> {
+        let db = self.db.lock().map_err(|_| lock_error())?;
+        let risk_at_limit = self
+            .refresh_playbook_setups_from_db(&db)
+            .map_err(db_error)?;
+        self.playbook_cache.set_risk_at_limit(risk_at_limit);
+        Ok(())
     }
 
     async fn get_or_refresh_options_snapshot(
@@ -3866,15 +3920,9 @@ impl TheDeskMcp {
         description = "Evaluate all active playbook setups against current market state. Returns per-setup status (conditionsMet, approaching, notActive) and recent signal count. Always frames results as 'your playbook says...' -- never advisory."
     )]
     async fn evaluate_playbook(&self) -> Result<CallToolResult, McpError> {
-        let (setups, risk_at_limit, fallback_price, count, data_age_ms) = {
+        let (setups, risk_at_limit) = self.playbook_cache.snapshot();
+        let (fallback_price, count, data_age_ms) = {
             let db = self.db.lock().map_err(|_| lock_error())?;
-            let setups = db.list_setups().unwrap_or_default();
-            let risk_at_limit = db
-                .load_risk_state()
-                .ok()
-                .flatten()
-                .map(|s| s.at_limit)
-                .unwrap_or(false);
             let fallback_price = db
                 .latest_feature_state()
                 .ok()
@@ -3883,7 +3931,7 @@ impl TheDeskMcp {
                 .unwrap_or(0.0);
             let count = db.count_playbook_signals().unwrap_or(0);
             let data_age_ms = compute_data_age(&db);
-            (setups, risk_at_limit, fallback_price, count, data_age_ms)
+            (fallback_price, count, data_age_ms)
         };
 
         let bid = self.last_bid.lock().map(|g| *g).unwrap_or(0.0);
@@ -3900,7 +3948,7 @@ impl TheDeskMcp {
         let mut setup_statuses: Vec<serde_json::Value> = Vec::new();
         if let (Ok(pipelines), Ok(mut rules)) = (self.pipelines.try_lock(), self.rules.lock()) {
             let market = pipelines.snapshot(bid, ask);
-            for setup in &setups {
+            for setup in setups.iter() {
                 let _ = rules.evaluate(setup, &market, risk_at_limit);
                 let state = rules.get_state(&setup.id);
                 setup_statuses.push(serde_json::json!({
@@ -3910,7 +3958,7 @@ impl TheDeskMcp {
                 }));
             }
         } else {
-            for setup in &setups {
+            for setup in setups.iter() {
                 setup_statuses.push(serde_json::json!({
                     "setupId": setup.id,
                     "setupName": setup.name,
@@ -4131,6 +4179,7 @@ impl TheDeskMcp {
             at_limit: false,
         };
         db.save_risk_state(&state).map_err(db_error)?;
+        self.playbook_cache.set_risk_at_limit(state.at_limit);
         Ok(text_result(serde_json::json!({
             "initialized": true,
             "riskState": state
@@ -4316,6 +4365,7 @@ impl TheDeskMcp {
             tracker.record_trade_result(result_r);
             let new_state = tracker.state();
             db.save_risk_state(&new_state).map_err(db_error)?;
+            self.playbook_cache.set_risk_at_limit(new_state.at_limit);
             updated_risk_state = Some(new_state);
         }
 
@@ -5232,6 +5282,7 @@ impl TheDeskMcp {
         tracker.record_trade_result(params.result_r);
         let new_state = tracker.state();
         db.save_risk_state(&new_state).map_err(db_error)?;
+        self.playbook_cache.set_risk_at_limit(new_state.at_limit);
 
         Ok(text_result(serde_json::json!({
             "recorded": true,
@@ -6732,6 +6783,7 @@ fn process_tick(
     detector: &Arc<Mutex<EventDetector>>,
     flow_emitter: &Arc<Mutex<FlowEventEmitter>>,
     rules: &Arc<Mutex<RulesEngine>>,
+    playbook_cache: &Arc<PlaybookRuntimeCache>,
     db: &Arc<Mutex<Database>>,
     last_bid: &Arc<Mutex<f64>>,
     last_ask: &Arc<Mutex<f64>>,
@@ -6780,19 +6832,9 @@ fn process_tick(
     };
 
     // Rules engine: evaluate setups and fire alerts (outside pipeline lock to avoid deadlock)
-    let setups = db
-        .lock()
-        .ok()
-        .and_then(|d| d.list_setups().ok())
-        .unwrap_or_default();
-    let risk_at_limit = db
-        .lock()
-        .ok()
-        .and_then(|d| d.load_risk_state().ok().flatten())
-        .map(|s| s.at_limit)
-        .unwrap_or(false);
+    let (setups, risk_at_limit) = playbook_cache.snapshot();
     if let Ok(mut r) = rules.lock() {
-        for setup in &setups {
+        for setup in setups.iter() {
             if let Some(alert) = r.evaluate(setup, &snapshot, risk_at_limit) {
                 if let Ok(d) = db.lock() {
                     let _ = d.insert_playbook_signal(
@@ -7335,6 +7377,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The startup backfill runs in a background task and populates pipeline
     // state concurrently with tool serving.
     let server = TheDeskMcp::new(db, pipelines, db_path.to_string_lossy().to_string());
+    server.hydrate_playbook_runtime_cache().map_err(|e| {
+        std::io::Error::other(format!(
+            "failed to hydrate playbook runtime cache from SQLite: {e}"
+        ))
+    })?;
 
     if scid_available {
         let (startup_cutover_tx, rx) = tokio::sync::oneshot::channel::<u64>();
@@ -7385,6 +7432,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let detector_bg = Arc::clone(&server.detector);
         let flow_emitter_bg = Arc::clone(&server.flow_emitter);
         let rules_bg = Arc::clone(&server.rules);
+        let playbook_cache_bg = Arc::clone(&server.playbook_cache);
         let last_bid_bg = Arc::clone(&server.last_bid);
         let last_ask_bg = Arc::clone(&server.last_ask);
         let db_bg = Arc::clone(&server.db);
@@ -7657,6 +7705,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             &detector_bg,
                             &flow_emitter_bg,
                             &rules_bg,
+                            &playbook_cache_bg,
                             &db_bg,
                             &last_bid_bg,
                             &last_ask_bg,
@@ -7878,7 +7927,11 @@ mod tests {
 
     fn test_server() -> TheDeskMcp {
         let db = Database::open(":memory:").expect("db");
-        TheDeskMcp::new(db, PipelineEngine::new(), ":memory:".into())
+        let server = TheDeskMcp::new(db, PipelineEngine::new(), ":memory:".into());
+        server
+            .hydrate_playbook_runtime_cache()
+            .expect("hydrate playbook cache");
+        server
     }
 
     fn write_scid_header(file: &mut NamedTempFile) {
@@ -8272,6 +8325,7 @@ mod tests {
                 &server.detector,
                 &server.flow_emitter,
                 &server.rules,
+                &server.playbook_cache,
                 &server.db,
                 &server.last_bid,
                 &server.last_ask,
@@ -8299,5 +8353,189 @@ mod tests {
         assert!((snapshot.vwap - 21000.5).abs() < 1e-9);
         assert_eq!(snapshot.session_low, 21000.0);
         assert_eq!(snapshot.session_high, 21001.0);
+    }
+
+    #[test]
+    fn playbook_cache_hydration_loads_active_setups_and_risk_gate() {
+        let db = Database::open(":memory:").expect("db");
+        db.upsert_setup(&SetupDefinition {
+            id: "active_seed".to_string(),
+            name: "Active Seed".to_string(),
+            active: true,
+            ..Default::default()
+        })
+        .expect("insert active");
+        db.upsert_setup(&SetupDefinition {
+            id: "inactive_seed".to_string(),
+            name: "Inactive Seed".to_string(),
+            active: false,
+            ..Default::default()
+        })
+        .expect("insert inactive");
+        db.save_risk_state(&RiskState {
+            at_limit: true,
+            ..Default::default()
+        })
+        .expect("save risk state");
+
+        let server = TheDeskMcp::new(db, PipelineEngine::new(), ":memory:".into());
+        server
+            .hydrate_playbook_runtime_cache()
+            .expect("hydrate playbook cache");
+        let (setups, risk_at_limit) = server.playbook_cache.snapshot();
+
+        assert_eq!(setups.len(), 1);
+        assert_eq!(setups[0].id, "active_seed");
+        assert!(risk_at_limit);
+    }
+
+    #[test]
+    fn process_tick_uses_cached_risk_gate_for_alert_suppression() {
+        let server = test_server();
+        server
+            .playbook_cache
+            .replace_active_setups(vec![SetupDefinition {
+                id: "risk_gated_setup".to_string(),
+                name: "Risk Gated Setup".to_string(),
+                active: true,
+                min_delta: 0.0,
+                conditions: Vec::new(),
+                ..Default::default()
+            }]);
+        server.playbook_cache.set_risk_at_limit(true);
+
+        let mut event_buffer = Vec::new();
+        process_tick(
+            &server.pipelines,
+            &server.detector,
+            &server.flow_emitter,
+            &server.rules,
+            &server.playbook_cache,
+            &server.db,
+            &server.last_bid,
+            &server.last_ask,
+            21_000.0,
+            1.0,
+            true,
+            Utc::now().timestamp_millis() as f64,
+            20_999.75,
+            21_000.25,
+            &mut event_buffer,
+        );
+
+        let db = server.db.lock().expect("db lock");
+        assert_eq!(db.count_playbook_signals().expect("signal count"), 0);
+        drop(db);
+        let state = server
+            .rules
+            .lock()
+            .expect("rules lock")
+            .get_state("risk_gated_setup");
+        assert_eq!(format!("{state:?}"), "NotActive");
+    }
+
+    #[tokio::test]
+    async fn evaluate_playbook_reads_cache_snapshot() {
+        let server = test_server();
+        server
+            .playbook_cache
+            .replace_active_setups(vec![SetupDefinition {
+                id: "cache_only_setup".to_string(),
+                name: "Cache Only Setup".to_string(),
+                active: true,
+                min_delta: 0.0,
+                conditions: Vec::new(),
+                ..Default::default()
+            }]);
+        server.playbook_cache.set_risk_at_limit(false);
+        *server.last_bid.lock().expect("bid lock") = 21_000.0;
+        *server.last_ask.lock().expect("ask lock") = 21_000.25;
+
+        let result = server.evaluate_playbook().await.expect("evaluate");
+        let rendered = format!("{result:?}");
+        assert!(rendered.contains("cache_only_setup"));
+    }
+
+    #[tokio::test]
+    async fn risk_state_mutation_tools_sync_playbook_cache() {
+        let server = test_server();
+        {
+            let db = server.db.lock().expect("db lock");
+            db.save_risk_config(&RiskConfigRecord {
+                max_daily_loss_r: 1.0,
+                ..Default::default()
+            })
+            .expect("save risk config");
+        }
+
+        server.playbook_cache.set_risk_at_limit(true);
+        server.init_risk_state().await.expect("init risk");
+        assert!(!server.playbook_cache.snapshot().1);
+        {
+            let db = server.db.lock().expect("db lock");
+            assert!(
+                !db.load_risk_state()
+                    .expect("load risk")
+                    .expect("risk state")
+                    .at_limit
+            );
+        }
+
+        server
+            .record_trade_result(Parameters(RecordTradeResultParams {
+                direction: "long".to_string(),
+                size: 1,
+                entry_price: 21_000.0,
+                exit_price: 20_990.0,
+                result_r: -2.0,
+                setup_id: None,
+                stop_price: None,
+                notes: None,
+            }))
+            .await
+            .expect("record trade");
+        assert!(server.playbook_cache.snapshot().1);
+        {
+            let db = server.db.lock().expect("db lock");
+            assert!(
+                db.load_risk_state()
+                    .expect("load risk")
+                    .expect("risk state")
+                    .at_limit
+            );
+        }
+
+        let trade_id = "risk_sync_trade".to_string();
+        server
+            .upsert_trade_entry(Parameters(UpsertTradeEntryParams {
+                id: Some(trade_id.clone()),
+                direction: "long".to_string(),
+                size: 1,
+                entry_price: 21_005.0,
+                ..Default::default()
+            }))
+            .await
+            .expect("upsert trade");
+        server
+            .close_trade_entry(Parameters(CloseTradeEntryParams {
+                id: trade_id,
+                exit_price: 21_015.0,
+                exit_time_ms: None,
+                result_r: Some(5.0),
+                gross_points: Some(10.0),
+                notes: None,
+                update_risk_state: Some(true),
+            }))
+            .await
+            .expect("close trade");
+
+        assert!(!server.playbook_cache.snapshot().1);
+        let db = server.db.lock().expect("db lock");
+        assert!(
+            !db.load_risk_state()
+                .expect("load risk")
+                .expect("risk state")
+                .at_limit
+        );
     }
 }

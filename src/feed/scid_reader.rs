@@ -56,6 +56,12 @@ pub struct ScanStats {
     pub records_scanned: usize,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct ReplayBatch {
+    pub ticks: Vec<ScidTick>,
+    pub next_offset: u64,
+}
+
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)]
 struct ScidHeader {
@@ -190,6 +196,117 @@ impl ScidReader {
             Ok(ScanControl::Continue)
         })?;
         Ok(out)
+    }
+
+    /// Capture the current aligned EOF cutover offset for deterministic startup handoff.
+    ///
+    /// The returned offset is always header-aware and record-aligned.
+    pub fn current_aligned_end_offset(&self) -> Result<u64, ScidError> {
+        let mut file = File::open(&self.path)?;
+        let header = Self::read_header(&mut file)?;
+        let data_start = header.header_size as u64;
+        let file_len = file.metadata()?.len();
+        Ok(scid_tail_offset_after_shrink(file_len, data_start))
+    }
+
+    /// Read ticks from `since_ms` through a fixed byte-offset cutover (exclusive).
+    ///
+    /// This is used for startup warm replay: replay is bounded to a captured cutover
+    /// offset so appends that happen after capture are left for the live tail.
+    pub fn read_bulk_since_until_offset(
+        &self,
+        since_ms: Option<f64>,
+        end_offset_exclusive: u64,
+    ) -> Result<ReplayBatch, ScidError> {
+        let mut file = File::open(&self.path)?;
+        let header = Self::read_header(&mut file)?;
+        let data_start = header.header_size as u64;
+        let file_len = file.metadata()?.len();
+        let file_end = scid_tail_offset_after_shrink(file_len, data_start);
+        let bounded_end =
+            scid_tail_offset_after_shrink(end_offset_exclusive, data_start).min(file_end);
+
+        if bounded_end <= data_start {
+            return Ok(ReplayBatch {
+                ticks: Vec::new(),
+                next_offset: data_start,
+            });
+        }
+
+        let total_records = (bounded_end - data_start) / SCID_RECORD_SIZE as u64;
+        let start_record = match since_ms {
+            Some(ts) => self.binary_search_record(&mut file, data_start, total_records, ts)?,
+            None => 0,
+        };
+        let start_offset = data_start + start_record * SCID_RECORD_SIZE as u64;
+        file.seek(SeekFrom::Start(start_offset))?;
+
+        let mut out = Vec::new();
+        let mut offset = start_offset;
+        let mut record = [0_u8; SCID_RECORD_SIZE];
+        while offset < bounded_end {
+            match file.read_exact(&mut record) {
+                Ok(()) => {
+                    offset = offset.saturating_add(SCID_RECORD_SIZE as u64);
+                    if let Some(tick) = self.parse_record(&record) {
+                        if let Some(start) = since_ms {
+                            if tick.timestamp_ms < start {
+                                continue;
+                            }
+                        }
+                        out.push(tick);
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(err) => return Err(err.into()),
+            }
+        }
+
+        Ok(ReplayBatch {
+            ticks: out,
+            next_offset: offset,
+        })
+    }
+
+    /// Read all ticks from an existing byte offset up to current aligned EOF.
+    ///
+    /// Returns the next aligned offset to resume from.
+    pub fn read_bulk_from_offset(&self, start_offset: u64) -> Result<ReplayBatch, ScidError> {
+        let mut file = File::open(&self.path)?;
+        let header = Self::read_header(&mut file)?;
+        let data_start = header.header_size as u64;
+        let file_len = file.metadata()?.len();
+        let file_end = scid_tail_offset_after_shrink(file_len, data_start);
+        let clamped_start = scid_tail_offset_after_shrink(start_offset, data_start).min(file_end);
+
+        if clamped_start >= file_end {
+            return Ok(ReplayBatch {
+                ticks: Vec::new(),
+                next_offset: file_end,
+            });
+        }
+
+        file.seek(SeekFrom::Start(clamped_start))?;
+        let mut out = Vec::new();
+        let mut offset = clamped_start;
+        let mut record = [0_u8; SCID_RECORD_SIZE];
+        while offset < file_end {
+            match file.read_exact(&mut record) {
+                Ok(()) => {
+                    offset = offset.saturating_add(SCID_RECORD_SIZE as u64);
+                    if let Some(tick) = self.parse_record(&record) {
+                        out.push(tick);
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(err) => return Err(err.into()),
+            }
+        }
+
+        Ok(ReplayBatch {
+            ticks: out,
+            next_offset: offset,
+        })
     }
 
     /// Scan ticks from the SCID file in order without materializing the full file.
@@ -524,26 +641,36 @@ mod tests {
     use std::io::Write;
     use tempfile::NamedTempFile;
 
+    fn write_record_with_timestamp_ms(file: &mut NamedTempFile, price: f32, timestamp_ms: f64) {
+        let mut rec = [0_u8; SCID_RECORD_SIZE];
+        let unix_us = (timestamp_ms * 1_000.0).round() as i64;
+        let sc_us = SC_TO_UNIX_EPOCH_US + unix_us;
+        rec[0..8].copy_from_slice(&sc_us.to_le_bytes());
+        rec[12..16].copy_from_slice(&(price + 0.25).to_le_bytes());
+        rec[16..20].copy_from_slice(&(price - 0.25).to_le_bytes());
+        rec[20..24].copy_from_slice(&price.to_le_bytes());
+        rec[24..28].copy_from_slice(&(1_u32).to_le_bytes());
+        rec[28..32].copy_from_slice(&(2_u32).to_le_bytes());
+        rec[32..36].copy_from_slice(&(0_u32).to_le_bytes());
+        rec[36..40].copy_from_slice(&(2_u32).to_le_bytes());
+        file.write_all(&rec).expect("record");
+    }
+
+    fn append_scid_records(file: &mut NamedTempFile, start_idx: usize, prices: &[f32]) {
+        for (idx, p) in prices.iter().enumerate() {
+            let ts_ms = 1_700_000_000_000.0 + (start_idx + idx) as f64;
+            write_record_with_timestamp_ms(file, *p, ts_ms);
+        }
+        file.flush().expect("flush");
+    }
+
     fn write_scid(file: &mut NamedTempFile, prices: &[f32]) {
         let mut header = vec![0_u8; SCID_HEADER_SIZE];
         header[0..4].copy_from_slice(SCID_MAGIC);
         header[4..8].copy_from_slice(&(SCID_HEADER_SIZE as u32).to_le_bytes());
         header[8..12].copy_from_slice(&(SCID_RECORD_SIZE as u32).to_le_bytes());
         file.write_all(&header).expect("header");
-        for (idx, p) in prices.iter().enumerate() {
-            let mut rec = [0_u8; SCID_RECORD_SIZE];
-            let sc_us = SC_TO_UNIX_EPOCH_US + ((1_700_000_000_000_i64 + idx as i64) * 1000);
-            rec[0..8].copy_from_slice(&sc_us.to_le_bytes());
-            rec[12..16].copy_from_slice(&(p + 0.25).to_le_bytes());
-            rec[16..20].copy_from_slice(&(p - 0.25).to_le_bytes());
-            rec[20..24].copy_from_slice(&p.to_le_bytes());
-            rec[24..28].copy_from_slice(&(1_u32).to_le_bytes());
-            rec[28..32].copy_from_slice(&(2_u32).to_le_bytes());
-            rec[32..36].copy_from_slice(&(0_u32).to_le_bytes());
-            rec[36..40].copy_from_slice(&(2_u32).to_le_bytes());
-            file.write_all(&rec).expect("record");
-        }
-        file.flush().expect("flush");
+        append_scid_records(file, 0, prices);
     }
 
     #[test]
@@ -628,5 +755,49 @@ mod tests {
         let one_rec = h + r;
         assert_eq!(scid_tail_offset_after_shrink(one_rec, h), one_rec);
         assert_eq!(scid_tail_offset_after_shrink(h, h), h);
+    }
+
+    #[test]
+    fn read_bulk_since_until_offset_stops_at_captured_cutover_after_append() {
+        let mut file = NamedTempFile::new().expect("temp");
+        write_scid(&mut file, &[21000.0, 21000.25, 21000.5]);
+        let reader = ScidReader::new(file.path());
+        let cutover = reader.current_aligned_end_offset().expect("cutover");
+
+        append_scid_records(&mut file, 3, &[21000.75, 21001.0]);
+
+        let warm = reader
+            .read_bulk_since_until_offset(None, cutover)
+            .expect("warm replay");
+        let all = reader.read_bulk().expect("all");
+
+        assert_eq!(warm.ticks.len(), 3);
+        assert_eq!(warm.next_offset, cutover);
+        assert_eq!(all.len(), 5);
+        assert_eq!(warm.ticks[2].price, 21000.5);
+        assert_eq!(all[4].price, 21001.0);
+    }
+
+    #[test]
+    fn cutover_offset_prevents_same_timestamp_overlap() {
+        let mut file = NamedTempFile::new().expect("temp");
+        write_scid(&mut file, &[21000.0]);
+        let reader = ScidReader::new(file.path());
+        let first_tick = reader.read_bulk().expect("first").remove(0);
+        let cutover = reader.current_aligned_end_offset().expect("cutover");
+
+        write_record_with_timestamp_ms(&mut file, 21000.25, first_tick.timestamp_ms);
+        file.flush().expect("flush");
+
+        let bounded = reader
+            .read_bulk_since_until_offset(Some(first_tick.timestamp_ms), cutover)
+            .expect("bounded");
+        let timestamp_only = reader
+            .read_bulk_since(Some(first_tick.timestamp_ms))
+            .expect("timestamp");
+
+        assert_eq!(bounded.ticks.len(), 1);
+        assert_eq!(timestamp_only.len(), 2);
+        assert_eq!(bounded.next_offset, cutover);
     }
 }

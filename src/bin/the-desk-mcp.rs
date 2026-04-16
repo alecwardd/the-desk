@@ -6554,12 +6554,10 @@ impl TheDeskMcp {
         description = "Validate data integrity: checks tick count, stream freshness, pipeline consistency invariants (POC within VA, VA contains ~70%% of TPOs, delta sum consistency), and session boundary correctness. Returns pass/fail status with details."
     )]
     async fn validate_data_integrity(&self) -> Result<CallToolResult, McpError> {
-        let db = self.db.lock().map_err(|_| lock_error())?;
-        let pipelines = self.pipelines.lock().map_err(|_| {
-            McpError::new(ErrorCode::INTERNAL_ERROR, "pipeline lock poisoned", None)
-        })?;
-        let tick_count = db.raw_tick_count().unwrap_or(0);
-        let last_ts = db.latest_tick_timestamp_ms().ok().flatten();
+        let db_snapshot = collect_validation_db_snapshot(&self.db)?;
+        let pipeline_invariants = collect_pipeline_invariants(&self.pipelines)?;
+        let tick_count = db_snapshot.tick_count;
+        let last_ts = db_snapshot.last_ts;
         let now_ms = chrono::Utc::now().timestamp_millis() as f64;
         let age_ms = last_ts.map(|v| now_ms - v).unwrap_or(f64::INFINITY);
         let stream_fresh = age_ms.is_finite() && age_ms <= FRESHNESS_THRESHOLD_MS;
@@ -6578,7 +6576,7 @@ impl TheDeskMcp {
             "freshnessThresholdMs": FRESHNESS_THRESHOLD_MS,
         });
         let mut invariants_ok = true;
-        for (name, passed, detail) in pipelines.validate_invariants() {
+        for (name, passed, detail) in pipeline_invariants {
             checks[name] = serde_json::json!({
                 "passed": passed,
                 "detail": detail
@@ -6610,7 +6608,9 @@ impl TheDeskMcp {
             "checks": checks
         });
 
-        let _ = db.insert_validation_run(now_ms, status, &result);
+        if let Ok(db) = self.db.lock() {
+            let _ = db.insert_validation_run(now_ms, status, &result);
+        }
 
         Ok(text_result(result))
     }
@@ -6653,7 +6653,34 @@ fn compute_data_age(db: &Database) -> f64 {
         .unwrap_or(-1.0)
 }
 
-fn persist_integrity_check(db: &Database, pipelines: &PipelineEngine) {
+#[derive(Debug, Clone, Copy)]
+struct ValidationDbSnapshot {
+    tick_count: i64,
+    last_ts: Option<f64>,
+}
+
+fn collect_validation_db_snapshot(
+    db: &Arc<Mutex<Database>>,
+) -> Result<ValidationDbSnapshot, McpError> {
+    let db = db.lock().map_err(|_| lock_error())?;
+    Ok(ValidationDbSnapshot {
+        tick_count: db.raw_tick_count().unwrap_or(0),
+        last_ts: db.latest_tick_timestamp_ms().ok().flatten(),
+    })
+}
+
+fn collect_pipeline_invariants(
+    pipelines: &Arc<Mutex<PipelineEngine>>,
+) -> Result<Vec<(String, bool, String)>, McpError> {
+    let pipelines = pipelines
+        .lock()
+        .map_err(|_| McpError::new(ErrorCode::INTERNAL_ERROR, "pipeline lock poisoned", None))?;
+    Ok(pipelines.validate_invariants())
+}
+
+/// `pipeline_invariants` must be collected under the pipeline mutex only; this function performs
+/// DB reads and writes without holding the pipeline lock (avoids `db`→`pipelines` lock ordering).
+fn persist_integrity_check(db: &Database, pipeline_invariants: &[(String, bool, String)]) {
     let tick_count = db.raw_tick_count().unwrap_or(0);
     let last_ts = db.latest_tick_timestamp_ms().ok().flatten();
     let now_ms = chrono::Utc::now().timestamp_millis() as f64;
@@ -6670,9 +6697,9 @@ fn persist_integrity_check(db: &Database, pipelines: &PipelineEngine) {
         "freshnessThresholdMs".to_string(),
         serde_json::json!(FRESHNESS_THRESHOLD_MS),
     );
-    for (name, passed, detail) in pipelines.validate_invariants() {
+    for (name, passed, detail) in pipeline_invariants {
         checks.insert(
-            name,
+            name.clone(),
             serde_json::json!({
                 "passed": passed,
                 "detail": detail
@@ -6827,30 +6854,66 @@ fn process_tick(
     }
 }
 
-fn persist_dom_summary_into_feature_state(
-    db: &Database,
+fn current_best_bid_ask(last_bid: &Arc<Mutex<f64>>, last_ask: &Arc<Mutex<f64>>) -> (f64, f64) {
+    let bid = last_bid.lock().ok().map(|v| *v).unwrap_or_default();
+    let ask = last_ask.lock().ok().map(|v| *v).unwrap_or_default();
+    (bid, ask)
+}
+
+fn build_live_feature_state_snapshot_payload(
+    pipelines: &Arc<Mutex<PipelineEngine>>,
+    last_bid: &Arc<Mutex<f64>>,
+    last_ask: &Arc<Mutex<f64>>,
+    timestamp_ms: f64,
+) -> Option<(f64, serde_json::Value)> {
+    if !timestamp_ms.is_finite() || timestamp_ms <= 0.0 {
+        return None;
+    }
+    let (bid, ask) = current_best_bid_ask(last_bid, last_ask);
+    if bid <= 0.0 {
+        return None;
+    }
+    let payload = pipelines.lock().ok().map(|p| {
+        serde_json::to_value(p.snapshot(bid.max(0.0), ask.max(0.0))).unwrap_or_default()
+    })?;
+    Some((timestamp_ms, payload))
+}
+
+fn persist_feature_state_payload(
+    db: &Arc<Mutex<Database>>,
+    timestamp_ms: f64,
+    payload: &serde_json::Value,
+) {
+    if let Ok(d) = db.lock() {
+        let _ = d.upsert_feature_state(timestamp_ms, payload);
+    }
+}
+
+/// Persist `feature_state` after `dom_summary` has been updated.
+/// Uses either the live pipeline snapshot path (`pipelines` then `db`) or a single DB critical
+/// section to merge DOM data into the previous snapshot, but never holds both mutexes at once.
+fn persist_feature_state_after_dom_summary(
+    db: &Arc<Mutex<Database>>,
     pipelines: &Arc<Mutex<PipelineEngine>>,
     last_bid: &Arc<Mutex<f64>>,
     last_ask: &Arc<Mutex<f64>>,
     timestamp_ms: f64,
     dom_summary: &DomSummary,
 ) {
-    let payload = {
-        let bid = last_bid.lock().ok().map(|v| *v).unwrap_or_default();
-        let ask = last_ask.lock().ok().map(|v| *v).unwrap_or_default();
-        if bid > 0.0 || ask > 0.0 {
-            pipelines.lock().ok().map(|p| {
-                serde_json::to_value(p.snapshot(bid.max(0.0), ask.max(0.0))).unwrap_or_default()
-            })
-        } else {
-            Some(merge_dom_summary_into_snapshot(
-                db.latest_feature_state().ok().flatten(),
-                dom_summary,
-            ))
+    let (bid, ask) = current_best_bid_ask(last_bid, last_ask);
+    if bid > 0.0 || ask > 0.0 {
+        if let Some((ts, payload)) =
+            build_live_feature_state_snapshot_payload(pipelines, last_bid, last_ask, timestamp_ms)
+        {
+            persist_feature_state_payload(db, ts, &payload);
         }
-    };
-    if let Some(payload) = payload {
-        let _ = db.upsert_feature_state(timestamp_ms, &payload);
+        return;
+    }
+
+    if let Ok(d) = db.lock() {
+        let payload =
+            merge_dom_summary_into_snapshot(d.latest_feature_state().ok().flatten(), dom_summary);
+        let _ = d.upsert_feature_state(timestamp_ms, &payload);
     }
 }
 
@@ -6874,56 +6937,31 @@ fn persist_depth_records(
     };
     let source_file = reader.path().to_string_lossy().to_string();
     let trading_day = session_date_from_timestamp_ms(last_record.timestamp_ms);
-    if let Ok(mut db) = db.lock() {
-        if let Ok(next_batch_id) = db.insert_depth_events_batch(&source_file, records, *batch_id) {
-            *batch_id = next_batch_id;
-        }
-        let snapshot = book.snapshot(&source_file, last_record.timestamp_ms, 10);
-        let snapshot_json = serde_json::to_value(&snapshot).unwrap_or_default();
-        let _ = db.insert_dom_snapshot(
-            &source_file,
-            last_record.timestamp_ms,
-            &trading_day,
-            &snapshot_json,
-        );
-
-        let feature_window_start = (last_record.timestamp_ms - 60_000.0).max(0.0);
-        let mut feature = {
-            let config = load_feed_config();
-            aggregate_window_trades(&config, feature_window_start, last_record.timestamp_ms)
-                .ok()
-                .and_then(|trades| {
-                    reader
-                        .summarize_window(
-                            feature_window_start,
-                            last_record.timestamp_ms,
-                            &trades,
-                            None,
-                            None,
-                        )
-                        .ok()
-                })
-                .map(|activity| build_dom_feature_snapshot(&snapshot, activity))
-                .unwrap_or_else(|| DomFeatureSnapshot {
-                    source_file: source_file.clone(),
-                    timestamp_ms: snapshot.snapshot_timestamp_ms,
-                    session_date: snapshot.session_date.clone(),
-                    dom_summary: build_dom_summary(
-                        &snapshot,
-                        &the_desk_backend::depth::PullStackActivitySummary {
-                            source_file: source_file.clone(),
-                            start_time_ms: feature_window_start,
-                            end_time_ms: last_record.timestamp_ms,
-                            session_date: snapshot.session_date.clone(),
-                            record_count: records.len(),
-                            batch_count: records.iter().filter(|r| r.end_of_batch).count(),
-                            bid: Default::default(),
-                            ask: Default::default(),
-                            top_pull_levels: Vec::new(),
-                            top_stack_levels: Vec::new(),
-                        },
-                    ),
-                    activity: the_desk_backend::depth::PullStackActivitySummary {
+    let snapshot = book.snapshot(&source_file, last_record.timestamp_ms, 10);
+    let feature_window_start = (last_record.timestamp_ms - 60_000.0).max(0.0);
+    let mut feature = {
+        let config = load_feed_config();
+        aggregate_window_trades(&config, feature_window_start, last_record.timestamp_ms)
+            .ok()
+            .and_then(|trades| {
+                reader
+                    .summarize_window(
+                        feature_window_start,
+                        last_record.timestamp_ms,
+                        &trades,
+                        None,
+                        None,
+                    )
+                    .ok()
+            })
+            .map(|activity| build_dom_feature_snapshot(&snapshot, activity))
+            .unwrap_or_else(|| DomFeatureSnapshot {
+                source_file: source_file.clone(),
+                timestamp_ms: snapshot.snapshot_timestamp_ms,
+                session_date: snapshot.session_date.clone(),
+                dom_summary: build_dom_summary(
+                    &snapshot,
+                    &the_desk_backend::depth::PullStackActivitySummary {
                         source_file: source_file.clone(),
                         start_time_ms: feature_window_start,
                         end_time_ms: last_record.timestamp_ms,
@@ -6935,47 +6973,328 @@ fn persist_depth_records(
                         top_pull_levels: Vec::new(),
                         top_stack_levels: Vec::new(),
                     },
-                })
-        };
-        let recent_summary_rows = db
-            .query_dom_feature_snapshots(
+                ),
+                activity: the_desk_backend::depth::PullStackActivitySummary {
+                    source_file: source_file.clone(),
+                    start_time_ms: feature_window_start,
+                    end_time_ms: last_record.timestamp_ms,
+                    session_date: snapshot.session_date.clone(),
+                    record_count: records.len(),
+                    batch_count: records.iter().filter(|r| r.end_of_batch).count(),
+                    bid: Default::default(),
+                    ask: Default::default(),
+                    top_pull_levels: Vec::new(),
+                    top_stack_levels: Vec::new(),
+                },
+            })
+    };
+
+    if let Ok(mut d) = db.lock() {
+        if let Ok(next_batch_id) = d.insert_depth_events_batch(&source_file, records, *batch_id) {
+            *batch_id = next_batch_id;
+        }
+        let snapshot_json = serde_json::to_value(&snapshot).unwrap_or_default();
+        let _ = d.insert_dom_snapshot(
+            &source_file,
+            last_record.timestamp_ms,
+            &trading_day,
+            &snapshot_json,
+        );
+    }
+
+    let (recent_summary_rows, session_rows) = if let Ok(d) = db.lock() {
+        (
+            d.query_dom_feature_snapshots(
                 Some((last_record.timestamp_ms - DOM_NARRATIVE_HORIZON_MS).max(0.0)),
                 Some((last_record.timestamp_ms - 0.001).max(0.0)),
                 512,
             )
-            .unwrap_or_default();
-        let recent_summaries = dom_summaries_from_rows(&recent_summary_rows);
-        let session_rows = db
-            .query_dom_feature_snapshots_for_trading_day(&trading_day, 50_000)
-            .unwrap_or_default();
-        let session_summaries = dom_summaries_from_rows(&session_rows);
-        enrich_dom_summary(
-            &mut feature.dom_summary,
-            Some(&feature.activity),
-            &recent_summaries,
-            Some(&session_summaries),
-        );
-        let feature_json = serde_json::to_value(&feature).unwrap_or_default();
-        let _ = db.insert_dom_feature_snapshot(
+            .unwrap_or_default(),
+            d.query_dom_feature_snapshots_for_trading_day(&trading_day, 50_000)
+                .unwrap_or_default(),
+        )
+    } else {
+        (Vec::new(), Vec::new())
+    };
+
+    let recent_summaries = dom_summaries_from_rows(&recent_summary_rows);
+    let session_summaries = dom_summaries_from_rows(&session_rows);
+    enrich_dom_summary(
+        &mut feature.dom_summary,
+        Some(&feature.activity),
+        &recent_summaries,
+        Some(&session_summaries),
+    );
+    let feature_json = serde_json::to_value(&feature).unwrap_or_default();
+
+    if let Ok(d) = db.lock() {
+        let _ = d.insert_dom_feature_snapshot(
             &source_file,
             feature.timestamp_ms,
             &trading_day,
             &feature_json,
         );
-        if let Ok(mut pipelines) = pipelines.lock() {
-            pipelines.set_dom_summary(Some(feature.dom_summary.clone()));
-        }
-        persist_dom_summary_into_feature_state(
-            &db,
-            pipelines,
-            last_bid,
-            last_ask,
-            feature.timestamp_ms,
-            &feature.dom_summary,
+    }
+
+    if let Ok(mut pl) = pipelines.lock() {
+        pl.set_dom_summary(Some(feature.dom_summary.clone()));
+    }
+
+    persist_feature_state_after_dom_summary(
+        db,
+        pipelines,
+        last_bid,
+        last_ask,
+        feature.timestamp_ms,
+        &feature.dom_summary,
+    );
+
+    feed_rt
+        .last_depth_timestamp_ms_bits
+        .store(tick_ms_to_bits(feature.timestamp_ms), Ordering::Release);
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StartupWarmReplayResult {
+    cutover_offset: u64,
+    applied_tick_count: usize,
+}
+
+fn safe_scid_data_offset(reader: &ScidReader) -> u64 {
+    ScidReader::header_size_bytes_for_path(reader.path()).unwrap_or(56)
+}
+
+/// Warm-replay SCID ticks into the live pipeline up to a pre-captured cutover offset.
+///
+/// The returned `cutover_offset` is the last fully consumed SCID offset, not the requested target,
+/// so the live tail can safely resume after truncated/partial startup reads without skipping ticks.
+fn run_startup_warm_replay(
+    reader: &ScidReader,
+    pipelines: &Arc<Mutex<PipelineEngine>>,
+    flow_emitter: &Arc<Mutex<FlowEventEmitter>>,
+    db: &Arc<Mutex<Database>>,
+    since_ms: f64,
+    requested_cutover_offset: u64,
+) -> StartupWarmReplayResult {
+    let replay_batch =
+        match reader.read_bulk_since_until_offset(Some(since_ms), requested_cutover_offset) {
+            Ok(batch) => batch,
+            Err(e) => {
+                let fallback_offset = safe_scid_data_offset(reader);
+                eprintln!(
+                    "[the-desk-mcp] Backfill error: {e}; live tail will resume from safe offset {}",
+                    fallback_offset
+                );
+                return StartupWarmReplayResult {
+                    cutover_offset: fallback_offset,
+                    applied_tick_count: 0,
+                };
+            }
+        };
+
+    let actual_cutover_offset = replay_batch.next_offset;
+    if actual_cutover_offset < requested_cutover_offset {
+        eprintln!(
+            "[the-desk-mcp] Warm replay stopped early at offset {}; live tail will resume there instead of requested cutover {}",
+            actual_cutover_offset,
+            requested_cutover_offset
         );
-        feed_rt
-            .last_depth_timestamp_ms_bits
-            .store(tick_ms_to_bits(feature.timestamp_ms), Ordering::Release);
+    }
+
+    let ticks = replay_batch.ticks;
+    if ticks.is_empty() {
+        eprintln!(
+            "[the-desk-mcp] No warm-replay ticks since prior Globex open (cutover offset {})",
+            actual_cutover_offset
+        );
+        return StartupWarmReplayResult {
+            cutover_offset: actual_cutover_offset,
+            applied_tick_count: 0,
+        };
+    }
+
+    // Hold pipeline lock only during tick processing. Release pipelines before
+    // acquiring DB at boundaries to avoid deadlock and let DB-only tools
+    // (e.g. get_feed_health) run while backfill proceeds.
+    let mut pipelines_guard = match pipelines.lock() {
+        Ok(p) => p,
+        Err(_) => {
+            return StartupWarmReplayResult {
+                cutover_offset: actual_cutover_offset,
+                applied_tick_count: 0,
+            };
+        }
+    };
+
+    let mut current_session = SessionType::Unknown;
+    let mut current_delta_segment = DeltaSegment::Unknown;
+    let mut boundary_count = 0u32;
+
+    for tick in &ticks {
+        if let Some(et_min) = et_minutes_from_timestamp(tick.timestamp_ms) {
+            let new_session = classify_session(et_min);
+            let new_segment = classify_delta_segment(et_min);
+
+            if new_session != current_session
+                && current_session != SessionType::Unknown
+                && new_session != SessionType::Unknown
+            {
+                let end_state = if current_session == SessionType::Rth {
+                    Some(pipelines_guard.session_end_state())
+                } else {
+                    None
+                };
+                let date = session_date_from_timestamp_ms(tick.timestamp_ms);
+                let today_str = session_date_from_timestamp_ms(tick.timestamp_ms);
+                drop(pipelines_guard);
+                if let Some(ref es) = end_state {
+                    if let Ok(db) = db.lock() {
+                        let _ = db.save_prior_day_full_with_dnva(
+                            &date,
+                            es.high,
+                            es.low,
+                            es.close,
+                            es.va_high,
+                            es.va_low,
+                            es.poc,
+                            Some(es.dnva_high),
+                            Some(es.dnva_low),
+                            Some(es.dnp),
+                        );
+                        eprintln!(
+                            "[the-desk-mcp] Session boundary: RTH→Globex, saved prior day H={:.2} L={:.2} C={:.2}",
+                            es.high, es.low, es.close
+                        );
+                    }
+                }
+
+                let prior = {
+                    if let Ok(db) = db.lock() {
+                        db.load_prior_day_full(&today_str)
+                    } else {
+                        Ok(None)
+                    }
+                };
+                pipelines_guard = match pipelines.lock() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        return StartupWarmReplayResult {
+                            cutover_offset: actual_cutover_offset,
+                            applied_tick_count: 0,
+                        };
+                    }
+                };
+                pipelines_guard.reset_session_with_type(new_session == SessionType::Globex);
+                if new_session == SessionType::Rth || new_session == SessionType::Globex {
+                    if let Ok(Some((h, l, c, va_h, va_l, poc, dnva_h, dnva_l, dnp))) = prior {
+                        pipelines_guard.levels.set_prior_day(h, l, c);
+                        if let (Some(vh), Some(vl), Some(pc)) = (va_h, va_l, poc) {
+                            pipelines_guard.levels.set_prior_profile(vh, vl, pc);
+                        }
+                        if let (Some(dh), Some(dl), Some(dp)) = (dnva_h, dnva_l, dnp) {
+                            pipelines_guard.levels.set_prior_dnva(dh, dl, dp);
+                        }
+                    }
+                }
+
+                let inv_session_type = if new_session == SessionType::Rth {
+                    "RTH"
+                } else if new_segment == DeltaSegment::Asia {
+                    "Asia"
+                } else {
+                    "London"
+                };
+                drop(pipelines_guard);
+                if let Ok(db) = db.lock() {
+                    if let Ok(summaries) =
+                        db.list_session_summaries(None, None, None, Some(inv_session_type), 5)
+                    {
+                        let prior_inv: Vec<PriorSessionData> = summaries
+                            .into_iter()
+                            .filter(|s| s.dnva_high > 0.0 && s.dnva_low > 0.0 && s.dnp > 0.0)
+                            .map(|s| PriorSessionData {
+                                final_delta: s.session_delta,
+                                dnva_high: s.dnva_high,
+                                dnva_low: s.dnva_low,
+                                dnp: s.dnp,
+                            })
+                            .collect();
+                        if let Ok(mut p) = pipelines.lock() {
+                            p.session_inventory.load_prior_sessions(prior_inv);
+                        }
+                    }
+                }
+                pipelines_guard = match pipelines.lock() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        return StartupWarmReplayResult {
+                            cutover_offset: actual_cutover_offset,
+                            applied_tick_count: 0,
+                        };
+                    }
+                };
+                boundary_count += 1;
+            } else if new_segment != current_delta_segment
+                && current_delta_segment != DeltaSegment::Unknown
+                && new_segment != DeltaSegment::Unknown
+            {
+                pipelines_guard.reset_segment(new_segment);
+                boundary_count += 1;
+            }
+
+            if new_session != SessionType::Unknown {
+                current_session = new_session;
+            }
+            if new_segment != DeltaSegment::Unknown {
+                current_delta_segment = new_segment;
+            }
+        }
+
+        let is_buy = matches!(tick.side, TradeSide::Buy);
+        let minute = minute_of_session_from_timestamp(tick.timestamp_ms);
+        pipelines_guard.on_trade_with_timestamp(
+            tick.price,
+            tick.volume,
+            is_buy,
+            minute,
+            tick.timestamp_ms,
+        );
+    }
+
+    let last = ticks.last().expect("ticks not empty");
+    let bid = if last.bid > 0.0 {
+        last.bid
+    } else {
+        last.price - 0.25
+    };
+    let ask = if last.ask > 0.0 {
+        last.ask
+    } else {
+        last.price + 0.25
+    };
+    let snapshot = pipelines_guard.snapshot(bid, ask);
+
+    // Sync flow emitter counts so live polling doesn't emit stale events.
+    if let Ok(mut fe) = flow_emitter.lock() {
+        fe.sync_counts(&pipelines_guard);
+    }
+    drop(pipelines_guard);
+    if let Ok(db) = db.lock() {
+        let _ = db.upsert_feature_state(
+            last.timestamp_ms,
+            &serde_json::to_value(&snapshot).unwrap_or_default(),
+        );
+    }
+    eprintln!(
+        "[the-desk-mcp] Backfill complete: {} ticks, {} session boundaries, last price {:.2}",
+        ticks.len(),
+        boundary_count,
+        last.price
+    );
+
+    StartupWarmReplayResult {
+        cutover_offset: actual_cutover_offset,
+        applied_tick_count: ticks.len(),
     }
 }
 
@@ -7010,6 +7329,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = load_feed_config();
     let reader = ScidReader::from_feed_config(&config);
     let scid_available = reader.path().exists();
+    let mut startup_cutover_rx = None;
 
     // Create the server immediately so stdio is ready before backfill starts.
     // The startup backfill runs in a background task and populates pipeline
@@ -7017,6 +7337,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let server = TheDeskMcp::new(db, pipelines, db_path.to_string_lossy().to_string());
 
     if scid_available {
+        let (startup_cutover_tx, rx) = tokio::sync::oneshot::channel::<u64>();
+        startup_cutover_rx = Some(rx);
         // Spawn background startup backfill from 2 Globex opens ago.
         // Clones the shared Arcs from the server so the backfill can update
         // pipeline and DB state without blocking the MCP listener.
@@ -7027,190 +7349,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         tokio::spawn(async move {
             let since = globex_open_ms(2);
+            let requested_cutover_offset = reader_startup
+                .current_aligned_end_offset()
+                .unwrap_or(safe_scid_data_offset(&reader_startup));
             eprintln!(
-                "[the-desk-mcp] Backfilling from {} ...",
-                reader_startup.path().display()
+                "[the-desk-mcp] Backfilling from {} up to cutover offset {} ...",
+                reader_startup.path().display(),
+                requested_cutover_offset
             );
-            let ticks = match reader_startup.read_bulk_since(Some(since)) {
-                Ok(t) if !t.is_empty() => t,
-                Ok(_) => {
-                    eprintln!("[the-desk-mcp] No ticks since prior Globex open");
-                    return;
-                }
-                Err(e) => {
-                    eprintln!("[the-desk-mcp] Backfill error: {e}");
-                    return;
-                }
-            };
-
-            // Hold pipeline lock only during tick processing. Release pipelines
-            // before acquiring db at boundaries to avoid deadlock and let DB-only
-            // tools (e.g. get_feed_health) run while backfill proceeds.
-            let mut pipelines = match pipelines_startup.lock() {
-                Ok(p) => p,
-                Err(_) => return,
-            };
-
-            let mut current_session = SessionType::Unknown;
-            let mut current_delta_segment = DeltaSegment::Unknown;
-            let mut boundary_count = 0u32;
-
-            for tick in &ticks {
-                if let Some(et_min) = et_minutes_from_timestamp(tick.timestamp_ms) {
-                    let new_session = classify_session(et_min);
-                    let new_segment = classify_delta_segment(et_min);
-
-                    if new_session != current_session
-                        && current_session != SessionType::Unknown
-                        && new_session != SessionType::Unknown
-                    {
-                        let end_state = if current_session == SessionType::Rth {
-                            Some(pipelines.session_end_state())
-                        } else {
-                            None
-                        };
-                        let date = session_date_from_timestamp_ms(tick.timestamp_ms);
-                        let today_str = session_date_from_timestamp_ms(tick.timestamp_ms);
-                        drop(pipelines);
-                        if let Some(ref es) = end_state {
-                            if let Ok(db) = db_startup.lock() {
-                                let _ = db.save_prior_day_full_with_dnva(
-                                    &date,
-                                    es.high,
-                                    es.low,
-                                    es.close,
-                                    es.va_high,
-                                    es.va_low,
-                                    es.poc,
-                                    Some(es.dnva_high),
-                                    Some(es.dnva_low),
-                                    Some(es.dnp),
-                                );
-                                eprintln!(
-                                    "[the-desk-mcp] Session boundary: RTH\u{2192}Globex, saved prior day H={:.2} L={:.2} C={:.2}",
-                                    es.high, es.low, es.close
-                                );
-                            }
-                        }
-                        let prior = {
-                            if let Ok(db) = db_startup.lock() {
-                                db.load_prior_day_full(&today_str)
-                            } else {
-                                Ok(None)
-                            }
-                        };
-                        pipelines = match pipelines_startup.lock() {
-                            Ok(p) => p,
-                            Err(_) => return,
-                        };
-                        pipelines.reset_session_with_type(new_session == SessionType::Globex);
-                        if new_session == SessionType::Rth || new_session == SessionType::Globex {
-                            if let Ok(Some((h, l, c, va_h, va_l, poc, dnva_h, dnva_l, dnp))) = prior
-                            {
-                                pipelines.levels.set_prior_day(h, l, c);
-                                if let (Some(vh), Some(vl), Some(pc)) = (va_h, va_l, poc) {
-                                    pipelines.levels.set_prior_profile(vh, vl, pc);
-                                }
-                                if let (Some(dh), Some(dl), Some(dp)) = (dnva_h, dnva_l, dnp) {
-                                    pipelines.levels.set_prior_dnva(dh, dl, dp);
-                                }
-                            }
-                        }
-                        let inv_session_type = if new_session == SessionType::Rth {
-                            "RTH"
-                        } else if new_segment == DeltaSegment::Asia {
-                            "Asia"
-                        } else {
-                            "London"
-                        };
-                        drop(pipelines);
-                        if let Ok(db) = db_startup.lock() {
-                            if let Ok(summaries) = db.list_session_summaries(
-                                None,
-                                None,
-                                None,
-                                Some(inv_session_type),
-                                5,
-                            ) {
-                                let prior_inv: Vec<PriorSessionData> = summaries
-                                    .into_iter()
-                                    .filter(|s| {
-                                        s.dnva_high > 0.0 && s.dnva_low > 0.0 && s.dnp > 0.0
-                                    })
-                                    .map(|s| PriorSessionData {
-                                        final_delta: s.session_delta,
-                                        dnva_high: s.dnva_high,
-                                        dnva_low: s.dnva_low,
-                                        dnp: s.dnp,
-                                    })
-                                    .collect();
-                                if let Ok(mut p) = pipelines_startup.lock() {
-                                    p.session_inventory.load_prior_sessions(prior_inv);
-                                }
-                            }
-                        }
-                        pipelines = match pipelines_startup.lock() {
-                            Ok(p) => p,
-                            Err(_) => return,
-                        };
-                        boundary_count += 1;
-                    } else if new_segment != current_delta_segment
-                        && current_delta_segment != DeltaSegment::Unknown
-                        && new_segment != DeltaSegment::Unknown
-                    {
-                        pipelines.reset_segment(new_segment);
-                        boundary_count += 1;
-                    }
-
-                    if new_session != SessionType::Unknown {
-                        current_session = new_session;
-                    }
-                    if new_segment != DeltaSegment::Unknown {
-                        current_delta_segment = new_segment;
-                    }
-                }
-
-                let is_buy = matches!(tick.side, TradeSide::Buy);
-                let minute = minute_of_session_from_timestamp(tick.timestamp_ms);
-                pipelines.on_trade_with_timestamp(
-                    tick.price,
-                    tick.volume,
-                    is_buy,
-                    minute,
-                    tick.timestamp_ms,
-                );
-            }
-
-            let last = ticks.last().unwrap();
-            let bid = if last.bid > 0.0 {
-                last.bid
-            } else {
-                last.price - 0.25
-            };
-            let ask = if last.ask > 0.0 {
-                last.ask
-            } else {
-                last.price + 0.25
-            };
-            let snapshot = pipelines.snapshot(bid, ask);
-
-            // Sync flow emitter counts so live polling doesn't emit stale events
-            if let Ok(mut fe) = flow_emitter_startup.lock() {
-                fe.sync_counts(&pipelines);
-            }
-            drop(pipelines);
-            if let Ok(db) = db_startup.lock() {
-                let _ = db.upsert_feature_state(
-                    last.timestamp_ms,
-                    &serde_json::to_value(&snapshot).unwrap_or_default(),
-                );
-            }
+            let startup = run_startup_warm_replay(
+                &reader_startup,
+                &pipelines_startup,
+                &flow_emitter_startup,
+                &db_startup,
+                since,
+                requested_cutover_offset,
+            );
             eprintln!(
-                "[the-desk-mcp] Backfill complete: {} ticks, {} session boundaries, last price {:.2}",
-                ticks.len(),
-                boundary_count,
-                last.price
+                "[the-desk-mcp] Startup SCID cutover: offset={}, warm_ticks_applied={}",
+                startup.cutover_offset, startup.applied_tick_count
             );
+            let _ = startup_cutover_tx.send(startup.cutover_offset);
         });
     } else {
         eprintln!(
@@ -7221,6 +7380,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Background: poll .scid for new ticks and update pipeline engine + DB
     if scid_available {
+        let startup_cutover_rx = startup_cutover_rx.take();
         let pipelines_bg = Arc::clone(&server.pipelines);
         let detector_bg = Arc::clone(&server.detector);
         let flow_emitter_bg = Arc::clone(&server.flow_emitter);
@@ -7239,7 +7399,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             use tokio::time::{sleep, Duration};
 
             let poll = Duration::from_millis(poll_ms.max(250));
-            let mut offset: u64 = 0;
+            let mut offset: u64;
             let mut last_market_tick_ts: f64 = 0.0;
             let mut persist_counter: u64 = 0;
             let mut event_buffer = Vec::new();
@@ -7253,16 +7413,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map(classify_delta_segment)
                 .unwrap_or(DeltaSegment::Unknown);
 
-            // Seek to current EOF so we only process NEW ticks
-            if let Ok(f) = std::fs::File::open(&reader_path) {
-                offset = f.metadata().map(|m| m.len()).unwrap_or(56);
-            }
+            offset = if let Some(rx) = startup_cutover_rx {
+                match rx.await {
+                    Ok(cutover_offset) => cutover_offset,
+                    Err(_) => safe_scid_data_offset(&ScidReader::new(reader_path.clone())),
+                }
+            } else {
+                ScidReader::new(reader_path.clone())
+                    .current_aligned_end_offset()
+                    .unwrap_or(56)
+            };
+            feed_rt_bg.scid_tail_offset.store(offset, Ordering::Release);
 
             loop {
                 sleep(poll).await;
                 if last_integrity_check.elapsed() >= std::time::Duration::from_secs(15) {
-                    if let (Ok(db), Ok(p)) = (db_bg.lock(), pipelines_bg.lock()) {
-                        persist_integrity_check(&db, &p);
+                    let pipeline_invariants = pipelines_bg
+                        .lock()
+                        .ok()
+                        .map(|p| p.validate_invariants())
+                        .unwrap_or_default();
+                    if let Ok(db) = db_bg.lock() {
+                        persist_integrity_check(&db, &pipeline_invariants);
                     }
                     last_integrity_check = std::time::Instant::now();
                 }
@@ -7340,90 +7512,118 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 && current_session != SessionType::Unknown
                                 && new_session != SessionType::Unknown
                             {
-                                if let Ok(mut p) = pipelines_bg.lock() {
-                                    let end_state = if current_session == SessionType::Rth {
-                                        Some(p.session_end_state())
-                                    } else {
-                                        None
-                                    };
-                                    let date = session_date_from_timestamp_ms(tick.timestamp_ms);
-                                    if let Some(ref es) = end_state {
-                                        if let Ok(db) = db_bg.lock() {
-                                            let _ = db.save_prior_day_full_with_dnva(
-                                                &date,
-                                                es.high,
-                                                es.low,
-                                                es.close,
-                                                es.va_high,
-                                                es.va_low,
-                                                es.poc,
-                                                Some(es.dnva_high),
-                                                Some(es.dnva_low),
-                                                Some(es.dnp),
-                                            );
-                                        }
-                                    }
-                                    let today_str =
-                                        session_date_from_timestamp_ms(tick.timestamp_ms);
-                                    let prior = if let Ok(db) = db_bg.lock() {
-                                        db.load_prior_day_full(&today_str).ok().flatten()
-                                    } else {
-                                        None
-                                    };
-                                    p.reset_session_with_type(new_session == SessionType::Globex);
-                                    if let Some((h, l, c, va_h, va_l, poc, dnva_h, dnva_l, dnp)) =
-                                        prior
-                                    {
-                                        p.levels.set_prior_day(h, l, c);
-                                        if let (Some(vh), Some(vl), Some(pc)) = (va_h, va_l, poc) {
-                                            p.levels.set_prior_profile(vh, vl, pc);
-                                        }
-                                        if let (Some(dh), Some(dl), Some(dp)) =
-                                            (dnva_h, dnva_l, dnp)
-                                        {
-                                            p.levels.set_prior_dnva(dh, dl, dp);
-                                        }
-                                    }
-                                    let inv_session_type = if new_session == SessionType::Rth {
-                                        "RTH"
-                                    } else if new_segment == DeltaSegment::Asia {
-                                        "Asia"
-                                    } else {
-                                        "London"
-                                    };
-                                    drop(p);
+                                // Match startup warm-backfill: never hold `pipelines` while waiting on
+                                // `db` (and never hold `db` while waiting on `pipelines`) so the depth
+                                // worker cannot deadlock with this path.
+                                let end_state = if current_session == SessionType::Rth {
+                                    pipelines_bg.lock().ok().map(|p| p.session_end_state())
+                                } else {
+                                    None
+                                };
+                                let date = session_date_from_timestamp_ms(tick.timestamp_ms);
+                                let today_str = session_date_from_timestamp_ms(tick.timestamp_ms);
+
+                                if let Some(ref es) = end_state {
                                     if let Ok(db) = db_bg.lock() {
-                                        if let Ok(summaries) = db.list_session_summaries(
-                                            None,
-                                            None,
-                                            None,
-                                            Some(inv_session_type),
-                                            5,
-                                        ) {
-                                            let prior_inv: Vec<PriorSessionData> = summaries
-                                                .into_iter()
-                                                .filter(|s| {
-                                                    s.dnva_high > 0.0
-                                                        && s.dnva_low > 0.0
-                                                        && s.dnp > 0.0
-                                                })
-                                                .map(|s| PriorSessionData {
-                                                    final_delta: s.session_delta,
-                                                    dnva_high: s.dnva_high,
-                                                    dnva_low: s.dnva_low,
-                                                    dnp: s.dnp,
-                                                })
-                                                .collect();
-                                            if let Ok(mut p) = pipelines_bg.lock() {
-                                                p.session_inventory.load_prior_sessions(prior_inv);
+                                        let _ = db.save_prior_day_full_with_dnva(
+                                            &date,
+                                            es.high,
+                                            es.low,
+                                            es.close,
+                                            es.va_high,
+                                            es.va_low,
+                                            es.poc,
+                                            Some(es.dnva_high),
+                                            Some(es.dnva_low),
+                                            Some(es.dnp),
+                                        );
+                                    }
+                                }
+
+                                let prior = {
+                                    if let Ok(db) = db_bg.lock() {
+                                        db.load_prior_day_full(&today_str)
+                                    } else {
+                                        Ok(None)
+                                    }
+                                };
+
+                                if let Ok(mut p) = pipelines_bg.lock() {
+                                    p.reset_session_with_type(new_session == SessionType::Globex);
+                                    if new_session == SessionType::Rth
+                                        || new_session == SessionType::Globex
+                                    {
+                                        if let Ok(Some((
+                                            h,
+                                            l,
+                                            c,
+                                            va_h,
+                                            va_l,
+                                            poc,
+                                            dnva_h,
+                                            dnva_l,
+                                            dnp,
+                                        ))) = prior
+                                        {
+                                            p.levels.set_prior_day(h, l, c);
+                                            if let (Some(vh), Some(vl), Some(pc)) =
+                                                (va_h, va_l, poc)
+                                            {
+                                                p.levels.set_prior_profile(vh, vl, pc);
+                                            }
+                                            if let (Some(dh), Some(dl), Some(dp)) =
+                                                (dnva_h, dnva_l, dnp)
+                                            {
+                                                p.levels.set_prior_dnva(dh, dl, dp);
                                             }
                                         }
                                     }
-                                    eprintln!(
-                                        "[the-desk-mcp] Live boundary: {:?} → {:?}",
-                                        current_session, new_session
-                                    );
                                 }
+
+                                let inv_session_type = if new_session == SessionType::Rth {
+                                    "RTH"
+                                } else if new_segment == DeltaSegment::Asia {
+                                    "Asia"
+                                } else {
+                                    "London"
+                                };
+
+                                let prior_inv: Vec<PriorSessionData> = if let Ok(db) = db_bg.lock()
+                                {
+                                    if let Ok(summaries) = db.list_session_summaries(
+                                        None,
+                                        None,
+                                        None,
+                                        Some(inv_session_type),
+                                        5,
+                                    ) {
+                                        summaries
+                                            .into_iter()
+                                            .filter(|s| {
+                                                s.dnva_high > 0.0 && s.dnva_low > 0.0 && s.dnp > 0.0
+                                            })
+                                            .map(|s| PriorSessionData {
+                                                final_delta: s.session_delta,
+                                                dnva_high: s.dnva_high,
+                                                dnva_low: s.dnva_low,
+                                                dnp: s.dnp,
+                                            })
+                                            .collect()
+                                    } else {
+                                        Vec::new()
+                                    }
+                                } else {
+                                    Vec::new()
+                                };
+
+                                if let Ok(mut p) = pipelines_bg.lock() {
+                                    p.session_inventory.load_prior_sessions(prior_inv);
+                                }
+
+                                eprintln!(
+                                    "[the-desk-mcp] Live boundary: {:?} → {:?}",
+                                    current_session, new_session
+                                );
                                 if let Ok(mut det) = detector_bg.lock() {
                                     det.reset();
                                 }
@@ -7536,24 +7736,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if ticks_this_poll > 0 {
                     persist_counter += 1;
                     if persist_counter.is_multiple_of(4) {
-                        if let (Ok(p), Ok(b), Ok(a), Ok(db)) = (
-                            pipelines_bg.lock(),
-                            last_bid_bg.lock(),
-                            last_ask_bg.lock(),
-                            db_bg.lock(),
-                        ) {
-                            let bid = if *b > 0.0 { *b } else { 0.0 };
-                            let ask = if *a > 0.0 { *a } else { 0.0 };
-                            if bid > 0.0
-                                && last_market_tick_ts.is_finite()
-                                && last_market_tick_ts > 0.0
-                            {
-                                let snapshot = p.snapshot(bid, ask);
-                                let _ = db.upsert_feature_state(
-                                    last_market_tick_ts,
-                                    &serde_json::to_value(&snapshot).unwrap_or_default(),
-                                );
-                            }
+                        if let Some((timestamp_ms, payload)) =
+                            build_live_feature_state_snapshot_payload(
+                                &pipelines_bg,
+                                &last_bid_bg,
+                                &last_ask_bg,
+                                last_market_tick_ts,
+                            )
+                        {
+                            persist_feature_state_payload(&db_bg, timestamp_ms, &payload);
                         }
                     }
                 }
@@ -7627,6 +7818,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
     use the_desk_backend::db::SessionSummary;
 
     fn summary_row(
@@ -7686,6 +7879,45 @@ mod tests {
     fn test_server() -> TheDeskMcp {
         let db = Database::open(":memory:").expect("db");
         TheDeskMcp::new(db, PipelineEngine::new(), ":memory:".into())
+    }
+
+    fn write_scid_header(file: &mut NamedTempFile) {
+        const SCID_HEADER_SIZE_TEST: usize = 56;
+        let mut header = vec![0_u8; SCID_HEADER_SIZE_TEST];
+        header[0..4].copy_from_slice(b"SCID");
+        header[4..8].copy_from_slice(&(SCID_HEADER_SIZE_TEST as u32).to_le_bytes());
+        header[8..12].copy_from_slice(&(SCID_RECORD_SIZE as u32).to_le_bytes());
+        file.write_all(&header).expect("header");
+        file.flush().expect("flush");
+    }
+
+    fn append_scid_record(file: &mut NamedTempFile, price: f32, timestamp_ms: f64) {
+        const SC_TO_UNIX_EPOCH_US_TEST: i64 = 2_209_161_600_000_000;
+        let mut rec = [0_u8; SCID_RECORD_SIZE];
+        let unix_us = (timestamp_ms * 1_000.0).round() as i64;
+        let sc_us = SC_TO_UNIX_EPOCH_US_TEST + unix_us;
+        rec[0..8].copy_from_slice(&sc_us.to_le_bytes());
+        rec[12..16].copy_from_slice(&(price + 0.25).to_le_bytes());
+        rec[16..20].copy_from_slice(&(price - 0.25).to_le_bytes());
+        rec[20..24].copy_from_slice(&price.to_le_bytes());
+        rec[24..28].copy_from_slice(&(1_u32).to_le_bytes());
+        rec[28..32].copy_from_slice(&(2_u32).to_le_bytes());
+        rec[32..36].copy_from_slice(&(0_u32).to_le_bytes());
+        rec[36..40].copy_from_slice(&(2_u32).to_le_bytes());
+        file.write_all(&rec).expect("record");
+    }
+
+    fn append_scid_sequence(file: &mut NamedTempFile, start_idx: usize, prices: &[f32]) {
+        let base_ts_ms = Utc
+            .with_ymd_and_hms(2026, 3, 5, 15, 0, 0)
+            .single()
+            .expect("base timestamp")
+            .timestamp_millis() as f64;
+        for (idx, price) in prices.iter().enumerate() {
+            let ts_ms = base_ts_ms + (start_idx + idx) as f64;
+            append_scid_record(file, *price, ts_ms);
+        }
+        file.flush().expect("flush");
     }
 
     #[test]
@@ -7950,5 +8182,122 @@ mod tests {
         assert!(rendered.contains("21030.0"));
         assert!(rendered.contains("priorLondonDnvaHigh"));
         assert!(rendered.contains("21040.0"));
+    }
+
+    /// Regression for Comment 1: exercise the actual validation and live-snapshot helper paths in
+    /// opposing phase order. If either path starts nesting `db` and `pipelines` again, this test
+    /// becomes a deadlock candidate instead of a clean join.
+    #[test]
+    fn validation_and_live_snapshot_helpers_join_under_opposing_phase_order() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let server = test_server();
+        *server.last_bid.lock().expect("bid lock") = 21_000.0;
+        *server.last_ask.lock().expect("ask lock") = 21_000.25;
+
+        let barrier = Arc::new(Barrier::new(2));
+
+        let validation_server = server.clone();
+        let validation_barrier = Arc::clone(&barrier);
+        let validation = thread::spawn(move || {
+            for _ in 0..200 {
+                let _ = collect_validation_db_snapshot(&validation_server.db).expect("db snapshot");
+                validation_barrier.wait();
+                let _ = collect_pipeline_invariants(&validation_server.pipelines)
+                    .expect("pipeline invariants");
+            }
+        });
+
+        let snapshot_server = server.clone();
+        let snapshot_barrier = Arc::clone(&barrier);
+        let snapshot = thread::spawn(move || {
+            for idx in 0..200 {
+                let (timestamp_ms, payload) = build_live_feature_state_snapshot_payload(
+                    &snapshot_server.pipelines,
+                    &snapshot_server.last_bid,
+                    &snapshot_server.last_ask,
+                    1_000.0 + idx as f64,
+                )
+                .expect("live snapshot payload");
+                snapshot_barrier.wait();
+                persist_feature_state_payload(&snapshot_server.db, timestamp_ms, &payload);
+            }
+        });
+
+        validation.join().expect("validation join");
+        snapshot.join().expect("snapshot join");
+
+        let db = server.db.lock().expect("db lock");
+        assert!(db
+            .latest_feature_state()
+            .expect("latest feature state")
+            .is_some());
+        assert_eq!(db.raw_tick_count().expect("raw tick count"), 0);
+    }
+
+    #[test]
+    fn startup_cutover_replay_plus_live_resume_applies_ticks_once() {
+        let server = test_server();
+        let mut file = NamedTempFile::new().expect("temp");
+        write_scid_header(&mut file);
+        append_scid_sequence(&mut file, 0, &[21000.0, 21000.25, 21000.5]);
+
+        let reader = ScidReader::new(file.path());
+        let since = Utc
+            .with_ymd_and_hms(2026, 3, 5, 15, 0, 0)
+            .single()
+            .expect("since timestamp")
+            .timestamp_millis() as f64;
+        let cutover = reader.current_aligned_end_offset().expect("cutover");
+
+        // Simulate ticks arriving during startup while warm replay is in progress.
+        append_scid_sequence(&mut file, 3, &[21000.75, 21001.0]);
+
+        let warm = run_startup_warm_replay(
+            &reader,
+            &server.pipelines,
+            &server.flow_emitter,
+            &server.db,
+            since,
+            cutover,
+        );
+        let live = reader
+            .read_bulk_from_offset(warm.cutover_offset)
+            .expect("live resume");
+        let mut event_buffer = Vec::new();
+        for tick in &live.ticks {
+            process_tick(
+                &server.pipelines,
+                &server.detector,
+                &server.flow_emitter,
+                &server.rules,
+                &server.db,
+                &server.last_bid,
+                &server.last_ask,
+                tick.price,
+                tick.volume,
+                matches!(tick.side, TradeSide::Buy),
+                tick.timestamp_ms,
+                tick.bid,
+                tick.ask,
+                &mut event_buffer,
+            );
+        }
+
+        let (bid, ask) = current_best_bid_ask(&server.last_bid, &server.last_ask);
+        let snapshot = server
+            .pipelines
+            .lock()
+            .expect("pipelines lock")
+            .snapshot(bid, ask);
+
+        assert_eq!(warm.cutover_offset, cutover);
+        assert_eq!(warm.applied_tick_count, 3);
+        assert_eq!(live.ticks.len(), 2);
+        assert_eq!(snapshot.last_price, 21001.0);
+        assert!((snapshot.vwap - 21000.5).abs() < 1e-9);
+        assert_eq!(snapshot.session_low, 21000.0);
+        assert_eq!(snapshot.session_high, 21001.0);
     }
 }

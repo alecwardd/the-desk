@@ -1,6 +1,6 @@
 # The Desk — Setup Ideas & Backtesting Research
 
-Living document for trade setup ideas, backtesting hypotheses, and research findings. Each idea is tracked from concept through validation.
+Living document for trade setup ideas, backtesting hypotheses, research findings, and cross-cutting infrastructure work (pipelines, MCP server surface, multi-instrument support). Each idea is tracked from concept through validation.
 
 ---
 
@@ -591,6 +591,38 @@ Allow VWAP to be anchored from a user-specified event or time, not just the sess
 
 ---
 
+### IDEA-017: MCP Product Hardening — Playbook & Guidance as First-Class Data
+
+**Status:** Idea
+**Source:** Product review — MCP exposes market intelligence well; playbook and trading philosophy remain primarily in repository markdown
+**Complements:** All Cursor agents; orchestrator and specialist prompts that should cite canonical definitions
+
+**Framing:** This is **MCP product hardening**, not a defect in the current server. The live surface already exposes market state, risk state, setup evaluation, and setup-oriented context. What it does *not* yet expose as first-class, queryable MCP data are the canonical artifacts: playbook rules, setup templates, methodology notes, and trader-specific guidance that today live in markdown under the repo (and in agent definitions).
+
+**Gap (precise):** `get_setup_context()` in `src/bin/the-desk-mcp.rs` returns **market and risk context** around a **named** setup — not the setup’s **definition** (conditions, template fields, narrative guardrails). Agents still infer playbook semantics from files on disk rather than from structured tool responses.
+
+**Implementation direction:**
+- There are **no MCP resource handlers** in `the-desk-mcp.rs` today. **Dedicated read tools** (e.g. list templates, fetch template by id, fetch playbook section or checksum) are likely the **simplest first increment** before investing in full MCP resources (`list_resources` / `read_resource`).
+- **Next concrete step:** add one or more read-only tools that return structured JSON (or similar) for setup templates and playbook excerpts, with stable ids and versioning metadata where useful. Iterate on shape and granularity with real agent prompts; consider resources later if clients benefit from URI-based discovery.
+
+**Success criteria (initial):** An agent can answer “what are the conditions for setup X?” and “what does the desk mean by term Y?” using MCP output alone, without opening arbitrary markdown paths unless the trader opts into repo-local files.
+
+---
+
+### IDEA-018: Multi-Instrument Concurrent Tracking (NQ, MNQ, ES, MES)
+
+**Status:** Idea
+**Source:** Roadmap — full product vision once the MCP surface and single-symbol path are “done enough”
+**Complements:** Correlation and SMT-style ideas (e.g. IDEA-009); session and regime context across equity index futures
+
+**Concept:** Run **four liquid CME equity index micro/mini roots** in parallel: **NQ**, **MNQ**, **ES**, and **MES** — each with its own pipeline state, session scoping, and tool addressing — so agents can reason about alignment, divergence, and relative strength without manually switching symbols or restarting the server.
+
+**Why it is non-trivial:** Today the architecture is optimized around a **primary** symbol stream (Sierra `.scid` tail + SQLite + `MarketState`). Multi-symbol implies duplicate or partitioned pipeline engines, feed scheduling, database keys or separate tables per instrument, MCP tool parameters (or namespaces) for “which symbol,” and clear rules for **never mixing RTH/Globex across symbols** in a single calculation by accident.
+
+**Sequencing:** Treat this as **Phase B** after IDEA-017 (and related MCP hardening): stabilize the agent contract first, then expand capacity so the same contract applies per symbol without ambiguity.
+
+---
+
 ## Priority 3 — Requires External Data
 
 ### IDEA-008: 0DTE Gamma Regime Trading
@@ -1005,4 +1037,4 @@ Ordered by expected information value × implementation ease:
 
 ---
 
-*Last updated: 2026-03-24*
+*Last updated: 2026-04-16*

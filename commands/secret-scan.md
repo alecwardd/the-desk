@@ -1,28 +1,19 @@
 ---
 name: secret-scan
-description: Scan source files for likely API key leaks and secret patterns. USE WHEN before commit, before opening a PR, or after config/auth changes.
+description: Scan staged and working tree files for accidentally committed API keys. USE WHEN reviewing security or before releases.
 ---
 
 # /secret-scan
 
-Scan the repository for common secret patterns.
+Search the repository for common secret patterns.
 
 ## Steps
 
-1. **Run scan with ripgrep (matches pre-commit secret convention):**
+1. Run ripgrep from the repo root:
    ```bash
-   rg -n -i "(sk-ant-[A-Za-z0-9_-]{20,}|sk_live_[A-Za-z0-9_-]{20,}|anthropic_api_key\\s*=\\s*['\"][A-Za-z0-9_-]{20,})" src src-tauri AGENT.md CLAUDE.md .cursorrules .cursor/commands .cursor/rules commands
+   rg -n -i "(sk-ant-[A-Za-z0-9_-]{20,}|sk_live_[A-Za-z0-9_-]{20,}|anthropic_api_key\\s*=\\s*['\"][A-Za-z0-9_-]{20,})" src AGENT.md CLAUDE.md .cursorrules .cursor/commands .cursor/rules commands
    ```
 
-2. **If no matches are found, report:**
-   - Secret scan status: clean
+2. Report any matches with file paths and line numbers.
 
-3. **If matches are found, report:**
-   - File paths and line references
-   - Whether each match appears to be real secret material or a false positive
-   - Required remediation steps before commit
-
-## Notes
-
-- Never commit real credentials or tokens.
-- Use environment variables or local config excluded from version control.
+3. If matches are false positives, document why before dismissing.

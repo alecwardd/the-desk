@@ -605,7 +605,7 @@ the-desk/
 │   ├── prompt-spec.md               # LLM prompt engineering specification
 │   ├── decision-log.md              # ADR-style key decisions and rationale
 │   └── roadmap.md                   # Phase sequencing, traceability, entry/exit criteria
-├── src-tauri/                        # Rust backend
+├── src/                              # Rust backend (current repo layout)
 │   ├── src/
 │   │   ├── main.rs
 │   │   ├── dtc/                     # DTC protocol client

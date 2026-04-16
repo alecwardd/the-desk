@@ -1,8 +1,0 @@
-{
-  "identifier": "default",
-  "description": "Default capability for The Desk",
-  "windows": ["main"],
-  "permissions": [
-    "core:default"
-  ]
-}

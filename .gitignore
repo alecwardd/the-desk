@@ -33,7 +33,6 @@ desktop.ini
 # Rust
 target/
 **/*.rs.bk
-Cargo.lock
 
 # Session recordings (large binary files)
 recordings/
@@ -46,12 +45,6 @@ recordings/
 # Logs
 *.log
 logs/
-
-# Tauri
-src-tauri/target/
-src-tauri/target_alt/
-src-tauri/WixTools/
-src-tauri/icons/
 
 # Temporary files
 *.tmp

@@ -491,7 +491,7 @@ All pipeline tests use a canonical test data set of NQ trades with known expecte
 | Delta divergence | Price new high, delta declining | DN-06 fires divergence alert |
 | DOM snapshot sequence | 10 snapshots at 100ms intervals | Absorption/imbalance patterns detectable |
 
-Data files stored at `src-tauri/test-data/` as JSON arrays of trade records.
+Data files stored at `test-data/` (or under `src/` during development) as JSON arrays of trade records.
 
 ### 5.2 Pipeline Unit Tests
 

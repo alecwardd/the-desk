@@ -1,44 +1,26 @@
 ---
 name: replay-session
-description: Load and replay a recorded session for testing. USE WHEN testing pipelines, rules engine, or coaching prompts against real recorded market data.
+description: Work with recorded sessions and historical data for testing. USE WHEN validating pipelines, rules, or research against stored ticks.
 ---
 
 # /replay-session
 
-Load a recorded NQ session and replay it through the full system.
-
-## Usage
-
-```
-/replay-session                    # List available recordings
-/replay-session [filename]         # Replay specific session
-/replay-session [filename] --speed 4x   # Replay at 4x speed
-```
+Session recordings are compressed files under `~/.the-desk/recordings/`. There is **no** in-repo GUI replay.
 
 ## Steps
 
-1. List available recordings from `~/.the-desk/recordings/`:
+1. List available recordings:
    ```bash
    ls -la ~/.the-desk/recordings/*.zst
    ```
 
-2. If a specific session is requested, load it:
-   ```bash
-   # Via Tauri command — the Rust replay engine handles decompression and playback
-   ```
+2. Use **historical backfill** and **research queries** (`backfill_history`, `run_backtest`, `query_*` tools) to validate pipelines against `.scid` history in the configured Sierra data directory.
 
-3. During replay, monitor:
-   - Pipeline outputs (VWAP, TPO, delta building correctly)
-   - Rules engine alerts (firing at expected times)
-   - Coaching prompts (appropriate content and timing)
-   - Performance (can we replay at 8x without dropping data?)
+3. During analysis, monitor pipeline outputs, rules alerts, and DB/session integrity (`validate_data_integrity`, `get_feed_health`).
 
-4. Report replay summary:
-   - Session date and duration
-   - Number of trades processed
-   - Alerts fired and coaching prompts generated
-   - Any errors or anomalies
+4. Report summary: session coverage, alerts, anomalies.
 
-## For Development
+## Notes
 
-If no recordings exist yet, capture a session from live SCID processing or use DOM replay over stored SQLite data (see `docs/dom-replay.md`).
+- The `recording` Rust module and DB `recording_path` fields remain for file-based session artifacts.
+- For ladder-specific review, use Sierra Chart or external tools; MCP still exposes DOM-oriented **summaries** from SQLite / `.depth` where implemented.

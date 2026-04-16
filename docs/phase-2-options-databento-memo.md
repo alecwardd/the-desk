@@ -100,7 +100,7 @@ Databento is the preferred options data provider for Phase 2. We ingest raw opti
 ## Implementation Checklist (when Phase 2 starts)
 
 - [ ] Add `databento` crate to `Cargo.toml`
-- [ ] Create `src-tauri/src/options/` module
+- [ ] Create `src/options/` module (or extend existing `options/` tree)
 - [ ] Implement `DatabentoClient` (auth, timeseries, symbology)
 - [ ] Implement `GreeksEngine` (Black-76, Black-Scholes; delta, gamma, charm, vanna)
 - [ ] Implement `GEXAggregator` (GEX by strike, key levels, dealer positioning)

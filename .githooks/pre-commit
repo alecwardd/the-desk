@@ -36,38 +36,26 @@ echo "  ✓ No secrets found"
 # ─── Rust Checks (only if Rust files changed) ─────────────────────
 if echo "$STAGED_FILES" | grep -q '\.rs$'; then
     echo "  Checking Rust formatting..."
-    if [ -d "src-tauri" ]; then
-        (cd src-tauri && cargo fmt --check 2>/dev/null) || {
-            echo "❌ FAILED: Rust formatting issues. Run: cd src-tauri && cargo fmt"
+    if [ -f "Cargo.toml" ]; then
+        (cargo fmt --check 2>/dev/null) || {
+            echo "❌ FAILED: Rust formatting issues. Run: cargo fmt"
             exit 1
         }
         echo "  ✓ Rust formatting OK"
 
         echo "  Running Rust linter..."
-        (cd src-tauri && cargo clippy -- -D warnings 2>/dev/null) || {
+        (cargo clippy -- -D warnings 2>/dev/null) || {
             echo "❌ FAILED: Clippy warnings found. Fix and re-commit."
             exit 1
         }
         echo "  ✓ Clippy OK"
 
         echo "  Running Rust tests..."
-        (cd src-tauri && cargo test --quiet 2>/dev/null) || {
+        (cargo test --quiet 2>/dev/null) || {
             echo "❌ FAILED: Rust tests failing. Fix and re-commit."
             exit 1
         }
         echo "  ✓ Rust tests passing"
-    fi
-fi
-
-# ─── TypeScript Checks (only if TS files changed) ─────────────────
-if echo "$STAGED_FILES" | grep -qE '\.(ts|tsx)$'; then
-    echo "  Checking TypeScript types..."
-    if [ -f "tsconfig.json" ]; then
-        npx tsc --noEmit 2>/dev/null || {
-            echo "❌ FAILED: TypeScript type errors. Fix and re-commit."
-            exit 1
-        }
-        echo "  ✓ TypeScript types OK"
     fi
 fi
 

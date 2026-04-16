@@ -1,7 +1,7 @@
 //! Outcome tracking for playbook signals.
 //!
 //! Tracks MFE/MAE and resolves signals when target, stop, or session end is reached.
-//! Callable from Tauri processing loop, MCP tick processing, and backfill replay.
+//! Callable from MCP tick processing and backfill replay.
 
 use crate::db::Database;
 use crate::session_date_from_timestamp_ms;

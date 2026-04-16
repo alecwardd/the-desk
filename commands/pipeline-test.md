@@ -11,7 +11,7 @@ Run all pipeline unit tests and report results.
 
 1. Run Rust pipeline tests:
    ```bash
-   cd src-tauri && cargo test --lib pipelines -- --nocapture
+   cargo test --lib pipelines -- --nocapture
    ```
 
 2. If tests pass, report: which pipelines were tested, number of assertions, all passing.

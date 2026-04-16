@@ -15,7 +15,7 @@ The Desk is a backend intelligence platform for discretionary NQ futures traders
 
 **It does NOT place or execute trades.** It is a trading partner — grounded in the trader's playbook and live market structure data. It can share opinions, flag concerns, and offer its read on the market, but the trader always makes the final call.
 
-**Primary interface:** AI agents in Cursor (and Claude Code, Codex) — not the Tauri desktop app. Coding agents should focus on the backend and MCP unless explicitly asked to work on the Tauri/React UI.
+**Primary interface:** AI agents in Cursor (and Claude Code, Codex). This repository is backend-only: Rust, SQLite, and MCP.
 
 ---
 
@@ -51,7 +51,7 @@ LAYER 3: MCP Server + LLM Orchestration
 
 **Rules:**
 - Never call the Claude API from Rust code (Layer 1 or 2)
-- Never put market data processing in TypeScript (belongs in Rust)
+- Never put market data processing outside the Rust crates (belongs in Rust)
 - The rules engine must work without any network connectivity
 - Coaching prompts should reference playbook rules and live data — opinions are welcome but must be grounded
 - MCP tools return structured data only — never raw tick streams
@@ -68,8 +68,6 @@ LAYER 3: MCP Server + LLM Orchestration
 | Data source | Sierra Chart `.scid` | Binary tick data, 40-byte records |
 | Database | SQLite (rusqlite) | Raw ticks, computed state, session history |
 | Compression | zstd | Cold storage archival |
-| Desktop frame | Tauri 2.x | Optional visualization layer (primary: MCP + Cursor agents) |
-| Frontend | React 19 + TypeScript | Optional UI (shadcn/ui, dark theme) — only when explicitly asked |
 | LLM | Claude API | Coaching prompts via Cursor agents |
 
 ---
@@ -105,21 +103,12 @@ These terms have precise meanings. Using them incorrectly will produce a broken 
 - Use `serde` with `#[serde(rename_all = "camelCase")]` for types that cross the IPC boundary
 - All pipeline calculations must be incremental (add new data, don't recalculate from scratch)
 - All public functions must have doc comments
-- Error handling: use `thiserror` for typed errors, convert to `String` at the Tauri command boundary only
+- Error handling: use `thiserror` for typed errors, convert to `String` at MCP tool / CLI boundaries only
 - Tests: every pipeline must have unit tests with known NQ data samples
-
-### TypeScript / React
-
-- Functional components with hooks only (no class components)
-- All Tauri IPC calls go through `src/lib/tauri-bridge.ts` — never call `invoke()` directly from components
-- All Tauri event listeners go in custom hooks under `src/hooks/`
-- Use TypeScript strict mode
-- State management: React Context for global state, local state for component-specific UI
-- No `any` types — define proper interfaces in `src/lib/types.ts`
 
 ### Shared
 
-- File names: kebab-case for TypeScript, snake_case for Rust (standard conventions)
+- File names: snake_case for Rust (standard conventions)
 - No hardcoded values — configuration goes in `~/.the-desk/config.toml`
 - No secrets in code — API keys go in environment or config, never committed
 - Every feature must work without the Claude API (graceful degradation to raw alerts)
@@ -148,9 +137,8 @@ Read these before working on related components:
 | Skill | When to Read | Path |
 |-------|-------------|------|
 | Trading Domain | Before implementing any pipeline or playbook logic | `skills/trading-domain/SKILL.md` |
-| Sierra SCID / feed | Before working on `.scid` tailing, symbol resolution, or `.depth` | `skills/trading-domain/SKILL.md` + `src-tauri/src/feed/` |
+| Sierra SCID / feed | Before working on `.scid` tailing, symbol resolution, or `.depth` | `skills/trading-domain/SKILL.md` + `src/feed/` |
 | Compliance | Before writing prompts or marketing text | `skills/compliance-research/SKILL.md` |
-| Tauri Bridge | Before implementing IPC between Rust and React | `skills/tauri-bridge/SKILL.md` |
 
 ---
 
@@ -158,9 +146,10 @@ Read these before working on related components:
 
 ```
 the-desk/
-├── src-tauri/src/                    # Rust backend (core)
+├── Cargo.toml                        # Rust package manifest (default-run: the-desk-mcp)
+├── src/                              # Library + binaries
+│   ├── lib.rs                        # Crate root (`the_desk_backend`)
 │   ├── bin/the-desk-mcp.rs           # MCP server binary (52 tools)
-│   ├── main.rs                       # Tauri app entry + processing loop
 │   ├── backfill.rs                   # Historical .scid backfill engine
 │   ├── research/mod.rs               # Query engine (frequency, conditional, distribution)
 │   ├── pipelines/                    # 14 pipeline modules + event detector
@@ -189,15 +178,13 @@ the-desk/
 │   ├── db/mod.rs                     # SQLite schema + operations
 │   ├── risk/mod.rs                   # Risk state tracking
 │   └── recording/mod.rs             # Session recording + replay
-├── src/                              # React frontend (optional — only when explicitly asked)
 ├── docs/
 │   ├── decision-log.md               # ADR-style decisions (living)
 │   └── archive/v0-tauri-gui/         # Pre-pivot planning docs (reference)
 ├── agents/                           # Cursor agent definitions
 ├── skills/                           # Domain knowledge for agents
 │   ├── trading-domain/SKILL.md       # TPO, delta, PTT methodology
-│   ├── compliance-research/          # Coaching vs advisory
-│   └── tauri-bridge/                 # IPC patterns
+│   └── compliance-research/          # Coaching vs advisory
 ├── .cursor/                          # Cursor IDE integration
 │   ├── mcp.json                      # MCP server config
 │   ├── agents/ → ../agents/

@@ -1,7 +1,6 @@
 pub mod backfill;
 pub mod db;
 pub mod depth;
-pub mod dom_replay;
 pub mod feed;
 pub mod memory;
 pub mod options;

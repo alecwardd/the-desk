@@ -1,7 +1,7 @@
 //! One-shot binary to initialize risk config and risk state.
 //! Run: cargo run --bin the-desk-init-risk
 //!
-//! Uses the same database as the-desk-mcp and Tauri app (~/.the-desk/data.db).
+//! Uses the same database as the-desk-mcp (~/.the-desk/data.db).
 
 use the_desk_backend::db::{Database, RiskConfigRecord};
 use the_desk_backend::risk::RiskState;

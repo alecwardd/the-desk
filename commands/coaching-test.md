@@ -1,20 +1,17 @@
 ---
 name: coaching-test
-description: Test the LLM coaching layer with simulated setup triggers. USE WHEN modifying prompts, testing Claude API integration, or verifying coaching output quality.
+description: Check coaching prompt quality and compliance. USE WHEN modifying prompts, MCP coaching-related tools, or verifying non-advisory phrasing.
 ---
 
 # /coaching-test
 
-Test coaching prompt generation with simulated scenarios.
+Validate coaching behavior without a frontend test suite (React was removed).
 
 ## Steps
 
-1. Run coaching prompt tests:
-   ```bash
-   cd src && npm test -- --grep "coaching"
-   ```
+1. **Manual / agent review:** Walk through orchestrator and risk-coach prompt templates in `agents/` and any coaching strings referenced from MCP or docs.
 
-2. Test each prompt type with sample data:
+2. Test each prompt type with sample structured data:
 
    **Setup Trigger Prompt:**
    - Input: DNVA Reversion setup triggered, price at 21432, DNP at 21448, upper DNVA at 21461
@@ -31,18 +28,10 @@ Test coaching prompt generation with simulated scenarios.
    - Input: first target hit, trader's plan says trim half
    - Verify: prompt references specific management rule, not generic advice
 
-3. Test graceful degradation:
-   - Simulate Claude API timeout
-   - Verify: raw alert displayed without coaching prose
-   - Verify: no crash, no hang, no blank screen
+3. **Graceful degradation:** Confirm raw alerts still surface when the Claude API is unavailable (no UI dependency).
 
 4. Compliance check (read `skills/compliance-research/SKILL.md` first):
-   - Scan all prompt templates for forbidden phrases
-   - Verify every prompt includes attribution to trader's rules
-   - Flag any language that could be interpreted as financial advice
+   - Scan prompt templates for forbidden phrases
+   - Verify attribution to trader's rules
 
-5. Report:
-   - All prompt types tested
-   - Compliance status (pass/fail with specific violations)
-   - API latency measurements
-   - Graceful degradation status
+5. Report: compliance status and any violations.

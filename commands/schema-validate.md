@@ -11,7 +11,7 @@ Validate all playbook definitions and database schema integrity.
 
 1. Run schema validation:
    ```bash
-   cd src-tauri && cargo test --lib db::schema_validation -- --nocapture
+   cargo test --lib db::schema_validation -- --nocapture
    ```
 
 2. Check all stored setups:

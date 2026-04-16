@@ -2,7 +2,7 @@
 name = "the-desk-backend"
 version = "0.1.0"
 edition = "2021"
-default-run = "the-desk-backend"
+default-run = "the-desk-mcp"
 
 [dependencies]
 chrono = { version = "0.4", features = ["serde"] }
@@ -14,15 +14,11 @@ rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tauri = { version = "2", features = [] }
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
 toml = "0.8"
 uuid = { version = "1", features = ["v4", "serde"] }
 zstd = "0.13"
-
-[build-dependencies]
-tauri-build = { version = "2", features = [] }
 
 [dev-dependencies]
 tempfile = "3"

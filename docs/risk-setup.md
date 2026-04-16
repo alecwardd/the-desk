@@ -64,7 +64,7 @@ No parameters required.
 cargo run --bin the-desk-init-risk
 ```
 
-This writes default risk config (R=80pts/$400, max 3R daily = $1,200, 3-loss circuit breaker) and creates the initial risk state row. Uses the same database as MCP and Tauri (`~/.the-desk/data.db`).
+This writes default risk config (R=80pts/$400, max 3R daily = $1,200, 3-loss circuit breaker) and creates the initial risk state row. Uses the same database as MCP (`~/.the-desk/data.db`).
 
 ## R Derivation
 
@@ -87,11 +87,6 @@ The current account-specific payout rules are:
 
 Those payout-cycle metrics are currently prompt-managed for the risk coach rather than persisted in the SQLite risk tables, so confirm them manually when payout eligibility matters.
 
-## Tauri App
+## MCP tools
 
-If using the Tauri desktop app, risk config and account state can also be set via:
-
-- `riskBridge.saveConfig(config)` — persist risk config  
-- `accountBridge.save(input)` — persist balance and positions  
-
-The MCP server shares the same SQLite database, so changes in either interface are visible to both.
+Use `save_risk_config`, `save_account_state`, and related tools from the MCP server to persist risk config and account state. All data lives in the same SQLite database under `~/.the-desk/data.db`.

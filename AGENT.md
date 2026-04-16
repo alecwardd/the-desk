@@ -13,7 +13,6 @@ Read these documents in order:
 1. **CLAUDE.md** — Project rules, architecture, conventions (READ FIRST)
 2. **README.md** — Architecture overview, project structure, data flow
 3. **Relevant skill** from `skills/` — Domain knowledge for your task
-4. **`docs/dom-replay.md`** — Required reading for DOM visualizer and historical ladder replay tasks
 
 ---
 
@@ -29,7 +28,6 @@ Sierra Chart (.scid) → Rust Pipeline Engine → SQLite → MCP Server → Curs
 **Key principles:**
 - Layers 1 (pipelines) and 2 (rules engine) are pure Rust, no network calls, sub-millisecond
 - Layer 3 (MCP + LLM coaching) can tolerate 1-5s latency
-- The Tauri desktop frame exists but is an optional visualization layer — MCP is the primary interface
 - **Every layer must be independently testable.** Never skip layers.
 
 ---
@@ -41,8 +39,6 @@ Sierra Chart (.scid) → Rust Pipeline Engine → SQLite → MCP Server → Curs
 - MCP server and tools
 - Agent definitions and prompts
 - SQLite, backfill, research queries
-
-**Secondary (only when explicitly asked):** The Tauri desktop app and React frontend (`src/`, `src-tauri` Tauri-specific code) are optional. Do NOT modify Tauri/React unless the user explicitly requests work on the desktop app, DOM replay, or UI.
 
 ---
 
@@ -61,7 +57,7 @@ When you need specialized help, spawn subagents for these tasks.
 
 ### Sierra data feed (.scid / `.depth`)
 **When:** Working on live ingestion, SCID tailing, symbol resolution, or `MarketDepthData` parsing
-**How:** Read `skills/trading-domain/SKILL.md` for session semantics; inspect `src-tauri/src/feed/scid_reader.rs` and `src-tauri/src/depth/` for formats. Live paths are **Sierra `.scid` + optional `.depth` files only** (no socket DTC client in-tree).
+**How:** Read `skills/trading-domain/SKILL.md` for session semantics; inspect `src/feed/scid_reader.rs` and `src/depth/` for formats. Live paths are **Sierra `.scid` + optional `.depth` files only** (no socket DTC client in-tree).
 
 ### Pipeline Verification
 **When:** After implementing or modifying a market structure pipeline
@@ -106,8 +102,6 @@ When you need specialized help, spawn subagents for these tasks.
 
 When implementing a feature:
 
-**Scope check:** Is this task about the Tauri app, DOM replay, or React UI? If no, focus on Rust/MCP. If yes, read `docs/dom-replay.md` (for DOM) or `skills/tauri-bridge/SKILL.md` (for IPC) first.
-
 1. **Read the relevant skill** from `skills/` for domain knowledge
 2. **Write the Rust code** in the appropriate module (`pipelines/`, `rules/`, `feed/`, `db/`)
 3. **Write tests** alongside the code — every pipeline must have unit tests
@@ -116,26 +110,13 @@ When implementing a feature:
 6. **Add MCP tool** in `src/bin/the-desk-mcp.rs` if agents need access
 7. **Run `cargo test`** before declaring done
 
-### DOM Replay / Tauri UI Tasks (Only When Explicitly Asked)
-
-If the task touches the DOM visualizer, historical ladder playback, or replay UI:
-
-1. Read `docs/dom-replay.md` before making changes
-2. Treat `src-tauri/src/dom_replay.rs` as the backend source of truth
-3. Keep DOM replay separate from `.desk` session replay in `src-tauri/src/recording/mod.rs`
-4. Preserve the current behavioral contract:
-   - SQLite first, Sierra file fallback second
-   - timestamp-based seek
-   - session-to-cursor volume profile
-   - no fake DOM when depth is unavailable
-
 ---
 
 ## Decision Framework
 
 | Question | Guidance |
 |----------|----------|
-| Should this be in Rust or TypeScript? | If it processes market data or evaluates rules → Rust. If it's UI-only → TypeScript. |
+| Should this be in Rust or somewhere else? | Market data, rules, persistence, and MCP → Rust. |
 | Should I add an MCP tool for this? | If an agent would benefit from querying this data → yes. Keep tools focused. |
 | Should I use the LLM for this? | If it can be computed deterministically → no LLM. If it requires synthesis → LLM. |
 | Should I add a new dependency? | Prefer existing deps. Check `Cargo.toml` first. |
@@ -323,15 +304,15 @@ For development without a live Sierra Chart connection, use `.scid` files from S
 
 ```bash
 # Run all tests
-cd src-tauri && cargo test
+cargo test
 
 # Run specific pipeline tests
-cd src-tauri && cargo test pipelines::tpo
-cd src-tauri && cargo test pipelines::delta
-cd src-tauri && cargo test pipelines::pinch
-cd src-tauri && cargo test pipelines::event_detector
+cargo test pipelines::tpo
+cargo test pipelines::delta
+cargo test pipelines::pinch
+cargo test pipelines::event_detector
 
 # Run research / backfill tests
-cd src-tauri && cargo test backfill
-cd src-tauri && cargo test research
+cargo test backfill
+cargo test research
 ```

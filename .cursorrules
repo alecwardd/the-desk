@@ -6,7 +6,7 @@ You are working on The Desk, a backend intelligence platform for discretionary N
 
 **Architecture:** Sierra Chart (.scid files) → Rust Pipeline Engine → SQLite → MCP Server → Cursor Agents
 
-**Stack:** Rust backend + SQLite + MCP (rmcp) + Tauri 2.x (optional visualization) + React/TypeScript (optional UI)
+**Stack:** Rust backend + SQLite + MCP (`rmcp`). No in-repo frontend.
 
 **Key constraint:** The Desk NEVER places trades, generates signals, or gives financial advice. It reflects the trader's own rules back to them.
 
@@ -15,13 +15,13 @@ You are working on The Desk, a backend intelligence platform for discretionary N
 1. Read `CLAUDE.md` for full project rules and "Never Do" list
 2. Read the relevant skill in `skills/` for domain knowledge:
    - Pipelines → `skills/trading-domain/SKILL.md`
-   - Sierra `.scid` / `.depth` → `skills/trading-domain/SKILL.md` + `src-tauri/src/feed/`
-   - IPC (Tauri/React) → `skills/tauri-bridge/SKILL.md` — only when explicitly working on desktop app or DOM replay
+   - Sierra `.scid` / `.depth` → `skills/trading-domain/SKILL.md` + `src/feed/`
    - UI copy/prompts → `skills/compliance-research/SKILL.md`
 
 ## Coding Patterns
 
-### Rust (src-tauri/)
+### Rust (`src/`)
+
 - All pipeline calculations are **incremental** — never recalculate from scratch
 - Use `tokio` async runtime, `serde` for serialization, `thiserror` for errors
 - NQ tick size = 0.25 points, tick value = $5.00. Never hardcode wrong values.
@@ -29,16 +29,12 @@ You are working on The Desk, a backend intelligence platform for discretionary N
 - MCP tools use `rmcp` with `#[tool_router]` / `#[tool_handler]` macros
 - Tool params: `Parameters(params): Parameters<T>` where T derives `Deserialize + JsonSchema + Default`
 
-### MCP Server (src/bin/the-desk-mcp.rs)
-- 33 tools exposed via stdio transport
+### MCP Server (`src/bin/the-desk-mcp.rs`)
+
+- Tools exposed via stdio transport
 - All tools return `Result<CallToolResult, McpError>`
 - Database access through `Arc<Mutex<Database>>`
 - New tools follow the pattern: add param struct, add `#[tool(...)]` handler, register in router
-
-### TypeScript (src/) — Optional UI Layer
-- All Tauri `invoke()` calls go through `src/lib/tauri-bridge.ts`
-- No `any` types. Define interfaces in `src/lib/types.ts`
-- Components use shadcn/ui with dark theme
 
 ## Trading Terms (Get These Right)
 

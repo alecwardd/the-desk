@@ -1,6 +1,6 @@
 ---
 name: rust-check
-description: Run Rust formatting, lint, build, and tests for src-tauri. USE WHEN changing Rust code or debugging backend/engine failures.
+description: Run Rust formatting, lint, build, and tests at repo root. USE WHEN changing Rust code or debugging backend/engine failures.
 ---
 
 # /rust-check
@@ -11,7 +11,7 @@ Run the full Rust verification pipeline for The Desk backend.
 
 1. **Format check, lint, build, test:**
    ```bash
-   cd src-tauri && cargo fmt --check && cargo clippy -- -D warnings && cargo build && cargo test
+   cargo fmt --check && cargo clippy -- -D warnings && cargo build && cargo test
    ```
 
 2. **If failures occur, report:**

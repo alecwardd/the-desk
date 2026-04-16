@@ -20,13 +20,13 @@ Sierra Chart (.scid files) → Rust Pipeline Engine → SQLite → MCP Server �
 8. **Specialized subagents** (market structure, order flow, levels, performance) access domain-specific tools and report to the orchestrator
 9. **You chat with agents** in Cursor who reference live (1-5s delayed) market data and historical statistics
 
-The primary interaction is via Cursor agents. The Tauri desktop app (DOM replay, optional dashboards) is secondary — use it when you want a visual replay; agents focus on backend and MCP by default.
+The primary interaction is via Cursor agents and MCP tools (stdio). There is no desktop or web UI in this repository.
 
 ## Ingestion Modes
 
 The Desk intentionally runs three ingestion paths:
 
-1. **Startup warm-backfill (MCP/Tauri startup):** reads recent `.scid` history to seed in-memory pipeline state quickly.
+1. **Startup warm-backfill (MCP startup):** reads recent `.scid` history to seed in-memory pipeline state quickly.
 2. **Historical research backfill (`backfill_history`):** queues a background historical job that streams `.scid` data into `session_summaries` + `market_events` without blocking the MCP server (`get_backfill_status` polls progress, `cancel_backfill` cancels long runs).
 3. **Live tail persistence:** polls `.scid` for new records, updates pipelines incrementally, and batch-writes `raw_ticks`.
 
@@ -83,16 +83,14 @@ Use `get_feed_health` and `validate_data_integrity` to confirm feed freshness an
 | MCP server | `rmcp` crate, stdio transport |
 | Data source | Sierra Chart `.scid` files (binary, 40-byte records) |
 | Compression | zstd (cold storage archival) |
-| Desktop frame | Tauri 2.x (optional visualization layer) |
-| Frontend | React 19 + TypeScript + shadcn/ui (optional) |
 
 ## Project Structure
 
 ```
 the-desk/
-├── src-tauri/src/
-│   ├── bin/the-desk-mcp.rs     # MCP server binary (33 tools)
-│   ├── main.rs                 # Tauri app entry + processing loop
+├── Cargo.toml                  # Rust package (default-run: the-desk-mcp)
+├── src/
+│   ├── bin/the-desk-mcp.rs     # MCP server binary
 │   ├── lib.rs                  # Module exports
 │   ├── backfill.rs             # Historical .scid backfill engine
 │   ├── research/mod.rs         # Query engine (frequency, conditional, distribution)
@@ -124,9 +122,8 @@ the-desk/
 │   ├── recording/mod.rs        # Session recording + replay
 ├── skills/                     # Domain knowledge for agents
 │   ├── trading-domain/SKILL.md # TPO, delta, PTT methodology
-│   ├── compliance-research/    # Coaching vs advisory positioning
-│   └── tauri-bridge/           # IPC patterns
-├── docs/dom-replay.md          # DOM replay visualizer guide for users and agents
+│   └── compliance-research/    # Coaching vs advisory positioning
+├── docs/dom-replay.md          # Note on removed DOM visualizer (MCP depth tools remain)
 ├── agents/                     # Cursor agent definitions
 ├── CLAUDE.md                   # Project rules for all agents
 └── AGENT.md                    # Agent workflow instructions
@@ -175,19 +172,19 @@ Once running, any Cursor agent can call tools like `get_market_snapshot`, `get_d
 ### Development
 
 ```bash
-# Run all tests (89 tests across pipelines, event detector, rules, db, research, dtc, recording)
-cd src-tauri && cargo test
+# From repository root — run all tests (pipelines, rules, db, research, MCP helpers, etc.)
+cargo test
 
 # Check compilation
-cd src-tauri && cargo check
+cargo check
 
 # Build MCP server (release)
-cd src-tauri && cargo build --release --bin the-desk-mcp
+cargo build --release --bin the-desk-mcp
 
 # Queue a historical backfill via MCP, then poll `get_backfill_status`
 
 # Run backfill from CLI (no MCP needed — useful for weekend prep)
-cd src-tauri && cargo run --bin the-desk-backfill -- --start 2026-03-02 --end 2026-03-06 --run-rules
+cargo run --bin the-desk-backfill -- --start 2026-03-02 --end 2026-03-06 --run-rules
 # Or load all available: cargo run --bin the-desk-backfill -- --run-rules
 ```
 
@@ -197,19 +194,6 @@ Historical jobs are asynchronous:
 2. Poll `get_backfill_status(jobId)`
 3. Inspect the final `result` when status is `completed`
 4. Call `cancel_backfill(jobId)` to stop a long-running replay safely
-
-## DOM Replay Visualizer
-
-The desktop app now includes a historical DOM replay workspace for NQ.
-
-- Open the app and use the footer navigation to select `DOM`
-- Load a 30-minute clip with `Start` and `End`
-- Replay at original tempo or slow it down with the speed controls
-- Use the scrubber to jump to a timestamp while keeping the ladder, tape, and session-to-cursor profile aligned
-
-The visualizer uses SQLite depth/tick history first and falls back to Sierra `.depth` / `.scid` files when needed. It is designed for review and research, not order entry.
-
-See [docs/dom-replay.md](/C:/the-desk/docs/dom-replay.md) for the full guide.
 
 ## Data Flow & Latency
 

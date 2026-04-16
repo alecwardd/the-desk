@@ -74,7 +74,7 @@ For weekly: each *week's* low > prior week's low (OTFU) or each week's high < pr
   - First violation → BALANCE; record invalidation level
 5. Return state, duration, invalidation level, and last N bars
 
-**Placement:** New tool in [the-desk-mcp.rs](c:\the-desk\src-tauri\src\bin\the-desk-mcp.rs); computation in [research](c:\the-desk\src-tauri\src\research) module (Layer 2.5) since it's historical aggregation, not live pipeline.
+**Placement:** New tool in [the-desk-mcp.rs](c:\the-desk\src\bin\the-desk-mcp.rs); computation in [research](c:\the-desk\src\research) module (Layer 2.5) since it's historical aggregation, not live pipeline.
 
 ---
 
@@ -109,13 +109,13 @@ Daily OTF can still be inferred from `get_session_history` (existing behavior), 
 
 | Task                      | Location                                  | Description                                                                                                             |
 | ------------------------- | ----------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
-| Research module OTF logic | `src-tauri/src/research/mod.rs`           | Add `one_timeframe_state(db, timeframe, lookback)` that aggregates session_summaries, computes OTF                      |
-| DB helper                 | `src-tauri/src/db/mod.rs`                 | Optional: `list_session_summaries_for_date_range(&self, start, end)` if not already covered by `list_session_summaries` |
-| MCP tool                  | `src-tauri/src/bin/the-desk-mcp.rs`       | Add `get_one_timeframe_state` tool, param struct, wire to research                                                      |
+| Research module OTF logic | `src/research/mod.rs`           | Add `one_timeframe_state(db, timeframe, lookback)` that aggregates session_summaries, computes OTF                      |
+| DB helper                 | `src/db/mod.rs`                 | Optional: `list_session_summaries_for_date_range(&self, start, end)` if not already covered by `list_session_summaries` |
+| MCP tool                  | `src/bin/the-desk-mcp.rs`       | Add `get_one_timeframe_state` tool, param struct, wire to research                                                      |
 | MCP descriptor            | `mcps/project-0-the-desk-the-desk/tools/` | Add `get_one_timeframe_state.json` for Cursor discovery                                                                 |
 | Agent definition          | `agents/market-structure-analyst.md`      | Add tool, update step 1, remove OTF limitation, update output format                                                    |
 | Trading-domain skill      | `skills/trading-domain/SKILL.md`          | Optional: Add short OTF subsection if not already present                                                               |
-| Tests                     | `src-tauri/src/research/` + `db/`         | Unit tests with known session data (e.g. 5 weeks of synthetic bars)                                                     |
+| Tests                     | `src/research/` + `db/`         | Unit tests with known session data (e.g. 5 weeks of synthetic bars)                                                     |
 
 
 ---

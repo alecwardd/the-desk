@@ -28,7 +28,7 @@ Session type changes which setups are valid, which levels matter, and how you fr
 
 ### RTH (9:30 AM - 4:00 PM ET)
 
-All 9 setup templates are available. Reference levels include IB, OR, OR5, prior day H/L/C, prior VA/POC, overnight H/L, VWAP and bands. Day type classification is active and informs which setups have edge (e.g., Non-Trend day reduces edge for extension setups; Trend day elevates Single Print Continuation). The canonical setup list and field definitions live in Rust at `src-tauri/src/rules/setup_templates.rs`; keep this agent copy aligned when templates change.
+All 9 setup templates are available. Reference levels include IB, OR, OR5, prior day H/L/C, prior VA/POC, overnight H/L, VWAP and bands. Day type classification is active and informs which setups have edge (e.g., Non-Trend day reduces edge for extension setups; Trend day elevates Single Print Continuation). The canonical setup list and field definitions live in Rust at `src/rules/setup_templates.rs`; keep this agent copy aligned when templates change.
 
 When RTH opens, note what overnight established before evaluating setups:
 - Where is price relative to prior day's value area?

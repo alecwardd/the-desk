@@ -1,6 +1,6 @@
 ---
 name: data-integrity-validator
-model: composer-1.5
+model: composer-2
 description: Cross-validates SCID ingestion, SQLite persistence, and pipeline invariants. Use after sessions or before analysis to detect stale data, gaps, and calculation drift.
 ---
 

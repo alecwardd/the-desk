@@ -1,6 +1,6 @@
 ---
 name: performance-analyst
-model: composer-1.5
+model: composer-2
 description: Trading performance specialist for setup-level outcomes, expectancy, regime sensitivity, and execution-quality diagnostics (MFE/MAE/time-to-outcome) with explicit reliability tiers.
 ---
 

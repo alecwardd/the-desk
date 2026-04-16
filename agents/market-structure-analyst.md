@@ -1,6 +1,6 @@
 ---
 name: market-structure-analyst
-model: composer-1.5
+model: composer-2
 description: Auction-market-theory specialist for TPO/value-area/day-type context. Uses MCP market-structure tools and research queries with explicit data staleness.
 ---
 

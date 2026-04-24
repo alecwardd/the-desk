@@ -96,6 +96,8 @@ pub struct LevelsPipeline {
     pub session_high: f64,
     /// Current RTH session low.
     pub session_low: f64,
+    /// First RTH trade price for the current session (RTH open).
+    pub session_open_price: f64,
     /// Most recent trade price seen by this pipeline.
     pub last_price: f64,
     /// Last trade price observed during RTH only.
@@ -134,6 +136,7 @@ impl Default for LevelsPipeline {
             overnight_low: 0.0,
             session_high: 0.0,
             session_low: 0.0,
+            session_open_price: 0.0,
             last_price: 0.0,
             rth_close_price: 0.0,
             globex_or30_high: 0.0,
@@ -149,6 +152,13 @@ impl Default for LevelsPipeline {
 }
 
 impl LevelsPipeline {
+    /// True if any RTH trade has been observed in the current session. Used by
+    /// the live boundary helper to skip RTH-close finalization on cold-start
+    /// where no RTH ticks were ever processed.
+    pub fn rth_started(&self) -> bool {
+        self.rth_started
+    }
+
     /// Reset session tracking while preserving prior-day levels.
     /// If RTH was active (RTH→Globex transition), saves prior-day reference
     /// and clears overnight range for fresh Globex tracking.
@@ -175,6 +185,7 @@ impl LevelsPipeline {
         }
         self.session_high = 0.0;
         self.session_low = 0.0;
+        self.session_open_price = 0.0;
         self.rth_close_price = 0.0;
         self.rth_started = false;
     }
@@ -270,6 +281,7 @@ impl LevelsPipeline {
                 }
                 self.session_high = price;
                 self.session_low = price;
+                self.session_open_price = price;
                 self.rth_close_price = price;
                 self.rth_started = true;
             }

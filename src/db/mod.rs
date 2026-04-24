@@ -6334,6 +6334,98 @@ impl Database {
         Ok(rows)
     }
 
+    /// Count playbook signals fired between `start_ms` and `end_ms` (inclusive
+    /// of `start`, exclusive of `end`). Used at RTH-close finalization to
+    /// populate `session_summaries.signal_count` from the same source the live
+    /// ingest path already wrote into.
+    pub fn count_playbook_signals_in_range(
+        &self,
+        start_ms: f64,
+        end_ms: f64,
+    ) -> Result<i64, DbError> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(1) FROM playbook_signals
+             WHERE timestamp_ms >= ?1 AND timestamp_ms < ?2",
+            params![start_ms, end_ms],
+            |r| r.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// Atomically persist the session_summaries row and the prior_day_levels
+    /// carry-forward for a just-closed RTH (or other) session inside a single
+    /// `BEGIN IMMEDIATE` transaction. This is the live counterpart of
+    /// `persist_historical_session` for the boundary-driven path that runs
+    /// inside the MCP ingest loop.
+    ///
+    /// `prior_day` packs `(high, low, close, va_high, va_low, poc, dnva_high,
+    /// dnva_low, dnp)` for the carry-forward row. Both writes commit together
+    /// or roll back together so a crash mid-write cannot leave the next
+    /// session reading half-updated levels.
+    pub fn persist_live_session_close(
+        &self,
+        summary: &SessionSummary,
+        prior_day: (f64, f64, f64, f64, f64, f64, f64, f64, f64),
+    ) -> Result<(), DbError> {
+        self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        let result = (|| -> Result<(), DbError> {
+            self.upsert_session_summary(summary)?;
+            self.save_prior_day_full_with_dnva_contract(
+                &summary.session_date,
+                prior_day.0,
+                prior_day.1,
+                prior_day.2,
+                prior_day.3,
+                prior_day.4,
+                prior_day.5,
+                Some(prior_day.6),
+                Some(prior_day.7),
+                Some(prior_day.8),
+                Some(summary.root_symbol.as_str()),
+                Some(summary.contract_symbol.as_str()),
+            )?;
+            // Mirror persist_historical_session: track untested DNPs so the
+            // research layer stays consistent regardless of whether the
+            // session was closed live or via backfill.
+            const DNP_TOLERANCE: f64 = 0.5;
+            if summary.low > 0.0 || summary.high > 0.0 {
+                self.delete_untested_dnps_touched_by_range(
+                    summary.low,
+                    summary.high,
+                    DNP_TOLERANCE,
+                    Some((&summary.session_date, &summary.session_type)),
+                )?;
+            }
+            if summary.dnp > 0.0 {
+                let dnp_tested = (summary.low <= summary.dnp + DNP_TOLERANCE)
+                    && (summary.high >= summary.dnp - DNP_TOLERANCE);
+                if dnp_tested {
+                    self.delete_untested_dnp_for_session(
+                        &summary.session_date,
+                        &summary.session_type,
+                    )?;
+                } else {
+                    self.save_untested_dnp(
+                        &summary.session_date,
+                        &summary.session_type,
+                        summary.dnp,
+                    )?;
+                }
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(err) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(err)
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn persist_historical_session(
         &self,

@@ -139,6 +139,12 @@ impl TapePacePipeline {
         self.dwell_tracker.reset();
     }
 
+    /// Most recent trade timestamp observed by this pipeline (epoch ms).
+    /// Returns `None` before any trade has been recorded or after `reset()`.
+    pub fn last_trade_timestamp_ms(&self) -> Option<f64> {
+        self.last_trade_timestamp_ms
+    }
+
     pub fn on_trade(&mut self, timestamp_ms: f64, volume: f64, price: f64) {
         if self.session_start_ms.is_none() {
             self.session_start_ms = Some(timestamp_ms);

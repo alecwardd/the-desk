@@ -7394,6 +7394,349 @@ fn read_scid_poll_step(
     })
 }
 
+/// Compute the RTH window in epoch milliseconds for a given session_date
+/// (`YYYY-MM-DD` interpreted as Eastern). Returns `(start_ms, end_ms)` where
+/// `start = 09:30 ET` and `end = 16:00 ET` on that date. Returns `None` on
+/// parse failure or DST ambiguity.
+fn rth_window_ms_for_date(session_date: &str) -> Option<(f64, f64)> {
+    use chrono::NaiveDate;
+    use chrono_tz::US::Eastern;
+    let date = NaiveDate::parse_from_str(session_date, "%Y-%m-%d").ok()?;
+    let open_naive = date.and_hms_opt(9, 30, 0)?;
+    let close_naive = date.and_hms_opt(16, 0, 0)?;
+    let open_ms = Eastern
+        .from_local_datetime(&open_naive)
+        .single()?
+        .timestamp_millis() as f64;
+    let close_ms = Eastern
+        .from_local_datetime(&close_naive)
+        .single()?
+        .timestamp_millis() as f64;
+    Some((open_ms, close_ms))
+}
+
+fn contract_scope(
+    contract_metadata: &the_desk_backend::feed::ContractMetadata,
+) -> (Option<&str>, Option<&str>) {
+    let root_symbol = contract_metadata.root_symbol.trim();
+    let contract_symbol = contract_metadata.contract_symbol.trim();
+    (
+        (!root_symbol.is_empty()).then_some(root_symbol),
+        (!contract_symbol.is_empty()).then_some(contract_symbol),
+    )
+}
+
+fn contract_session_scope(
+    contract_metadata: &the_desk_backend::feed::ContractMetadata,
+) -> Option<SessionScopeFilter> {
+    let (root_symbol, contract_symbol) = contract_scope(contract_metadata);
+    if root_symbol.is_none() && contract_symbol.is_none() {
+        return None;
+    }
+    Some(SessionScopeFilter {
+        root_symbol: root_symbol.map(ToString::to_string),
+        contract_symbol: contract_symbol.map(ToString::to_string),
+        include_rollover_sessions: false,
+        ..Default::default()
+    })
+}
+
+/// Outcome of a successful RTH close finalization, used for logging/telemetry
+/// and consumed by the boundary-recovery tests to assert the just-closed
+/// metrics match what was persisted.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct RthCloseResult {
+    session_date: String,
+    high: f64,
+    low: f64,
+    close: f64,
+    session_delta: f64,
+}
+
+#[derive(Debug)]
+#[allow(dead_code)]
+enum RthCloseFinalizeError {
+    PipelineLockUnavailable(&'static str),
+    DbLockUnavailable,
+    Persist(the_desk_backend::db::DbError),
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Atomically finalize an RTH session at the first non-RTH tick after `RTH_CLOSE_ET`.
+///
+/// Builds a `SessionSummary` from the current pipeline state using the same
+/// `summary_from_state` helper the backfill path uses, persists both the
+/// `session_summaries` row and the `prior_day_levels` carry-forward row in a
+/// single SQLite transaction, and then refreshes the in-memory carry-forward
+/// state (`LevelsPipeline` prior_*, `SessionInventoryPipeline` prior_sessions)
+/// directly from the just-built data so the next session reads consistent
+/// levels without having to re-query SQLite immediately.
+///
+/// Returns `None` if no RTH session was active (cold-start or post-close
+/// re-entry where the pipeline has already been reset). Otherwise returns a
+/// summary of the just-closed session for logging.
+fn finalize_rth_close(
+    pipelines: &Arc<Mutex<PipelineEngine>>,
+    db: &Arc<Mutex<Database>>,
+    detector: Option<&Arc<Mutex<EventDetector>>>,
+    flow_emitter: Option<&Arc<Mutex<FlowEventEmitter>>>,
+    boundary_tick_ts: f64,
+    last_bid_hint: f64,
+    last_ask_hint: f64,
+    contract_metadata: &the_desk_backend::feed::ContractMetadata,
+) -> Result<Option<RthCloseResult>, RthCloseFinalizeError> {
+    use the_desk_backend::pipelines::{MarketState, PriorSessionData, SessionEndState};
+
+    struct CloseData {
+        snapshot: MarketState,
+        open_price: f64,
+        tick_count: i64,
+        total_volume: f64,
+        end_state: SessionEndState,
+        close_ts: f64,
+        session_delta: f64,
+    }
+
+    let close_data = {
+        let p = pipelines
+            .lock()
+            .map_err(|_| RthCloseFinalizeError::PipelineLockUnavailable("snapshot"))?;
+        if !p.levels.rth_started() {
+            return Ok(None);
+        }
+        let close_ts = p
+            .tape_pace
+            .last_trade_timestamp_ms()
+            .unwrap_or(boundary_tick_ts);
+        let bid = if last_bid_hint > 0.0 {
+            last_bid_hint
+        } else {
+            (p.levels.last_price - 0.25).max(0.0)
+        };
+        let ask = if last_ask_hint > 0.0 {
+            last_ask_hint
+        } else {
+            p.levels.last_price + 0.25
+        };
+        let snapshot = p.snapshot_at(bid, ask, close_ts);
+        let open_price = p.levels.session_open_price;
+        let tick_count = p.vwap.trade_count() as i64;
+        let total_volume = p.rvol.session_volume();
+        let end_state = p.session_end_state();
+        let session_delta = snapshot.session_delta;
+        CloseData {
+            snapshot,
+            open_price,
+            tick_count,
+            total_volume,
+            end_state,
+            close_ts,
+            session_delta,
+        }
+    };
+
+    let session_date = session_date_from_timestamp_ms(close_data.close_ts);
+    let signal_count = if let Some((rth_start, rth_end)) = rth_window_ms_for_date(&session_date) {
+        if let Ok(d) = db.lock() {
+            d.count_playbook_signals_in_range(rth_start, rth_end)
+                .unwrap_or(0)
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+
+    let mut summary = backfill::summary_from_state(
+        &close_data.snapshot,
+        &session_date,
+        "RTH",
+        close_data.open_price,
+        close_data.tick_count,
+        close_data.total_volume,
+        signal_count,
+    );
+
+    // Stamp contract metadata so the persisted row matches the active contract
+    // even if the snapshot was built before set_contract_metadata propagated.
+    if summary.root_symbol.is_empty() {
+        summary.root_symbol = contract_metadata.root_symbol.clone();
+    }
+    if summary.contract_symbol.is_empty() {
+        summary.contract_symbol = contract_metadata.contract_symbol.clone();
+    }
+    if summary.contract_month.is_none() {
+        summary.contract_month = contract_metadata.contract_month.clone();
+    }
+    if summary.symbol_resolution_mode.is_empty() {
+        summary.symbol_resolution_mode = contract_metadata.symbol_resolution_mode.clone();
+    }
+
+    let prior_day_tuple = (
+        close_data.end_state.high,
+        close_data.end_state.low,
+        close_data.end_state.close,
+        close_data.end_state.va_high,
+        close_data.end_state.va_low,
+        close_data.end_state.poc,
+        close_data.end_state.dnva_high,
+        close_data.end_state.dnva_low,
+        close_data.end_state.dnp,
+    );
+
+    db.lock()
+        .map_err(|_| RthCloseFinalizeError::DbLockUnavailable)?
+        .persist_live_session_close(&summary, prior_day_tuple)
+        .map_err(RthCloseFinalizeError::Persist)?;
+
+    let mut p = pipelines
+        .lock()
+        .map_err(|_| RthCloseFinalizeError::PipelineLockUnavailable("carry_forward_refresh"))?;
+    // Refresh in-memory carry-forward directly from the just-built data so
+    // the next session reads consistent state without re-querying SQLite.
+    let just_closed = PriorSessionData {
+        final_delta: close_data.session_delta,
+        dnva_high: close_data.end_state.dnva_high,
+        dnva_low: close_data.end_state.dnva_low,
+        dnp: close_data.end_state.dnp,
+    };
+    // Anticipate Globex (the next visible session). Levels::reset_session()
+    // copies session_high/low/close into prior_day_*; we then apply
+    // VA/POC/DNVA from the just-built end_state directly because
+    // reset_session() does not touch those.
+    p.reset_session_with_type(true);
+    p.levels.set_prior_profile(
+        close_data.end_state.va_high,
+        close_data.end_state.va_low,
+        close_data.end_state.poc,
+    );
+    p.levels.set_prior_dnva(
+        close_data.end_state.dnva_high,
+        close_data.end_state.dnva_low,
+        close_data.end_state.dnp,
+    );
+    p.levels.set_prior_day_contract_context(
+        Some(contract_metadata.root_symbol.as_str()),
+        Some(contract_metadata.contract_symbol.as_str()),
+        Some(contract_metadata.contract_symbol.as_str()),
+    );
+    if just_closed.dnva_high > 0.0 && just_closed.dnva_low > 0.0 && just_closed.dnp > 0.0 {
+        p.session_inventory.push_just_closed_session(just_closed, 5);
+    }
+    drop(p);
+
+    if let Some(det) = detector {
+        if let Ok(mut d) = det.lock() {
+            d.reset();
+        }
+    }
+    if let Some(fe) = flow_emitter {
+        if let Ok(mut emitter) = fe.lock() {
+            emitter.reset();
+        }
+    }
+
+    eprintln!(
+        "[the-desk-mcp] RTH close finalized atomically for {session_date}: H={:.2} L={:.2} C={:.2} delta={:.0} signals={signal_count}",
+        close_data.end_state.high,
+        close_data.end_state.low,
+        close_data.end_state.close,
+        close_data.session_delta,
+    );
+
+    Ok(Some(RthCloseResult {
+        session_date,
+        high: close_data.end_state.high,
+        low: close_data.end_state.low,
+        close: close_data.end_state.close,
+        session_delta: close_data.session_delta,
+    }))
+}
+
+/// Reset pipelines for a new session and load the most recent prior-day /
+/// prior-session inventory references from SQLite. Used at session boundaries
+/// other than the RTH close (which goes through `finalize_rth_close`).
+///
+/// Idempotent: safe to invoke even when in-memory state was already prepared
+/// by a prior `finalize_rth_close` (the DB read returns the same atomically
+/// persisted values).
+fn prepare_for_new_session(
+    pipelines: &Arc<Mutex<PipelineEngine>>,
+    db: &Arc<Mutex<Database>>,
+    new_session: SessionType,
+    new_segment: DeltaSegment,
+    boundary_tick_ts: f64,
+    contract_metadata: &the_desk_backend::feed::ContractMetadata,
+) {
+    let lookup_date = session_date_from_timestamp_ms(boundary_tick_ts);
+    let (root_symbol, contract_symbol) = contract_scope(contract_metadata);
+    let prior = if let Ok(d) = db.lock() {
+        d.load_prior_day_reference_scoped(&lookup_date, root_symbol, contract_symbol)
+            .unwrap_or(None)
+    } else {
+        None
+    };
+
+    if let Ok(mut p) = pipelines.lock() {
+        p.reset_session_with_type(new_session == SessionType::Globex);
+        if matches!(new_session, SessionType::Rth | SessionType::Globex) {
+            if let Some(prior_ref) = prior {
+                p.levels
+                    .set_prior_day(prior_ref.high, prior_ref.low, prior_ref.close);
+                p.levels.set_prior_day_contract_context(
+                    prior_ref.root_symbol.as_deref(),
+                    prior_ref.contract_symbol.as_deref(),
+                    contract_symbol,
+                );
+                if let (Some(vh), Some(vl), Some(pc)) =
+                    (prior_ref.va_high, prior_ref.va_low, prior_ref.poc)
+                {
+                    p.levels.set_prior_profile(vh, vl, pc);
+                }
+                if let (Some(dh), Some(dl), Some(dp)) =
+                    (prior_ref.dnva_high, prior_ref.dnva_low, prior_ref.dnp)
+                {
+                    p.levels.set_prior_dnva(dh, dl, dp);
+                }
+            } else {
+                p.levels
+                    .set_prior_day_contract_context(root_symbol, None, contract_symbol);
+            }
+        }
+    }
+
+    let inv_session_type = if new_session == SessionType::Rth {
+        "RTH"
+    } else if new_segment == DeltaSegment::Asia {
+        "Asia"
+    } else {
+        "London"
+    };
+
+    let scope = contract_session_scope(contract_metadata);
+    let mut prior_inv: Vec<PriorSessionData> = if let Ok(d) = db.lock() {
+        d.list_session_summaries_scoped(None, None, None, Some(inv_session_type), 5, scope.as_ref())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|s| s.dnva_high > 0.0 && s.dnva_low > 0.0 && s.dnp > 0.0)
+            .map(|s| PriorSessionData {
+                final_delta: s.session_delta,
+                dnva_high: s.dnva_high,
+                dnva_low: s.dnva_low,
+                dnp: s.dnp,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    prior_inv.reverse();
+
+    if let Ok(mut p) = pipelines.lock() {
+        p.session_inventory.load_prior_sessions(prior_inv);
+    }
+}
+
 /// Warm-replay SCID ticks into the live pipeline up to a pre-captured cutover offset.
 ///
 /// The returned `cutover_offset` is the last fully consumed SCID offset, not the requested target,
@@ -7405,6 +7748,7 @@ fn run_startup_warm_replay(
     db: &Arc<Mutex<Database>>,
     since_ms: f64,
     requested_cutover_offset: u64,
+    contract_metadata: &the_desk_backend::feed::ContractMetadata,
 ) -> StartupWarmReplayResult {
     let replay_batch =
         match reader.read_bulk_since_until_offset(Some(since_ms), requested_cutover_offset) {
@@ -7464,47 +7808,25 @@ fn run_startup_warm_replay(
         if let Some(et_min) = et_minutes_from_timestamp(tick.timestamp_ms) {
             let new_session = classify_session(et_min);
             let new_segment = classify_delta_segment(et_min);
+            let session_changed = new_session != current_session;
+            let exiting_rth = current_session == SessionType::Rth && session_changed;
 
-            if new_session != current_session
-                && current_session != SessionType::Unknown
-                && new_session != SessionType::Unknown
-            {
-                let end_state = if current_session == SessionType::Rth {
-                    Some(pipelines_guard.session_end_state())
-                } else {
-                    None
-                };
-                let date = session_date_from_timestamp_ms(tick.timestamp_ms);
-                let today_str = session_date_from_timestamp_ms(tick.timestamp_ms);
+            if exiting_rth {
+                // RTH close: atomically persist the session_summaries +
+                // prior_day_levels rows together so the next session can
+                // never observe half-updated carry-forward state if the
+                // process crashes between 16:00 and 18:00 ET.
                 drop(pipelines_guard);
-                if let Some(ref es) = end_state {
-                    if let Ok(db) = db.lock() {
-                        let _ = db.save_prior_day_full_with_dnva(
-                            &date,
-                            es.high,
-                            es.low,
-                            es.close,
-                            es.va_high,
-                            es.va_low,
-                            es.poc,
-                            Some(es.dnva_high),
-                            Some(es.dnva_low),
-                            Some(es.dnp),
-                        );
-                        eprintln!(
-                            "[the-desk-mcp] Session boundary: RTH→Globex, saved prior day H={:.2} L={:.2} C={:.2}",
-                            es.high, es.low, es.close
-                        );
-                    }
-                }
-
-                let prior = {
-                    if let Ok(db) = db.lock() {
-                        db.load_prior_day_full(&today_str)
-                    } else {
-                        Ok(None)
-                    }
-                };
+                let finalize = finalize_rth_close(
+                    pipelines,
+                    db,
+                    None,
+                    Some(flow_emitter),
+                    tick.timestamp_ms,
+                    tick.bid,
+                    tick.ask,
+                    contract_metadata,
+                );
                 pipelines_guard = match pipelines.lock() {
                     Ok(p) => p,
                     Err(_) => {
@@ -7514,46 +7836,34 @@ fn run_startup_warm_replay(
                         };
                     }
                 };
-                pipelines_guard.reset_session_with_type(new_session == SessionType::Globex);
-                if new_session == SessionType::Rth || new_session == SessionType::Globex {
-                    if let Ok(Some((h, l, c, va_h, va_l, poc, dnva_h, dnva_l, dnp))) = prior {
-                        pipelines_guard.levels.set_prior_day(h, l, c);
-                        if let (Some(vh), Some(vl), Some(pc)) = (va_h, va_l, poc) {
-                            pipelines_guard.levels.set_prior_profile(vh, vl, pc);
-                        }
-                        if let (Some(dh), Some(dl), Some(dp)) = (dnva_h, dnva_l, dnp) {
-                            pipelines_guard.levels.set_prior_dnva(dh, dl, dp);
-                        }
+                match finalize {
+                    Ok(_) => {
+                        boundary_count += 1;
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "[the-desk-mcp] Warm-replay RTH close finalization failed at {:.0}: {:?}; keeping boundary pinned to RTH so the next post-close tick retries before mixed-session state can accumulate",
+                            tick.timestamp_ms, err
+                        );
+                        continue;
                     }
                 }
-
-                let inv_session_type = if new_session == SessionType::Rth {
-                    "RTH"
-                } else if new_segment == DeltaSegment::Asia {
-                    "Asia"
-                } else {
-                    "London"
-                };
+            } else if session_changed
+                && new_session != SessionType::Unknown
+                && current_session != SessionType::Unknown
+            {
+                // Other known→known session transitions (e.g. Globex→RTH at
+                // 09:30 ET). Reuses prepare_for_new_session for consistency
+                // with the live path.
                 drop(pipelines_guard);
-                if let Ok(db) = db.lock() {
-                    if let Ok(summaries) =
-                        db.list_session_summaries(None, None, None, Some(inv_session_type), 5)
-                    {
-                        let prior_inv: Vec<PriorSessionData> = summaries
-                            .into_iter()
-                            .filter(|s| s.dnva_high > 0.0 && s.dnva_low > 0.0 && s.dnp > 0.0)
-                            .map(|s| PriorSessionData {
-                                final_delta: s.session_delta,
-                                dnva_high: s.dnva_high,
-                                dnva_low: s.dnva_low,
-                                dnp: s.dnp,
-                            })
-                            .collect();
-                        if let Ok(mut p) = pipelines.lock() {
-                            p.session_inventory.load_prior_sessions(prior_inv);
-                        }
-                    }
-                }
+                prepare_for_new_session(
+                    pipelines,
+                    db,
+                    new_session,
+                    new_segment,
+                    tick.timestamp_ms,
+                    contract_metadata,
+                );
                 pipelines_guard = match pipelines.lock() {
                     Ok(p) => p,
                     Err(_) => {
@@ -7564,7 +7874,37 @@ fn run_startup_warm_replay(
                     }
                 };
                 boundary_count += 1;
-            } else if new_segment != current_delta_segment
+            } else if session_changed
+                && current_session == SessionType::Unknown
+                && new_session != SessionType::Unknown
+            {
+                // Unknown→known transition (e.g. Unknown→Globex at 18:00 ET
+                // after the 16:00 ET close finalization, or cold start
+                // crossing into RTH/Globex). prepare_for_new_session is
+                // idempotent: if state was already prepared by an earlier
+                // finalize_rth_close, the DB read returns the same atomically
+                // persisted values.
+                drop(pipelines_guard);
+                prepare_for_new_session(
+                    pipelines,
+                    db,
+                    new_session,
+                    new_segment,
+                    tick.timestamp_ms,
+                    contract_metadata,
+                );
+                pipelines_guard = match pipelines.lock() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        return StartupWarmReplayResult {
+                            cutover_offset: actual_cutover_offset,
+                            applied_tick_count: 0,
+                        };
+                    }
+                };
+                boundary_count += 1;
+            } else if !session_changed
+                && new_segment != current_delta_segment
                 && current_delta_segment != DeltaSegment::Unknown
                 && new_segment != DeltaSegment::Unknown
             {
@@ -7572,9 +7912,10 @@ fn run_startup_warm_replay(
                 boundary_count += 1;
             }
 
-            if new_session != SessionType::Unknown {
-                current_session = new_session;
-            }
+            // Track Unknown explicitly so a subsequent Unknown→known transition
+            // can prepare the next session correctly even though the gap
+            // window itself produces no pipeline updates.
+            current_session = new_session;
             if new_segment != DeltaSegment::Unknown {
                 current_delta_segment = new_segment;
             }
@@ -7615,6 +7956,47 @@ fn run_startup_warm_replay(
             &serde_json::to_value(&snapshot).unwrap_or_default(),
         );
     }
+
+    // Post-replay reconciliation: if the warm-replay tail ended mid-RTH but
+    // the wall clock has moved past 16:00 ET on that same date, the
+    // SCID file is missing the post-close ticks that would normally drive
+    // the boundary detector. Force the close finalization here so the
+    // session_summaries / prior_day_levels rows exist before live polling
+    // begins. This covers the "process started after RTH close, no Unknown
+    // ticks in SCID" edge case.
+    if current_session == SessionType::Rth {
+        let now_ms = chrono::Utc::now().timestamp_millis() as f64;
+        let last_session_date = session_date_from_timestamp_ms(last.timestamp_ms);
+        let now_session_date = session_date_from_timestamp_ms(now_ms);
+        let now_et = et_minutes_from_timestamp(now_ms).unwrap_or(0);
+        let past_close = last_session_date == now_session_date && now_et >= RTH_CLOSE_ET;
+        let summary_exists = db
+            .lock()
+            .ok()
+            .and_then(|d| d.has_session_summary_for(&last_session_date, "RTH").ok())
+            .unwrap_or(true);
+        if past_close && !summary_exists {
+            eprintln!(
+                "[the-desk-mcp] Warm-replay ended mid-RTH for {last_session_date} but wall clock is past 16:00 ET; finalizing close from current pipeline state"
+            );
+            if let Err(err) = finalize_rth_close(
+                pipelines,
+                db,
+                None,
+                Some(flow_emitter),
+                last.timestamp_ms,
+                bid,
+                ask,
+                contract_metadata,
+            ) {
+                eprintln!(
+                    "[the-desk-mcp] Warm-replay reconciliation close finalization failed for {last_session_date}: {:?}",
+                    err
+                );
+            }
+        }
+    }
+
     eprintln!(
         "[the-desk-mcp] Backfill complete: {} ticks, {} session boundaries, last price {:.2}",
         ticks.len(),
@@ -7632,8 +8014,11 @@ fn run_startup_warm_replay(
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db_path = data_dir().join("data.db");
     let db = Database::open(&db_path.to_string_lossy())?;
+    let config = load_feed_config();
+    let contract_metadata = resolve_contract_metadata(&config);
 
     let mut pipelines = PipelineEngine::new();
+    pipelines.set_contract_metadata(contract_metadata.clone());
     if let Ok(volumes) = db.recent_rth_session_volumes(20) {
         let curves: Vec<Vec<f64>> = volumes
             .into_iter()
@@ -7644,19 +8029,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Load prior-day levels so MCP tools return correct values before backfill.
     let today = the_desk_backend::et_now_trading_day();
-    if let Ok(Some((high, low, close, va_h, va_l, poc, dnva_h, dnva_l, dnp))) =
-        db.load_prior_day_full(&today)
+    let (root_symbol, contract_symbol) = contract_scope(&contract_metadata);
+    if let Ok(Some(prior_ref)) =
+        db.load_prior_day_reference_scoped(&today, root_symbol, contract_symbol)
     {
-        pipelines.levels.set_prior_day(high, low, close);
-        if let (Some(vh), Some(vl), Some(pc)) = (va_h, va_l, poc) {
+        pipelines
+            .levels
+            .set_prior_day(prior_ref.high, prior_ref.low, prior_ref.close);
+        pipelines.levels.set_prior_day_contract_context(
+            prior_ref.root_symbol.as_deref(),
+            prior_ref.contract_symbol.as_deref(),
+            contract_symbol,
+        );
+        if let (Some(vh), Some(vl), Some(pc)) = (prior_ref.va_high, prior_ref.va_low, prior_ref.poc)
+        {
             pipelines.levels.set_prior_profile(vh, vl, pc);
         }
-        if let (Some(dh), Some(dl), Some(dp)) = (dnva_h, dnva_l, dnp) {
+        if let (Some(dh), Some(dl), Some(dp)) =
+            (prior_ref.dnva_high, prior_ref.dnva_low, prior_ref.dnp)
+        {
             pipelines.levels.set_prior_dnva(dh, dl, dp);
         }
+    } else {
+        pipelines
+            .levels
+            .set_prior_day_contract_context(root_symbol, None, contract_symbol);
     }
 
-    let config = load_feed_config();
     let reader = ScidReader::from_feed_config(&config);
     let scid_available = reader.path().exists();
     let mut startup_cutover_rx = None;
@@ -7681,6 +8080,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let flow_emitter_startup = Arc::clone(&server.flow_emitter);
         let db_startup = Arc::clone(&server.db);
         let reader_startup = reader.clone();
+        let contract_metadata_startup = contract_metadata.clone();
 
         tokio::spawn(async move {
             let fallback_cutover_offset = safe_scid_data_offset(&reader_startup);
@@ -7701,6 +8101,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &db_startup,
                     since,
                     requested_cutover_offset,
+                    &contract_metadata_startup,
                 )
             })
             .await
@@ -7738,7 +8139,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let poll_ms = config.flush_poll_ms;
         let price_scale = config.price_scale;
         let reader_path = reader.path().to_path_buf();
-        let contract_metadata = resolve_contract_metadata(&config);
+        let contract_metadata = contract_metadata.clone();
         let feed_rt_bg = Arc::clone(&server.feed_runtime);
 
         tokio::spawn(async move {
@@ -7848,119 +8249,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if let Some(et_min) = et_minutes_from_timestamp(tick.timestamp_ms) {
                         let new_session = classify_session(et_min);
                         let new_segment = classify_delta_segment(et_min);
+                        let session_changed = new_session != current_session;
+                        let exiting_rth = current_session == SessionType::Rth && session_changed;
 
-                        if new_session != current_session
-                            && current_session != SessionType::Unknown
-                            && new_session != SessionType::Unknown
-                        {
-                            // Match startup warm-backfill: never hold `pipelines` while waiting on
-                            // `db` (and never hold `db` while waiting on `pipelines`) so the depth
-                            // worker cannot deadlock with this path.
-                            let end_state = if current_session == SessionType::Rth {
-                                pipelines_bg.lock().ok().map(|p| p.session_end_state())
-                            } else {
-                                None
-                            };
-                            let date = session_date_from_timestamp_ms(tick.timestamp_ms);
-                            let today_str = session_date_from_timestamp_ms(tick.timestamp_ms);
-
-                            if let Some(ref es) = end_state {
-                                if let Ok(db) = db_bg.lock() {
-                                    let _ = db.save_prior_day_full_with_dnva(
-                                        &date,
-                                        es.high,
-                                        es.low,
-                                        es.close,
-                                        es.va_high,
-                                        es.va_low,
-                                        es.poc,
-                                        Some(es.dnva_high),
-                                        Some(es.dnva_low),
-                                        Some(es.dnp),
+                        if exiting_rth {
+                            // RTH close (RTH→Unknown at 16:00 ET, or RTH→Globex
+                            // if the Unknown gap is empty in this feed): persist
+                            // session_summaries + prior_day_levels atomically and
+                            // refresh in-memory carry-forward so the next live
+                            // tick already sees consistent state.
+                            let (last_bid_hint, last_ask_hint) =
+                                current_best_bid_ask(&last_bid_bg, &last_ask_bg);
+                            match finalize_rth_close(
+                                &pipelines_bg,
+                                &db_bg,
+                                Some(&detector_bg),
+                                Some(&flow_emitter_bg),
+                                tick.timestamp_ms,
+                                last_bid_hint,
+                                last_ask_hint,
+                                &contract_metadata,
+                            ) {
+                                Ok(_) => {
+                                    eprintln!(
+                                        "[the-desk-mcp] Live boundary: {:?} → {:?} (RTH close finalized)",
+                                        current_session, new_session
                                     );
                                 }
-                            }
-
-                            let prior = {
-                                if let Ok(db) = db_bg.lock() {
-                                    db.load_prior_day_full(&today_str)
-                                } else {
-                                    Ok(None)
-                                }
-                            };
-
-                            if let Ok(mut p) = pipelines_bg.lock() {
-                                p.reset_session_with_type(new_session == SessionType::Globex);
-                                if new_session == SessionType::Rth
-                                    || new_session == SessionType::Globex
-                                {
-                                    if let Ok(Some((
-                                        h,
-                                        l,
-                                        c,
-                                        va_h,
-                                        va_l,
-                                        poc,
-                                        dnva_h,
-                                        dnva_l,
-                                        dnp,
-                                    ))) = prior
-                                    {
-                                        p.levels.set_prior_day(h, l, c);
-                                        if let (Some(vh), Some(vl), Some(pc)) = (va_h, va_l, poc) {
-                                            p.levels.set_prior_profile(vh, vl, pc);
-                                        }
-                                        if let (Some(dh), Some(dl), Some(dp)) =
-                                            (dnva_h, dnva_l, dnp)
-                                        {
-                                            p.levels.set_prior_dnva(dh, dl, dp);
-                                        }
-                                    }
+                                Err(err) => {
+                                    eprintln!(
+                                        "[the-desk-mcp] Live RTH close finalization failed at {:.0}: {:?}; skipping this post-close tick so the next one retries before mixed-session state can accumulate",
+                                        tick.timestamp_ms, err
+                                    );
+                                    continue;
                                 }
                             }
-
-                            let inv_session_type = if new_session == SessionType::Rth {
-                                "RTH"
-                            } else if new_segment == DeltaSegment::Asia {
-                                "Asia"
-                            } else {
-                                "London"
-                            };
-
-                            let prior_inv: Vec<PriorSessionData> = if let Ok(db) = db_bg.lock() {
-                                if let Ok(summaries) = db.list_session_summaries(
-                                    None,
-                                    None,
-                                    None,
-                                    Some(inv_session_type),
-                                    5,
-                                ) {
-                                    summaries
-                                        .into_iter()
-                                        .filter(|s| {
-                                            s.dnva_high > 0.0 && s.dnva_low > 0.0 && s.dnp > 0.0
-                                        })
-                                        .map(|s| PriorSessionData {
-                                            final_delta: s.session_delta,
-                                            dnva_high: s.dnva_high,
-                                            dnva_low: s.dnva_low,
-                                            dnp: s.dnp,
-                                        })
-                                        .collect()
-                                } else {
-                                    Vec::new()
-                                }
-                            } else {
-                                Vec::new()
-                            };
-
-                            if let Ok(mut p) = pipelines_bg.lock() {
-                                p.session_inventory.load_prior_sessions(prior_inv);
-                            }
-
-                            eprintln!(
-                                "[the-desk-mcp] Live boundary: {:?} → {:?}",
-                                current_session, new_session
+                        } else if session_changed
+                            && new_session != SessionType::Unknown
+                            && current_session != SessionType::Unknown
+                        {
+                            // Other known→known transitions, e.g. Globex→RTH at
+                            // 09:30 ET. Reuses the shared boundary helper.
+                            prepare_for_new_session(
+                                &pipelines_bg,
+                                &db_bg,
+                                new_session,
+                                new_segment,
+                                tick.timestamp_ms,
+                                &contract_metadata,
                             );
                             if let Ok(mut det) = detector_bg.lock() {
                                 det.reset();
@@ -7968,7 +8304,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             if let Ok(mut fe) = flow_emitter_bg.lock() {
                                 fe.reset();
                             }
-                        } else if new_segment != current_delta_segment
+                            eprintln!(
+                                "[the-desk-mcp] Live boundary: {:?} → {:?}",
+                                current_session, new_session
+                            );
+                        } else if session_changed
+                            && current_session == SessionType::Unknown
+                            && new_session != SessionType::Unknown
+                        {
+                            // Unknown→known (e.g. 18:00 ET Globex open after RTH
+                            // already closed earlier in this process, or cold
+                            // start landing inside RTH/Globex). Idempotent with
+                            // any in-memory state finalize_rth_close already
+                            // installed.
+                            prepare_for_new_session(
+                                &pipelines_bg,
+                                &db_bg,
+                                new_session,
+                                new_segment,
+                                tick.timestamp_ms,
+                                &contract_metadata,
+                            );
+                            if let Ok(mut det) = detector_bg.lock() {
+                                det.reset();
+                            }
+                            if let Ok(mut fe) = flow_emitter_bg.lock() {
+                                fe.reset();
+                            }
+                            eprintln!("[the-desk-mcp] Live boundary: Unknown → {:?}", new_session);
+                        } else if !session_changed
+                            && new_segment != current_delta_segment
                             && current_delta_segment != DeltaSegment::Unknown
                             && new_segment != DeltaSegment::Unknown
                         {
@@ -7981,9 +8346,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
 
-                        if new_session != SessionType::Unknown {
-                            current_session = new_session;
-                        }
+                        // Track Unknown explicitly so the next Unknown→known
+                        // transition triggers prepare_for_new_session.
+                        current_session = new_session;
                         if new_segment != DeltaSegment::Unknown {
                             current_delta_segment = new_segment;
                         }
@@ -8204,6 +8569,18 @@ mod tests {
             .hydrate_playbook_runtime_cache()
             .expect("hydrate playbook cache");
         server
+    }
+
+    fn test_contract_metadata() -> the_desk_backend::feed::ContractMetadata {
+        the_desk_backend::feed::ContractMetadata {
+            root_symbol: "NQ".to_string(),
+            contract_symbol: "NQH26".to_string(),
+            contract_month: Some("2026-03".to_string()),
+            symbol_resolution_mode: "manual".to_string(),
+            symbol_resolution_source: "test".to_string(),
+            configured_symbol: "NQH26".to_string(),
+            ..Default::default()
+        }
     }
 
     fn write_scid_header(file: &mut NamedTempFile) {
@@ -8688,6 +9065,7 @@ mod tests {
             &server.db,
             since,
             cutover,
+            &test_contract_metadata(),
         );
         let live = reader
             .read_bulk_from_offset(warm.cutover_offset)
@@ -8753,6 +9131,7 @@ mod tests {
             &server.db,
             since,
             cutover,
+            &test_contract_metadata(),
         );
         let live = read_scid_poll_step(&reader, warm.cutover_offset).expect("live step");
 
@@ -9000,6 +9379,273 @@ mod tests {
                 .expect("load risk")
                 .expect("risk state")
                 .at_limit
+        );
+    }
+
+    /// Build an epoch-ms timestamp for an RTH wall-clock time on a fixed test
+    /// date (2026-03-05, a Thursday in DST). Used by the boundary-recovery
+    /// tests to drive `finalize_rth_close` deterministically.
+    fn rth_ts(hour: u32, minute: u32, second: u32) -> f64 {
+        use chrono::NaiveDate;
+        use chrono_tz::US::Eastern;
+        let naive = NaiveDate::from_ymd_opt(2026, 3, 5)
+            .expect("date")
+            .and_hms_opt(hour, minute, second)
+            .expect("time");
+        Eastern
+            .from_local_datetime(&naive)
+            .single()
+            .expect("non-ambiguous ET timestamp")
+            .timestamp_millis() as f64
+    }
+
+    /// Drive a few RTH ticks through the pipeline so finalize_rth_close has
+    /// real session state to snapshot. Mirrors the live ingest call shape but
+    /// skips the rules engine to keep tests focused on boundary persistence.
+    fn warm_rth_session(server: &TheDeskMcp, prices: &[f64]) {
+        let mut p = server.pipelines.lock().expect("pipelines");
+        for (i, price) in prices.iter().enumerate() {
+            let ts = rth_ts(15, 30, i as u32);
+            let minute = minute_of_session_from_timestamp(ts);
+            p.on_trade_with_timestamp(*price, 1.0, i % 2 == 0, minute, ts);
+        }
+    }
+
+    /// Boundary recovery: a single live RTH→Unknown transition must persist
+    /// `session_summaries` and `prior_day_levels` in one transaction, refresh
+    /// in-memory carry-forward, and leave `session_inventory` aware of the
+    /// just-closed session before any further DB read happens.
+    #[test]
+    fn finalize_rth_close_persists_summary_and_carry_forward_atomically() {
+        let server = test_server();
+        warm_rth_session(&server, &[21_000.0, 21_005.0, 21_010.0, 21_015.0, 21_012.0]);
+
+        let boundary_ts = rth_ts(16, 0, 1);
+        let result = finalize_rth_close(
+            &server.pipelines,
+            &server.db,
+            None,
+            None,
+            boundary_ts,
+            21_011.75,
+            21_012.25,
+            &test_contract_metadata(),
+        )
+        .expect("close finalize")
+        .expect("close result");
+
+        assert_eq!(result.session_date, "2026-03-05");
+        assert!((result.high - 21_015.0).abs() < 1e-6);
+        assert!((result.low - 21_000.0).abs() < 1e-6);
+
+        let db = server.db.lock().expect("db");
+        assert!(db
+            .has_session_summary_for("2026-03-05", "RTH")
+            .expect("summary lookup"));
+        let prior = db
+            .load_prior_day_full("2026-03-06")
+            .expect("prior load")
+            .expect("prior row exists");
+        assert!((prior.0 - 21_015.0).abs() < 1e-6);
+        assert!((prior.1 - 21_000.0).abs() < 1e-6);
+        drop(db);
+
+        // In-memory carry-forward should match the just-built end-state without
+        // any extra DB reload.
+        let p = server.pipelines.lock().expect("pipelines");
+        assert!((p.levels.prior_day_high - 21_015.0).abs() < 1e-6);
+        assert!((p.levels.prior_day_low - 21_000.0).abs() < 1e-6);
+        assert!(!p.levels.rth_started());
+    }
+
+    /// Restart idempotency: calling `finalize_rth_close` again after the
+    /// session has been reset must be a no-op (returns None) and must not
+    /// clobber the persisted summary or write a duplicate row.
+    #[test]
+    fn finalize_rth_close_is_idempotent_on_replay() {
+        let server = test_server();
+        warm_rth_session(&server, &[21_000.0, 21_005.0, 21_010.0]);
+
+        let boundary_ts = rth_ts(16, 0, 1);
+        let _ = finalize_rth_close(
+            &server.pipelines,
+            &server.db,
+            None,
+            None,
+            boundary_ts,
+            21_009.75,
+            21_010.25,
+            &test_contract_metadata(),
+        )
+        .expect("first close");
+
+        let summary_v1 = {
+            let db = server.db.lock().expect("db");
+            db.list_session_summaries(None, None, None, Some("RTH"), 5)
+                .expect("list")
+        };
+        assert_eq!(summary_v1.len(), 1);
+
+        // Second call: pipeline has been reset, so finalize_rth_close should
+        // return None rather than re-persisting an empty snapshot.
+        let second = finalize_rth_close(
+            &server.pipelines,
+            &server.db,
+            None,
+            None,
+            boundary_ts,
+            21_009.75,
+            21_010.25,
+            &test_contract_metadata(),
+        )
+        .expect("second finalize");
+        assert!(second.is_none());
+
+        let summary_v2 = {
+            let db = server.db.lock().expect("db");
+            db.list_session_summaries(None, None, None, Some("RTH"), 5)
+                .expect("list")
+        };
+        assert_eq!(summary_v2.len(), 1);
+        assert_eq!(summary_v1[0].session_date, summary_v2[0].session_date);
+        assert!((summary_v1[0].high - summary_v2[0].high).abs() < 1e-9);
+    }
+
+    /// Cross-session inventory must see the just-closed RTH session via the
+    /// in-memory `prior_sessions()` list immediately after `finalize_rth_close`,
+    /// without waiting for a same-turn DB reload (which can race with the
+    /// `date < ?1` semantics in `load_prior_day_full`).
+    #[test]
+    fn finalize_rth_close_makes_session_inventory_visible_in_memory() {
+        let server = test_server();
+        warm_rth_session(&server, &[21_000.0, 21_010.0, 21_005.0, 21_015.0]);
+
+        // Before close: session_inventory has no prior sessions.
+        {
+            let p = server.pipelines.lock().expect("pipelines");
+            assert!(p.session_inventory.prior_sessions().is_empty());
+        }
+
+        let _ = finalize_rth_close(
+            &server.pipelines,
+            &server.db,
+            None,
+            None,
+            rth_ts(16, 0, 1),
+            21_014.75,
+            21_015.25,
+            &test_contract_metadata(),
+        )
+        .expect("close finalize")
+        .expect("close result");
+
+        let p = server.pipelines.lock().expect("pipelines");
+        let inv = p.session_inventory.prior_sessions();
+        assert_eq!(
+            inv.len(),
+            1,
+            "session_inventory should expose the just-closed RTH session"
+        );
+        assert!(
+            inv[0].dnp > 0.0,
+            "just-closed entry must carry a usable DNP"
+        );
+    }
+
+    /// `persist_live_session_close` must commit `session_summaries` and
+    /// `prior_day_levels` in one transaction. This direct DB-level test
+    /// guards against the row-by-row regression where a crash between writes
+    /// would leave the next session reading half-updated levels.
+    #[test]
+    fn persist_live_session_close_writes_summary_and_prior_day_together() {
+        let db = Database::open(":memory:").expect("db");
+        let summary = summary_row("2026-03-05", "RTH", 21_010.0, 20_990.0, 21_000.0);
+        db.persist_live_session_close(
+            &summary,
+            (
+                21_020.0, 20_980.0, 21_000.0, 21_015.0, 20_995.0, 21_005.0, 21_010.0, 20_990.0,
+                21_000.0,
+            ),
+        )
+        .expect("atomic close");
+
+        assert!(db
+            .has_session_summary_for("2026-03-05", "RTH")
+            .expect("summary check"));
+        let row = db
+            .load_prior_day_full("2026-03-06")
+            .expect("prior load")
+            .expect("prior row");
+        assert!((row.0 - 21_020.0).abs() < 1e-9);
+        assert!((row.1 - 20_980.0).abs() < 1e-9);
+        assert_eq!(row.6, Some(21_010.0));
+    }
+
+    #[test]
+    fn prepare_for_new_session_scopes_contract_data_and_restores_inventory_order() {
+        let server = test_server();
+        {
+            let db = server.db.lock().expect("db");
+            db.save_prior_day_full_with_dnva_contract(
+                "2026-03-04",
+                22_000.0,
+                21_900.0,
+                21_950.0,
+                21_980.0,
+                21_920.0,
+                21_950.0,
+                Some(21_970.0),
+                Some(21_930.0),
+                Some(21_950.0),
+                Some("NQ"),
+                Some("NQM26"),
+            )
+            .expect("wrong-contract prior day");
+            db.save_prior_day_full_with_dnva_contract(
+                "2026-03-03",
+                21_100.0,
+                20_900.0,
+                21_000.0,
+                21_050.0,
+                20_950.0,
+                21_000.0,
+                Some(21_025.0),
+                Some(20_975.0),
+                Some(21_000.0),
+                Some("NQ"),
+                Some("NQH26"),
+            )
+            .expect("matching-contract prior day");
+
+            let mut older = summary_row("2026-03-03", "RTH", 21_025.0, 20_975.0, 21_000.0);
+            older.contract_symbol = "NQH26".to_string();
+            let mut newer = summary_row("2026-03-04", "RTH", 21_075.0, 21_000.0, 21_050.0);
+            newer.contract_symbol = "NQH26".to_string();
+            let mut wrong_contract = summary_row("2026-03-02", "RTH", 22_075.0, 22_000.0, 22_050.0);
+            wrong_contract.contract_symbol = "NQM26".to_string();
+            db.upsert_session_summary(&older).expect("older summary");
+            db.upsert_session_summary(&newer).expect("newer summary");
+            db.upsert_session_summary(&wrong_contract)
+                .expect("wrong-contract summary");
+        }
+
+        prepare_for_new_session(
+            &server.pipelines,
+            &server.db,
+            SessionType::Rth,
+            DeltaSegment::Rth,
+            rth_ts(9, 30, 0),
+            &test_contract_metadata(),
+        );
+
+        let p = server.pipelines.lock().expect("pipelines");
+        assert!((p.levels.prior_day_high - 21_100.0).abs() < 1e-9);
+        assert_eq!(p.levels.prior_day_contract_symbol.as_deref(), Some("NQH26"));
+        let inv = p.session_inventory.prior_sessions();
+        assert_eq!(inv.len(), 2);
+        assert!(
+            (inv.last().expect("newest prior session").dnp - 21_050.0).abs() < 1e-9,
+            "newest same-contract session should be the comparison anchor"
         );
     }
 }

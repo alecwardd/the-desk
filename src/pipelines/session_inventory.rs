@@ -62,6 +62,24 @@ impl SessionInventoryPipeline {
         self.compute_trend_count();
     }
 
+    /// Append a just-closed session as the new most-recent prior session and
+    /// trim the list to the most recent `max_keep` entries. Used at boundary
+    /// finalization so cross-session inventory tracking sees the latest close
+    /// without round-tripping through SQLite.
+    pub fn push_just_closed_session(&mut self, data: PriorSessionData, max_keep: usize) {
+        self.prior_sessions.push(data);
+        if max_keep > 0 && self.prior_sessions.len() > max_keep {
+            let drop = self.prior_sessions.len() - max_keep;
+            self.prior_sessions.drain(0..drop);
+        }
+        self.compute_trend_count();
+    }
+
+    /// Read-only access to the loaded prior sessions (oldest first, newest last).
+    pub fn prior_sessions(&self) -> &[PriorSessionData] {
+        &self.prior_sessions
+    }
+
     /// Update with current session's live delta and DNP.
     pub fn update(&mut self, session_delta: f64, dnp: f64) {
         self.current_session_delta = session_delta;

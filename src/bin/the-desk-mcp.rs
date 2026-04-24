@@ -63,6 +63,109 @@ const JOB_PROGRESS_PERSIST_INTERVAL_MS: f64 = 1_000.0;
 const JOB_PROGRESS_RECORD_STEP: usize = 50_000;
 const JOB_PROGRESS_RATE_EMA_ALPHA: f64 = 0.25;
 const PIPELINE_CONTENTION_RECENT_WINDOW_MS: u64 = 5_000;
+const MAX_RESEARCH_RESULT_LIMIT: u64 = 500;
+const MAX_RESEARCH_MIN_COUNT: i64 = 10_000;
+const MAX_MIN_RESOLVED: i64 = 10_000;
+const MAX_DOM_BEHAVIOR_MIN_DURATION_MS: f64 = 86_400_000.0;
+const RESEARCH_EVENT_TYPES: &[&str] = &[
+    "ib_formed",
+    "or_formed",
+    "ib_extension_hit",
+    "ib_reentry",
+    "ib_reentry_hit_mid",
+    "ib_reentry_full_traverse",
+    "new_session_high",
+    "new_session_low",
+    "day_type_change",
+    "poor_high_detected",
+    "poor_low_detected",
+    "excess_high_detected",
+    "excess_low_detected",
+    "or5_mid_retest",
+    "dnp_cross",
+    "rvol_spike",
+    "absorption_detected",
+    "absorption_confirmed",
+    "absorption_invalidated",
+    "pinch_detected",
+    "acceleration_zone_created",
+    "acceleration_zone_held",
+    "large_trade_cluster",
+];
+const RESEARCH_LEVEL_TEST_NAMES: &[&str] = &[
+    "prior_day_high",
+    "prior_day_low",
+    "prior_day_close",
+    "overnight_high",
+    "overnight_low",
+    "ib_high",
+    "ib_low",
+    "ib_mid",
+    "previous_vah",
+    "previous_val",
+    "previous_poc",
+    "vwap",
+    "vwap_1sd_upper",
+    "vwap_1sd_lower",
+    "vwap_2sd_upper",
+    "vwap_2sd_lower",
+    "dnp",
+    "dnva_high",
+    "dnva_low",
+];
+const RESEARCH_OUTCOME_FIELDS: &[&str] = &[
+    "close_vs_ib_mid",
+    "close_vs_vwap",
+    "close_vs_poc",
+    "day_type",
+    "profile_shape",
+    "balance_state",
+    "single_prints_direction",
+    "poor_high",
+    "poor_low",
+    "excess_high",
+    "excess_low",
+];
+const RESEARCH_DISTRIBUTION_METRICS: &[&str] = &[
+    "ib_range",
+    "high",
+    "low",
+    "close",
+    "open_price",
+    "poc",
+    "vah",
+    "val",
+    "ib_high",
+    "ib_low",
+    "ib_mid",
+    "or_high",
+    "or_low",
+    "total_volume",
+    "tick_count",
+    "session_delta",
+    "cumulative_delta",
+    "dnp",
+    "dnva_high",
+    "dnva_low",
+    "vwap_close",
+    "signal_count",
+    "rvol_ratio",
+];
+const SIGNAL_OUTCOME_SESSION_FIELDS: &[&str] = &[
+    "day_type",
+    "profile_shape",
+    "balance_state",
+    "close_vs_ib_mid",
+    "close_vs_vwap",
+    "single_prints_direction",
+];
+const DOM_BEHAVIOR_NAMES: &[&str] = &[
+    "bid_support_persisted",
+    "ask_resistance_persisted",
+    "liquidity_flip",
+    "pulling_acceleration",
+    "stacking_acceleration",
+];
 type DnvaTriple = (f64, f64, f64);
 
 /// MCP clients (e.g. Cursor) may reject `tools/list` when `serde_json::Value` becomes JSON Schema
@@ -888,6 +991,57 @@ fn validate_ymd_opt(label: &str, value: Option<&str>) -> Result<(), McpError> {
     Ok(())
 }
 
+fn validate_ymd_range(
+    start_label: &str,
+    start_value: Option<&str>,
+    end_label: &str,
+    end_value: Option<&str>,
+) -> Result<(), McpError> {
+    validate_ymd_opt(start_label, start_value)?;
+    validate_ymd_opt(end_label, end_value)?;
+    if let (Some(start), Some(end)) = (start_value, end_value) {
+        if start > end {
+            return Err(invalid_params_error(format!(
+                "{start_label} must be on or before {end_label}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn parse_non_empty_string(label: &str, raw: &str) -> Result<String, McpError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(invalid_params_error(format!("{label} must not be empty")));
+    }
+    Ok(trimmed.to_string())
+}
+
+fn parse_optional_non_empty_string(
+    label: &str,
+    raw: Option<&str>,
+) -> Result<Option<String>, McpError> {
+    raw.map(|value| parse_non_empty_string(label, value))
+        .transpose()
+}
+
+fn parse_allowed_lowercase_value(
+    label: &str,
+    raw: &str,
+    allowed: &[&str],
+) -> Result<String, McpError> {
+    let normalized = parse_non_empty_string(label, raw)?.to_ascii_lowercase();
+    if allowed.contains(&normalized.as_str()) {
+        Ok(normalized)
+    } else {
+        Err(invalid_params_error(format!(
+            "{label} must be one of {}, got: {}",
+            allowed.join("|"),
+            raw.trim()
+        )))
+    }
+}
+
 fn build_session_scope_filter(
     params: &SessionScopeParams,
 ) -> Result<Option<SessionScopeFilter>, McpError> {
@@ -942,23 +1096,23 @@ fn build_session_scope_filter(
         .clone()
         .or_else(|| params.trading_day.clone());
     validate_ymd_opt("tradingDay", params.trading_day.as_deref())?;
-    validate_ymd_opt("tradingDayStart", trading_day_start.as_deref())?;
-    validate_ymd_opt("tradingDayEnd", trading_day_end.as_deref())?;
-    if let (Some(sd), Some(ed)) = (trading_day_start.as_deref(), trading_day_end.as_deref()) {
-        if sd > ed {
-            return Err(invalid_params_error(
-                "tradingDayStart must be on or before tradingDayEnd",
-            ));
-        }
-    }
+    validate_ymd_range(
+        "tradingDayStart",
+        trading_day_start.as_deref(),
+        "tradingDayEnd",
+        trading_day_end.as_deref(),
+    )?;
+    let root_symbol = parse_optional_non_empty_string("rootSymbol", params.root_symbol.as_deref())?;
+    let contract_symbol =
+        parse_optional_non_empty_string("contractSymbol", params.contract_symbol.as_deref())?;
 
     let scope = SessionScopeFilter {
         session_type,
         session_segment,
         trading_day_start,
         trading_day_end,
-        root_symbol: params.root_symbol.clone(),
-        contract_symbol: params.contract_symbol.clone(),
+        root_symbol,
+        contract_symbol,
         include_rollover_sessions: params.include_rollover_sessions,
         continuous_mode: params.continuous_mode,
     };
@@ -966,6 +1120,10 @@ fn build_session_scope_filter(
         && scope.session_segment.is_none()
         && scope.trading_day_start.is_none()
         && scope.trading_day_end.is_none()
+        && scope.root_symbol.is_none()
+        && scope.contract_symbol.is_none()
+        && scope.include_rollover_sessions
+        && !scope.continuous_mode
     {
         Ok(None)
     } else {
@@ -979,11 +1137,9 @@ fn parse_scope_value(
     let Some(scope) = scope else {
         return Ok(None);
     };
-    let parsed: SessionScopeFilter = serde_json::from_value(scope)
+    let parsed: SessionScopeParams = serde_json::from_value(scope)
         .map_err(|e| invalid_params_error(format!("invalid scope payload: {e}")))?;
-    validate_ymd_opt("tradingDayStart", parsed.trading_day_start.as_deref())?;
-    validate_ymd_opt("tradingDayEnd", parsed.trading_day_end.as_deref())?;
-    Ok(Some(parsed))
+    build_session_scope_filter(&parsed)
 }
 
 fn parse_setup_perf_sort(sort_by: Option<&str>) -> Result<SetupPerformanceSortBy, McpError> {
@@ -996,6 +1152,90 @@ fn parse_setup_perf_sort(sort_by: Option<&str>) -> Result<SetupPerformanceSortBy
             "sortBy must be one of winRate|avgR|resolved|totalSignals, got: {other}"
         ))),
     }
+}
+
+fn parse_research_event_type(raw: &str) -> Result<String, McpError> {
+    let event_type = parse_non_empty_string("eventType", raw)?.to_ascii_lowercase();
+    if RESEARCH_EVENT_TYPES.contains(&event_type.as_str()) {
+        return Ok(event_type);
+    }
+    if let Some(level_name) = event_type.strip_suffix("_test") {
+        if RESEARCH_LEVEL_TEST_NAMES.contains(&level_name) {
+            return Ok(event_type);
+        }
+    }
+    Err(invalid_params_error(format!(
+        "eventType must be a supported research event type, got: {}",
+        raw.trim()
+    )))
+}
+
+fn parse_research_outcome_field(raw: &str) -> Result<String, McpError> {
+    parse_allowed_lowercase_value("outcomeField", raw, RESEARCH_OUTCOME_FIELDS)
+}
+
+fn parse_distribution_metric(raw: &str) -> Result<String, McpError> {
+    parse_allowed_lowercase_value("metric", raw, RESEARCH_DISTRIBUTION_METRICS)
+}
+
+fn parse_signal_outcome_session_field(raw: &str) -> Result<String, McpError> {
+    parse_allowed_lowercase_value("sessionField", raw, SIGNAL_OUTCOME_SESSION_FIELDS)
+}
+
+fn parse_dom_behavior_name(raw: &str) -> Result<String, McpError> {
+    parse_allowed_lowercase_value("behavior", raw, DOM_BEHAVIOR_NAMES)
+}
+
+fn parse_research_min_count(value: Option<i64>) -> Result<i64, McpError> {
+    let min_count = value.unwrap_or(1);
+    if !(1..=MAX_RESEARCH_MIN_COUNT).contains(&min_count) {
+        return Err(invalid_params_error(format!(
+            "minCount must be between 1 and {MAX_RESEARCH_MIN_COUNT}, got: {min_count}"
+        )));
+    }
+    Ok(min_count)
+}
+
+fn parse_nonnegative_i64(
+    label: &str,
+    value: Option<i64>,
+    default: i64,
+    max: i64,
+) -> Result<i64, McpError> {
+    let parsed = value.unwrap_or(default);
+    if parsed < 0 || parsed > max {
+        return Err(invalid_params_error(format!(
+            "{label} must be between 0 and {max}, got: {parsed}"
+        )));
+    }
+    Ok(parsed)
+}
+
+fn parse_bounded_limit(
+    label: &str,
+    value: Option<u64>,
+    default: u64,
+    max: u64,
+) -> Result<usize, McpError> {
+    let limit = value.unwrap_or(default);
+    if limit == 0 || limit > max {
+        return Err(invalid_params_error(format!(
+            "{label} must be between 1 and {max}, got: {limit}"
+        )));
+    }
+    Ok(limit as usize)
+}
+
+fn parse_dom_behavior_min_duration(value: Option<f64>) -> Result<f64, McpError> {
+    let min_duration_ms = value.unwrap_or(15_000.0);
+    if !min_duration_ms.is_finite()
+        || !(0.0..=MAX_DOM_BEHAVIOR_MIN_DURATION_MS).contains(&min_duration_ms)
+    {
+        return Err(invalid_params_error(format!(
+            "minDurationMs must be a finite number between 0 and {MAX_DOM_BEHAVIOR_MIN_DURATION_MS}, got: {min_duration_ms}"
+        )));
+    }
+    Ok(min_duration_ms)
 }
 
 fn normalize_signal_source(raw: &str) -> Option<&'static str> {
@@ -3851,13 +4091,19 @@ impl TheDeskMcp {
         &self,
         Parameters(params): Parameters<DomBehaviorFrequencyParams>,
     ) -> Result<CallToolResult, McpError> {
-        validate_ymd_opt("startDate", params.start_date.as_deref())?;
-        validate_ymd_opt("endDate", params.end_date.as_deref())?;
+        validate_ymd_range(
+            "startDate",
+            params.start_date.as_deref(),
+            "endDate",
+            params.end_date.as_deref(),
+        )?;
+        let behavior = parse_dom_behavior_name(&params.behavior)?;
+        let min_duration_ms = parse_dom_behavior_min_duration(params.min_duration_ms)?;
         let db = self.db.lock().map_err(|_| lock_error())?;
         let result = research::dom_behavior_frequency(
             &db,
-            &params.behavior,
-            params.min_duration_ms.unwrap_or(15_000.0),
+            &behavior,
+            min_duration_ms,
             params.start_date.as_deref(),
             params.end_date.as_deref(),
         )
@@ -3874,15 +4120,22 @@ impl TheDeskMcp {
         &self,
         Parameters(params): Parameters<DomBehaviorConditionalParams>,
     ) -> Result<CallToolResult, McpError> {
-        validate_ymd_opt("startDate", params.start_date.as_deref())?;
-        validate_ymd_opt("endDate", params.end_date.as_deref())?;
+        validate_ymd_range(
+            "startDate",
+            params.start_date.as_deref(),
+            "endDate",
+            params.end_date.as_deref(),
+        )?;
         let scope = parse_scope_value(params.scope)?;
+        let behavior = parse_dom_behavior_name(&params.behavior)?;
+        let setup_id = parse_optional_non_empty_string("setupId", params.setup_id.as_deref())?;
+        let min_duration_ms = parse_dom_behavior_min_duration(params.min_duration_ms)?;
         let db = self.db.lock().map_err(|_| lock_error())?;
         let result = research::dom_behavior_conditional(
             &db,
-            &params.behavior,
-            params.setup_id.as_deref(),
-            params.min_duration_ms.unwrap_or(15_000.0),
+            &behavior,
+            setup_id.as_deref(),
+            min_duration_ms,
             params.start_date.as_deref(),
             params.end_date.as_deref(),
             scope.as_ref(),
@@ -3900,15 +4153,22 @@ impl TheDeskMcp {
         &self,
         Parameters(params): Parameters<DomReactionAtLevelsParams>,
     ) -> Result<CallToolResult, McpError> {
-        validate_ymd_opt("startDate", params.start_date.as_deref())?;
-        validate_ymd_opt("endDate", params.end_date.as_deref())?;
+        validate_ymd_range(
+            "startDate",
+            params.start_date.as_deref(),
+            "endDate",
+            params.end_date.as_deref(),
+        )?;
         let scope = parse_scope_value(params.scope)?;
+        let event_type = parse_research_event_type(&params.event_type)?;
+        let behavior = parse_dom_behavior_name(&params.behavior)?;
+        let min_duration_ms = parse_dom_behavior_min_duration(params.min_duration_ms)?;
         let db = self.db.lock().map_err(|_| lock_error())?;
         let result = research::dom_reaction_at_levels(
             &db,
-            &params.event_type,
-            &params.behavior,
-            params.min_duration_ms.unwrap_or(15_000.0),
+            &event_type,
+            &behavior,
+            min_duration_ms,
             params.start_date.as_deref(),
             params.end_date.as_deref(),
             scope.as_ref(),
@@ -6003,11 +6263,18 @@ impl TheDeskMcp {
         &self,
         Parameters(params): Parameters<FrequencyParams>,
     ) -> Result<CallToolResult, McpError> {
+        validate_ymd_range(
+            "startDate",
+            params.start_date.as_deref(),
+            "endDate",
+            params.end_date.as_deref(),
+        )?;
         let scope = build_session_scope_filter(&params.session_scope)?;
+        let event_type = parse_research_event_type(&params.event_type)?;
         let db = self.db.lock().map_err(|_| lock_error())?;
         match research::event_frequency(
             &db,
-            &params.event_type,
+            &event_type,
             params.start_date.as_deref(),
             params.end_date.as_deref(),
             scope.as_ref(),
@@ -6026,15 +6293,24 @@ impl TheDeskMcp {
         &self,
         Parameters(params): Parameters<ConditionalParams>,
     ) -> Result<CallToolResult, McpError> {
+        validate_ymd_range(
+            "startDate",
+            params.start_date.as_deref(),
+            "endDate",
+            params.end_date.as_deref(),
+        )?;
         let scope = build_session_scope_filter(&params.session_scope)?;
+        let event_type = parse_research_event_type(&params.event_type)?;
+        let min_count = parse_research_min_count(params.min_count)?;
+        let outcome_field = parse_research_outcome_field(&params.outcome_field)?;
+        let outcome_value = parse_non_empty_string("outcomeValue", &params.outcome_value)?;
         let db = self.db.lock().map_err(|_| lock_error())?;
-        let min_count = params.min_count.unwrap_or(1);
         match research::conditional_probability(
             &db,
-            &params.event_type,
+            &event_type,
             min_count,
-            &params.outcome_field,
-            &params.outcome_value,
+            &outcome_field,
+            &outcome_value,
             params.start_date.as_deref(),
             params.end_date.as_deref(),
             scope.as_ref(),
@@ -6053,11 +6329,18 @@ impl TheDeskMcp {
         &self,
         Parameters(params): Parameters<DistributionParams>,
     ) -> Result<CallToolResult, McpError> {
+        validate_ymd_range(
+            "startDate",
+            params.start_date.as_deref(),
+            "endDate",
+            params.end_date.as_deref(),
+        )?;
         let scope = build_session_scope_filter(&params.session_scope)?;
+        let metric = parse_distribution_metric(&params.metric)?;
         let db = self.db.lock().map_err(|_| lock_error())?;
         match research::metric_distribution(
             &db,
-            &params.metric,
+            &metric,
             params.start_date.as_deref(),
             params.end_date.as_deref(),
             scope.as_ref(),
@@ -6076,11 +6359,18 @@ impl TheDeskMcp {
         &self,
         Parameters(params): Parameters<SignalOutcomeDistributionParams>,
     ) -> Result<CallToolResult, McpError> {
+        validate_ymd_range(
+            "startDate",
+            params.start_date.as_deref(),
+            "endDate",
+            params.end_date.as_deref(),
+        )?;
         let scope = build_session_scope_filter(&params.session_scope)?;
+        let setup_id = parse_non_empty_string("setupId", &params.setup_id)?;
         let db = self.db.lock().map_err(|_| lock_error())?;
         match research::signal_outcome_distribution(
             &db,
-            &params.setup_id,
+            &setup_id,
             params.start_date.as_deref(),
             params.end_date.as_deref(),
             scope.as_ref(),
@@ -6099,13 +6389,22 @@ impl TheDeskMcp {
         &self,
         Parameters(params): Parameters<SignalOutcomeConditionalParams>,
     ) -> Result<CallToolResult, McpError> {
+        validate_ymd_range(
+            "startDate",
+            params.start_date.as_deref(),
+            "endDate",
+            params.end_date.as_deref(),
+        )?;
         let scope = build_session_scope_filter(&params.session_scope)?;
+        let setup_id = parse_non_empty_string("setupId", &params.setup_id)?;
+        let session_field = parse_signal_outcome_session_field(&params.session_field)?;
+        let field_value = parse_non_empty_string("fieldValue", &params.field_value)?;
         let db = self.db.lock().map_err(|_| lock_error())?;
         match research::signal_outcome_conditional(
             &db,
-            &params.setup_id,
-            &params.session_field,
-            &params.field_value,
+            &setup_id,
+            &session_field,
+            &field_value,
             params.start_date.as_deref(),
             params.end_date.as_deref(),
             scope.as_ref(),
@@ -6124,11 +6423,18 @@ impl TheDeskMcp {
         &self,
         Parameters(params): Parameters<SignalOutcomeExcursionsParams>,
     ) -> Result<CallToolResult, McpError> {
+        validate_ymd_range(
+            "startDate",
+            params.start_date.as_deref(),
+            "endDate",
+            params.end_date.as_deref(),
+        )?;
         let scope = build_session_scope_filter(&params.session_scope)?;
+        let setup_id = parse_optional_non_empty_string("setupId", params.setup_id.as_deref())?;
         let db = self.db.lock().map_err(|_| lock_error())?;
         match research::signal_outcome_excursions(
             &db,
-            params.setup_id.as_deref(),
+            setup_id.as_deref(),
             params.start_date.as_deref(),
             params.end_date.as_deref(),
             scope.as_ref(),
@@ -6147,6 +6453,12 @@ impl TheDeskMcp {
         &self,
         Parameters(params): Parameters<SessionHistoryParams>,
     ) -> Result<CallToolResult, McpError> {
+        validate_ymd_range(
+            "startDate",
+            params.start_date.as_deref(),
+            "endDate",
+            params.end_date.as_deref(),
+        )?;
         let scope = build_session_scope_filter(&params.session_scope)?;
         let start_date = scope
             .as_ref()
@@ -6156,12 +6468,13 @@ impl TheDeskMcp {
             .as_ref()
             .and_then(|s| s.trading_day_end.as_deref())
             .or(params.end_date.as_deref());
+        let day_type = parse_optional_non_empty_string("dayType", params.day_type.as_deref())?;
         let db = self.db.lock().map_err(|_| lock_error())?;
-        let limit = params.limit.unwrap_or(20) as usize;
+        let limit = parse_bounded_limit("limit", params.limit, 20, MAX_RESEARCH_RESULT_LIMIT)?;
         match db.list_session_summaries_scoped(
             start_date,
             end_date,
-            params.day_type.as_deref(),
+            day_type.as_deref(),
             scope.as_ref().and_then(|s| s.session_type.as_deref()),
             limit,
             scope.as_ref(),
@@ -6253,10 +6566,17 @@ impl TheDeskMcp {
         &self,
         Parameters(params): Parameters<SetupPerformanceMatrixParams>,
     ) -> Result<CallToolResult, McpError> {
+        validate_ymd_range(
+            "startDate",
+            params.start_date.as_deref(),
+            "endDate",
+            params.end_date.as_deref(),
+        )?;
         let scope = build_session_scope_filter(&params.session_scope)?;
         let sort_by = parse_setup_perf_sort(params.sort_by.as_deref())?;
-        let min_resolved = params.min_resolved.unwrap_or(0).max(0);
-        let limit = params.limit.unwrap_or(50).max(1) as usize;
+        let min_resolved =
+            parse_nonnegative_i64("minResolved", params.min_resolved, 0, MAX_MIN_RESOLVED)?;
+        let limit = parse_bounded_limit("limit", params.limit, 50, MAX_RESEARCH_RESULT_LIMIT)?;
         let db = self.db.lock().map_err(|_| lock_error())?;
         match db.setup_performance_matrix_filtered(
             params.start_date.as_deref(),
@@ -9002,6 +9322,101 @@ mod tests {
             .expect("some");
         assert_eq!(scope.session_type.as_deref(), Some("Globex"));
         assert_eq!(scope.session_segment.as_deref(), Some("London"));
+
+        let root_only = SessionScopeParams {
+            root_symbol: Some("NQ".into()),
+            ..Default::default()
+        };
+        let scope = build_session_scope_filter(&root_only)
+            .expect("root-only scope")
+            .expect("some");
+        assert_eq!(scope.root_symbol.as_deref(), Some("NQ"));
+    }
+
+    #[test]
+    fn parse_scope_value_validates_loose_scope_payloads() {
+        assert!(parse_scope_value(Some(serde_json::json!({
+            "sessionType": "bad"
+        })))
+        .is_err());
+
+        let scope = parse_scope_value(Some(serde_json::json!({
+            "rootSymbol": "NQ",
+            "continuousMode": true
+        })))
+        .expect("scope")
+        .expect("some");
+        assert_eq!(scope.root_symbol.as_deref(), Some("NQ"));
+        assert!(scope.continuous_mode);
+    }
+
+    #[test]
+    fn research_field_validators_accept_supported_values() {
+        assert_eq!(
+            parse_research_event_type("ib_mid_test").expect("event"),
+            "ib_mid_test"
+        );
+        assert_eq!(
+            parse_research_event_type("IB_REENTRY").expect("event"),
+            "ib_reentry"
+        );
+        assert_eq!(
+            parse_research_outcome_field("close_vs_vwap").expect("field"),
+            "close_vs_vwap"
+        );
+        assert_eq!(
+            parse_distribution_metric("session_delta").expect("metric"),
+            "session_delta"
+        );
+        assert_eq!(
+            parse_signal_outcome_session_field("balance_state").expect("session field"),
+            "balance_state"
+        );
+        assert_eq!(
+            parse_dom_behavior_name("Liquidity_Flip").expect("behavior"),
+            "liquidity_flip"
+        );
+    }
+
+    #[test]
+    fn research_field_validators_reject_invalid_inputs() {
+        assert!(parse_research_event_type("made_up_event").is_err());
+        assert!(parse_research_event_type("made_up_test").is_err());
+        assert!(parse_research_outcome_field("not_a_field").is_err());
+        assert!(parse_distribution_metric("not_a_metric").is_err());
+        assert!(parse_signal_outcome_session_field("not_a_field").is_err());
+        assert!(parse_dom_behavior_name("not_a_behavior").is_err());
+        assert!(parse_research_min_count(Some(-1)).is_err());
+        assert!(parse_research_min_count(Some(0)).is_err());
+        assert!(parse_nonnegative_i64("minResolved", Some(-1), 0, MAX_MIN_RESOLVED).is_err());
+        assert!(parse_bounded_limit("limit", Some(0), 20, MAX_RESEARCH_RESULT_LIMIT).is_err());
+        assert!(parse_dom_behavior_min_duration(Some(f64::INFINITY)).is_err());
+        assert!(parse_dom_behavior_min_duration(Some(-1.0)).is_err());
+    }
+
+    #[test]
+    fn validate_ymd_range_rejects_invalid_and_reversed_dates() {
+        assert!(validate_ymd_range(
+            "startDate",
+            Some("2026-03-04"),
+            "endDate",
+            Some("2026-03-05")
+        )
+        .is_ok());
+        assert!(validate_ymd_range(
+            "startDate",
+            Some("2026-03-05"),
+            "endDate",
+            Some("2026-03-04")
+        )
+        .is_err());
+        assert!(validate_ymd_range(
+            "startDate",
+            Some("03-05-2026"),
+            "endDate",
+            Some("2026-03-06")
+        )
+        .is_err());
     }
 
     #[test]

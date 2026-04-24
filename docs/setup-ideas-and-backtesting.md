@@ -89,39 +89,35 @@ That said, the project is in the zone where the next order of improvement is not
 
 ### Weakest points that need addressing
 
-#### 1. Session-end snapshot atomicity (high priority — trading impact)
+#### 1. Pipeline contention fallback and startup no-snapshot path are now surfaced
 
-If the MCP crashes at 4:14:59 PM ET, the RTH close snapshot is not atomically persisted. Prior-day level carry-forward on the next session would then be wrong or flagged invalid. **Fix:** write the final (VWAP, VA high/low, DNVA, POC, DNP, cum delta) to a dedicated `session_closes` table inside a single transaction at RTH close, and also at 5-minute intervals during the final hour.
+[src/bin/the-desk-mcp.rs](../src/bin/the-desk-mcp.rs) now covers both contention cases. When `get_market_snapshot` falls back to persisted feature state, callers still receive `degradationReason = "pipeline_lock_contended; using persisted_feature_state"` and `freshnessStatus = "contended"`. When the pipeline lock is contended before any persisted feature snapshot is available, the tool now returns a structured degraded payload with `snapshotAvailable = false`, `snapshotSource = "contention_unavailable"`, `freshnessStatus = "contended"`, and a contention-specific `degradationReason` (`"pipeline_lock_contended; no_persisted_feature_state_available_yet"` or the DB-busy variant). `pipelineLockRecentlyContended` is also now latched over a short recent window instead of mirroring only the latest `try_lock()` sample. **Status:** closed.
 
-#### 2. Pipeline lock contention is detected but swallowed
+#### 2. Input validation at the MCP boundary is uneven
 
-[src/bin/the-desk-mcp.rs](../src/bin/the-desk-mcp.rs) (around line 108 as of the audit) sets `pipeline_lock_contended` but the flag is not surfaced in `degradation_reason` on snapshot responses. An agent calling `get_market_snapshot` during contention gets stale data with no warning. **Fix:** populate `degradation_reason` whenever the contention atomic is set.
+Validation is better than the first audit pass implied: there are already explicit guards for time windows and `YYYY-MM-DD` dates. But the coverage is inconsistent across tools, and Serde still gives you type safety more than domain validity. Negative counts, unsupported field names, oversized windows, and impossible enum-like strings can still leak through to DB errors or misleading results. **Fix:** centralize parameter validation per tool family, add allowlists/range checks for bounded numerics and research fields, and keep returning typed `McpError` with actionable messages.
 
-#### 3. Input validation at the MCP boundary is weak
-
-Serde gives you type safety, not range validity. A `percentile: 150` or malformed date silently produces garbage or a DB error. **Fix:** add explicit bounds checks per tool handler (percentile 0–100, dates parseable ET, window ≤ sensible max, etc.). Return typed `McpError` with actionable messages.
-
-#### 4. Clock skew / duplicate-timestamp defense
+#### 3. Clock skew / duplicate-timestamp defense
 
 [src/feed/scid_reader.rs](../src/feed/scid_reader.rs) and the ingest loop assume strictly monotonic SCID timestamps. Sierra occasionally emits equal-or-lower ticks under load. **Fix:** in ingest, if `ts <= last_ts` → skip (or bump by 1µs) and increment a `skipped_nonmonotonic` counter that is reported by `get_feed_health`.
 
-#### 5. Restart loses in-flight setup state
+#### 4. Restart loses in-flight setup state
 
 If the server restarts mid-session, the rules engine's "Approaching / ConditionsMet / Confirmed" states are in-memory only. Agents cannot see that setup X was 80% confirmed 3 minutes ago. **Fix:** persist state machine transitions to a `setup_state_log` table; on restart, replay the last N minutes and rehydrate.
 
-#### 6. Contract rollover awareness
+#### 5. Contract rollover awareness
 
 [src/pipelines/levels.rs](../src/pipelines/levels.rs) has `carry_forward_levels_valid` flags, but there is no pre-session tool that proactively warns the agent. **Fix:** add a `validate_contract_rollover()` MCP tool that returns current root vs prior-session root and whether prior-day references should be cleared.
 
-#### 7. Research query SQL not audited for statistical soundness
+#### 6. Research query SQL not audited for statistical soundness
 
 [src/research/mod.rs](../src/research/mod.rs) does frequency / conditional / distribution queries — but the SQL itself needs a dedicated read. Off-by-one in percentile edges, incorrect GROUP BY over session boundaries, or double-counting overlapping events would silently poison the statistics playbooks are built on. **Fix:** dedicated review pass with golden-file tests (known input → known output percentiles).
 
-#### 8. Structured logging is ad-hoc
+#### 7. Structured logging is ad-hoc
 
 Mix of `println!` and `tracing`. For a professional tool you want JSON-structured logs with stable field names so a post-mortem on yesterday's bad fill can be filtered cleanly. **Fix:** `tracing-subscriber` with JSON layer, standardize event names (`scid.tick`, `pipeline.contention`, `setup.transition`, `event.detected`).
 
-#### 9. No end-to-end session replay test
+#### 8. No end-to-end session replay test
 
 All pipeline tests are unit level. A multi-day `.scid` golden-file test that asserts "these events at these timestamps with these magnitudes" would catch drift from future refactors — which is the single biggest silent risk to a system like this over 12–24 months.
 

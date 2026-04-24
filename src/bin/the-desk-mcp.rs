@@ -62,6 +62,7 @@ const FRESHNESS_THRESHOLD_MS: f64 = 15_000.0;
 const JOB_PROGRESS_PERSIST_INTERVAL_MS: f64 = 1_000.0;
 const JOB_PROGRESS_RECORD_STEP: usize = 50_000;
 const JOB_PROGRESS_RATE_EMA_ALPHA: f64 = 0.25;
+const PIPELINE_CONTENTION_RECENT_WINDOW_MS: u64 = 5_000;
 type DnvaTriple = (f64, f64, f64);
 
 /// MCP clients (e.g. Cursor) may reject `tools/list` when `serde_json::Value` becomes JSON Schema
@@ -92,7 +93,8 @@ pub struct McpFeedRuntimeState {
     pub scid_tail_reset_count: Arc<AtomicU64>,
     pub scid_last_shrink_len: Arc<AtomicU64>,
     pub last_scid_poll_wall_ms: Arc<AtomicU64>,
-    pub pipeline_lock_contended: Arc<AtomicBool>,
+    pub pipeline_lock_contended_now: Arc<AtomicBool>,
+    pub pipeline_last_contended_wall_ms: Arc<AtomicU64>,
 }
 
 impl Default for McpFeedRuntimeState {
@@ -105,8 +107,29 @@ impl Default for McpFeedRuntimeState {
             scid_tail_reset_count: Arc::new(AtomicU64::new(0)),
             scid_last_shrink_len: Arc::new(AtomicU64::new(0)),
             last_scid_poll_wall_ms: Arc::new(AtomicU64::new(0)),
-            pipeline_lock_contended: Arc::new(AtomicBool::new(false)),
+            pipeline_lock_contended_now: Arc::new(AtomicBool::new(false)),
+            pipeline_last_contended_wall_ms: Arc::new(AtomicU64::new(0)),
         }
+    }
+}
+
+impl McpFeedRuntimeState {
+    fn record_pipeline_lock_sample(&self, contended: bool, observed_at_ms: u64) {
+        self.pipeline_lock_contended_now
+            .store(contended, Ordering::Release);
+        if contended {
+            self.pipeline_last_contended_wall_ms
+                .store(observed_at_ms, Ordering::Release);
+        }
+    }
+
+    fn pipeline_lock_recently_contended(&self, now_ms: u64) -> bool {
+        if self.pipeline_lock_contended_now.load(Ordering::Acquire) {
+            return true;
+        }
+        let last_contended = self.pipeline_last_contended_wall_ms.load(Ordering::Acquire);
+        last_contended > 0
+            && now_ms.saturating_sub(last_contended) <= PIPELINE_CONTENTION_RECENT_WINDOW_MS
     }
 }
 
@@ -204,6 +227,27 @@ fn merge_tool_live_metadata(target: &mut serde_json::Value, r: &LiveMarketResolu
             serde_json::json!(r.db_contended),
         );
     }
+}
+
+fn render_market_snapshot_payload(r: &LiveMarketResolution) -> serde_json::Value {
+    let snap = r.snapshot.clone();
+    let top_dom = r
+        .dom_summary
+        .clone()
+        .or_else(|| snap.get("domSummary").cloned());
+    let snapshot_available = !snap.is_null();
+    let mut out = serde_json::json!({
+        "snapshot": snap,
+        "domSummary": top_dom,
+        "snapshotAvailable": snapshot_available,
+    });
+    if !snapshot_available {
+        out["message"] = serde_json::json!(
+            "Current market snapshot is temporarily unavailable while live pipeline contention is active. Retry shortly."
+        );
+    }
+    merge_tool_live_metadata(&mut out, r);
+    out
 }
 
 #[derive(Clone)]
@@ -1998,7 +2042,8 @@ impl TheDeskMcp {
 
     /// Single coherent live view: in-memory pipeline when available, else persisted `feature_state`.
     fn resolve_live_market_view(&self) -> Option<LiveMarketResolution> {
-        let now_ms = chrono::Utc::now().timestamp_millis() as f64;
+        let now_wall_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        let now_ms = now_wall_ms as f64;
         let atomic_ts = tick_ms_from_bits(
             self.feed_runtime
                 .last_scid_tick_ms_bits
@@ -2024,8 +2069,7 @@ impl TheDeskMcp {
         let pipelines_guard = self.pipelines.try_lock();
         let pipelines_contended = pipelines_guard.is_err();
         self.feed_runtime
-            .pipeline_lock_contended
-            .store(pipelines_contended, Ordering::Release);
+            .record_pipeline_lock_sample(pipelines_contended, now_wall_ms);
 
         if let Ok(pipelines) = pipelines_guard {
             let bid = self.last_bid.lock().ok().map(|g| *g).unwrap_or(0.0);
@@ -2126,6 +2170,89 @@ impl TheDeskMcp {
         }
 
         None
+    }
+
+    /// Structured degraded snapshot metadata when the pipeline lock is contended before any
+    /// readable market snapshot exists.
+    fn resolve_market_snapshot_contention_gap(&self) -> Option<LiveMarketResolution> {
+        let now_wall_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        let now_ms = now_wall_ms as f64;
+        let atomic_ts = tick_ms_from_bits(
+            self.feed_runtime
+                .last_scid_tick_ms_bits
+                .load(Ordering::Acquire),
+        );
+        let depth_atomic = tick_ms_from_bits(
+            self.feed_runtime
+                .last_depth_timestamp_ms_bits
+                .load(Ordering::Acquire),
+        );
+
+        let db_guard = self.db.try_lock();
+        let db_contended = db_guard.is_err();
+        let (latest_db_tick, dom_state) = match db_guard {
+            Ok(db) => (
+                db.latest_tick_timestamp_ms().ok().flatten(),
+                db.latest_dom_feature_state().ok().flatten(),
+            ),
+            Err(_) => (None, None),
+        };
+
+        let pipelines_guard = self.pipelines.try_lock();
+        let pipelines_contended = pipelines_guard.is_err();
+        self.feed_runtime
+            .record_pipeline_lock_sample(pipelines_contended, now_wall_ms);
+        if !pipelines_contended {
+            return None;
+        }
+
+        let latest_depth_ts = dom_state.as_ref().map(|(ts, _)| *ts).or(depth_atomic);
+        let dom_summary = dom_state.as_ref().and_then(|(_, payload)| {
+            payload
+                .get("domSummary")
+                .filter(|summary| !summary.is_null())
+                .cloned()
+        });
+        let dom_source = if dom_summary.is_some() {
+            "persisted_dom_feature_state"
+        } else {
+            "unavailable"
+        };
+        let known_as_of = [atomic_ts, latest_db_tick, latest_depth_ts]
+            .into_iter()
+            .flatten()
+            .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let as_of = known_as_of.unwrap_or(now_ms);
+        let data_age_ms = known_as_of.map(|ts| (now_ms - ts).max(0.0)).unwrap_or(-1.0);
+        let degradation_reason = if db_contended {
+            "pipeline_lock_contended; persisted_feature_state_unavailable_db_busy"
+        } else {
+            "pipeline_lock_contended; no_persisted_feature_state_available_yet"
+        };
+
+        Some(LiveMarketResolution {
+            snapshot: serde_json::Value::Null,
+            snapshot_source: "contention_unavailable",
+            dom_summary,
+            dom_source,
+            as_of_timestamp_ms: as_of,
+            pipeline_processed_through_ms: atomic_ts,
+            latest_db_tick_timestamp_ms: latest_db_tick,
+            latest_depth_timestamp_ms: latest_depth_ts,
+            data_age_ms,
+            degradation_reason: Some(degradation_reason.to_string()),
+            pipelines_contended: true,
+            db_contended,
+        })
+    }
+
+    fn current_market_snapshot_payload(&self) -> Option<serde_json::Value> {
+        self.resolve_live_market_view()
+            .map(|r| render_market_snapshot_payload(&r))
+            .or_else(|| {
+                self.resolve_market_snapshot_contention_gap()
+                    .map(|r| render_market_snapshot_payload(&r))
+            })
     }
 
     fn data_age_from_db_or_atomic(&self) -> f64 {
@@ -2476,17 +2603,7 @@ impl TheDeskMcp {
         description = "Current market snapshot: last price, VWAP with 1/2/3 SD bands, TPO value area (high/low/POC), delta neutral value area (DNVA high/low/DNP), session delta, cumulative delta, key levels (prior day H/L/C, prior VA/POC, overnight range, OR, IB), Globex/London opening ranges, and session context (sessionType, sessionSegment, tradingDay), plus tape pace, imbalance count, absorption event count, and average trade size. Prefers live pipeline state; falls back to last persisted snapshot."
     )]
     async fn get_market_snapshot(&self) -> Result<CallToolResult, McpError> {
-        if let Some(r) = self.resolve_live_market_view() {
-            let snap = r.snapshot.clone();
-            let top_dom = r
-                .dom_summary
-                .clone()
-                .or_else(|| snap.get("domSummary").cloned());
-            let mut out = serde_json::json!({
-                "snapshot": snap,
-                "domSummary": top_dom,
-            });
-            merge_tool_live_metadata(&mut out, &r);
+        if let Some(out) = self.current_market_snapshot_payload() {
             return Ok(text_result(out));
         }
         Ok(no_data(
@@ -5502,7 +5619,8 @@ impl TheDeskMcp {
         let scid_len = fr.scid_file_len.load(Ordering::Acquire);
         let scid_resets = fr.scid_tail_reset_count.load(Ordering::Acquire);
         let shrink_len = fr.scid_last_shrink_len.load(Ordering::Acquire);
-        let pipeline_contended = fr.pipeline_lock_contended.load(Ordering::Acquire);
+        let now_wall_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        let pipeline_contended = fr.pipeline_lock_recently_contended(now_wall_ms);
 
         Ok(text_result(serde_json::json!({
             "liveDataSource": "scid",
@@ -6711,6 +6829,7 @@ impl TheDeskMcp {
         let age_ms = last_ts.map(|v| now_ms - v).unwrap_or(f64::INFINITY);
         let stream_fresh = age_ms.is_finite() && age_ms <= FRESHNESS_THRESHOLD_MS;
         let fr = &self.feed_runtime;
+        let now_wall_ms = now_ms.max(0.0) as u64;
         let atomic_scid_ts = tick_ms_from_bits(fr.last_scid_tick_ms_bits.load(Ordering::Acquire));
         let atomic_age_ms = atomic_scid_ts
             .map(|t| (now_ms - t).max(0.0))
@@ -6750,7 +6869,7 @@ impl TheDeskMcp {
                 -1.0
             },
             "scidTailResetCount": fr.scid_tail_reset_count.load(Ordering::Acquire),
-            "pipelineLockRecentlyContended": fr.pipeline_lock_contended.load(Ordering::Acquire),
+            "pipelineLockRecentlyContended": fr.pipeline_lock_recently_contended(now_wall_ms),
             "lastDepthTimestampMs": tick_ms_from_bits(
                 fr.last_depth_timestamp_ms_bits.load(Ordering::Acquire),
             ),
@@ -8790,6 +8909,66 @@ mod tests {
         assert_eq!(tick_ms_from_bits(tick_ms_to_bits(t)), Some(t));
         assert_eq!(tick_ms_to_bits(0.0), 0);
         assert_eq!(tick_ms_from_bits(0), None);
+    }
+
+    #[test]
+    fn pipeline_lock_recently_contended_uses_a_latched_window() {
+        let runtime = McpFeedRuntimeState::default();
+        runtime.record_pipeline_lock_sample(true, 10_000);
+        assert!(runtime.pipeline_lock_recently_contended(10_000));
+
+        runtime.record_pipeline_lock_sample(false, 10_500);
+        assert!(runtime.pipeline_lock_recently_contended(14_999));
+        assert!(!runtime
+            .pipeline_lock_recently_contended(10_000 + PIPELINE_CONTENTION_RECENT_WINDOW_MS + 1));
+    }
+
+    #[test]
+    fn current_market_snapshot_payload_surfaces_structured_contention_gap() {
+        let server = test_server();
+        let pipeline_ts = 1_700_000_000_000.0;
+        server
+            .feed_runtime
+            .last_scid_tick_ms_bits
+            .store(tick_ms_to_bits(pipeline_ts), Ordering::Release);
+
+        let _pipeline_guard = server.pipelines.lock().expect("pipelines");
+        let payload = server
+            .current_market_snapshot_payload()
+            .expect("structured contention payload");
+
+        assert_eq!(
+            payload.get("snapshotAvailable").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            payload.get("snapshotSource").and_then(|v| v.as_str()),
+            Some("contention_unavailable")
+        );
+        assert_eq!(
+            payload.get("freshnessStatus").and_then(|v| v.as_str()),
+            Some("contended")
+        );
+        assert_eq!(
+            payload.get("degradationReason").and_then(|v| v.as_str()),
+            Some("pipeline_lock_contended; no_persisted_feature_state_available_yet")
+        );
+        assert_eq!(
+            payload
+                .get("pipelineProcessedThroughMs")
+                .and_then(|v| v.as_f64()),
+            Some(pipeline_ts)
+        );
+        assert_eq!(
+            payload.get("dbLockContended").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            payload.get("message").and_then(|v| v.as_str()),
+            Some(
+                "Current market snapshot is temporarily unavailable while live pipeline contention is active. Retry shortly."
+            )
+        );
     }
 
     #[test]

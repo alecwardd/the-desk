@@ -84,7 +84,7 @@ That said, the project is in the zone where the next order of improvement is not
 2. **Incremental math everywhere.** Every pipeline accumulates; nothing recomputes from scratch. This is the right ceiling for sub-ms tick latency and the reason 100-pt volatile opens do not melt the system.
 3. **Terminology precision.** [CLAUDE.md](../CLAUDE.md) enforces it and the code reflects it. That is a moat — most trading tooling (retail and vendor) gets TPO/delta/value-area wrong.
 4. **Research infrastructure exists.** [src/research/mod.rs](../src/research/mod.rs) plus [src/backfill.rs](../src/backfill.rs) plus the event detector means you can actually ask "given X, what is P(Y)?" against real history. Most traders never get there.
-5. **Observability primitives are in place.** `McpFeedRuntimeState` in [src/bin/the-desk-mcp.rs](../src/bin/the-desk-mcp.rs) exposes tick freshness, lock contention, poll latency, SCID offsets via tools. Good foundation.
+5. **Observability primitives are in place.** `McpFeedRuntimeState` in [src/bin/the-desk-mcp.rs](../src/bin/the-desk-mcp.rs) exposes tick freshness, lock contention, poll latency, SCID offsets, and now non-monotonic SCID counters via tools. Combined with `scan_scid_timestamp_anomalies`, this is a good foundation for feed diagnostics.
 6. **This document (`setup-ideas-and-backtesting.md`) is gold.** It is the kind of living artifact that makes the rest of the system valuable. Keep investing here.
 
 ### Weakest points that need addressing
@@ -97,9 +97,13 @@ That said, the project is in the zone where the next order of improvement is not
 
 Validation is better than the first audit pass implied: there are already explicit guards for time windows and `YYYY-MM-DD` dates. But the coverage is inconsistent across tools, and Serde still gives you type safety more than domain validity. Negative counts, unsupported field names, oversized windows, and impossible enum-like strings can still leak through to DB errors or misleading results. **Fix:** centralize parameter validation per tool family, add allowlists/range checks for bounded numerics and research fields, and keep returning typed `McpError` with actionable messages.
 
-#### 3. Clock skew / duplicate-timestamp defense
+#### 3. Clock skew / duplicate-timestamp defense is now implemented
 
-[src/feed/scid_reader.rs](../src/feed/scid_reader.rs) and the ingest loop assume strictly monotonic SCID timestamps. Sierra occasionally emits equal-or-lower ticks under load. **Fix:** in ingest, if `ts <= last_ts` → skip (or bump by 1µs) and increment a `skipped_nonmonotonic` counter that is reported by `get_feed_health`.
+The gap this note originally called out is now covered. [src/feed/monotonic.rs](../src/feed/monotonic.rs) adds a shared `MonotonicTickGuard` that classifies `equalTimestamp` vs `backwardTimestamp`, counts skipped ticks, and captures bounded samples. Mutating SCID paths now use that guard instead of assuming strict monotonicity: startup warm replay and live tailing in [src/bin/the-desk-mcp.rs](../src/bin/the-desk-mcp.rs), historical replay in [src/backfill.rs](../src/backfill.rs), raw tick ingest in [src/scid_tick_ingest.rs](../src/scid_tick_ingest.rs), and the fallback tail loop in [src/feed/scid_reader.rs](../src/feed/scid_reader.rs).
+
+The observability side is also in place. `get_feed_health` and `validate_data_integrity` now expose `skippedNonMonotonicTicks`, `duplicateTimestampTicks`, `backwardTimestampTicks`, and `lastNonMonotonicTimestampMs`. There is also a dedicated `scan_scid_timestamp_anomalies` MCP tool for file-order historical scans, backed by [src/scid_timestamp_diagnostics.rs](../src/scid_timestamp_diagnostics.rs). That matters because it separates "runtime has skipped bad ticks since startup" from "the SCID file contains older anomalies somewhere in history."
+
+Current status from validation: the recent-date scan path is working as intended and came back clean on the current session window, while a full-file scan did surface older duplicate/backward timestamp regions in the historical SCID file. That is the expected shape: runtime defense is implemented, health reporting exists, and the historical scanner can now prove whether anomalies are present. **Status:** closed.
 
 #### 4. Restart loses in-flight setup state
 

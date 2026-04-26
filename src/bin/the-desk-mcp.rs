@@ -24,6 +24,9 @@ use the_desk_backend::depth::{
     DomFeatureSnapshot, DomSummary, PullStackActivitySummary, ScanControl as DepthScanControl,
     DOM_NARRATIVE_HORIZON_MS,
 };
+use the_desk_backend::feed::monotonic::{
+    MonotonicTickGuard, MonotonicTimestampDecision, MonotonicTimestampViolationKind,
+};
 use the_desk_backend::feed::scid_reader::{
     scid_tail_offset_after_shrink, ScanControl as ScidScanControl, ScidReader, ScidTick,
     SCID_RECORD_SIZE,
@@ -49,6 +52,7 @@ use the_desk_backend::research;
 use the_desk_backend::risk::{RiskConfig, RiskState, RiskTracker};
 use the_desk_backend::rules::{RulesEngine, SetupDefinition};
 use the_desk_backend::scid_tick_ingest::{self, TickIngestParams};
+use the_desk_backend::scid_timestamp_diagnostics;
 use the_desk_backend::{
     classify_delta_segment, classify_session, et_minutes_from_timestamp, globex_open_ms,
     minute_of_session_from_timestamp, session_date_from_timestamp_ms,
@@ -63,6 +67,7 @@ const JOB_PROGRESS_PERSIST_INTERVAL_MS: f64 = 1_000.0;
 const JOB_PROGRESS_RECORD_STEP: usize = 50_000;
 const JOB_PROGRESS_RATE_EMA_ALPHA: f64 = 0.25;
 const PIPELINE_CONTENTION_RECENT_WINDOW_MS: u64 = 5_000;
+const MONOTONIC_ANOMALY_RECENT_WINDOW_MS: f64 = 60_000.0;
 const MAX_RESEARCH_RESULT_LIMIT: u64 = 500;
 const MAX_RESEARCH_MIN_COUNT: i64 = 10_000;
 const MAX_MIN_RESOLVED: i64 = 10_000;
@@ -195,6 +200,10 @@ pub struct McpFeedRuntimeState {
     pub scid_file_len: Arc<AtomicU64>,
     pub scid_tail_reset_count: Arc<AtomicU64>,
     pub scid_last_shrink_len: Arc<AtomicU64>,
+    pub skipped_non_monotonic_ticks: Arc<AtomicU64>,
+    pub duplicate_timestamp_ticks: Arc<AtomicU64>,
+    pub backward_timestamp_ticks: Arc<AtomicU64>,
+    pub last_non_monotonic_tick_ms_bits: Arc<AtomicU64>,
     pub last_scid_poll_wall_ms: Arc<AtomicU64>,
     pub pipeline_lock_contended_now: Arc<AtomicBool>,
     pub pipeline_last_contended_wall_ms: Arc<AtomicU64>,
@@ -209,10 +218,34 @@ impl Default for McpFeedRuntimeState {
             scid_file_len: Arc::new(AtomicU64::new(0)),
             scid_tail_reset_count: Arc::new(AtomicU64::new(0)),
             scid_last_shrink_len: Arc::new(AtomicU64::new(0)),
+            skipped_non_monotonic_ticks: Arc::new(AtomicU64::new(0)),
+            duplicate_timestamp_ticks: Arc::new(AtomicU64::new(0)),
+            backward_timestamp_ticks: Arc::new(AtomicU64::new(0)),
+            last_non_monotonic_tick_ms_bits: Arc::new(AtomicU64::new(0)),
             last_scid_poll_wall_ms: Arc::new(AtomicU64::new(0)),
             pipeline_lock_contended_now: Arc::new(AtomicBool::new(false)),
             pipeline_last_contended_wall_ms: Arc::new(AtomicU64::new(0)),
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct MonotonicRuntimeSnapshot {
+    skipped_non_monotonic_ticks: u64,
+    duplicate_timestamp_ticks: u64,
+    backward_timestamp_ticks: u64,
+    last_non_monotonic_timestamp_ms: Option<f64>,
+}
+
+impl MonotonicRuntimeSnapshot {
+    fn has_recent_violation(&self, now_ms: f64) -> bool {
+        self.last_non_monotonic_timestamp_ms
+            .map(|ts| {
+                now_ms.is_finite()
+                    && now_ms >= ts
+                    && now_ms - ts <= MONOTONIC_ANOMALY_RECENT_WINDOW_MS
+            })
+            .unwrap_or(false)
     }
 }
 
@@ -233,6 +266,33 @@ impl McpFeedRuntimeState {
         let last_contended = self.pipeline_last_contended_wall_ms.load(Ordering::Acquire);
         last_contended > 0
             && now_ms.saturating_sub(last_contended) <= PIPELINE_CONTENTION_RECENT_WINDOW_MS
+    }
+
+    fn record_non_monotonic_tick(&self, kind: MonotonicTimestampViolationKind, timestamp_ms: f64) {
+        self.skipped_non_monotonic_ticks
+            .fetch_add(1, Ordering::AcqRel);
+        match kind {
+            MonotonicTimestampViolationKind::EqualTimestamp => {
+                self.duplicate_timestamp_ticks
+                    .fetch_add(1, Ordering::AcqRel);
+            }
+            MonotonicTimestampViolationKind::BackwardTimestamp => {
+                self.backward_timestamp_ticks.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+        self.last_non_monotonic_tick_ms_bits
+            .store(tick_ms_to_bits(timestamp_ms), Ordering::Release);
+    }
+
+    fn monotonicity_snapshot(&self) -> MonotonicRuntimeSnapshot {
+        MonotonicRuntimeSnapshot {
+            skipped_non_monotonic_ticks: self.skipped_non_monotonic_ticks.load(Ordering::Acquire),
+            duplicate_timestamp_ticks: self.duplicate_timestamp_ticks.load(Ordering::Acquire),
+            backward_timestamp_ticks: self.backward_timestamp_ticks.load(Ordering::Acquire),
+            last_non_monotonic_timestamp_ms: tick_ms_from_bits(
+                self.last_non_monotonic_tick_ms_bits.load(Ordering::Acquire),
+            ),
+        }
     }
 }
 
@@ -1722,6 +1782,17 @@ struct IngestRawTicksParams {
     only_gaps: Option<bool>,
     #[serde(alias = "wait_for_completion")]
     wait_for_completion: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct ScanScidTimestampAnomaliesParams {
+    #[serde(alias = "start_date")]
+    start_date: Option<String>,
+    #[serde(alias = "end_date")]
+    end_date: Option<String>,
+    max_events_reported: Option<usize>,
+    persist_result: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -5881,6 +5952,7 @@ impl TheDeskMcp {
         let shrink_len = fr.scid_last_shrink_len.load(Ordering::Acquire);
         let now_wall_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
         let pipeline_contended = fr.pipeline_lock_recently_contended(now_wall_ms);
+        let monotonicity = fr.monotonicity_snapshot();
 
         Ok(text_result(serde_json::json!({
             "liveDataSource": "scid",
@@ -5908,6 +5980,10 @@ impl TheDeskMcp {
             "scidFileLenBytes": scid_len,
             "scidTailResetCount": scid_resets,
             "scidLastShrinkFileLenBytes": shrink_len,
+            "skippedNonMonotonicTicks": monotonicity.skipped_non_monotonic_ticks,
+            "duplicateTimestampTicks": monotonicity.duplicate_timestamp_ticks,
+            "backwardTimestampTicks": monotonicity.backward_timestamp_ticks,
+            "lastNonMonotonicTimestampMs": monotonicity.last_non_monotonic_timestamp_ms,
             "pipelineLockRecentlyContended": pipeline_contended
         })))
     }
@@ -5965,6 +6041,79 @@ impl TheDeskMcp {
         Ok(text_result(
             serde_json::to_value(&report).unwrap_or_else(|_| serde_json::json!({})),
         ))
+    }
+
+    #[tool(
+        description = "Scan the active Sierra .scid file in byte order for equal or backward timestamps. Returns anomaly counts, worst backward delta, and capped samples for the requested date clip."
+    )]
+    async fn scan_scid_timestamp_anomalies(
+        &self,
+        Parameters(params): Parameters<ScanScidTimestampAnomaliesParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let config = load_feed_config();
+        let contract = resolve_contract_metadata(&config);
+        let reader = ScidReader::from_feed_config(&config);
+        if !reader.path().exists() {
+            return Ok(no_data(
+                "SCID file not found. Ensure Sierra Chart data path is configured in ~/.the-desk/config.toml",
+            ));
+        }
+
+        let (start_ms, end_ms_exclusive) = backfill::parse_backfill_date_range(
+            params.start_date.as_deref(),
+            params.end_date.as_deref(),
+        )
+        .map_err(|e| invalid_params_error(e.to_string()))?;
+        let sample_limit = params.max_events_reported.unwrap_or(20).min(200);
+        let reader_for_scan = reader.clone();
+        let report = tokio::task::spawn_blocking(move || {
+            scid_timestamp_diagnostics::scan_scid_timestamp_anomalies(
+                &reader_for_scan,
+                start_ms,
+                end_ms_exclusive,
+                sample_limit,
+            )
+        })
+        .await
+        .map_err(|e| db_error(format!("timestamp anomaly scan task join: {e}")))?
+        .map_err(db_error)?;
+
+        let status = if report.monotonicity.has_violations() {
+            "warning"
+        } else {
+            "ok"
+        };
+        let mut result = serde_json::json!({
+            "status": status,
+            "liveDataSource": "scid",
+            "rootSymbol": contract.root_symbol,
+            "contractSymbol": contract.contract_symbol,
+            "contractMonth": contract.contract_month,
+            "scidPath": report.scid_path,
+            "scanStartMs": report.scan_start_ms,
+            "scanEndMsExclusive": report.scan_end_ms_exclusive,
+            "scidFirstTimestampMs": report.scid_first_timestamp_ms,
+            "scidLastTimestampMs": report.scid_last_timestamp_ms,
+            "recordsScanned": report.records_scanned,
+            "acceptedTicks": report.monotonicity.accepted_ticks,
+            "skippedNonMonotonicTicks": report.monotonicity.skipped_non_monotonic_ticks,
+            "duplicateTimestampTicks": report.monotonicity.duplicate_timestamp_ticks,
+            "backwardTimestampTicks": report.monotonicity.backward_timestamp_ticks,
+            "largestBackwardDeltaMs": report.monotonicity.worst_backward_delta_ms,
+            "lastNonMonotonicTimestampMs": report.monotonicity.last_non_monotonic_timestamp_ms,
+            "samples": report.monotonicity.samples,
+            "persistedToValidationRuns": false,
+        });
+
+        if params.persist_result.unwrap_or(false) {
+            let now_ms = chrono::Utc::now().timestamp_millis() as f64;
+            let db = self.db.lock().map_err(|_| lock_error())?;
+            db.insert_validation_run(now_ms, status, &result)
+                .map_err(db_error)?;
+            result["persistedToValidationRuns"] = serde_json::json!(true);
+        }
+
+        Ok(text_result(result))
     }
 
     #[tool(
@@ -7156,6 +7305,8 @@ impl TheDeskMcp {
             .unwrap_or(f64::INFINITY);
         let stream_fresh_atomic =
             atomic_age_ms.is_finite() && atomic_age_ms <= FRESHNESS_THRESHOLD_MS;
+        let monotonicity = fr.monotonicity_snapshot();
+        let recent_monotonic_violation = monotonicity.has_recent_violation(now_ms);
 
         let mut checks = serde_json::json!({
             "rawTicksPresent": tick_count > 0,
@@ -7164,6 +7315,12 @@ impl TheDeskMcp {
             "freshnessThresholdMs": FRESHNESS_THRESHOLD_MS,
         });
         let mut invariants_ok = true;
+        checks["monotonicTimestamps"] = serde_json::json!({
+            "passed": !recent_monotonic_violation,
+            "detail": monotonicity_check_detail(monotonicity),
+            "recentWindowMs": MONOTONIC_ANOMALY_RECENT_WINDOW_MS,
+        });
+        invariants_ok &= !recent_monotonic_violation;
         for (name, passed, detail) in pipeline_invariants {
             checks[name] = serde_json::json!({
                 "passed": passed,
@@ -7189,6 +7346,10 @@ impl TheDeskMcp {
                 -1.0
             },
             "scidTailResetCount": fr.scid_tail_reset_count.load(Ordering::Acquire),
+            "skippedNonMonotonicTicks": monotonicity.skipped_non_monotonic_ticks,
+            "duplicateTimestampTicks": monotonicity.duplicate_timestamp_ticks,
+            "backwardTimestampTicks": monotonicity.backward_timestamp_ticks,
+            "lastNonMonotonicTimestampMs": monotonicity.last_non_monotonic_timestamp_ms,
             "pipelineLockRecentlyContended": fr.pipeline_lock_recently_contended(now_wall_ms),
             "lastDepthTimestampMs": tick_ms_from_bits(
                 fr.last_depth_timestamp_ms_bits.load(Ordering::Acquire),
@@ -7266,14 +7427,32 @@ fn collect_pipeline_invariants(
     Ok(pipelines.validate_invariants())
 }
 
+fn monotonicity_check_detail(snapshot: MonotonicRuntimeSnapshot) -> String {
+    match snapshot.last_non_monotonic_timestamp_ms {
+        Some(last_ts) => format!(
+            "skipped={} duplicate={} backward={} lastNonMonotonicTimestampMs={last_ts:.0}",
+            snapshot.skipped_non_monotonic_ticks,
+            snapshot.duplicate_timestamp_ticks,
+            snapshot.backward_timestamp_ticks
+        ),
+        None => "no non-monotonic SCID ticks observed since startup".to_string(),
+    }
+}
+
 /// `pipeline_invariants` must be collected under the pipeline mutex only; this function performs
 /// DB reads and writes without holding the pipeline lock (avoids `db`→`pipelines` lock ordering).
-fn persist_integrity_check(db: &Database, pipeline_invariants: &[(String, bool, String)]) {
+fn persist_integrity_check(
+    db: &Database,
+    pipeline_invariants: &[(String, bool, String)],
+    feed_rt: &McpFeedRuntimeState,
+) {
     let tick_count = db.raw_tick_count().unwrap_or(0);
     let last_ts = db.latest_tick_timestamp_ms().ok().flatten();
     let now_ms = chrono::Utc::now().timestamp_millis() as f64;
     let age_ms = last_ts.map(|v| now_ms - v).unwrap_or(f64::INFINITY);
     let stream_fresh = age_ms.is_finite() && age_ms <= FRESHNESS_THRESHOLD_MS;
+    let monotonicity = feed_rt.monotonicity_snapshot();
+    let recent_monotonic_violation = monotonicity.has_recent_violation(now_ms);
 
     let mut checks = serde_json::Map::new();
     checks.insert(
@@ -7284,6 +7463,14 @@ fn persist_integrity_check(db: &Database, pipeline_invariants: &[(String, bool, 
     checks.insert(
         "freshnessThresholdMs".to_string(),
         serde_json::json!(FRESHNESS_THRESHOLD_MS),
+    );
+    checks.insert(
+        "monotonicTimestamps".to_string(),
+        serde_json::json!({
+            "passed": !recent_monotonic_violation,
+            "detail": monotonicity_check_detail(monotonicity),
+            "recentWindowMs": MONOTONIC_ANOMALY_RECENT_WINDOW_MS,
+        }),
     );
     for (name, passed, detail) in pipeline_invariants {
         checks.insert(
@@ -7308,6 +7495,10 @@ fn persist_integrity_check(db: &Database, pipeline_invariants: &[(String, bool, 
         "status": status,
         "tickCount": tick_count,
         "lastTickAgeMs": if age_ms.is_finite() { age_ms } else { -1.0 },
+        "skippedNonMonotonicTicks": monotonicity.skipped_non_monotonic_ticks,
+        "duplicateTimestampTicks": monotonicity.duplicate_timestamp_ticks,
+        "backwardTimestampTicks": monotonicity.backward_timestamp_ticks,
+        "lastNonMonotonicTimestampMs": monotonicity.last_non_monotonic_timestamp_ms,
         "checks": checks
     });
     let _ = db.insert_validation_run(now_ms, status, &result);
@@ -8180,11 +8371,13 @@ fn prepare_for_new_session(
 ///
 /// The returned `cutover_offset` is the last fully consumed SCID offset, not the requested target,
 /// so the live tail can safely resume after truncated/partial startup reads without skipping ticks.
+#[allow(clippy::too_many_arguments)]
 fn run_startup_warm_replay(
     reader: &ScidReader,
     pipelines: &Arc<Mutex<PipelineEngine>>,
     flow_emitter: &Arc<Mutex<FlowEventEmitter>>,
     db: &Arc<Mutex<Database>>,
+    feed_rt: &McpFeedRuntimeState,
     since_ms: f64,
     requested_cutover_offset: u64,
     contract_metadata: &the_desk_backend::feed::ContractMetadata,
@@ -8242,8 +8435,18 @@ fn run_startup_warm_replay(
     let mut current_session = SessionType::Unknown;
     let mut current_delta_segment = DeltaSegment::Unknown;
     let mut boundary_count = 0u32;
+    let mut monotonic_guard = MonotonicTickGuard::default();
+    let mut applied_tick_count = 0usize;
+    let mut last_applied_tick: Option<ScidTick> = None;
 
     for tick in &ticks {
+        match monotonic_guard.observe(tick.timestamp_ms) {
+            MonotonicTimestampDecision::Accept => {}
+            MonotonicTimestampDecision::Skip(kind) => {
+                feed_rt.record_non_monotonic_tick(kind, tick.timestamp_ms);
+                continue;
+            }
+        }
         if let Some(et_min) = et_minutes_from_timestamp(tick.timestamp_ms) {
             let new_session = classify_session(et_min);
             let new_segment = classify_delta_segment(et_min);
@@ -8369,9 +8572,30 @@ fn run_startup_warm_replay(
             minute,
             tick.timestamp_ms,
         );
+        applied_tick_count += 1;
+        last_applied_tick = Some(tick.clone());
     }
 
-    let last = ticks.last().expect("ticks not empty");
+    let warm_monotonicity = monotonic_guard.into_stats();
+    if warm_monotonicity.has_violations() {
+        eprintln!(
+            "[the-desk-mcp] Warm replay skipped {} non-monotonic SCID ticks (duplicate={}, backward={})",
+            warm_monotonicity.skipped_non_monotonic_ticks,
+            warm_monotonicity.duplicate_timestamp_ticks,
+            warm_monotonicity.backward_timestamp_ticks
+        );
+    }
+    let Some(last) = last_applied_tick else {
+        eprintln!(
+            "[the-desk-mcp] Warm replay skipped all {} candidate ticks due to non-monotonic timestamps",
+            ticks.len()
+        );
+        return StartupWarmReplayResult {
+            cutover_offset: actual_cutover_offset,
+            applied_tick_count: 0,
+        };
+    };
+
     let bid = if last.bid > 0.0 {
         last.bid
     } else {
@@ -8438,14 +8662,12 @@ fn run_startup_warm_replay(
 
     eprintln!(
         "[the-desk-mcp] Backfill complete: {} ticks, {} session boundaries, last price {:.2}",
-        ticks.len(),
-        boundary_count,
-        last.price
+        applied_tick_count, boundary_count, last.price
     );
 
     StartupWarmReplayResult {
         cutover_offset: actual_cutover_offset,
-        applied_tick_count: ticks.len(),
+        applied_tick_count,
     }
 }
 
@@ -8520,6 +8742,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let db_startup = Arc::clone(&server.db);
         let reader_startup = reader.clone();
         let contract_metadata_startup = contract_metadata.clone();
+        let feed_rt_startup = (*server.feed_runtime).clone();
 
         tokio::spawn(async move {
             let fallback_cutover_offset = safe_scid_data_offset(&reader_startup);
@@ -8538,6 +8761,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &pipelines_startup,
                     &flow_emitter_startup,
                     &db_startup,
+                    &feed_rt_startup,
                     since,
                     requested_cutover_offset,
                     &contract_metadata_startup,
@@ -8592,6 +8816,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut tick_buffer: Vec<RawTickBatchRow> = Vec::new();
             let mut last_integrity_check =
                 std::time::Instant::now() - std::time::Duration::from_secs(30);
+            let mut monotonic_guard = MonotonicTickGuard::default();
             // Seed current session and segment from the system clock so we can detect boundaries.
             let now_et = et_minutes_from_timestamp(chrono::Utc::now().timestamp_millis() as f64);
             let mut current_session = now_et.map(classify_session).unwrap_or(SessionType::Unknown);
@@ -8626,7 +8851,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .map(|p| p.validate_invariants())
                         .unwrap_or_default();
                     if let Ok(db) = db_bg.lock() {
-                        persist_integrity_check(&db, &pipeline_invariants);
+                        persist_integrity_check(&db, &pipeline_invariants, &feed_rt_bg);
                     }
                     last_integrity_check = std::time::Instant::now();
                 }
@@ -8661,6 +8886,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .scid_tail_reset_count
                         .fetch_add(1, Ordering::AcqRel);
                     if step.was_shrink_reset() {
+                        monotonic_guard = MonotonicTickGuard::default();
                         feed_rt_bg
                             .scid_last_shrink_len
                             .store(step.file_len, Ordering::Release);
@@ -8680,6 +8906,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 let mut ticks_this_poll = 0u64;
                 for tick in &step.ticks {
+                    match monotonic_guard.observe(tick.timestamp_ms) {
+                        MonotonicTimestampDecision::Accept => {}
+                        MonotonicTimestampDecision::Skip(kind) => {
+                            feed_rt_bg.record_non_monotonic_tick(kind, tick.timestamp_ms);
+                            continue;
+                        }
+                    }
                     last_market_tick_ts = tick.timestamp_ms;
                     feed_rt_bg
                         .last_scid_tick_ms_bits
@@ -9125,6 +9358,13 @@ mod tests {
 
     fn unix_ms_to_sc_depth(ms: i64) -> i64 {
         ms * 1_000 + 2_209_161_600_000_000
+    }
+
+    fn parse_text_tool_result(result: CallToolResult) -> serde_json::Value {
+        match &result.content[0].raw {
+            RawContent::Text(text) => serde_json::from_str(&text.text).expect("json text result"),
+            other => panic!("expected text tool result, got {other:?}"),
+        }
     }
 
     #[test]
@@ -9657,6 +9897,7 @@ mod tests {
             &server.pipelines,
             &server.flow_emitter,
             &server.db,
+            &server.feed_runtime,
             since,
             cutover,
             &test_contract_metadata(),
@@ -9723,6 +9964,7 @@ mod tests {
             &server.pipelines,
             &server.flow_emitter,
             &server.db,
+            &server.feed_runtime,
             since,
             cutover,
             &test_contract_metadata(),
@@ -9733,6 +9975,56 @@ mod tests {
         assert_eq!(live.ticks.len(), 2);
         assert!((live.ticks[0].price - 21000.75).abs() < 1e-9);
         assert!((live.ticks[1].price - 21001.0).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn warm_replay_reports_non_monotonic_ticks_in_health_and_integrity() {
+        let server = test_server();
+        let mut file = NamedTempFile::new().expect("temp");
+        write_scid_header(&mut file);
+        let base_ts_ms = Utc::now().timestamp_millis() as f64;
+        append_scid_record(&mut file, 21000.0, base_ts_ms);
+        append_scid_record(&mut file, 21000.25, base_ts_ms);
+        append_scid_record(&mut file, 21000.5, base_ts_ms - 1.0);
+        append_scid_record(&mut file, 21000.75, base_ts_ms + 2.0);
+        file.flush().expect("flush");
+
+        let reader = ScidReader::new(file.path());
+        let warm = run_startup_warm_replay(
+            &reader,
+            &server.pipelines,
+            &server.flow_emitter,
+            &server.db,
+            &server.feed_runtime,
+            base_ts_ms - 10.0,
+            reader.current_aligned_end_offset().expect("cutover"),
+            &test_contract_metadata(),
+        );
+
+        assert_eq!(warm.applied_tick_count, 2);
+
+        let health = parse_text_tool_result(server.get_feed_health().await.expect("feed health"));
+        assert_eq!(health["skippedNonMonotonicTicks"].as_u64(), Some(2));
+        assert_eq!(health["duplicateTimestampTicks"].as_u64(), Some(1));
+        assert_eq!(health["backwardTimestampTicks"].as_u64(), Some(1));
+        assert_eq!(
+            health["lastNonMonotonicTimestampMs"].as_f64(),
+            Some(base_ts_ms - 1.0)
+        );
+
+        let integrity = parse_text_tool_result(
+            server
+                .validate_data_integrity()
+                .await
+                .expect("validate integrity"),
+        );
+        assert_eq!(integrity["skippedNonMonotonicTicks"].as_u64(), Some(2));
+        assert_eq!(integrity["duplicateTimestampTicks"].as_u64(), Some(1));
+        assert_eq!(integrity["backwardTimestampTicks"].as_u64(), Some(1));
+        assert_eq!(
+            integrity["checks"]["monotonicTimestamps"]["passed"].as_bool(),
+            Some(false)
+        );
     }
 
     #[test]

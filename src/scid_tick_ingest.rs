@@ -6,6 +6,9 @@
 
 use crate::backfill::{parse_backfill_date_range, BackfillJobError};
 use crate::db::{Database, RawTickBatchRow};
+use crate::feed::monotonic::{
+    MonotonicTickGuard, MonotonicTimestampDecision, MonotonicTimestampStats,
+};
 use crate::feed::scid_reader::{ScanControl, ScidError, ScidReader};
 use crate::feed::{ContractMetadata, TradeSide};
 use crate::session_date_from_timestamp_ms;
@@ -67,6 +70,7 @@ pub struct TickIngestResult {
     pub ticks_submitted_to_insert: usize,
     pub gaps_processed: usize,
     pub gap_labels: Vec<String>,
+    pub scid_timestamp_monotonicity: MonotonicTimestampStats,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -285,11 +289,18 @@ pub fn ingest_scid_tick_gaps(
     let mut scanned = 0_usize;
     let mut submitted = 0_usize;
     let mut labels: Vec<String> = Vec::new();
+    let mut monotonic_guard = MonotonicTickGuard::default();
 
     for gap in gaps {
         labels.push(gap.label.to_string());
-        reader.scan_range(Some(gap.from_ms), Some(gap.to_ms_exclusive), |tick| {
+        reader.scan_range_in_file_order(Some(gap.from_ms), Some(gap.to_ms_exclusive), |tick| {
             scanned += 1;
+            if !matches!(
+                monotonic_guard.observe(tick.timestamp_ms),
+                MonotonicTimestampDecision::Accept
+            ) {
+                return Ok(ScanControl::Continue);
+            }
             let is_buy = matches!(tick.side, TradeSide::Buy);
             let bid = if tick.bid > 0.0 {
                 tick.bid
@@ -332,6 +343,7 @@ pub fn ingest_scid_tick_gaps(
         ticks_submitted_to_insert: submitted,
         gaps_processed: gaps.len(),
         gap_labels: labels,
+        scid_timestamp_monotonicity: monotonic_guard.into_stats(),
     })
 }
 
@@ -359,4 +371,89 @@ pub fn run_tick_ingest(
     };
 
     Ok((report, result))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    const SCID_HEADER_SIZE_TEST: usize = 56;
+    const SCID_MAGIC_TEST: &[u8; 4] = b"SCID";
+    const SC_TO_UNIX_EPOCH_US_TEST: i64 = 2_209_161_600_000_000;
+
+    fn write_scid_header(file: &mut NamedTempFile) {
+        let mut header = vec![0_u8; SCID_HEADER_SIZE_TEST];
+        header[0..4].copy_from_slice(SCID_MAGIC_TEST);
+        header[4..8].copy_from_slice(&(SCID_HEADER_SIZE_TEST as u32).to_le_bytes());
+        header[8..12]
+            .copy_from_slice(&(crate::feed::scid_reader::SCID_RECORD_SIZE as u32).to_le_bytes());
+        file.write_all(&header).expect("header");
+    }
+
+    fn write_record(file: &mut NamedTempFile, timestamp_ms: f64, price: f32) {
+        let mut rec = [0_u8; crate::feed::scid_reader::SCID_RECORD_SIZE];
+        let unix_us = (timestamp_ms * 1_000.0).round() as i64;
+        let sc_us = SC_TO_UNIX_EPOCH_US_TEST + unix_us;
+        rec[0..8].copy_from_slice(&sc_us.to_le_bytes());
+        rec[12..16].copy_from_slice(&(price + 0.25).to_le_bytes());
+        rec[16..20].copy_from_slice(&(price - 0.25).to_le_bytes());
+        rec[20..24].copy_from_slice(&price.to_le_bytes());
+        rec[24..28].copy_from_slice(&(1_u32).to_le_bytes());
+        rec[28..32].copy_from_slice(&(2_u32).to_le_bytes());
+        rec[32..36].copy_from_slice(&(0_u32).to_le_bytes());
+        rec[36..40].copy_from_slice(&(2_u32).to_le_bytes());
+        file.write_all(&rec).expect("record");
+    }
+
+    #[test]
+    fn ingest_scid_tick_gaps_reports_skipped_non_monotonic_ticks() {
+        let mut file = NamedTempFile::new().expect("temp");
+        write_scid_header(&mut file);
+        let base = 1_700_000_000_000.0;
+        write_record(&mut file, base, 21000.0);
+        write_record(&mut file, base, 21000.25);
+        write_record(&mut file, base - 1.0, 21000.5);
+        write_record(&mut file, base + 2.0, 21000.75);
+        file.flush().expect("flush");
+
+        let db = Database::open(":memory:").expect("db");
+        let contract = ContractMetadata {
+            root_symbol: "NQ".to_string(),
+            contract_symbol: "NQH26.CME".to_string(),
+            ..ContractMetadata::default()
+        };
+        let result = ingest_scid_tick_gaps(
+            &ScidReader::new(file.path()),
+            &db,
+            &contract,
+            &[TickIngestGap {
+                label: "full_clip",
+                from_ms: base - 10.0,
+                to_ms_exclusive: base + 10.0,
+                estimated_scid_records: None,
+            }],
+        )
+        .expect("ingest");
+
+        assert_eq!(result.scid_records_scanned, 4);
+        assert_eq!(result.ticks_submitted_to_insert, 2);
+        assert_eq!(result.scid_timestamp_monotonicity.accepted_ticks, 2);
+        assert_eq!(
+            result
+                .scid_timestamp_monotonicity
+                .skipped_non_monotonic_ticks,
+            2
+        );
+        assert_eq!(
+            result.scid_timestamp_monotonicity.duplicate_timestamp_ticks,
+            1
+        );
+        assert_eq!(
+            result.scid_timestamp_monotonicity.backward_timestamp_ticks,
+            1
+        );
+        assert_eq!(db.raw_tick_count().expect("count"), 2);
+    }
 }

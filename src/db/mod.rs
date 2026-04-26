@@ -7352,6 +7352,64 @@ mod tests {
     }
 
     #[test]
+    fn raw_tick_batch_dedups_full_identity_but_keeps_equal_timestamp_variants() {
+        let db = test_db();
+        let rows: Vec<RawTickBatchRow> = vec![
+            (
+                1_000.0,
+                21000.0,
+                5.0,
+                20999.75,
+                21000.25,
+                true,
+                "2026-03-04".to_string(),
+                "NQ".to_string(),
+                "NQH26.CME".to_string(),
+            ),
+            (
+                1_000.0,
+                21000.0,
+                5.0,
+                20999.75,
+                21000.25,
+                true,
+                "2026-03-04".to_string(),
+                "NQ".to_string(),
+                "NQH26.CME".to_string(),
+            ),
+            (
+                1_000.0,
+                21000.25,
+                5.0,
+                21000.0,
+                21000.5,
+                true,
+                "2026-03-04".to_string(),
+                "NQ".to_string(),
+                "NQH26.CME".to_string(),
+            ),
+        ];
+
+        db.insert_raw_ticks_batch(&rows).expect("batch insert");
+
+        assert_eq!(db.raw_tick_count().expect("count"), 2);
+        let ticks = db
+            .query_ticks_filtered(
+                Some(999.0),
+                Some(1001.0),
+                None,
+                None,
+                Some("2026-03-04"),
+                10,
+            )
+            .expect("query");
+        assert_eq!(ticks.len(), 2);
+        assert_eq!(ticks[0].timestamp_ms, 1_000.0);
+        assert_eq!(ticks[1].timestamp_ms, 1_000.0);
+        assert_ne!(ticks[0].price, ticks[1].price);
+    }
+
+    #[test]
     fn get_snapshot_near_returns_closest() {
         let db = test_db();
         // Insert three snapshots at t=1000, 5000, 9000.

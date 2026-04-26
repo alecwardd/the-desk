@@ -11,6 +11,7 @@ pub mod research;
 pub mod risk;
 pub mod rules;
 pub mod scid_tick_ingest;
+pub mod scid_timestamp_diagnostics;
 pub mod templates;
 
 use chrono::{Datelike, TimeZone, Timelike, Utc};

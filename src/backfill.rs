@@ -1,4 +1,5 @@
 use crate::db::{Database, ReplaySignalRecord, SessionSummary, SignalOutcome};
+use crate::feed::monotonic::{MonotonicTickGuard, MonotonicTimestampStats};
 use crate::feed::scid_reader::{ScanControl, ScidReader};
 use crate::feed::TradeSide;
 use crate::feed::{load_feed_config, resolve_contract_metadata};
@@ -88,6 +89,7 @@ pub struct BackfillResult {
     pub signals_fired: usize,
     pub backtest_run_id: Option<String>,
     pub integrity_status: String,
+    pub scid_timestamp_monotonicity: MonotonicTimestampStats,
     pub warnings: Vec<String>,
 }
 
@@ -417,9 +419,10 @@ where
     let mut tick_events = Vec::new();
     let mut gaps = Vec::new();
     let mut cancelled = false;
+    let mut monotonic_guard = MonotonicTickGuard::default();
 
     let scan_stats = reader
-        .scan_range(start_ms, end_ms_exclusive, |tick| {
+        .scan_range_in_file_order(start_ms, end_ms_exclusive, |tick| {
             if cancel_flag.load(Ordering::Relaxed) {
                 cancelled = true;
                 return Ok(ScanControl::Stop);
@@ -428,6 +431,13 @@ where
             state.progress.records_scanned += 1;
             if state.progress.records_scanned == 1 {
                 state.progress.current_phase = "processing_session".to_string();
+            }
+
+            if !matches!(
+                monotonic_guard.observe(tick.timestamp_ms),
+                crate::feed::monotonic::MonotonicTimestampDecision::Accept
+            ) {
+                return Ok(ScanControl::Continue);
             }
 
             let tick_ctx = match tick_time_context_from_timestamp_ms(tick.timestamp_ms) {
@@ -726,6 +736,15 @@ where
             state.sessions_skipped
         ));
     }
+    let monotonicity = monotonic_guard.into_stats();
+    if monotonicity.has_violations() {
+        state.warnings.push(format!(
+            "skipped {} non-monotonic SCID ticks during replay (duplicate={}, backward={})",
+            monotonicity.skipped_non_monotonic_ticks,
+            monotonicity.duplicate_timestamp_ticks,
+            monotonicity.backward_timestamp_ticks
+        ));
+    }
 
     let backtest_run_id =
         if params.job_type == HistoricalJobType::Backtest && state.total_signals_fired > 0 {
@@ -754,6 +773,7 @@ where
         } else {
             "warning".to_string()
         },
+        scid_timestamp_monotonicity: monotonicity,
         warnings: state.warnings,
     })
 }
@@ -1160,6 +1180,38 @@ fn runtime_err(err: impl std::fmt::Display) -> BackfillJobError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::Database;
+    use crate::feed::scid_reader::{ScidReader, SCID_RECORD_SIZE};
+    use std::io::Write;
+    use std::sync::atomic::AtomicBool;
+    use tempfile::NamedTempFile;
+
+    const SCID_HEADER_SIZE_TEST: usize = 56;
+    const SCID_MAGIC_TEST: &[u8; 4] = b"SCID";
+    const SC_TO_UNIX_EPOCH_US_TEST: i64 = 2_209_161_600_000_000;
+
+    fn write_scid_header(file: &mut NamedTempFile) {
+        let mut header = vec![0_u8; SCID_HEADER_SIZE_TEST];
+        header[0..4].copy_from_slice(SCID_MAGIC_TEST);
+        header[4..8].copy_from_slice(&(SCID_HEADER_SIZE_TEST as u32).to_le_bytes());
+        header[8..12].copy_from_slice(&(SCID_RECORD_SIZE as u32).to_le_bytes());
+        file.write_all(&header).expect("header");
+    }
+
+    fn write_record(file: &mut NamedTempFile, timestamp_ms: f64, price: f32) {
+        let mut rec = [0_u8; SCID_RECORD_SIZE];
+        let unix_us = (timestamp_ms * 1_000.0).round() as i64;
+        let sc_us = SC_TO_UNIX_EPOCH_US_TEST + unix_us;
+        rec[0..8].copy_from_slice(&sc_us.to_le_bytes());
+        rec[12..16].copy_from_slice(&(price + 0.25).to_le_bytes());
+        rec[16..20].copy_from_slice(&(price - 0.25).to_le_bytes());
+        rec[20..24].copy_from_slice(&price.to_le_bytes());
+        rec[24..28].copy_from_slice(&(1_u32).to_le_bytes());
+        rec[28..32].copy_from_slice(&(2_u32).to_le_bytes());
+        rec[32..36].copy_from_slice(&(0_u32).to_le_bytes());
+        rec[36..40].copy_from_slice(&(2_u32).to_le_bytes());
+        file.write_all(&rec).expect("record");
+    }
 
     #[test]
     fn summary_computes_close_vs_levels() {
@@ -1227,5 +1279,51 @@ mod tests {
         assert_eq!(segment.high, 21012.0);
         assert_eq!(segment.tick_count, 2);
         assert_eq!(segment.volume, 7.0);
+    }
+
+    #[test]
+    fn backfill_reports_non_monotonic_tick_warnings() {
+        let mut file = NamedTempFile::new().expect("temp");
+        write_scid_header(&mut file);
+        let base = chrono::Utc
+            .with_ymd_and_hms(2026, 3, 5, 21, 30, 0)
+            .single()
+            .expect("base timestamp")
+            .timestamp_millis() as f64;
+        write_record(&mut file, base, 21000.0);
+        write_record(&mut file, base, 21000.25);
+        write_record(&mut file, base - 1.0, 21000.5);
+        write_record(&mut file, base + 2.0, 21000.75);
+        file.flush().expect("flush");
+
+        let db = Database::open(":memory:").expect("db");
+        let cancel_flag = AtomicBool::new(false);
+        let result = run_backfill_job(
+            &ScidReader::new(file.path()),
+            &db,
+            &BackfillJobParams {
+                job_id: "job-1".to_string(),
+                job_type: HistoricalJobType::ResearchBackfill,
+                start_date: Some("2026-03-05".to_string()),
+                end_date: Some("2026-03-05".to_string()),
+                force: true,
+                run_rules: false,
+                setup_ids: None,
+            },
+            |_| {},
+            &cancel_flag,
+        )
+        .expect("backfill");
+
+        assert_eq!(
+            result
+                .scid_timestamp_monotonicity
+                .skipped_non_monotonic_ticks,
+            2
+        );
+        assert!(result
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("non-monotonic SCID ticks")));
     }
 }

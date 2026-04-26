@@ -1,3 +1,4 @@
+use crate::feed::monotonic::{MonotonicTickGuard, MonotonicTimestampDecision};
 use crate::feed::symbol_resolution::{resolve_contract_metadata, symbol_to_scid_file};
 use crate::feed::{FeedConfig, FeedEvent, TradeSide};
 use std::fs::File;
@@ -310,6 +311,76 @@ impl ScidReader {
         })
     }
 
+    fn bounded_aligned_end_offset(
+        file_len: u64,
+        data_start: u64,
+        end_offset_exclusive: Option<u64>,
+    ) -> u64 {
+        let file_end = scid_tail_offset_after_shrink(file_len, data_start);
+        match end_offset_exclusive {
+            Some(bound) => scid_tail_offset_after_shrink(bound, data_start).min(file_end),
+            None => file_end,
+        }
+    }
+
+    fn scan_range_in_file_order_internal<F>(
+        &self,
+        start_ms: Option<f64>,
+        end_ms_exclusive: Option<f64>,
+        end_offset_exclusive: Option<u64>,
+        mut on_tick: F,
+    ) -> Result<ScanStats, ScidError>
+    where
+        F: FnMut(ScidTick) -> Result<ScanControl, String>,
+    {
+        let mut file = File::open(&self.path)?;
+        let header = Self::read_header(&mut file)?;
+        let data_start = header.header_size as u64;
+        let file_len = file.metadata()?.len();
+        let bounded_end =
+            Self::bounded_aligned_end_offset(file_len, data_start, end_offset_exclusive);
+        if bounded_end <= data_start {
+            return Ok(ScanStats::default());
+        }
+
+        file.seek(SeekFrom::Start(data_start))?;
+        let mut stats = ScanStats {
+            estimated_records: ((bounded_end - data_start) / SCID_RECORD_SIZE as u64) as usize,
+            records_scanned: 0,
+        };
+        let mut offset = data_start;
+        let mut record = [0_u8; SCID_RECORD_SIZE];
+        while offset < bounded_end {
+            match file.read_exact(&mut record) {
+                Ok(()) => {
+                    offset = offset.saturating_add(SCID_RECORD_SIZE as u64);
+                    let Some(tick) = self.parse_record(&record) else {
+                        continue;
+                    };
+                    if let Some(start) = start_ms {
+                        if tick.timestamp_ms < start {
+                            continue;
+                        }
+                    }
+                    if let Some(end_ms) = end_ms_exclusive {
+                        if tick.timestamp_ms >= end_ms {
+                            continue;
+                        }
+                    }
+                    stats.records_scanned += 1;
+                    match on_tick(tick).map_err(ScidError::Callback)? {
+                        ScanControl::Continue => {}
+                        ScanControl::Stop => break,
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(err) => return Err(err.into()),
+            }
+        }
+
+        Ok(stats)
+    }
+
     /// Scan ticks from the SCID file in order without materializing the full file.
     ///
     /// `end_ms_exclusive` stops the scan before the first tick whose timestamp is at
@@ -368,6 +439,46 @@ impl ScidReader {
         }
 
         Ok(stats)
+    }
+
+    /// Scan ticks in file order without using binary search-derived bounds.
+    ///
+    /// This is slower than [`Self::scan_range`] for large files, but it is robust
+    /// to localized non-monotonic timestamps because it evaluates every record in
+    /// byte order instead of assuming timestamps are globally sorted.
+    pub fn scan_range_in_file_order<F>(
+        &self,
+        start_ms: Option<f64>,
+        end_ms_exclusive: Option<f64>,
+        on_tick: F,
+    ) -> Result<ScanStats, ScidError>
+    where
+        F: FnMut(ScidTick) -> Result<ScanControl, String>,
+    {
+        self.scan_range_in_file_order_internal(start_ms, end_ms_exclusive, None, on_tick)
+    }
+
+    /// Scan ticks in file order up to a captured cutover offset (exclusive).
+    ///
+    /// Unlike [`Self::scan_range`], this method does not stop early when a tick
+    /// timestamp reaches `end_ms_exclusive` because later records can still fall
+    /// back into range when the source file contains non-monotonic timestamps.
+    pub fn scan_range_in_file_order_until_offset<F>(
+        &self,
+        start_ms: Option<f64>,
+        end_ms_exclusive: Option<f64>,
+        end_offset_exclusive: u64,
+        on_tick: F,
+    ) -> Result<ScanStats, ScidError>
+    where
+        F: FnMut(ScidTick) -> Result<ScanControl, String>,
+    {
+        self.scan_range_in_file_order_internal(
+            start_ms,
+            end_ms_exclusive,
+            Some(end_offset_exclusive),
+            on_tick,
+        )
     }
 
     /// First and last trade timestamps in the `.scid` file (by record order).
@@ -492,6 +603,7 @@ impl ScidReader {
 
             let mut offset: u64 =
                 ScidReader::header_size_bytes_for_path(reader.path()).unwrap_or(0);
+            let mut monotonic_guard = MonotonicTickGuard::default();
             let poll = Duration::from_millis(poll_ms.max(100));
 
             loop {
@@ -502,8 +614,17 @@ impl ScidReader {
 
                 match reader.read_bulk_from_offset(offset) {
                     Ok(batch) => {
+                        if batch.next_offset < offset {
+                            monotonic_guard = MonotonicTickGuard::default();
+                        }
                         offset = batch.next_offset;
                         for tick in batch.ticks {
+                            if !matches!(
+                                monotonic_guard.observe(tick.timestamp_ms),
+                                MonotonicTimestampDecision::Accept
+                            ) {
+                                continue;
+                            }
                             let _ = tx.send(FeedEvent::Quote {
                                 symbol_id: 1,
                                 bid: tick.bid,
@@ -678,6 +799,34 @@ mod tests {
             .expect("scan");
         assert_eq!(scanned, 1);
         assert_eq!(stats.records_scanned, 1);
+    }
+
+    #[test]
+    fn scan_range_in_file_order_keeps_non_monotonic_records_in_range() {
+        let mut file = NamedTempFile::new().expect("temp");
+        let mut header = vec![0_u8; SCID_HEADER_SIZE];
+        header[0..4].copy_from_slice(SCID_MAGIC);
+        header[4..8].copy_from_slice(&(SCID_HEADER_SIZE as u32).to_le_bytes());
+        header[8..12].copy_from_slice(&(SCID_RECORD_SIZE as u32).to_le_bytes());
+        file.write_all(&header).expect("header");
+        let base = 1_700_000_000_000.0;
+        write_record_with_timestamp_ms(&mut file, 21000.0, base);
+        write_record_with_timestamp_ms(&mut file, 21000.25, base + 2.0);
+        write_record_with_timestamp_ms(&mut file, 21000.5, base + 1.0);
+        write_record_with_timestamp_ms(&mut file, 21000.75, base + 4.0);
+        file.flush().expect("flush");
+
+        let reader = ScidReader::new(file.path());
+        let mut timestamps = Vec::new();
+        let stats = reader
+            .scan_range_in_file_order(Some(base + 1.0), Some(base + 4.0), |tick| {
+                timestamps.push(tick.timestamp_ms);
+                Ok(ScanControl::Continue)
+            })
+            .expect("scan");
+
+        assert_eq!(timestamps, vec![base + 2.0, base + 1.0]);
+        assert_eq!(stats.records_scanned, 2);
     }
 
     #[test]

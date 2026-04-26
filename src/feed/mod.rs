@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+pub mod monotonic;
 pub mod scid_reader;
 pub mod symbol_resolution;
 

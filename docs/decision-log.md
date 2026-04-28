@@ -349,3 +349,44 @@ When a tool blocks on `lock()`, the MCP server cannot process other requests (st
 - Each sit-down is a separate session with independent risk tracking
 - Each sit-down is a separate session but risk carries across sessions for the same calendar day
 - One continuous session with pauses
+
+---
+
+### ADR-015: Local storage tiers and maintenance command
+
+**Date:** 2026-04-26
+**Status:** Decided
+
+**Context:** The Desk's runtime SQLite database grew large enough to pressure the primary `C:` drive. Source code and build artifacts were not the main issue; the dominant storage was `~/.the-desk/data.db` and its WAL, while Sierra Chart `.scid` data already lived on the trading/data drive.
+
+**Decision:** Keep all data local, but separate runtime state, cold archives, build cache, and maintenance temp space on the larger local trading/data drive. The recommended Windows layout is:
+
+```text
+T:\TheDesk\
+  state\        # data.db, config.toml, WAL/SHM files
+  archive\      # zstd-compressed cold raw-tick archives
+  backups\      # database snapshots
+  build-cache\  # optional Cargo target dir
+  temp\         # SQLite temp files during maintenance
+```
+
+The existing `~/.the-desk` path may be preserved with a Windows directory junction pointing to `T:\TheDesk\state`, so binaries and MCP config do not need a database-path migration. Storage configuration lives in `~/.the-desk/config.toml`:
+
+```toml
+[storage]
+warm_retention_days = 30
+cold_archive_dir = "T:\\TheDesk\\archive"
+auto_archive = true
+```
+
+Add `the-desk-storage` as the operator-facing maintenance binary for local storage:
+
+- `--status` reports raw tick coverage, archive cutoff, warm/cold config, and SQLite page usage.
+- `--archive` streams old raw ticks into compressed `.csv.zst` archive files and deletes only after each archive is written and row-count checked.
+- `--vacuum` attempts physical SQLite compaction after archival and forces SQLite temp files onto the data drive.
+
+**Consequences:**
+- C: is protected from runtime database growth.
+- Old raw ticks can be moved out of SQLite while preserving session summaries, market events, signal outcomes, journal/risk records, and research metadata.
+- Full SQLite compaction remains an explicit outside-market-hours operation because large `VACUUM` runs can take hours and temporarily require substantial free space.
+- The maintenance command is local-only and does not change the core architecture: Sierra `.scid` remains the canonical raw market-data source, deterministic Rust pipelines remain Layer 1, and MCP tools continue to expose structured data only.

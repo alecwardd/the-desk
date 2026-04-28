@@ -149,6 +149,11 @@ symbol_mode = "hybrid"
 symbol = "NQH26.CME"
 active_symbol_override = "NQH26.CME"
 flush_poll_ms = 1000
+
+[storage]
+warm_retention_days = 30
+cold_archive_dir = "T:\\TheDesk\\archive"
+auto_archive = true
 ```
 
 ### MCP Server
@@ -216,7 +221,41 @@ Designed for directional trading with 15-minute to 1-hour holds — not HFT.
 - **Warm (past 30 days):** ticks + snapshots in SQLite, fully queryable, session summaries + events
 - **Cold (30+ days):** zstd-compressed monthly archives, session summaries retained in SQLite
 
-~250K ticks/day for NQ. ~1.5-2 GB total after a year including warm + cold tiers.
+Runtime state lives at `~/.the-desk` by default. On Windows, this can be moved to a larger local drive with a directory junction, for example:
+
+```powershell
+C:\Users\<user>\.the-desk -> T:\TheDesk\state
+```
+
+Recommended local layout for data-heavy installs:
+
+```text
+T:\TheDesk\
+  state\        # data.db, config.toml, WAL/SHM files
+  archive\      # compressed cold raw-tick archives
+  backups\      # manual/automated database snapshots
+  build-cache\  # optional Cargo target dir
+  temp\         # SQLite temp files during maintenance
+```
+
+Use the storage maintenance binary outside market hours:
+
+```powershell
+# Keep build artifacts off C: during maintenance runs
+$env:CARGO_TARGET_DIR = "T:\TheDesk\build-cache"
+
+# Inspect current warm/cold status
+cargo run --bin the-desk-storage -- --status
+
+# Archive raw ticks older than the configured warm window
+cargo run --bin the-desk-storage -- --archive
+
+# Attempt physical SQLite compaction after archiving.
+# This can take hours on large DBs and needs substantial free space on T:.
+cargo run --bin the-desk-storage -- --vacuum
+```
+
+Archiving removes old `raw_ticks` rows from SQLite after writing compressed `.csv.zst` files to `cold_archive_dir`. Session summaries, market events, signal outcomes, journal/risk records, and research metadata remain in SQLite. `VACUUM` is optional physical compaction; stop it if the target drive approaches the free-space safety floor.
 
 ### Research Database (SQLite)
 

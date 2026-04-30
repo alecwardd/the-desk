@@ -195,7 +195,7 @@ Rules:
 
 ## MCP Tools Reference
 
-The MCP server (`src/bin/the-desk-mcp.rs`) exposes 103 MCP tools across 11 categories.
+The MCP server (`src/bin/the-desk-mcp.rs`) exposes 113 MCP tools across 12 categories.
 
 ### Live vs Historical — Quick Reference
 
@@ -246,6 +246,16 @@ The MCP server (`src/bin/the-desk-mcp.rs`) exposes 103 MCP tools across 11 categ
 | | `acknowledge_setup_prompt` | Mark discretionary confirmation as acknowledged for a setup lifecycle |
 | | `mark_setup_in_trade` | Mark a setup lifecycle as in-trade |
 | | `close_setup_state` | Close a setup lifecycle state |
+| **Attention** | `get_attention_inbox` | Ranked proactive inbox. First call for "what deserves attention now?" |
+| | `get_signal_detail` | Full evidence, priority breakdown, linked setup/risk context, and suggested next tools for one signal |
+| | `acknowledge_attention_signal` | Mark an attention signal reviewed by trader or agent |
+| | `what_changed_since` | Cursor-based catch-up feed for structure/setup/risk changes since a prior cursor |
+| | `get_attention_changelog` | Replay signal lifecycle deltas: created, priority changed, acknowledged, expired, invalidated, notified |
+| | `get_active_trade_ideas` | Current idea-card overlays derived from playbook setup lifecycle and attention signals |
+| | `mark_trade_idea_confirmed` | Mark a trade idea confirmed with evidence |
+| | `mark_trade_idea_invalidated` | Mark a trade idea invalidated with a reason |
+| | `mark_trade_idea_in_trade` | Mark a trade idea as in-trade, optionally linked to a signal outcome |
+| | `mark_trade_idea_resolved` | Mark a trade idea resolved with an outcome note |
 | **Risk** | `get_risk_state` | Daily P&L in R, trade count, streaks, drawdown, at-limit status |
 | | `get_risk_config` | R-value, max daily loss, circuit breaker, trade limits |
 | | `save_risk_config` | Persist risk configuration (partial updates supported) |
@@ -290,7 +300,7 @@ The MCP server (`src/bin/the-desk-mcp.rs`) exposes 103 MCP tools across 11 categ
 
 | Agent | Primary context | Key tools |
 |-------|------------------|-----------|
-| **orchestrator** | Both — routes by intent | All; routes `historical_research` to backtest-analyst. Memory: `get_pre_session_briefing`, `refresh_memory_state`, `get_memory_brief`, `save_agent_insight`, `recall_agent_insights`, `acknowledge_agent_insight`, `create_memory_followup`, `resolve_memory_followup`, `detect_behavioral_patterns`, `get_behavioral_patterns` |
+| **orchestrator** | Both — routes by intent | All; first call `get_attention_inbox` / `what_changed_since` when the trader asks what changed or what deserves attention. Routes `historical_research` to backtest-analyst. Memory: `get_pre_session_briefing`, `refresh_memory_state`, `get_memory_brief`, `save_agent_insight`, `recall_agent_insights`, `acknowledge_agent_insight`, `create_memory_followup`, `resolve_memory_followup`, `detect_behavioral_patterns`, `get_behavioral_patterns` |
 | **market-structure-analyst** | Live + historical | Live: `get_tpo_profile`, `get_key_levels`, `get_day_type`, `get_rvol`, `get_delta_profile`. Historical: `query_event_frequency`, `query_conditional`, `query_distribution`, `compare_sessions`, `get_session_history`, `get_research_summary` |
 | **orderflow-analyst** | Live + historical | Live: `get_delta_profile`, `get_tape_pace`, `get_footprint`, `get_imbalances`, `get_absorption_events`, DOM tools. Historical: same research tools as market-structure |
 | **levels-analyst** | Live + historical | Live: `get_key_levels`, `get_proximity_report`, `get_or5_status`. Historical: `query_event_frequency`, `query_conditional`, `compare_sessions`, `get_session_history` |
@@ -411,3 +421,10 @@ These are operational diagnostics exposed by `get_runtime_events` and JSON logs.
 | `setup.transition` | Setup lifecycle transition persisted. |
 | `depth.poll_failed` | Depth poll task failed. |
 | `depth.worker_failed` | Depth worker failed while processing/persisting depth state. |
+| `attention.signal_emitted` | Attention signal was emitted or refreshed from deterministic market/setup/risk context. |
+| `attention.signal_priority_changed` | Existing attention signal changed priority bucket or score. |
+| `attention.signal_acknowledged` | Trader or agent acknowledged an attention signal. |
+| `attention.signal_expired` | Attention signal expired from the active inbox. |
+| `attention.signal_invalidated` | Attention signal or linked idea was invalidated. |
+| `attention.notifier_dispatched` | Configured notifier sink dispatched an attention alert. |
+| `attention.notifier_failed` | Reserved for future external notifier sinks (webhook/toast) when dispatch fails. |

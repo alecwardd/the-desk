@@ -1,3 +1,4 @@
+pub mod attention;
 pub mod backfill;
 pub mod db;
 pub mod depth;

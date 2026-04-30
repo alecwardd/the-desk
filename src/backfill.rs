@@ -1,11 +1,15 @@
-use crate::db::{Database, PriorDayReference, ReplaySignalRecord, SessionSummary, SignalOutcome};
+use crate::attention::{AttentionPulseKind, SignalComposer, SignalComposerInput};
+use crate::db::{
+    AttentionSignalQuery, Database, PriorDayReference, ReplaySignalRecord, SessionSummary,
+    SetupRuntimeStateRecord, SignalOutcome,
+};
 use crate::feed::monotonic::{MonotonicTickGuard, MonotonicTimestampStats};
 use crate::feed::scid_reader::{ScanControl, ScidReader};
 use crate::feed::TradeSide;
 use crate::feed::{load_feed_config, resolve_contract_metadata, ContractMetadata};
 use crate::pipelines::{EventDetector, FlowEventEmitter, MarketState, PipelineEngine};
 use crate::rollover::{build_contract_rollover_status, PriorReferenceTrust};
-use crate::rules::{RulesEngine, SetupDefinition};
+use crate::rules::{RulesEngine, SetupDefinition, SetupRuntimeSnapshot};
 use crate::{
     classify_delta_segment, session_date_from_timestamp_ms, tick_time_context_from_timestamp_ms,
     DeltaSegment, SessionType,
@@ -130,6 +134,7 @@ struct SessionBuffers {
     event_buffer: Vec<crate::pipelines::event_detector::MarketEvent>,
     replay_signals: Vec<ReplaySignalRecord>,
     signal_outcomes: Vec<SignalOutcome>,
+    setup_runtime_states: Vec<SetupRuntimeStateRecord>,
     session_open_price: f64,
     session_tick_count: i64,
     session_volume: f64,
@@ -141,6 +146,7 @@ impl Default for SessionBuffers {
             event_buffer: Vec::new(),
             replay_signals: Vec::new(),
             signal_outcomes: Vec::new(),
+            setup_runtime_states: Vec::new(),
             session_open_price: 0.0,
             session_tick_count: 0,
             session_volume: 0.0,
@@ -710,7 +716,20 @@ where
             if current_session == SessionType::Rth {
                 if let Some(ref mut rules) = rules {
                     for setup in &setups {
-                        if let Some(alert) = rules.evaluate(setup, &snapshot, false) {
+                        let alert = rules.evaluate(setup, &snapshot, false);
+                        if let Some(runtime) = rules.runtime_snapshot(&setup.id) {
+                            upsert_buffered_setup_runtime(
+                                &mut state.buffers.setup_runtime_states,
+                                runtime_record_from_replay_snapshot(
+                                    runtime,
+                                    &current_date,
+                                    &contract_metadata,
+                                    source,
+                                    tick.timestamp_ms,
+                                ),
+                            );
+                        }
+                        if let Some(alert) = alert {
                             let signal_id = format!(
                                 "{}_{}_{}",
                                 params.job_id, alert.setup_id, tick.timestamp_ms as u64
@@ -996,6 +1015,20 @@ where
         on_progress(&state.progress);
         db.insert_market_events_batch(&state.buffers.event_buffer)
             .map_err(runtime_err)?;
+        if let Some((bid, ask, _price, timestamp_ms)) = last_tick_meta {
+            let snapshot = state
+                .pipeline
+                .snapshot_for_detection(bid, ask, timestamp_ms);
+            persist_attention_for_replay(
+                db,
+                params,
+                state,
+                &snapshot,
+                current_date,
+                source,
+                timestamp_ms,
+            )?;
+        }
         state.total_events += state.buffers.event_buffer.len();
         state.sessions_processed += 1;
         state.progress.sessions_completed = state.sessions_processed;
@@ -1075,6 +1108,15 @@ where
             ),
         )
         .map_err(runtime_err)?;
+        persist_attention_for_replay(
+            db,
+            params,
+            state,
+            &snapshot,
+            current_date,
+            source,
+            exit_time_ms,
+        )?;
 
         state.total_events += state.buffers.event_buffer.len();
         state.total_signals_fired += state.buffers.replay_signals.len();
@@ -1117,6 +1159,103 @@ where
         state.progress.sessions_skipped = state.sessions_skipped;
     }
 
+    Ok(())
+}
+
+fn runtime_record_from_replay_snapshot(
+    snapshot: SetupRuntimeSnapshot,
+    session_date: &str,
+    contract_metadata: &ContractMetadata,
+    source: &str,
+    updated_at_ms: f64,
+) -> SetupRuntimeStateRecord {
+    SetupRuntimeStateRecord {
+        session_date: session_date.to_string(),
+        root_symbol: Some(contract_metadata.root_symbol.clone()),
+        contract_symbol: Some(contract_metadata.contract_symbol.clone()),
+        setup_id: snapshot.setup_id,
+        setup_name: snapshot.setup_name,
+        state: snapshot.state,
+        readiness: snapshot.readiness,
+        readiness_score: snapshot.readiness_score,
+        met_count: snapshot.met_count as i64,
+        total_count: snapshot.total_count as i64,
+        met_conditions: snapshot.met_conditions,
+        missing_conditions: snapshot.missing_conditions,
+        deterministic_all_met: snapshot.deterministic_all_met,
+        requires_discretionary: snapshot.requires_discretionary,
+        current_price: snapshot.current_price,
+        last_evaluated_at_ms: snapshot.last_evaluated_at_ms,
+        last_transition_at_ms: snapshot.last_transition_at_ms,
+        last_alert_emitted_at_ms: snapshot.last_alert_emitted_at_ms,
+        source: source.to_string(),
+        updated_at_ms,
+    }
+}
+
+fn upsert_buffered_setup_runtime(
+    records: &mut Vec<SetupRuntimeStateRecord>,
+    record: SetupRuntimeStateRecord,
+) {
+    if let Some(existing) = records.iter_mut().find(|existing| {
+        existing.session_date == record.session_date && existing.setup_id == record.setup_id
+    }) {
+        *existing = record;
+    } else {
+        records.push(record);
+    }
+}
+
+fn persist_attention_for_replay(
+    db: &Database,
+    params: &BackfillJobParams,
+    state: &BackfillRunState,
+    snapshot: &MarketState,
+    _current_date: &str,
+    source: &str,
+    timestamp_ms: f64,
+) -> Result<(), BackfillJobError> {
+    if state.buffers.event_buffer.is_empty() {
+        return Ok(());
+    }
+    let prior_active_signals = db
+        .query_attention_signals(&AttentionSignalQuery {
+            status: Some("active".to_string()),
+            min_priority: None,
+            include_expired: false,
+            cursor_signal_id: None,
+            since_ms: None,
+            trading_day: Some(snapshot.trading_day.clone()),
+            root_symbol: Some(snapshot.root_symbol.clone()).filter(|v| !v.is_empty()),
+            contract_symbol: Some(snapshot.contract_symbol.clone()).filter(|v| !v.is_empty()),
+            source: Some(source.to_string()),
+            job_id: Some(params.job_id.clone()),
+            limit: 250,
+            ..AttentionSignalQuery::default()
+        })
+        .map_err(runtime_err)?;
+    let composer = SignalComposer::default();
+    let output = composer.compose(SignalComposerInput {
+        pulse_kind: AttentionPulseKind::EventDriven,
+        events: &state.buffers.event_buffer,
+        setup_states: &state.buffers.setup_runtime_states,
+        risk_state: None,
+        market_snapshot: snapshot,
+        prior_active_signals: &prior_active_signals,
+        timestamp_ms,
+        source,
+        job_id: Some(params.job_id.as_str()),
+    });
+    for signal in &output.signals {
+        db.upsert_attention_signal(signal).map_err(runtime_err)?;
+    }
+    for event in &output.signal_events {
+        db.insert_attention_signal_event(event)
+            .map_err(runtime_err)?;
+    }
+    for idea in &output.idea_cards {
+        db.upsert_trade_idea_card(idea).map_err(runtime_err)?;
+    }
     Ok(())
 }
 

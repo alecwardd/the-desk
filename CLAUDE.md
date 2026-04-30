@@ -44,7 +44,7 @@ LAYER 2.5: Research Infrastructure (Rust)
   - Pure math over historical data. No LLM calls.
 
 LAYER 3: MCP Server + LLM Orchestration
- - 103 MCP tools expose pipeline state, rules evaluation, setup lifecycle state, research queries, and data queries
+ - 113 MCP tools expose pipeline state, rules evaluation, setup lifecycle state, research queries, and data queries
   - Cursor agents call tools for market context during conversation
   - Claude API synthesizes coaching from structured data (1-5s latency acceptable)
 ```
@@ -64,7 +64,7 @@ LAYER 3: MCP Server + LLM Orchestration
 |-----------|-----------|-------|
 | Pipeline engine | Rust | 14 incremental pipeline modules, sub-ms per tick |
 | Rules engine | Rust | Typed conditions, setup state machine |
-| MCP server | `rmcp` crate | 103 MCP tools via stdio transport |
+| MCP server | `rmcp` crate | 113 MCP tools via stdio transport |
 | Data source | Sierra Chart `.scid` | Binary tick data, 40-byte records |
 | Database | SQLite (rusqlite) | Raw ticks, computed state, session history |
 | Compression | zstd | Cold storage archival |
@@ -149,7 +149,7 @@ the-desk/
 ├── Cargo.toml                        # Rust package manifest (default-run: the-desk-mcp)
 ├── src/                              # Library + binaries
 │   ├── lib.rs                        # Crate root (`the_desk_backend`)
-│   ├── bin/the-desk-mcp.rs           # MCP server binary (103 tools)
+│   ├── bin/the-desk-mcp.rs           # MCP server binary (113 tools)
 │   ├── backfill.rs                   # Historical .scid backfill engine
 │   ├── research/mod.rs               # Query engine (frequency, conditional, distribution)
 │   ├── pipelines/                    # 14 pipeline modules + event detector

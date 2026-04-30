@@ -13,11 +13,15 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
+use the_desk_backend::attention::{
+    AttentionNotifierConfig, AttentionPulseKind, SignalComposer, SignalComposerInput,
+};
 use the_desk_backend::backfill;
 use the_desk_backend::db::{
-    AccountStateRecord, Database, HistoricalJobRun, ImportedFillRecord, JournalEntry,
-    OpenPositionRecord, RawTickBatchRow, ReplaySignalRecord, RiskConfigRecord, SessionRecord,
-    SessionScopeFilter, SetupPerformanceSortBy, SetupRuntimeStateRecord, SignalOutcome,
+    AccountStateRecord, AttentionChangelogQuery, AttentionSignalQuery, AttentionSignalRecord,
+    Database, HistoricalJobRun, ImportedFillRecord, JournalEntry, OpenPositionRecord,
+    RawTickBatchRow, ReplaySignalRecord, RiskConfigRecord, SessionRecord, SessionScopeFilter,
+    SetupPerformanceSortBy, SetupRuntimeStateRecord, SignalOutcome, TradeIdeaQuery,
     TradeImportBatchRecord, TradeRecord, TradeReviewUpdate, RESEARCH_DISTRIBUTION_METRICS,
 };
 use the_desk_backend::depth::{
@@ -53,7 +57,7 @@ use the_desk_backend::options::{
 };
 use the_desk_backend::outcome_tracker;
 use the_desk_backend::pipelines::{
-    EventDetector, FlowEventEmitter, PipelineEngine, PriorSessionData, RvolPipeline,
+    EventDetector, FlowEventEmitter, MarketEvent, PipelineEngine, PriorSessionData, RvolPipeline,
 };
 use the_desk_backend::research;
 use the_desk_backend::risk::{RiskConfig, RiskState, RiskTracker};
@@ -702,6 +706,56 @@ fn spawn_runtime_event_pruner(runtime_events: Arc<RuntimeEventStore>, db: Arc<Mu
             sleep(interval).await;
             if let Ok(db) = db.lock() {
                 prune_runtime_events_if_enabled(runtime_events.as_ref(), &db);
+            }
+        }
+    });
+}
+
+fn spawn_attention_periodic_pulse(
+    pipelines: Arc<Mutex<PipelineEngine>>,
+    db: Arc<Mutex<Database>>,
+    runtime_events: Arc<RuntimeEventStore>,
+    last_bid: Arc<Mutex<f64>>,
+    last_ask: Arc<Mutex<f64>>,
+) {
+    tokio::spawn(async move {
+        let interval = Duration::from_secs(5);
+        loop {
+            sleep(interval).await;
+            let timestamp_ms = chrono::Utc::now().timestamp_millis() as f64;
+            let snapshot = {
+                let Ok(pipelines) = pipelines.try_lock() else {
+                    continue;
+                };
+                let (bid, ask) = current_best_bid_ask(&last_bid, &last_ask);
+                pipelines.snapshot(bid, ask)
+            };
+            if snapshot.last_price <= 0.0 || snapshot.trading_day.is_empty() {
+                continue;
+            }
+            if snapshot.session_type == "Unknown" {
+                continue;
+            }
+            if let Ok(db) = db.lock() {
+                expire_and_audit_attention_signals(
+                    &db,
+                    &runtime_events,
+                    timestamp_ms,
+                    Some("live"),
+                );
+                if snapshot.session_type == "RTH" {
+                    compose_and_persist_attention(
+                        &db,
+                        &runtime_events,
+                        &snapshot,
+                        &[],
+                        AttentionPulseKind::Periodic,
+                        timestamp_ms,
+                        "live",
+                        None,
+                    );
+                }
+                dispatch_attention_runtime_notifications(&db, &runtime_events, timestamp_ms);
             }
         }
     });
@@ -2335,6 +2389,108 @@ struct SetupLifecycleParams {
     setup_id: String,
 }
 
+#[derive(Debug, Default, Clone, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct AttentionCursorParams {
+    #[serde(alias = "last_signal_id")]
+    last_signal_id: Option<String>,
+    #[serde(alias = "last_event_id")]
+    last_event_id: Option<String>,
+    #[serde(alias = "since_ms")]
+    since_ms: Option<f64>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct AttentionInboxParams {
+    status: Option<String>,
+    #[serde(alias = "min_priority")]
+    min_priority: Option<String>,
+    limit: Option<usize>,
+    #[serde(alias = "include_expired")]
+    include_expired: Option<bool>,
+    cursor: Option<AttentionCursorParams>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct AttentionSignalDetailParams {
+    #[serde(alias = "signal_id")]
+    signal_id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct AttentionSignalAcknowledgeParams {
+    #[serde(alias = "signal_id")]
+    signal_id: String,
+    #[serde(alias = "acknowledged_by")]
+    acknowledged_by: String,
+    note: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct WhatChangedSinceParams {
+    cursor: Option<AttentionCursorParams>,
+    limit: Option<usize>,
+    #[serde(alias = "include_signals")]
+    include_signals: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct AttentionChangelogParams {
+    cursor: Option<AttentionCursorParams>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct ActiveTradeIdeasParams {
+    status: Option<String>,
+    #[serde(alias = "setup_id")]
+    setup_id: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct TradeIdeaConfirmParams {
+    #[serde(alias = "idea_id")]
+    idea_id: String,
+    #[serde(alias = "evidence_note")]
+    evidence_note: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct TradeIdeaInvalidateParams {
+    #[serde(alias = "idea_id")]
+    idea_id: String,
+    #[serde(alias = "reason_code")]
+    reason_code: String,
+    note: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct TradeIdeaInTradeParams {
+    #[serde(alias = "idea_id")]
+    idea_id: String,
+    #[serde(alias = "signal_outcome_id")]
+    signal_outcome_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct TradeIdeaResolveParams {
+    #[serde(alias = "idea_id")]
+    idea_id: String,
+    outcome: String,
+    note: Option<String>,
+}
+
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 struct MemoryBriefParams {
@@ -2645,6 +2801,89 @@ impl TheDeskMcp {
             (!contract_symbol.is_empty()).then_some(contract_symbol),
         );
         Ok(())
+    }
+
+    fn transition_trade_idea_tool(
+        &self,
+        idea_id: &str,
+        lifecycle: &str,
+        status: &str,
+        note: Option<&str>,
+    ) -> Result<CallToolResult, McpError> {
+        let timestamp_ms = chrono::Utc::now().timestamp_millis() as f64;
+        let (changed, idea, linked_signal) = {
+            let db = self.db.lock().map_err(|_| lock_error())?;
+            let before = db.get_trade_idea_card(idea_id).map_err(db_error)?;
+            db.transition_trade_idea(idea_id, lifecycle, status, note, timestamp_ms)
+                .map_err(db_error)?;
+            let idea = db.get_trade_idea_card(idea_id).map_err(db_error)?;
+            let linked_signal = if matches!(lifecycle, "invalidated" | "resolved") {
+                before
+                    .as_ref()
+                    .and_then(|idea| idea.linked_attention_signal_id.as_deref())
+                    .or_else(|| {
+                        idea.as_ref()
+                            .and_then(|idea| idea.linked_attention_signal_id.as_deref())
+                    })
+                    .map(|signal_id| {
+                        let (signal_status, event_type) = if lifecycle == "invalidated" {
+                            ("invalidated", "invalidated")
+                        } else {
+                            ("acknowledged", "acknowledged")
+                        };
+                        db.update_attention_signal_status(
+                            signal_id,
+                            signal_status,
+                            event_type,
+                            Some("trade_idea"),
+                            note,
+                            timestamp_ms,
+                        )
+                    })
+                    .transpose()
+                    .map_err(db_error)?
+                    .flatten()
+            } else {
+                None
+            };
+            let changed = idea
+                .as_ref()
+                .map(|idea| idea.updated_at_ms == timestamp_ms)
+                .unwrap_or(false);
+            (changed, idea, linked_signal)
+        };
+        if changed {
+            let event_name = match lifecycle {
+                "invalidated" => "attention.signal_invalidated",
+                "resolved" => "attention.signal_acknowledged",
+                _ => "attention.signal_emitted",
+            };
+            record_runtime_event(
+                &self.runtime_events,
+                Some(&self.db),
+                RuntimeEventLevel::Info,
+                event_name,
+                "attention",
+                "Trade idea lifecycle changed.",
+                serde_json::json!({
+                    "ideaId": idea_id,
+                    "lifecycle": lifecycle,
+                    "status": status,
+                    "changed": changed,
+                    "linkedSignalId": linked_signal.as_ref().map(|signal| signal.signal_id.clone()),
+                    "note": note,
+                }),
+            );
+        }
+        Ok(text_result(serde_json::json!({
+            "ideaId": idea_id,
+            "lifecycle": lifecycle,
+            "status": status,
+            "changed": changed,
+            "persisted": changed,
+            "idea": idea,
+            "linkedSignal": linked_signal
+        })))
     }
 
     async fn get_or_refresh_options_snapshot(
@@ -5016,6 +5255,278 @@ impl TheDeskMcp {
             "readiness": after.readiness,
             "persisted": true,
         })))
+    }
+
+    #[tool(
+        description = "Ranked proactive attention inbox. Call this first when asking what deserves attention now; returns durable playbook-grounded signals, never raw ticks."
+    )]
+    async fn get_attention_inbox(
+        &self,
+        Parameters(params): Parameters<AttentionInboxParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let limit = params.limit.unwrap_or(25).clamp(1, 100);
+        let cursor = params.cursor.unwrap_or_default();
+        let db = self.db.lock().map_err(|_| lock_error())?;
+        let signals = db
+            .query_attention_signals(&AttentionSignalQuery {
+                status: params.status,
+                min_priority: params.min_priority,
+                include_expired: params.include_expired.unwrap_or(false),
+                cursor_signal_id: cursor.last_signal_id,
+                since_ms: cursor.since_ms,
+                limit,
+                ..AttentionSignalQuery::default()
+            })
+            .map_err(db_error)?;
+        let next_cursor = signals.last().map(|signal| {
+            serde_json::json!({
+                "lastSignalId": signal.signal_id,
+                "sinceMs": signal.updated_at_ms
+            })
+        });
+        Ok(text_result(serde_json::json!({
+            "signals": signals,
+            "count": signals.len(),
+            "nextCursor": next_cursor,
+            "dataAgeMs": compute_data_age(&db)
+        })))
+    }
+
+    #[tool(
+        description = "Full detail for one attention signal: evidence links, setup/risk context references, priority breakdown, and suggested next MCP tools for agent routing."
+    )]
+    async fn get_signal_detail(
+        &self,
+        Parameters(params): Parameters<AttentionSignalDetailParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let db = self.db.lock().map_err(|_| lock_error())?;
+        let signal = db
+            .get_attention_signal(&params.signal_id)
+            .map_err(db_error)?
+            .ok_or_else(|| invalid_params_error("unknown signal_id"))?;
+        let changelog = db
+            .query_attention_changelog(&AttentionChangelogQuery {
+                signal_id: Some(signal.signal_id.clone()),
+                cursor_event_id: None,
+                since_ms: Some(signal.created_at_ms - 1.0),
+                limit: 50,
+            })
+            .map_err(db_error)?;
+        Ok(text_result(serde_json::json!({
+            "signal": signal,
+            "changelog": changelog,
+            "suggestedTools": signal.suggested_tools,
+            "dataAgeMs": compute_data_age(&db)
+        })))
+    }
+
+    #[tool(
+        description = "Acknowledge an attention signal as reviewed by the trader or an agent. Use acknowledgedBy='trader' or 'agent:<name>'."
+    )]
+    async fn acknowledge_attention_signal(
+        &self,
+        Parameters(params): Parameters<AttentionSignalAcknowledgeParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let actor = parse_non_empty_string("acknowledgedBy", &params.acknowledged_by)?;
+        if actor != "trader" && !actor.starts_with("agent:") {
+            return Err(invalid_params_error(
+                "acknowledgedBy must be 'trader' or 'agent:<name>'",
+            ));
+        }
+        let timestamp_ms = chrono::Utc::now().timestamp_millis() as f64;
+        let (acknowledged, signal) = {
+            let db = self.db.lock().map_err(|_| lock_error())?;
+            let acknowledged = db
+                .acknowledge_attention_signal(
+                    &params.signal_id,
+                    &actor,
+                    params.note.as_deref(),
+                    timestamp_ms,
+                )
+                .map_err(db_error)?;
+            let signal = db
+                .get_attention_signal(&params.signal_id)
+                .map_err(db_error)?;
+            (acknowledged, signal)
+        };
+        if let Some(signal) = &signal {
+            record_runtime_event_scoped(
+                &self.runtime_events,
+                Some(&self.db),
+                RuntimeEventLevel::Info,
+                "attention.signal_acknowledged",
+                "attention",
+                "Attention signal acknowledged.",
+                serde_json::json!({
+                    "signalId": signal.signal_id,
+                    "acknowledgedBy": actor,
+                }),
+                Some(signal.session_date.clone()),
+                signal.root_symbol.clone(),
+                signal.contract_symbol.clone(),
+            );
+        }
+        Ok(text_result(serde_json::json!({
+            "signalId": params.signal_id,
+            "acknowledged": acknowledged,
+            "signal": signal
+        })))
+    }
+
+    #[tool(
+        description = "Cursor-based catch-up feed for what changed since a prior attention cursor. Use when the trader asks what changed while away."
+    )]
+    async fn what_changed_since(
+        &self,
+        Parameters(params): Parameters<WhatChangedSinceParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let cursor = params.cursor.unwrap_or_default();
+        let limit = params.limit.unwrap_or(50).clamp(1, 200);
+        let db = self.db.lock().map_err(|_| lock_error())?;
+        let changelog = db
+            .query_attention_changelog(&AttentionChangelogQuery {
+                signal_id: None,
+                cursor_event_id: cursor.last_event_id.clone(),
+                since_ms: cursor.since_ms,
+                limit,
+            })
+            .map_err(db_error)?;
+        let signals = if params.include_signals.unwrap_or(true) {
+            db.query_attention_signals(&AttentionSignalQuery {
+                status: None,
+                min_priority: None,
+                include_expired: true,
+                cursor_signal_id: cursor.last_signal_id,
+                since_ms: cursor.since_ms,
+                limit,
+                ..AttentionSignalQuery::default()
+            })
+            .map_err(db_error)?
+        } else {
+            Vec::new()
+        };
+        let next_cursor = serde_json::json!({
+            "lastEventId": changelog.last().map(|event| event.event_id.clone()),
+            "lastSignalId": signals.last().map(|signal| signal.signal_id.clone()),
+            "sinceMs": changelog
+                .last()
+                .map(|event| event.occurred_at_ms)
+                .or_else(|| signals.last().map(|signal| signal.updated_at_ms))
+                .or(cursor.since_ms)
+        });
+        Ok(text_result(serde_json::json!({
+            "changes": changelog,
+            "signals": signals,
+            "nextCursor": next_cursor,
+            "dataAgeMs": compute_data_age(&db)
+        })))
+    }
+
+    #[tool(
+        description = "Replay attention signal lifecycle deltas such as created, priority_changed, acknowledged, expired, invalidated, or notified. Use for agent catch-up and audit trails."
+    )]
+    async fn get_attention_changelog(
+        &self,
+        Parameters(params): Parameters<AttentionChangelogParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let cursor = params.cursor.unwrap_or_default();
+        let limit = params.limit.unwrap_or(50).clamp(1, 200);
+        let db = self.db.lock().map_err(|_| lock_error())?;
+        let events = db
+            .query_attention_changelog(&AttentionChangelogQuery {
+                signal_id: None,
+                cursor_event_id: cursor.last_event_id,
+                since_ms: cursor.since_ms,
+                limit,
+            })
+            .map_err(db_error)?;
+        let next_cursor = events.last().map(|event| {
+            serde_json::json!({
+                "lastEventId": event.event_id,
+                "sinceMs": event.occurred_at_ms
+            })
+        });
+        Ok(text_result(serde_json::json!({
+            "events": events,
+            "count": events.len(),
+            "nextCursor": next_cursor,
+            "dataAgeMs": compute_data_age(&db)
+        })))
+    }
+
+    #[tool(
+        description = "Current trade idea cards derived from playbook setup lifecycle and attention signals. These are idea-state overlays, not execution instructions."
+    )]
+    async fn get_active_trade_ideas(
+        &self,
+        Parameters(params): Parameters<ActiveTradeIdeasParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let db = self.db.lock().map_err(|_| lock_error())?;
+        let ideas = db
+            .query_trade_idea_cards(&TradeIdeaQuery {
+                status: params.status.or_else(|| Some("active".to_string())),
+                setup_id: params.setup_id,
+                limit: params.limit.unwrap_or(25).clamp(1, 100),
+            })
+            .map_err(db_error)?;
+        Ok(text_result(serde_json::json!({
+            "ideas": ideas,
+            "count": ideas.len(),
+            "dataAgeMs": compute_data_age(&db)
+        })))
+    }
+
+    #[tool(
+        description = "Mark a trade idea as confirmed with evidence. Enforces typed lifecycle instead of a free-form state setter."
+    )]
+    async fn mark_trade_idea_confirmed(
+        &self,
+        Parameters(params): Parameters<TradeIdeaConfirmParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.transition_trade_idea_tool(
+            &params.idea_id,
+            "confirmed",
+            "active",
+            Some(params.evidence_note.as_str()),
+        )
+    }
+
+    #[tool(description = "Mark a trade idea as invalidated with a reason code and optional note.")]
+    async fn mark_trade_idea_invalidated(
+        &self,
+        Parameters(params): Parameters<TradeIdeaInvalidateParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let note = params
+            .note
+            .as_deref()
+            .map(|note| format!("{}: {}", params.reason_code, note))
+            .unwrap_or(params.reason_code);
+        self.transition_trade_idea_tool(&params.idea_id, "invalidated", "closed", Some(&note))
+    }
+
+    #[tool(description = "Mark a trade idea as in-trade, optionally linking a signal outcome ID.")]
+    async fn mark_trade_idea_in_trade(
+        &self,
+        Parameters(params): Parameters<TradeIdeaInTradeParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let note = params
+            .signal_outcome_id
+            .as_ref()
+            .map(|id| format!("linked signal outcome: {id}"));
+        self.transition_trade_idea_tool(&params.idea_id, "in_trade", "active", note.as_deref())
+    }
+
+    #[tool(description = "Mark a trade idea as resolved with an outcome and optional note.")]
+    async fn mark_trade_idea_resolved(
+        &self,
+        Parameters(params): Parameters<TradeIdeaResolveParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let note = params
+            .note
+            .as_deref()
+            .map(|note| format!("{}: {}", params.outcome, note))
+            .unwrap_or(params.outcome);
+        self.transition_trade_idea_tool(&params.idea_id, "resolved", "closed", Some(&note))
     }
 
     #[tool(
@@ -8510,6 +9021,242 @@ fn evaluate_setups_for_snapshot(
     }
 }
 
+fn record_attention_runtime_event(
+    runtime_events: &Arc<RuntimeEventStore>,
+    db: &Database,
+    event_name: &str,
+    message: &str,
+    signal: &AttentionSignalRecord,
+    fields: serde_json::Value,
+) {
+    let mut event = RuntimeEvent::new(
+        RuntimeEventLevel::Info,
+        event_name,
+        "attention",
+        message,
+        fields,
+    );
+    event.session_date = Some(signal.session_date.clone());
+    event.root_symbol = signal.root_symbol.clone();
+    event.contract_symbol = signal.contract_symbol.clone();
+    if let Some(recorded) = runtime_events.record(event) {
+        persist_runtime_event_in_db(runtime_events, db, &recorded);
+    }
+}
+
+fn expire_and_audit_attention_signals(
+    db: &Database,
+    runtime_events: &Arc<RuntimeEventStore>,
+    timestamp_ms: f64,
+    source: Option<&str>,
+) {
+    let expired = db
+        .expire_stale_attention_signals(timestamp_ms, source)
+        .unwrap_or_default();
+    for signal in expired {
+        record_attention_runtime_event(
+            runtime_events,
+            db,
+            "attention.signal_expired",
+            "Attention signal expired.",
+            &signal,
+            serde_json::json!({
+                "signalId": signal.signal_id,
+                "kind": signal.kind,
+                "priority": signal.priority,
+                "expiresAtMs": signal.expires_at_ms,
+            }),
+        );
+    }
+}
+
+fn dispatch_attention_runtime_notifications(
+    db: &Database,
+    runtime_events: &Arc<RuntimeEventStore>,
+    timestamp_ms: f64,
+) {
+    let last_cursor = db
+        .load_attention_notifier_cursor("runtime_event")
+        .ok()
+        .flatten();
+    let since_ms = last_cursor.and_then(|(_, ts)| ts);
+    let mut signals = db
+        .query_attention_signals(&AttentionSignalQuery {
+            status: Some("active".to_string()),
+            min_priority: Some("high".to_string()),
+            include_expired: false,
+            cursor_signal_id: None,
+            since_ms,
+            source: Some("live".to_string()),
+            limit: 100,
+            ..AttentionSignalQuery::default()
+        })
+        .unwrap_or_default();
+    signals.sort_by(|a, b| {
+        a.created_at_ms
+            .partial_cmp(&b.created_at_ms)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.signal_id.cmp(&b.signal_id))
+    });
+    let config = AttentionNotifierConfig {
+        enabled: true,
+        ..AttentionNotifierConfig::default()
+    };
+    let mut last_dispatched: Option<String> = None;
+    for signal in signals {
+        if signal.updated_at_ms > timestamp_ms {
+            continue;
+        }
+        let decision = config.evaluate(&signal);
+        if !decision.should_dispatch {
+            continue;
+        }
+        record_attention_runtime_event(
+            runtime_events,
+            db,
+            "attention.notifier_dispatched",
+            "Runtime-event attention notifier dispatched.",
+            &signal,
+            serde_json::json!({
+                "signalId": signal.signal_id,
+                "kind": signal.kind,
+                "priority": signal.priority,
+                "reason": decision.reason,
+                "sink": "runtime_event",
+            }),
+        );
+        let event_id = format!(
+            "ase_{}",
+            the_desk_backend::db::stable_hash_hex(&format!(
+                "{}|notified|runtime_event|{timestamp_ms:.3}",
+                signal.signal_id
+            ))
+        );
+        let _ =
+            db.insert_attention_signal_event(&the_desk_backend::db::AttentionSignalEventRecord {
+                event_id,
+                signal_id: signal.signal_id.clone(),
+                event_type: "notified".to_string(),
+                occurred_at_ms: timestamp_ms,
+                session_date: signal.session_date.clone(),
+                source: signal.source.clone(),
+                actor: Some("runtime_event".to_string()),
+                note: Some("runtime-event notifier sink".to_string()),
+                payload: serde_json::json!({
+                    "sink": "runtime_event",
+                    "priority": signal.priority,
+                    "kind": signal.kind,
+                }),
+            });
+        last_dispatched = Some(signal.signal_id.clone());
+    }
+    if let Some(signal_id) = last_dispatched {
+        let _ = db.save_attention_notifier_cursor("runtime_event", Some(&signal_id), timestamp_ms);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compose_and_persist_attention(
+    db: &Database,
+    runtime_events: &Arc<RuntimeEventStore>,
+    snapshot: &the_desk_backend::pipelines::MarketState,
+    new_events: &[MarketEvent],
+    pulse_kind: AttentionPulseKind,
+    timestamp_ms: f64,
+    source: &str,
+    job_id: Option<&str>,
+) {
+    if source == "live" {
+        expire_and_audit_attention_signals(db, runtime_events, timestamp_ms, Some(source));
+    }
+    if new_events.is_empty() && pulse_kind == AttentionPulseKind::EventDriven {
+        return;
+    }
+    let setup_states = db
+        .load_setup_runtime_state_for_session(&snapshot.trading_day)
+        .unwrap_or_default();
+    let risk_state = db.load_risk_state().ok().flatten();
+    let prior_active_signals = db
+        .query_attention_signals(&AttentionSignalQuery {
+            status: Some("active".to_string()),
+            min_priority: None,
+            include_expired: false,
+            cursor_signal_id: None,
+            since_ms: None,
+            trading_day: Some(snapshot.trading_day.clone()),
+            root_symbol: Some(snapshot.root_symbol.clone()).filter(|v| !v.is_empty()),
+            contract_symbol: Some(snapshot.contract_symbol.clone()).filter(|v| !v.is_empty()),
+            source: Some(source.to_string()),
+            job_id: job_id.map(str::to_string),
+            limit: 250,
+            ..AttentionSignalQuery::default()
+        })
+        .unwrap_or_default();
+    let composer = SignalComposer::default();
+    let output = composer.compose(SignalComposerInput {
+        pulse_kind,
+        events: new_events,
+        setup_states: &setup_states,
+        risk_state: risk_state.as_ref(),
+        market_snapshot: snapshot,
+        prior_active_signals: &prior_active_signals,
+        timestamp_ms,
+        source,
+        job_id,
+    });
+    for signal in &output.signals {
+        let mut signal = signal.clone();
+        if source != "live" {
+            signal.status = "expired".to_string();
+            signal.expires_at_ms = Some(timestamp_ms);
+        }
+        if db.upsert_attention_signal(&signal).is_ok() {
+            record_attention_runtime_event(
+                runtime_events,
+                db,
+                "attention.signal_emitted",
+                "Attention signal emitted or updated.",
+                &signal,
+                serde_json::json!({
+                    "signalId": signal.signal_id,
+                    "kind": signal.kind,
+                    "priority": signal.priority,
+                    "dedupeKey": signal.dedupe_key,
+                    "pulseKind": format!("{:?}", pulse_kind),
+                }),
+            );
+        }
+    }
+    for event in &output.signal_events {
+        let _ = db.insert_attention_signal_event(event);
+        if event.event_type == "priority_changed" {
+            if let Some(signal) = output
+                .signals
+                .iter()
+                .find(|s| s.signal_id == event.signal_id)
+            {
+                record_attention_runtime_event(
+                    runtime_events,
+                    db,
+                    "attention.signal_priority_changed",
+                    "Attention signal priority changed.",
+                    signal,
+                    serde_json::json!({
+                        "signalId": signal.signal_id,
+                        "priority": signal.priority,
+                    }),
+                );
+            }
+        }
+    }
+    for idea in &output.idea_cards {
+        let _ = db.upsert_trade_idea_card(idea);
+    }
+    if source == "live" {
+        dispatch_attention_runtime_notifications(db, runtime_events, timestamp_ms);
+    }
+}
+
 /// Process a single tick through the pipeline engine, event detector, rules engine, and outcome tracker.
 #[allow(clippy::too_many_arguments)]
 fn process_tick(
@@ -8541,6 +9288,7 @@ fn process_tick(
         return;
     }
     let minute = minute_of_session_from_timestamp(timestamp_ms);
+    let event_buffer_start = event_buffer.len();
     let snapshot = {
         if let Ok(mut p) = pipelines.lock() {
             p.on_trade_with_timestamp(price, volume, is_buy, minute, timestamp_ms);
@@ -8565,6 +9313,7 @@ fn process_tick(
             return;
         }
     };
+    let new_attention_events: Vec<MarketEvent> = event_buffer[event_buffer_start..].to_vec();
     let setup_trading_day = trading_day_from_timestamp_ms(timestamp_ms);
 
     // Rules engine: evaluate setups and persist progress outside the pipeline lock.
@@ -8582,6 +9331,18 @@ fn process_tick(
     // Outcome tracker: update MFE/MAE and resolve signals
     if let Ok(d) = db.lock() {
         let _ = outcome_tracker::on_tick(&d, price, timestamp_ms, None);
+        if !new_attention_events.is_empty() {
+            compose_and_persist_attention(
+                &d,
+                runtime_events,
+                &snapshot,
+                &new_attention_events,
+                AttentionPulseKind::EventDriven,
+                timestamp_ms,
+                "live",
+                None,
+            );
+        }
     }
 
     // Flush event buffer periodically
@@ -10013,6 +10774,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&runtime_events),
     );
     spawn_runtime_event_pruner(Arc::clone(&server.runtime_events), Arc::clone(&server.db));
+    spawn_attention_periodic_pulse(
+        Arc::clone(&server.pipelines),
+        Arc::clone(&server.db),
+        Arc::clone(&server.runtime_events),
+        Arc::clone(&server.last_bid),
+        Arc::clone(&server.last_ask),
+    );
     // Keep non-blocking file appenders alive for the lifetime of the MCP server.
     let _ = &logging_runtime;
     record_runtime_event(

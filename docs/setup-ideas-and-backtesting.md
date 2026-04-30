@@ -122,6 +122,8 @@ The current system is a very good **reactive** partner: agent asks → tools ans
 1. **Push, don't just pull**  
    Add a **signal bus** — when the event detector fires a notable event (OR5 mid retest, DNP cross, absorption failure, RVOL percentile jump), push a structured message that an orchestrator agent can subscribe to. Right now everything requires the agent to poll. A push model enables "the Desk flagged an absorption failure at 10:47; here is the structure" without the agent having to keep guessing when to check.
 
+   Implementation direction: local MCP remains pull/query, so the robust version is a durable **attention inbox** rather than unsolicited Cursor chat push. The Rust backend composes market events, setup lifecycle, risk state, and periodic absence checks into ranked `attention_signals`; agents call `get_attention_inbox`, `get_signal_detail`, `what_changed_since`, and `get_active_trade_ideas` to reason from that inbox. External pings should stay behind notifier sinks and use short, non-advisory language.
+
 2. **Close the research → playbook loop programmatically**  
    The pieces exist. What is missing is a **promotion pipeline**:
    - Idea captured in `setup-ideas-and-backtesting.md` →

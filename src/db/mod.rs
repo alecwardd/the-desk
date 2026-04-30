@@ -523,6 +523,114 @@ pub struct ReplaySignalRecord {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AttentionSignalRecord {
+    pub signal_id: String,
+    pub dedupe_key: String,
+    pub status: String,
+    pub priority: String,
+    pub priority_score: f64,
+    pub confidence: f64,
+    pub kind: String,
+    pub title: String,
+    pub summary: String,
+    pub created_at_ms: f64,
+    pub updated_at_ms: f64,
+    pub last_seen_ms: f64,
+    pub expires_at_ms: Option<f64>,
+    pub session_date: String,
+    pub trading_day: String,
+    pub session_type: String,
+    pub session_segment: String,
+    pub root_symbol: Option<String>,
+    pub contract_symbol: Option<String>,
+    pub current_price: f64,
+    pub source: String,
+    pub job_id: Option<String>,
+    pub source_event_ids: Vec<String>,
+    pub linked_setup_id: Option<String>,
+    pub linked_setup_transition_id: Option<String>,
+    pub linked_signal_outcome_id: Option<String>,
+    pub linked_idea_id: Option<String>,
+    pub suggested_tools: Vec<String>,
+    pub acknowledged_by: Option<String>,
+    pub acknowledged_at_ms: Option<f64>,
+    pub acknowledgement_note: Option<String>,
+    pub payload: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttentionSignalEventRecord {
+    pub event_id: String,
+    pub signal_id: String,
+    pub event_type: String,
+    pub occurred_at_ms: f64,
+    pub session_date: String,
+    pub source: String,
+    pub actor: Option<String>,
+    pub note: Option<String>,
+    pub payload: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TradeIdeaCardRecord {
+    pub idea_id: String,
+    pub status: String,
+    pub lifecycle: String,
+    pub thesis: String,
+    pub missing_confirmation: Vec<String>,
+    pub invalidation: Vec<String>,
+    pub management_context: serde_json::Value,
+    pub risk_context: serde_json::Value,
+    pub linked_setup_id: Option<String>,
+    pub linked_signal_outcome_id: Option<String>,
+    pub linked_attention_signal_id: Option<String>,
+    pub session_date: String,
+    pub trading_day: String,
+    pub root_symbol: Option<String>,
+    pub contract_symbol: Option<String>,
+    pub created_at_ms: f64,
+    pub updated_at_ms: f64,
+    pub resolved_at_ms: Option<f64>,
+    pub payload: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AttentionSignalQuery {
+    pub status: Option<String>,
+    pub min_priority: Option<String>,
+    pub include_expired: bool,
+    pub cursor_signal_id: Option<String>,
+    pub since_ms: Option<f64>,
+    pub session_date: Option<String>,
+    pub trading_day: Option<String>,
+    pub root_symbol: Option<String>,
+    pub contract_symbol: Option<String>,
+    pub source: Option<String>,
+    pub job_id: Option<String>,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AttentionChangelogQuery {
+    pub signal_id: Option<String>,
+    pub cursor_event_id: Option<String>,
+    pub since_ms: Option<f64>,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TradeIdeaQuery {
+    pub status: Option<String>,
+    pub setup_id: Option<String>,
+    pub limit: usize,
+}
+
+pub type AttentionNotifierCursor = (Option<String>, Option<f64>);
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct HistoricalJobRun {
     pub id: String,
     pub job_type: String,
@@ -554,6 +662,51 @@ fn default_signal_source() -> String {
 
 fn default_include_rollover_sessions() -> bool {
     true
+}
+
+/// Stable non-cryptographic hash for deterministic local IDs.
+pub fn stable_hash_hex(input: &str) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in input.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+/// Deterministic identity for a market event, matching the existing DB uniqueness fields.
+pub fn market_event_identity(event: &MarketEvent) -> String {
+    format!(
+        "{}|{:.0}|{}|{}|{:.2}|{}|{}|{}|{}|{}",
+        event.session_date,
+        event.timestamp_ms,
+        event.event_type,
+        event.level_name.as_deref().unwrap_or(""),
+        event.price,
+        event.direction.as_deref().unwrap_or(""),
+        event
+            .sequence_num
+            .map(|v| v.to_string())
+            .unwrap_or_default(),
+        event.session_type,
+        event.session_segment,
+        event.trading_day,
+    )
+}
+
+/// Deterministic ID for a market event. Safe across live/replay retries.
+pub fn market_event_id(event: &MarketEvent) -> String {
+    format!("evt_{}", stable_hash_hex(&market_event_identity(event)))
+}
+
+fn min_priority_score(priority: Option<&str>) -> f64 {
+    match priority {
+        Some("urgent") => 80.0,
+        Some("high") => 60.0,
+        Some("normal") => 35.0,
+        Some("low") => f64::NEG_INFINITY,
+        _ => f64::NEG_INFINITY,
+    }
 }
 
 impl SessionScopeFilter {
@@ -932,6 +1085,9 @@ impl Database {
         }
         if version < 23 {
             self.migrate_v23()?;
+        }
+        if version < 24 {
+            self.migrate_v24()?;
         }
 
         Ok(())
@@ -2104,6 +2260,116 @@ impl Database {
               ON runtime_events(category, emitted_at_ms DESC);
 
             UPDATE schema_version SET version = 23;
+            ",
+        )?;
+        Ok(())
+    }
+
+    /// V24: durable attention inbox and idea-card overlay for proactive agent workflows.
+    fn migrate_v24(&self) -> Result<(), DbError> {
+        let _ = self
+            .conn
+            .execute_batch("ALTER TABLE market_events ADD COLUMN event_id TEXT NULL");
+        self.conn.execute_batch(
+            "
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_market_events_event_id
+              ON market_events(event_id)
+              WHERE event_id IS NOT NULL;
+
+            CREATE TABLE IF NOT EXISTS attention_signals (
+              signal_id TEXT PRIMARY KEY,
+              dedupe_key TEXT NOT NULL,
+              status TEXT NOT NULL,
+              priority TEXT NOT NULL,
+              priority_score REAL NOT NULL,
+              confidence REAL NOT NULL,
+              kind TEXT NOT NULL,
+              title TEXT NOT NULL,
+              summary TEXT NOT NULL,
+              created_at_ms REAL NOT NULL,
+              updated_at_ms REAL NOT NULL,
+              last_seen_ms REAL NOT NULL,
+              expires_at_ms REAL NULL,
+              session_date TEXT NOT NULL,
+              trading_day TEXT NOT NULL,
+              session_type TEXT NOT NULL,
+              session_segment TEXT NOT NULL,
+              root_symbol TEXT NULL,
+              contract_symbol TEXT NULL,
+              current_price REAL NOT NULL,
+              source TEXT NOT NULL,
+              job_id TEXT NULL,
+              source_event_ids_json TEXT NOT NULL DEFAULT '[]',
+              linked_setup_id TEXT NULL,
+              linked_setup_transition_id TEXT NULL,
+              linked_signal_outcome_id TEXT NULL,
+              linked_idea_id TEXT NULL,
+              suggested_tools_json TEXT NOT NULL DEFAULT '[]',
+              acknowledged_by TEXT NULL,
+              acknowledged_at_ms REAL NULL,
+              acknowledgement_note TEXT NULL,
+              payload_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_attention_signals_dedupe_active
+              ON attention_signals(dedupe_key, session_date, source, COALESCE(job_id, ''))
+              WHERE status IN ('new', 'active');
+            CREATE INDEX IF NOT EXISTS idx_attention_signals_rank
+              ON attention_signals(status, priority_score DESC, updated_at_ms DESC);
+            CREATE INDEX IF NOT EXISTS idx_attention_signals_session
+              ON attention_signals(session_date, updated_at_ms DESC);
+            CREATE INDEX IF NOT EXISTS idx_attention_signals_kind
+              ON attention_signals(kind, updated_at_ms DESC);
+
+            CREATE TABLE IF NOT EXISTS attention_signal_events (
+              event_id TEXT PRIMARY KEY,
+              signal_id TEXT NOT NULL,
+              event_type TEXT NOT NULL,
+              occurred_at_ms REAL NOT NULL,
+              session_date TEXT NOT NULL,
+              source TEXT NOT NULL,
+              actor TEXT NULL,
+              note TEXT NULL,
+              payload_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS idx_attention_signal_events_signal
+              ON attention_signal_events(signal_id, occurred_at_ms DESC);
+            CREATE INDEX IF NOT EXISTS idx_attention_signal_events_time
+              ON attention_signal_events(occurred_at_ms DESC);
+
+            CREATE TABLE IF NOT EXISTS trade_idea_cards (
+              idea_id TEXT PRIMARY KEY,
+              status TEXT NOT NULL,
+              lifecycle TEXT NOT NULL,
+              thesis TEXT NOT NULL,
+              missing_confirmation_json TEXT NOT NULL DEFAULT '[]',
+              invalidation_json TEXT NOT NULL DEFAULT '[]',
+              management_context_json TEXT NOT NULL DEFAULT '{}',
+              risk_context_json TEXT NOT NULL DEFAULT '{}',
+              linked_setup_id TEXT NULL,
+              linked_signal_outcome_id TEXT NULL,
+              linked_attention_signal_id TEXT NULL,
+              session_date TEXT NOT NULL,
+              trading_day TEXT NOT NULL,
+              root_symbol TEXT NULL,
+              contract_symbol TEXT NULL,
+              created_at_ms REAL NOT NULL,
+              updated_at_ms REAL NOT NULL,
+              resolved_at_ms REAL NULL,
+              payload_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS idx_trade_idea_cards_session
+              ON trade_idea_cards(session_date, updated_at_ms DESC);
+            CREATE INDEX IF NOT EXISTS idx_trade_idea_cards_setup
+              ON trade_idea_cards(linked_setup_id, updated_at_ms DESC);
+
+            CREATE TABLE IF NOT EXISTS attention_notifier_state (
+              sink TEXT PRIMARY KEY,
+              last_notified_signal_id TEXT NULL,
+              last_notified_at_ms REAL NULL,
+              updated_at_ms REAL NOT NULL
+            );
+
+            UPDATE schema_version SET version = 24;
             ",
         )?;
         Ok(())
@@ -4432,6 +4698,654 @@ impl Database {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    // ------------------------------------------------------------------
+    // Attention signals and idea cards
+    // ------------------------------------------------------------------
+
+    fn validate_attention_signal(signal: &AttentionSignalRecord) -> Result<(), DbError> {
+        if signal.signal_id.trim().is_empty() {
+            return Err(DbError::InvalidQuery(
+                "attention signal_id must not be empty".to_string(),
+            ));
+        }
+        if signal.dedupe_key.trim().is_empty() {
+            return Err(DbError::InvalidQuery(
+                "attention dedupe_key must not be empty".to_string(),
+            ));
+        }
+        let has_trace = !signal.source_event_ids.is_empty()
+            || signal.linked_setup_id.is_some()
+            || signal.linked_setup_transition_id.is_some()
+            || signal.linked_signal_outcome_id.is_some()
+            || signal
+                .payload
+                .get("conditionFields")
+                .and_then(|v| v.as_array())
+                .map(|values| !values.is_empty())
+                .unwrap_or(false);
+        if !has_trace {
+            return Err(DbError::InvalidQuery(
+                "attention signals must link to a source event, setup, outcome, or condition field"
+                    .to_string(),
+            ));
+        }
+        let title = signal.title.trim().to_ascii_lowercase();
+        let summary = signal.summary.trim().to_ascii_lowercase();
+        let advisory_prefixes = ["buy ", "sell ", "enter ", "exit ", "long ", "short "];
+        if advisory_prefixes
+            .iter()
+            .any(|prefix| title.starts_with(prefix))
+            && !title.starts_with("your playbook says")
+        {
+            return Err(DbError::InvalidQuery(
+                "attention signal title uses advisory phrasing".to_string(),
+            ));
+        }
+        let advisory_summary_fragments = [
+            "you should buy",
+            "you should sell",
+            "go long",
+            "go short",
+            "enter long",
+            "enter short",
+        ];
+        if advisory_summary_fragments
+            .iter()
+            .any(|fragment| summary.contains(fragment))
+            && !summary.contains("your playbook says")
+        {
+            return Err(DbError::InvalidQuery(
+                "attention signal summary uses advisory phrasing".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn decode_attention_signal_row(row: &Row<'_>) -> rusqlite::Result<AttentionSignalRecord> {
+        let source_event_ids_json: String = row.get(22)?;
+        let suggested_tools_json: String = row.get(27)?;
+        let payload_json: String = row.get(31)?;
+        Ok(AttentionSignalRecord {
+            signal_id: row.get(0)?,
+            dedupe_key: row.get(1)?,
+            status: row.get(2)?,
+            priority: row.get(3)?,
+            priority_score: row.get(4)?,
+            confidence: row.get(5)?,
+            kind: row.get(6)?,
+            title: row.get(7)?,
+            summary: row.get(8)?,
+            created_at_ms: row.get(9)?,
+            updated_at_ms: row.get(10)?,
+            last_seen_ms: row.get(11)?,
+            expires_at_ms: row.get(12)?,
+            session_date: row.get(13)?,
+            trading_day: row.get(14)?,
+            session_type: row.get(15)?,
+            session_segment: row.get(16)?,
+            root_symbol: row.get(17)?,
+            contract_symbol: row.get(18)?,
+            current_price: row.get(19)?,
+            source: row.get(20)?,
+            job_id: row.get(21)?,
+            source_event_ids: serde_json::from_str(&source_event_ids_json).unwrap_or_default(),
+            linked_setup_id: row.get(23)?,
+            linked_setup_transition_id: row.get(24)?,
+            linked_signal_outcome_id: row.get(25)?,
+            linked_idea_id: row.get(26)?,
+            suggested_tools: serde_json::from_str(&suggested_tools_json).unwrap_or_default(),
+            acknowledged_by: row.get(28)?,
+            acknowledged_at_ms: row.get(29)?,
+            acknowledgement_note: row.get(30)?,
+            payload: serde_json::from_str(&payload_json).unwrap_or_else(|_| serde_json::json!({})),
+        })
+    }
+
+    /// Insert or update a durable attention signal by deterministic signal ID.
+    pub fn upsert_attention_signal(&self, signal: &AttentionSignalRecord) -> Result<(), DbError> {
+        Self::validate_attention_signal(signal)?;
+        self.conn.execute(
+            "INSERT INTO attention_signals
+             (signal_id, dedupe_key, status, priority, priority_score, confidence, kind, title,
+              summary, created_at_ms, updated_at_ms, last_seen_ms, expires_at_ms, session_date,
+              trading_day, session_type, session_segment, root_symbol, contract_symbol,
+              current_price, source, job_id, source_event_ids_json, linked_setup_id,
+              linked_setup_transition_id, linked_signal_outcome_id, linked_idea_id,
+              suggested_tools_json, acknowledged_by, acknowledged_at_ms, acknowledgement_note,
+              payload_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+                     ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30,
+                     ?31, ?32)
+             ON CONFLICT(signal_id) DO UPDATE SET
+              status=excluded.status,
+              priority=excluded.priority,
+              priority_score=excluded.priority_score,
+              confidence=excluded.confidence,
+              title=excluded.title,
+              summary=excluded.summary,
+              updated_at_ms=excluded.updated_at_ms,
+              last_seen_ms=excluded.last_seen_ms,
+              expires_at_ms=excluded.expires_at_ms,
+              current_price=excluded.current_price,
+              source_event_ids_json=excluded.source_event_ids_json,
+              linked_setup_id=COALESCE(excluded.linked_setup_id, attention_signals.linked_setup_id),
+              linked_setup_transition_id=COALESCE(excluded.linked_setup_transition_id, attention_signals.linked_setup_transition_id),
+              linked_signal_outcome_id=COALESCE(excluded.linked_signal_outcome_id, attention_signals.linked_signal_outcome_id),
+              linked_idea_id=COALESCE(excluded.linked_idea_id, attention_signals.linked_idea_id),
+              suggested_tools_json=excluded.suggested_tools_json,
+              payload_json=excluded.payload_json",
+            params![
+                signal.signal_id,
+                signal.dedupe_key,
+                signal.status,
+                signal.priority,
+                signal.priority_score,
+                signal.confidence,
+                signal.kind,
+                signal.title,
+                signal.summary,
+                signal.created_at_ms,
+                signal.updated_at_ms,
+                signal.last_seen_ms,
+                signal.expires_at_ms,
+                signal.session_date,
+                signal.trading_day,
+                signal.session_type,
+                signal.session_segment,
+                signal.root_symbol,
+                signal.contract_symbol,
+                signal.current_price,
+                signal.source,
+                signal.job_id,
+                serde_json::to_string(&signal.source_event_ids)?,
+                signal.linked_setup_id,
+                signal.linked_setup_transition_id,
+                signal.linked_signal_outcome_id,
+                signal.linked_idea_id,
+                serde_json::to_string(&signal.suggested_tools)?,
+                signal.acknowledged_by,
+                signal.acknowledged_at_ms,
+                signal.acknowledgement_note,
+                serde_json::to_string(&signal.payload)?,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Record a signal lifecycle event for changelog/cursor consumers.
+    pub fn insert_attention_signal_event(
+        &self,
+        event: &AttentionSignalEventRecord,
+    ) -> Result<(), DbError> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO attention_signal_events
+             (event_id, signal_id, event_type, occurred_at_ms, session_date, source, actor, note, payload_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                event.event_id,
+                event.signal_id,
+                event.event_type,
+                event.occurred_at_ms,
+                event.session_date,
+                event.source,
+                event.actor,
+                event.note,
+                serde_json::to_string(&event.payload)?,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Query ranked attention inbox rows.
+    pub fn query_attention_signals(
+        &self,
+        query: &AttentionSignalQuery,
+    ) -> Result<Vec<AttentionSignalRecord>, DbError> {
+        let limit = query.limit.clamp(1, 500) as i64;
+        let now_ms = chrono::Utc::now().timestamp_millis() as f64;
+        let cursor_updated_at = query
+            .cursor_signal_id
+            .as_deref()
+            .and_then(|signal_id| {
+                self.conn
+                    .query_row(
+                        "SELECT updated_at_ms FROM attention_signals WHERE signal_id = ?1",
+                        [signal_id],
+                        |row| row.get::<_, f64>(0),
+                    )
+                    .ok()
+            })
+            .unwrap_or(f64::INFINITY);
+        let mut stmt = self.conn.prepare(
+            "SELECT signal_id, dedupe_key, status, priority, priority_score, confidence, kind,
+                    title, summary, created_at_ms, updated_at_ms, last_seen_ms, expires_at_ms,
+                    session_date, trading_day, session_type, session_segment, root_symbol,
+                    contract_symbol, current_price, source, job_id, source_event_ids_json,
+                    linked_setup_id, linked_setup_transition_id, linked_signal_outcome_id,
+                    linked_idea_id, suggested_tools_json, acknowledged_by, acknowledged_at_ms,
+                    acknowledgement_note, payload_json
+             FROM attention_signals
+             WHERE (?1 IS NULL OR status = ?1)
+               AND (?2 IS NULL OR updated_at_ms > ?2)
+               AND (?3 OR expires_at_ms IS NULL OR expires_at_ms > ?4)
+               AND updated_at_ms < ?5
+               AND priority_score >= ?6
+               AND (?7 IS NULL OR session_date = ?7)
+               AND (?8 IS NULL OR trading_day = ?8)
+               AND (?9 IS NULL OR root_symbol = ?9)
+               AND (?10 IS NULL OR contract_symbol = ?10)
+               AND (?11 IS NULL OR source = ?11)
+               AND (?12 IS NULL OR job_id = ?12)
+             ORDER BY priority_score DESC, updated_at_ms DESC
+             LIMIT ?13",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                query.status,
+                query.since_ms,
+                query.include_expired,
+                now_ms,
+                cursor_updated_at,
+                min_priority_score(query.min_priority.as_deref()),
+                query.session_date,
+                query.trading_day,
+                query.root_symbol,
+                query.contract_symbol,
+                query.source,
+                query.job_id,
+                limit
+            ],
+            Self::decode_attention_signal_row,
+        )?;
+        Ok(rows.filter_map(|row| row.ok()).collect())
+    }
+
+    pub fn get_attention_signal(
+        &self,
+        signal_id: &str,
+    ) -> Result<Option<AttentionSignalRecord>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT signal_id, dedupe_key, status, priority, priority_score, confidence, kind,
+                    title, summary, created_at_ms, updated_at_ms, last_seen_ms, expires_at_ms,
+                    session_date, trading_day, session_type, session_segment, root_symbol,
+                    contract_symbol, current_price, source, job_id, source_event_ids_json,
+                    linked_setup_id, linked_setup_transition_id, linked_signal_outcome_id,
+                    linked_idea_id, suggested_tools_json, acknowledged_by, acknowledged_at_ms,
+                    acknowledgement_note, payload_json
+             FROM attention_signals WHERE signal_id = ?1",
+        )?;
+        let mut rows = stmt.query_map([signal_id], Self::decode_attention_signal_row)?;
+        rows.next().transpose().map_err(DbError::from)
+    }
+
+    pub fn acknowledge_attention_signal(
+        &self,
+        signal_id: &str,
+        actor: &str,
+        note: Option<&str>,
+        timestamp_ms: f64,
+    ) -> Result<bool, DbError> {
+        let changed = self.conn.execute(
+            "UPDATE attention_signals
+             SET status='acknowledged', acknowledged_by=?2, acknowledged_at_ms=?3,
+                 acknowledgement_note=?4, updated_at_ms=?3
+             WHERE signal_id=?1",
+            params![signal_id, actor, timestamp_ms, note],
+        )? > 0;
+        if changed {
+            let session_date = self
+                .get_attention_signal(signal_id)?
+                .map(|signal| signal.session_date)
+                .unwrap_or_default();
+            let event_id = format!(
+                "ase_{}",
+                stable_hash_hex(&format!(
+                    "{signal_id}|acknowledged|{timestamp_ms:.0}|{actor}"
+                ))
+            );
+            self.insert_attention_signal_event(&AttentionSignalEventRecord {
+                event_id,
+                signal_id: signal_id.to_string(),
+                event_type: "acknowledged".to_string(),
+                occurred_at_ms: timestamp_ms,
+                session_date,
+                source: "live".to_string(),
+                actor: Some(actor.to_string()),
+                note: note.map(str::to_string),
+                payload: serde_json::json!({}),
+            })?;
+        }
+        Ok(changed)
+    }
+
+    /// Expire active signals whose TTL has passed.
+    pub fn expire_stale_attention_signals(
+        &self,
+        timestamp_ms: f64,
+        source: Option<&str>,
+    ) -> Result<Vec<AttentionSignalRecord>, DbError> {
+        let mut sql = String::from(
+            "SELECT signal_id, dedupe_key, status, priority, priority_score, confidence, kind,
+                    title, summary, created_at_ms, updated_at_ms, last_seen_ms, expires_at_ms,
+                    session_date, trading_day, session_type, session_segment, root_symbol,
+                    contract_symbol, current_price, source, job_id, source_event_ids_json,
+                    linked_setup_id, linked_setup_transition_id, linked_signal_outcome_id,
+                    linked_idea_id, suggested_tools_json, acknowledged_by, acknowledged_at_ms,
+                    acknowledgement_note, payload_json
+             FROM attention_signals
+             WHERE status IN ('new', 'active')
+               AND expires_at_ms IS NOT NULL
+               AND expires_at_ms <= ?1",
+        );
+        let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(timestamp_ms)];
+        if let Some(source) = source {
+            sql.push_str(&format!(" AND source = ?{}", bind_values.len() + 1));
+            bind_values.push(Box::new(source.to_string()));
+        }
+        sql.push_str(" ORDER BY expires_at_ms ASC, signal_id ASC");
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+            bind_values.iter().map(|v| v.as_ref()).collect();
+        let expired = {
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(params_ref.as_slice(), Self::decode_attention_signal_row)?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        for signal in &expired {
+            self.conn.execute(
+                "UPDATE attention_signals
+                 SET status='expired', updated_at_ms=?2
+                 WHERE signal_id=?1 AND status IN ('new', 'active')",
+                params![signal.signal_id, timestamp_ms],
+            )?;
+            let event_id = format!(
+                "ase_{}",
+                stable_hash_hex(&format!("{}|expired|{:.3}", signal.signal_id, timestamp_ms))
+            );
+            self.insert_attention_signal_event(&AttentionSignalEventRecord {
+                event_id,
+                signal_id: signal.signal_id.clone(),
+                event_type: "expired".to_string(),
+                occurred_at_ms: timestamp_ms,
+                session_date: signal.session_date.clone(),
+                source: signal.source.clone(),
+                actor: None,
+                note: Some("signal TTL elapsed".to_string()),
+                payload: serde_json::json!({
+                    "expiresAtMs": signal.expires_at_ms,
+                    "kind": signal.kind,
+                    "priority": signal.priority,
+                }),
+            })?;
+        }
+        Ok(expired)
+    }
+
+    pub fn query_attention_changelog(
+        &self,
+        query: &AttentionChangelogQuery,
+    ) -> Result<Vec<AttentionSignalEventRecord>, DbError> {
+        let limit = query.limit.clamp(1, 500) as i64;
+        let cursor_ts = query
+            .cursor_event_id
+            .as_deref()
+            .and_then(|event_id| {
+                self.conn
+                    .query_row(
+                        "SELECT occurred_at_ms FROM attention_signal_events WHERE event_id = ?1",
+                        [event_id],
+                        |row| row.get::<_, f64>(0),
+                    )
+                    .ok()
+            })
+            .unwrap_or(0.0);
+        let since_ms = query.since_ms.unwrap_or(cursor_ts);
+        let mut stmt = self.conn.prepare(
+            "SELECT event_id, signal_id, event_type, occurred_at_ms, session_date, source, actor, note, payload_json
+             FROM attention_signal_events
+             WHERE occurred_at_ms > ?1
+               AND (?2 IS NULL OR signal_id = ?2)
+             ORDER BY occurred_at_ms ASC, event_id ASC
+             LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![since_ms, query.signal_id, limit], |row| {
+            let payload_json: String = row.get(8)?;
+            Ok(AttentionSignalEventRecord {
+                event_id: row.get(0)?,
+                signal_id: row.get(1)?,
+                event_type: row.get(2)?,
+                occurred_at_ms: row.get(3)?,
+                session_date: row.get(4)?,
+                source: row.get(5)?,
+                actor: row.get(6)?,
+                note: row.get(7)?,
+                payload: serde_json::from_str(&payload_json)
+                    .unwrap_or_else(|_| serde_json::json!({})),
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn upsert_trade_idea_card(&self, idea: &TradeIdeaCardRecord) -> Result<(), DbError> {
+        self.conn.execute(
+            "INSERT INTO trade_idea_cards
+             (idea_id, status, lifecycle, thesis, missing_confirmation_json, invalidation_json,
+              management_context_json, risk_context_json, linked_setup_id, linked_signal_outcome_id,
+              linked_attention_signal_id, session_date, trading_day, root_symbol, contract_symbol,
+              created_at_ms, updated_at_ms, resolved_at_ms, payload_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
+             ON CONFLICT(idea_id) DO UPDATE SET
+              status=excluded.status,
+              lifecycle=excluded.lifecycle,
+              thesis=excluded.thesis,
+              missing_confirmation_json=excluded.missing_confirmation_json,
+              invalidation_json=excluded.invalidation_json,
+              management_context_json=excluded.management_context_json,
+              risk_context_json=excluded.risk_context_json,
+              linked_signal_outcome_id=COALESCE(excluded.linked_signal_outcome_id, trade_idea_cards.linked_signal_outcome_id),
+              linked_attention_signal_id=COALESCE(excluded.linked_attention_signal_id, trade_idea_cards.linked_attention_signal_id),
+              updated_at_ms=excluded.updated_at_ms,
+              resolved_at_ms=excluded.resolved_at_ms,
+              payload_json=excluded.payload_json",
+            params![
+                idea.idea_id,
+                idea.status,
+                idea.lifecycle,
+                idea.thesis,
+                serde_json::to_string(&idea.missing_confirmation)?,
+                serde_json::to_string(&idea.invalidation)?,
+                serde_json::to_string(&idea.management_context)?,
+                serde_json::to_string(&idea.risk_context)?,
+                idea.linked_setup_id,
+                idea.linked_signal_outcome_id,
+                idea.linked_attention_signal_id,
+                idea.session_date,
+                idea.trading_day,
+                idea.root_symbol,
+                idea.contract_symbol,
+                idea.created_at_ms,
+                idea.updated_at_ms,
+                idea.resolved_at_ms,
+                serde_json::to_string(&idea.payload)?,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn decode_trade_idea_row(row: &Row<'_>) -> rusqlite::Result<TradeIdeaCardRecord> {
+        let missing_json: String = row.get(4)?;
+        let invalidation_json: String = row.get(5)?;
+        let management_json: String = row.get(6)?;
+        let risk_json: String = row.get(7)?;
+        let payload_json: String = row.get(18)?;
+        Ok(TradeIdeaCardRecord {
+            idea_id: row.get(0)?,
+            status: row.get(1)?,
+            lifecycle: row.get(2)?,
+            thesis: row.get(3)?,
+            missing_confirmation: serde_json::from_str(&missing_json).unwrap_or_default(),
+            invalidation: serde_json::from_str(&invalidation_json).unwrap_or_default(),
+            management_context: serde_json::from_str(&management_json)
+                .unwrap_or_else(|_| serde_json::json!({})),
+            risk_context: serde_json::from_str(&risk_json)
+                .unwrap_or_else(|_| serde_json::json!({})),
+            linked_setup_id: row.get(8)?,
+            linked_signal_outcome_id: row.get(9)?,
+            linked_attention_signal_id: row.get(10)?,
+            session_date: row.get(11)?,
+            trading_day: row.get(12)?,
+            root_symbol: row.get(13)?,
+            contract_symbol: row.get(14)?,
+            created_at_ms: row.get(15)?,
+            updated_at_ms: row.get(16)?,
+            resolved_at_ms: row.get(17)?,
+            payload: serde_json::from_str(&payload_json).unwrap_or_else(|_| serde_json::json!({})),
+        })
+    }
+
+    pub fn query_trade_idea_cards(
+        &self,
+        query: &TradeIdeaQuery,
+    ) -> Result<Vec<TradeIdeaCardRecord>, DbError> {
+        let limit = query.limit.clamp(1, 500) as i64;
+        let mut stmt = self.conn.prepare(
+            "SELECT idea_id, status, lifecycle, thesis, missing_confirmation_json, invalidation_json,
+                    management_context_json, risk_context_json, linked_setup_id, linked_signal_outcome_id,
+                    linked_attention_signal_id, session_date, trading_day, root_symbol, contract_symbol,
+                    created_at_ms, updated_at_ms, resolved_at_ms, payload_json
+             FROM trade_idea_cards
+             WHERE (?1 IS NULL OR status = ?1)
+               AND (?2 IS NULL OR linked_setup_id = ?2)
+             ORDER BY updated_at_ms DESC
+             LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(
+            params![query.status, query.setup_id, limit],
+            Self::decode_trade_idea_row,
+        )?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn get_trade_idea_card(
+        &self,
+        idea_id: &str,
+    ) -> Result<Option<TradeIdeaCardRecord>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT idea_id, status, lifecycle, thesis, missing_confirmation_json, invalidation_json,
+                    management_context_json, risk_context_json, linked_setup_id, linked_signal_outcome_id,
+                    linked_attention_signal_id, session_date, trading_day, root_symbol, contract_symbol,
+                    created_at_ms, updated_at_ms, resolved_at_ms, payload_json
+             FROM trade_idea_cards
+             WHERE idea_id = ?1",
+        )?;
+        let mut rows = stmt.query_map([idea_id], Self::decode_trade_idea_row)?;
+        rows.next().transpose().map_err(DbError::from)
+    }
+
+    pub fn update_attention_signal_status(
+        &self,
+        signal_id: &str,
+        status: &str,
+        event_type: &str,
+        actor: Option<&str>,
+        note: Option<&str>,
+        timestamp_ms: f64,
+    ) -> Result<Option<AttentionSignalRecord>, DbError> {
+        let changed = self.conn.execute(
+            "UPDATE attention_signals
+             SET status=?2, updated_at_ms=?3
+             WHERE signal_id=?1",
+            params![signal_id, status, timestamp_ms],
+        )? > 0;
+        if !changed {
+            return Ok(None);
+        }
+        let signal = self.get_attention_signal(signal_id)?;
+        if let Some(signal) = &signal {
+            let event_id = format!(
+                "ase_{}",
+                stable_hash_hex(&format!(
+                    "{}|{}|{timestamp_ms:.3}|{}",
+                    signal_id, event_type, status
+                ))
+            );
+            self.insert_attention_signal_event(&AttentionSignalEventRecord {
+                event_id,
+                signal_id: signal_id.to_string(),
+                event_type: event_type.to_string(),
+                occurred_at_ms: timestamp_ms,
+                session_date: signal.session_date.clone(),
+                source: signal.source.clone(),
+                actor: actor.map(str::to_string),
+                note: note.map(str::to_string),
+                payload: serde_json::json!({
+                    "status": status,
+                    "kind": signal.kind,
+                    "priority": signal.priority,
+                }),
+            })?;
+        }
+        Ok(signal)
+    }
+
+    pub fn transition_trade_idea(
+        &self,
+        idea_id: &str,
+        lifecycle: &str,
+        status: &str,
+        note: Option<&str>,
+        timestamp_ms: f64,
+    ) -> Result<bool, DbError> {
+        let resolved_at_ms = if matches!(lifecycle, "resolved" | "invalidated") {
+            Some(timestamp_ms)
+        } else {
+            None
+        };
+        let changed = self.conn.execute(
+            "UPDATE trade_idea_cards
+             SET lifecycle=?2, status=?3, updated_at_ms=?4, resolved_at_ms=COALESCE(?5, resolved_at_ms),
+                 payload_json=json_set(payload_json, '$.lastTransitionNote', ?6)
+             WHERE idea_id=?1
+               AND (lifecycle != ?2 OR status != ?3)",
+            params![idea_id, lifecycle, status, timestamp_ms, resolved_at_ms, note.unwrap_or("")],
+        )? > 0;
+        Ok(changed)
+    }
+
+    pub fn save_attention_notifier_cursor(
+        &self,
+        sink: &str,
+        signal_id: Option<&str>,
+        timestamp_ms: f64,
+    ) -> Result<(), DbError> {
+        self.conn.execute(
+            "INSERT INTO attention_notifier_state
+             (sink, last_notified_signal_id, last_notified_at_ms, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?3)
+             ON CONFLICT(sink) DO UPDATE SET
+              last_notified_signal_id=excluded.last_notified_signal_id,
+              last_notified_at_ms=excluded.last_notified_at_ms,
+              updated_at_ms=excluded.updated_at_ms",
+            params![sink, signal_id, timestamp_ms],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_attention_notifier_cursor(
+        &self,
+        sink: &str,
+    ) -> Result<Option<AttentionNotifierCursor>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT last_notified_signal_id, last_notified_at_ms
+             FROM attention_notifier_state WHERE sink = ?1",
+        )?;
+        let mut rows = stmt.query([sink])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some((row.get(0)?, row.get(1)?)))
+        } else {
+            Ok(None)
+        }
+    }
+
     pub fn insert_microstructure_snapshot(
         &self,
         timestamp_ms: f64,
@@ -5603,14 +6517,15 @@ impl Database {
             let mut stmt = tx.prepare_cached(
                 "INSERT OR IGNORE INTO market_events
                  (session_date, timestamp_ms, event_type, level_name, price, direction, sequence_num, metadata_json,
-                  session_type, session_segment, trading_day)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                  session_type, session_segment, trading_day, event_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             )?;
             for e in events {
                 let meta = e
                     .metadata
                     .as_ref()
                     .map(|m| serde_json::to_string(m).unwrap_or_default());
+                let event_id = market_event_id(e);
                 stmt.execute(params![
                     e.session_date,
                     e.timestamp_ms,
@@ -5623,6 +6538,7 @@ impl Database {
                     &e.session_type,
                     &e.session_segment,
                     &e.trading_day,
+                    event_id,
                 ])?;
             }
         }
@@ -7536,8 +8452,8 @@ impl Database {
                 let mut stmt = self.conn.prepare_cached(
                     "INSERT OR IGNORE INTO market_events
                      (session_date, timestamp_ms, event_type, level_name, price, direction, sequence_num, metadata_json,
-                      session_type, session_segment, trading_day)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                      session_type, session_segment, trading_day, event_id)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 )?;
                 for e in events {
                     let meta = e
@@ -7556,6 +8472,7 @@ impl Database {
                         &e.session_type,
                         &e.session_segment,
                         &e.trading_day,
+                        market_event_id(e),
                     ])?;
                 }
             }
@@ -7992,6 +8909,372 @@ mod tests {
         assert_eq!(rows[0].setup_id, "or5");
         assert_eq!(rows[0].readiness, SetupReadiness::DeterministicReady);
         assert_eq!(rows[0].met_conditions.len(), 2);
+    }
+
+    #[test]
+    fn attention_signal_round_trips_and_acknowledges() {
+        let db = test_db();
+        let signal = AttentionSignalRecord {
+            signal_id: "sig_test".to_string(),
+            dedupe_key: "setup_lifecycle_change:or5:2026-03-05".to_string(),
+            status: "active".to_string(),
+            priority: "high".to_string(),
+            priority_score: 72.0,
+            confidence: 1.0,
+            kind: "setup_lifecycle_change".to_string(),
+            title: "Setup lifecycle changed: OR5".to_string(),
+            summary: "Your playbook says OR5 is deterministic-ready.".to_string(),
+            created_at_ms: 1_000.0,
+            updated_at_ms: 1_000.0,
+            last_seen_ms: 1_000.0,
+            expires_at_ms: Some(61_000.0),
+            session_date: "2026-03-05".to_string(),
+            trading_day: "2026-03-05".to_string(),
+            session_type: "RTH".to_string(),
+            session_segment: "None".to_string(),
+            root_symbol: Some("NQ".to_string()),
+            contract_symbol: Some("NQH26.CME".to_string()),
+            current_price: 21010.0,
+            source: "live".to_string(),
+            job_id: None,
+            source_event_ids: Vec::new(),
+            linked_setup_id: Some("or5".to_string()),
+            linked_setup_transition_id: None,
+            linked_signal_outcome_id: None,
+            linked_idea_id: None,
+            suggested_tools: vec!["get_setup_context".to_string()],
+            acknowledged_by: None,
+            acknowledged_at_ms: None,
+            acknowledgement_note: None,
+            payload: serde_json::json!({
+                "conditionFields": ["setup_readiness"],
+                "priorityBreakdown": { "kindWeight": 35.0 }
+            }),
+        };
+        db.upsert_attention_signal(&signal)
+            .expect("upsert attention signal");
+        let rows = db
+            .query_attention_signals(&AttentionSignalQuery {
+                status: Some("active".to_string()),
+                min_priority: Some("high".to_string()),
+                include_expired: true,
+                limit: 10,
+                ..AttentionSignalQuery::default()
+            })
+            .expect("query attention");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].signal_id, "sig_test");
+
+        assert!(db
+            .acknowledge_attention_signal("sig_test", "trader", Some("reviewed"), 2_000.0)
+            .expect("ack"));
+        let signal = db
+            .get_attention_signal("sig_test")
+            .expect("get")
+            .expect("exists");
+        assert_eq!(signal.status, "acknowledged");
+        assert_eq!(signal.acknowledged_by.as_deref(), Some("trader"));
+        let changelog = db
+            .query_attention_changelog(&AttentionChangelogQuery {
+                since_ms: Some(0.0),
+                limit: 10,
+                ..AttentionChangelogQuery::default()
+            })
+            .expect("changelog");
+        assert_eq!(changelog.len(), 1);
+        assert_eq!(changelog[0].event_type, "acknowledged");
+    }
+
+    #[test]
+    fn attention_notifier_cursor_round_trips() {
+        let db = test_db();
+        assert!(db
+            .load_attention_notifier_cursor("runtime_event")
+            .expect("load empty")
+            .is_none());
+        db.save_attention_notifier_cursor("runtime_event", Some("sig_1"), 1_000.0)
+            .expect("save cursor");
+        let cursor = db
+            .load_attention_notifier_cursor("runtime_event")
+            .expect("load cursor")
+            .expect("cursor exists");
+        assert_eq!(cursor.0.as_deref(), Some("sig_1"));
+        assert_eq!(cursor.1, Some(1_000.0));
+        db.save_attention_notifier_cursor("runtime_event", Some("sig_2"), 2_000.0)
+            .expect("update cursor");
+        let cursor = db
+            .load_attention_notifier_cursor("runtime_event")
+            .expect("reload cursor")
+            .expect("cursor exists");
+        assert_eq!(cursor.0.as_deref(), Some("sig_2"));
+        assert_eq!(cursor.1, Some(2_000.0));
+    }
+
+    #[test]
+    fn attention_query_filters_priority_before_limit_and_scopes_changelog() {
+        let db = test_db();
+        for i in 0..5 {
+            db.upsert_attention_signal(&AttentionSignalRecord {
+                signal_id: format!("sig_low_{i}"),
+                dedupe_key: format!("low:{i}"),
+                status: "active".to_string(),
+                priority: "low".to_string(),
+                priority_score: 10.0,
+                confidence: 1.0,
+                kind: "market_structure_change".to_string(),
+                title: format!("Low priority {i}"),
+                summary: "Your playbook says this is low priority.".to_string(),
+                created_at_ms: 1_000.0 + i as f64,
+                updated_at_ms: 1_000.0 + i as f64,
+                last_seen_ms: 1_000.0 + i as f64,
+                expires_at_ms: Some(10_000.0),
+                session_date: "2026-03-05".to_string(),
+                trading_day: "2026-03-05".to_string(),
+                session_type: "RTH".to_string(),
+                session_segment: "None".to_string(),
+                root_symbol: Some("NQ".to_string()),
+                contract_symbol: Some("NQH26.CME".to_string()),
+                current_price: 21000.0,
+                source: "live".to_string(),
+                job_id: None,
+                source_event_ids: vec![format!("evt_low_{i}")],
+                linked_setup_id: None,
+                linked_setup_transition_id: None,
+                linked_signal_outcome_id: None,
+                linked_idea_id: None,
+                suggested_tools: Vec::new(),
+                acknowledged_by: None,
+                acknowledged_at_ms: None,
+                acknowledgement_note: None,
+                payload: serde_json::json!({"conditionFields": ["dnp_cross"]}),
+            })
+            .expect("insert low");
+        }
+        db.upsert_attention_signal(&AttentionSignalRecord {
+            signal_id: "sig_high".to_string(),
+            dedupe_key: "high:1".to_string(),
+            status: "active".to_string(),
+            priority: "high".to_string(),
+            priority_score: 70.0,
+            confidence: 1.0,
+            kind: "risk_context_change".to_string(),
+            title: "Risk context changed".to_string(),
+            summary: "Your playbook says risk context changed.".to_string(),
+            created_at_ms: 2_000.0,
+            updated_at_ms: 2_000.0,
+            last_seen_ms: 2_000.0,
+            expires_at_ms: Some(10_000.0),
+            session_date: "2026-03-05".to_string(),
+            trading_day: "2026-03-05".to_string(),
+            session_type: "RTH".to_string(),
+            session_segment: "None".to_string(),
+            root_symbol: Some("NQ".to_string()),
+            contract_symbol: Some("NQH26.CME".to_string()),
+            current_price: 21000.0,
+            source: "live".to_string(),
+            job_id: None,
+            source_event_ids: Vec::new(),
+            linked_setup_id: Some("risk".to_string()),
+            linked_setup_transition_id: None,
+            linked_signal_outcome_id: None,
+            linked_idea_id: None,
+            suggested_tools: Vec::new(),
+            acknowledged_by: None,
+            acknowledged_at_ms: None,
+            acknowledgement_note: None,
+            payload: serde_json::json!({"conditionFields": ["risk_state"]}),
+        })
+        .expect("insert high");
+        let rows = db
+            .query_attention_signals(&AttentionSignalQuery {
+                min_priority: Some("high".to_string()),
+                include_expired: true,
+                limit: 1,
+                ..AttentionSignalQuery::default()
+            })
+            .expect("query high");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].signal_id, "sig_high");
+
+        db.insert_attention_signal_event(&AttentionSignalEventRecord {
+            event_id: "ase_high".to_string(),
+            signal_id: "sig_high".to_string(),
+            event_type: "created".to_string(),
+            occurred_at_ms: 2_000.0,
+            session_date: "2026-03-05".to_string(),
+            source: "live".to_string(),
+            actor: None,
+            note: None,
+            payload: serde_json::json!({}),
+        })
+        .expect("insert event");
+        db.insert_attention_signal_event(&AttentionSignalEventRecord {
+            event_id: "ase_low".to_string(),
+            signal_id: "sig_low_0".to_string(),
+            event_type: "created".to_string(),
+            occurred_at_ms: 2_001.0,
+            session_date: "2026-03-05".to_string(),
+            source: "live".to_string(),
+            actor: None,
+            note: None,
+            payload: serde_json::json!({}),
+        })
+        .expect("insert event");
+        let events = db
+            .query_attention_changelog(&AttentionChangelogQuery {
+                signal_id: Some("sig_high".to_string()),
+                since_ms: Some(0.0),
+                limit: 10,
+                ..AttentionChangelogQuery::default()
+            })
+            .expect("query scoped changelog");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_id, "ase_high");
+    }
+
+    #[test]
+    fn expire_stale_attention_signals_updates_status_and_changelog() {
+        let db = test_db();
+        let mut signal = AttentionSignalRecord {
+            signal_id: "sig_expire".to_string(),
+            dedupe_key: "expire:1".to_string(),
+            status: "active".to_string(),
+            priority: "normal".to_string(),
+            priority_score: 40.0,
+            confidence: 1.0,
+            kind: "market_structure_change".to_string(),
+            title: "Structure changed".to_string(),
+            summary: "Your playbook says structure changed.".to_string(),
+            created_at_ms: 1_000.0,
+            updated_at_ms: 1_000.0,
+            last_seen_ms: 1_000.0,
+            expires_at_ms: Some(1_500.0),
+            session_date: "2026-03-05".to_string(),
+            trading_day: "2026-03-05".to_string(),
+            session_type: "RTH".to_string(),
+            session_segment: "None".to_string(),
+            root_symbol: Some("NQ".to_string()),
+            contract_symbol: Some("NQH26.CME".to_string()),
+            current_price: 21000.0,
+            source: "live".to_string(),
+            job_id: None,
+            source_event_ids: vec!["evt_1".to_string()],
+            linked_setup_id: None,
+            linked_setup_transition_id: None,
+            linked_signal_outcome_id: None,
+            linked_idea_id: None,
+            suggested_tools: Vec::new(),
+            acknowledged_by: None,
+            acknowledged_at_ms: None,
+            acknowledgement_note: None,
+            payload: serde_json::json!({"conditionFields": ["dnp_cross"]}),
+        };
+        db.upsert_attention_signal(&signal).expect("insert");
+        let expired = db
+            .expire_stale_attention_signals(2_000.0, Some("live"))
+            .expect("expire");
+        assert_eq!(expired.len(), 1);
+        signal = db
+            .get_attention_signal("sig_expire")
+            .expect("get")
+            .expect("signal exists");
+        assert_eq!(signal.status, "expired");
+        let events = db
+            .query_attention_changelog(&AttentionChangelogQuery {
+                signal_id: Some("sig_expire".to_string()),
+                since_ms: Some(0.0),
+                limit: 10,
+                ..AttentionChangelogQuery::default()
+            })
+            .expect("query changelog");
+        assert_eq!(events[0].event_type, "expired");
+    }
+
+    #[test]
+    fn trade_idea_invalidation_can_update_linked_attention_signal() {
+        let db = test_db();
+        db.upsert_attention_signal(&AttentionSignalRecord {
+            signal_id: "sig_linked".to_string(),
+            dedupe_key: "setup_lifecycle_change:or5:2026-03-05".to_string(),
+            status: "active".to_string(),
+            priority: "high".to_string(),
+            priority_score: 70.0,
+            confidence: 1.0,
+            kind: "setup_lifecycle_change".to_string(),
+            title: "Setup lifecycle changed: OR5".to_string(),
+            summary: "Your playbook says OR5 changed.".to_string(),
+            created_at_ms: 1_000.0,
+            updated_at_ms: 1_000.0,
+            last_seen_ms: 1_000.0,
+            expires_at_ms: Some(60_000.0),
+            session_date: "2026-03-05".to_string(),
+            trading_day: "2026-03-05".to_string(),
+            session_type: "RTH".to_string(),
+            session_segment: "None".to_string(),
+            root_symbol: Some("NQ".to_string()),
+            contract_symbol: Some("NQH26.CME".to_string()),
+            current_price: 21000.0,
+            source: "live".to_string(),
+            job_id: None,
+            source_event_ids: Vec::new(),
+            linked_setup_id: Some("or5".to_string()),
+            linked_setup_transition_id: None,
+            linked_signal_outcome_id: None,
+            linked_idea_id: Some("idea_or5".to_string()),
+            suggested_tools: Vec::new(),
+            acknowledged_by: None,
+            acknowledged_at_ms: None,
+            acknowledgement_note: None,
+            payload: serde_json::json!({"conditionFields": ["setup_readiness"]}),
+        })
+        .expect("insert signal");
+        db.upsert_trade_idea_card(&TradeIdeaCardRecord {
+            idea_id: "idea_or5".to_string(),
+            status: "active".to_string(),
+            lifecycle: "forming".to_string(),
+            thesis: "Your playbook is tracking OR5 as forming.".to_string(),
+            missing_confirmation: Vec::new(),
+            invalidation: Vec::new(),
+            management_context: serde_json::json!({}),
+            risk_context: serde_json::json!({}),
+            linked_setup_id: Some("or5".to_string()),
+            linked_signal_outcome_id: None,
+            linked_attention_signal_id: Some("sig_linked".to_string()),
+            session_date: "2026-03-05".to_string(),
+            trading_day: "2026-03-05".to_string(),
+            root_symbol: Some("NQ".to_string()),
+            contract_symbol: Some("NQH26.CME".to_string()),
+            created_at_ms: 1_000.0,
+            updated_at_ms: 1_000.0,
+            resolved_at_ms: None,
+            payload: serde_json::json!({}),
+        })
+        .expect("insert idea");
+
+        assert!(db
+            .transition_trade_idea("idea_or5", "invalidated", "closed", Some("failed"), 2_000.0)
+            .expect("transition idea"));
+        let signal = db
+            .update_attention_signal_status(
+                "sig_linked",
+                "invalidated",
+                "invalidated",
+                Some("trade_idea"),
+                Some("failed"),
+                2_000.0,
+            )
+            .expect("update signal")
+            .expect("signal");
+        assert_eq!(signal.status, "invalidated");
+        let events = db
+            .query_attention_changelog(&AttentionChangelogQuery {
+                signal_id: Some("sig_linked".to_string()),
+                since_ms: Some(0.0),
+                limit: 10,
+                ..AttentionChangelogQuery::default()
+            })
+            .expect("changelog");
+        assert_eq!(events[0].event_type, "invalidated");
     }
 
     #[test]

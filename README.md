@@ -16,7 +16,7 @@ Sierra Chart (.scid files) → Rust Pipeline Engine → SQLite → MCP Server �
 4. **EventDetector** logs ~30 structured market events (level tests, IB extensions, day type changes, etc.)
 5. **SQLite** stores raw ticks, computed state, session summaries, market events, signal outcomes, and playbook signals
 6. **Research query engine** answers frequency, conditional probability, and distribution questions over historical data
-7. **MCP server** exposes 103 MCP tools that any Cursor agent can call for market context, feed diagnostics, setup lifecycle state, and historical research
+7. **MCP server** exposes 113 MCP tools that any Cursor agent can call for market context, feed diagnostics, setup lifecycle state, and historical research
 8. **Specialized subagents** (market structure, order flow, levels, performance) access domain-specific tools and report to the orchestrator
 9. **You chat with agents** in Cursor who reference live (1-5s delayed) market data and historical statistics
 

@@ -401,6 +401,11 @@ impl PipelineEngine {
         self.contract_metadata = metadata;
     }
 
+    /// Return the contract metadata currently bound to this live pipeline engine.
+    pub fn contract_metadata(&self) -> &ContractMetadata {
+        &self.contract_metadata
+    }
+
     /// Reset all pipelines for a new trading session.
     /// Accumulates outgoing session delta into the cross-session cumulative total
     /// before clearing. Defaults to RTH session type for RVOL.

@@ -349,6 +349,7 @@ pub struct SessionSummary {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PriorDayReference {
+    pub date: String,
     pub high: f64,
     pub low: f64,
     pub close: f64,
@@ -3732,7 +3733,7 @@ impl Database {
             bind_values.push(Box::new(root_symbol.to_string()));
         }
         let sql = format!(
-            "SELECT high, low, close, va_high, va_low, poc, dnva_high, dnva_low, dnp, root_symbol, contract_symbol
+            "SELECT date, high, low, close, va_high, va_low, poc, dnva_high, dnva_low, dnp, root_symbol, contract_symbol
              FROM prior_day_levels WHERE {} ORDER BY date DESC LIMIT 1",
             conditions.join(" AND ")
         );
@@ -3742,21 +3743,39 @@ impl Database {
         let mut rows = stmt.query(params_ref.as_slice())?;
         if let Some(row) = rows.next()? {
             Ok(Some(PriorDayReference {
-                high: row.get(0)?,
-                low: row.get(1)?,
-                close: row.get(2)?,
-                va_high: row.get(3)?,
-                va_low: row.get(4)?,
-                poc: row.get(5)?,
-                dnva_high: row.get(6)?,
-                dnva_low: row.get(7)?,
-                dnp: row.get(8)?,
-                root_symbol: row.get(9)?,
-                contract_symbol: row.get(10)?,
+                date: row.get(0)?,
+                high: row.get(1)?,
+                low: row.get(2)?,
+                close: row.get(3)?,
+                va_high: row.get(4)?,
+                va_low: row.get(5)?,
+                poc: row.get(6)?,
+                dnva_high: row.get(7)?,
+                dnva_low: row.get(8)?,
+                dnp: row.get(9)?,
+                root_symbol: row.get(10)?,
+                contract_symbol: row.get(11)?,
             }))
         } else {
             Ok(None)
         }
+    }
+
+    pub fn load_prior_day_reference_for_contract(
+        &self,
+        before_date: &str,
+        root_symbol: &str,
+        contract_symbol: &str,
+    ) -> Result<Option<PriorDayReference>, DbError> {
+        self.load_prior_day_reference_scoped(before_date, Some(root_symbol), Some(contract_symbol))
+    }
+
+    pub fn load_prior_day_reference_for_root(
+        &self,
+        before_date: &str,
+        root_symbol: &str,
+    ) -> Result<Option<PriorDayReference>, DbError> {
+        self.load_prior_day_reference_scoped(before_date, Some(root_symbol), None)
     }
 
     // ------------------------------------------------------------------

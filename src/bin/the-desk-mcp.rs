@@ -51,6 +51,7 @@ use the_desk_backend::pipelines::{
 };
 use the_desk_backend::research;
 use the_desk_backend::risk::{RiskConfig, RiskState, RiskTracker};
+use the_desk_backend::rollover::{build_contract_rollover_status, ContractRolloverStatus};
 use the_desk_backend::rules::{
     RulesEngine, SetupDefinition, SetupEvaluationOutcome, SetupRuntimeSnapshot, SetupState,
     SetupTransition,
@@ -2348,6 +2349,33 @@ impl TheDeskMcp {
         Ok(())
     }
 
+    fn current_pipeline_contract_metadata(
+        &self,
+    ) -> Option<the_desk_backend::feed::ContractMetadata> {
+        self.pipelines
+            .lock()
+            .ok()
+            .map(|pipelines| pipelines.contract_metadata().clone())
+    }
+
+    fn rollover_status_for_date(
+        &self,
+        db: &Database,
+        active_contract: &the_desk_backend::feed::ContractMetadata,
+        before_date: &str,
+        data_age_ms: Option<f64>,
+    ) -> Result<ContractRolloverStatus, McpError> {
+        let server_contract = self.current_pipeline_contract_metadata();
+        build_rollover_status_from_db(
+            db,
+            active_contract,
+            server_contract.as_ref(),
+            before_date,
+            data_age_ms,
+        )
+        .map_err(db_error)
+    }
+
     fn persist_manual_setup_state_change(
         &self,
         setup_id: &str,
@@ -3044,11 +3072,12 @@ impl TheDeskMcp {
     }
 
     #[tool(
-        description = "Current session context: sessionType (RTH/Globex/Unknown), sessionSegment (Asia/London/None), tradingDay (6 PM ET roll), and data freshness."
+        description = "Current session context: sessionType (RTH/Globex/Unknown), sessionSegment (Asia/London/None), tradingDay (6 PM ET roll), data freshness, and contract rollover status."
     )]
     async fn get_session_context(&self) -> Result<CallToolResult, McpError> {
         if let Some(r) = self.resolve_live_market_view() {
             let s = &r.snapshot;
+            let active_contract = resolve_contract_metadata(&load_feed_config());
             let et_minutes = et_minutes_from_timestamp(r.as_of_timestamp_ms).unwrap_or(-1);
             let (is_transition, transition_from, transition_to, transition_phase) =
                 if let Some((from, to, phase)) = transition_hint(et_minutes) {
@@ -3083,6 +3112,20 @@ impl TheDeskMcp {
                 "transitionPhase": transition_phase,
                 "etMinutes": et_minutes,
             });
+            let rollover_date = s
+                .get("tradingDay")
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string)
+                .unwrap_or_else(the_desk_backend::et_now_trading_day);
+            let db = self.db.lock().map_err(|_| lock_error())?;
+            let rollover_status = self.rollover_status_for_date(
+                &db,
+                &active_contract,
+                &rollover_date,
+                Some(r.data_age_ms),
+            )?;
+            out["rolloverStatus"] =
+                serde_json::to_value(rollover_status).unwrap_or_else(|_| serde_json::json!({}));
             merge_tool_live_metadata(&mut out, &r);
             return Ok(text_result(out));
         }
@@ -3132,13 +3175,14 @@ impl TheDeskMcp {
     }
 
     #[tool(
-        description = "Key reference levels: prior day high/low/close, prior session value area high/low and POC, overnight (Globex) high/low, Globex OR30 and London OR60, and initial balance high/low. Includes sessionType (RTH vs Globex), sessionSegment (Asia/London/None), and tradingDay."
+        description = "Key reference levels: prior day high/low/close, prior session value area high/low and POC, overnight (Globex) high/low, Globex OR30 and London OR60, and initial balance high/low. Includes sessionType, tradingDay, and contract rollover status so agents can gate carry-forward references."
     )]
     async fn get_key_levels(&self) -> Result<CallToolResult, McpError> {
         let Some(r) = self.resolve_live_market_view() else {
             return Ok(no_data("No key levels available"));
         };
         let s = &r.snapshot;
+        let active_contract = resolve_contract_metadata(&load_feed_config());
         let session_type = s.get("sessionType").and_then(|v| v.as_str());
         let session_segment = s.get("sessionSegment").and_then(|v| v.as_str());
         let trading_day = s.get("tradingDay").and_then(|v| v.as_str());
@@ -3184,6 +3228,17 @@ impl TheDeskMcp {
             "priorAsiaDnp": serde_json::Value::Null,
             "untestedDnps": serde_json::json!([]),
         });
+        let rollover_date = trading_day
+            .map(ToString::to_string)
+            .unwrap_or_else(the_desk_backend::et_now_trading_day);
+        let rollover_status = self.rollover_status_for_date(
+            &db,
+            &active_contract,
+            &rollover_date,
+            Some(r.data_age_ms),
+        )?;
+        out["rolloverStatus"] =
+            serde_json::to_value(rollover_status).unwrap_or_else(|_| serde_json::json!({}));
         if is_globex {
             out["sessionScopeNote"] = serde_json::json!("For Globex, use overnightHigh/overnightLow as the session range. sessionHigh, sessionLow, IB, OR, and OR5 are RTH-only and may be zero or from a prior RTH session.");
         }
@@ -5663,7 +5718,7 @@ impl TheDeskMcp {
     }
 
     #[tool(
-        description = "Build a session-start memory packet that merges the ranked memory brief with current account and risk context. When persisted memory maintenance is dirty (`memoryMaintenance.refreshSuggested`), runs a single bounded `refresh_memory_state` (patterns + insight lifecycle) before building the brief unless `skipMemoryRefreshIfDirty` is true."
+        description = "Build a session-start packet that merges ranked memory, current account/risk context, and contract rollover status. When persisted memory maintenance is dirty (`memoryMaintenance.refreshSuggested`), runs a single bounded `refresh_memory_state` unless `skipMemoryRefreshIfDirty` is true."
     )]
     async fn get_pre_session_briefing(
         &self,
@@ -5705,11 +5760,20 @@ impl TheDeskMcp {
         .map_err(db_error)?;
         let account_state = db.load_account_state().map_err(db_error)?;
         let risk_state = db.load_risk_state().map_err(db_error)?;
+        let active_contract = resolve_contract_metadata(&load_feed_config());
+        let data_age_ms = compute_data_age(&db);
+        let rollover_status = self.rollover_status_for_date(
+            &db,
+            &active_contract,
+            &the_desk_backend::et_now_trading_day(),
+            Some(data_age_ms),
+        )?;
         Ok(text_result(serde_json::json!({
             "memoryBrief": memory_brief,
             "accountState": account_state,
             "riskState": risk_state,
-            "memoryAutoRefreshed": memory_auto_refreshed
+            "memoryAutoRefreshed": memory_auto_refreshed,
+            "rolloverStatus": rollover_status
         })))
     }
 
@@ -6180,7 +6244,7 @@ impl TheDeskMcp {
     }
 
     #[tool(
-        description = "Feed health diagnostics: SCID path status, file metadata, latest DB tick timestamp, ingest lag, and freshness/source state."
+        description = "Feed health diagnostics: SCID path status, file metadata, latest DB tick timestamp, ingest lag, freshness/source state, and contract rollover status."
     )]
     async fn get_feed_health(&self) -> Result<CallToolResult, McpError> {
         let config = load_feed_config();
@@ -6200,6 +6264,12 @@ impl TheDeskMcp {
         let tick_count = db.raw_tick_count().unwrap_or(0);
         let latest_tick_ms = db.latest_tick_timestamp_ms().ok().flatten();
         let data_age_ms = compute_data_age(&db);
+        let rollover_status = self.rollover_status_for_date(
+            &db,
+            &contract,
+            &the_desk_backend::et_now_trading_day(),
+            Some(data_age_ms),
+        )?;
         let source_state = if !file_exists {
             "missing"
         } else {
@@ -6233,6 +6303,7 @@ impl TheDeskMcp {
             "fileModifiedMs": file_modified_ms,
             "depthFileCount": contract.depth_file_count,
             "warnings": contract.warnings,
+            "rolloverStatus": rollover_status,
             "latestDbTickTimestampMs": latest_tick_ms,
             "dbTickCount": tick_count,
             "ingestLagMs": data_age_ms,
@@ -6250,6 +6321,23 @@ impl TheDeskMcp {
             "lastNonMonotonicTimestampMs": monotonicity.last_non_monotonic_timestamp_ms,
             "pipelineLockRecentlyContended": pipeline_contended
         })))
+    }
+
+    #[tool(
+        description = "Validate active futures contract rollover state before trusting prior-session references. Compares freshly resolved contract, live pipeline contract, current-contract prior levels, same-root legacy levels, resolver warnings, and feed freshness. Returns whether prior-day references are authoritative, legacy-context-only, or should be cleared/backfilled."
+    )]
+    async fn get_contract_rollover_status(&self) -> Result<CallToolResult, McpError> {
+        let config = load_feed_config();
+        let contract = resolve_contract_metadata(&config);
+        let db = self.db.lock().map_err(|_| lock_error())?;
+        let data_age_ms = compute_data_age(&db);
+        let status = self.rollover_status_for_date(
+            &db,
+            &contract,
+            &the_desk_backend::et_now_trading_day(),
+            Some(data_age_ms),
+        )?;
+        Ok(text_result(serde_json::json!(status)))
     }
 
     #[tool(
@@ -7551,7 +7639,7 @@ impl TheDeskMcp {
     }
 
     #[tool(
-        description = "Validate data integrity: checks tick count, stream freshness, pipeline consistency invariants (POC within VA, VA contains ~70%% of TPOs, delta sum consistency), and session boundary correctness. Returns pass/fail status with details."
+        description = "Validate data integrity: checks tick count, stream freshness, contract rollover status, and pipeline consistency invariants (POC within VA, VA contains ~70%% of TPOs, delta sum consistency). Returns pass/fail status with details."
     )]
     async fn validate_data_integrity(&self) -> Result<CallToolResult, McpError> {
         let db_snapshot = collect_validation_db_snapshot(&self.db)?;
@@ -7571,6 +7659,17 @@ impl TheDeskMcp {
             atomic_age_ms.is_finite() && atomic_age_ms <= FRESHNESS_THRESHOLD_MS;
         let monotonicity = fr.monotonicity_snapshot();
         let recent_monotonic_violation = monotonicity.has_recent_violation(now_ms);
+        let active_contract = resolve_contract_metadata(&load_feed_config());
+        let rollover_status = if let Ok(db) = self.db.lock() {
+            Some(self.rollover_status_for_date(
+                &db,
+                &active_contract,
+                &the_desk_backend::et_now_trading_day(),
+                Some(age_ms),
+            )?)
+        } else {
+            None
+        };
 
         let mut checks = serde_json::json!({
             "rawTicksPresent": tick_count > 0,
@@ -7579,6 +7678,18 @@ impl TheDeskMcp {
             "freshnessThresholdMs": FRESHNESS_THRESHOLD_MS,
         });
         let mut invariants_ok = true;
+        if let Some(status) = &rollover_status {
+            let passed = status.prior_references_authoritative
+                && !status.should_clear_prior_levels
+                && status.server_contract_matches_resolver;
+            checks["contractRollover"] = serde_json::json!({
+                "passed": passed,
+                "status": &status.status,
+                "agentAction": &status.agent_action,
+                "detail": status.notes.join(" ")
+            });
+            invariants_ok &= passed;
+        }
         checks["monotonicTimestamps"] = serde_json::json!({
             "passed": !recent_monotonic_violation,
             "detail": monotonicity_check_detail(monotonicity),
@@ -7599,7 +7710,7 @@ impl TheDeskMcp {
             "ok"
         };
 
-        let result = serde_json::json!({
+        let mut result = serde_json::json!({
             "status": status,
             "liveDataSource": "scid",
             "tickCount": tick_count,
@@ -7620,6 +7731,10 @@ impl TheDeskMcp {
             ),
             "checks": checks
         });
+        if let Some(status) = rollover_status {
+            result["rolloverStatus"] =
+                serde_json::to_value(status).unwrap_or_else(|_| serde_json::json!({}));
+        }
 
         if let Ok(db) = self.db.lock() {
             let _ = db.insert_validation_run(now_ms, status, &result);
@@ -8447,6 +8562,36 @@ fn contract_scope(
         (!root_symbol.is_empty()).then_some(root_symbol),
         (!contract_symbol.is_empty()).then_some(contract_symbol),
     )
+}
+
+fn build_rollover_status_from_db(
+    db: &Database,
+    active_contract: &the_desk_backend::feed::ContractMetadata,
+    server_contract: Option<&the_desk_backend::feed::ContractMetadata>,
+    before_date: &str,
+    data_age_ms: Option<f64>,
+) -> Result<ContractRolloverStatus, the_desk_backend::db::DbError> {
+    let root_symbol = active_contract.root_symbol.trim();
+    let contract_symbol = active_contract.contract_symbol.trim();
+    let current_contract_reference = if !root_symbol.is_empty() && !contract_symbol.is_empty() {
+        db.load_prior_day_reference_for_contract(before_date, root_symbol, contract_symbol)?
+    } else {
+        None
+    };
+    let same_root_reference = if !root_symbol.is_empty() {
+        db.load_prior_day_reference_for_root(before_date, root_symbol)?
+    } else {
+        None
+    };
+
+    Ok(build_contract_rollover_status(
+        active_contract,
+        server_contract,
+        current_contract_reference,
+        same_root_reference,
+        data_age_ms,
+        FRESHNESS_THRESHOLD_MS,
+    ))
 }
 
 fn contract_session_scope(
@@ -9619,6 +9764,7 @@ mod tests {
     use std::path::Path;
     use tempfile::{tempdir, NamedTempFile};
     use the_desk_backend::db::SessionSummary;
+    use the_desk_backend::rollover::{ContractRolloverAgentAction, ContractRolloverStatusKind};
     use the_desk_backend::rules::SetupReadiness;
 
     fn summary_row(
@@ -9694,6 +9840,104 @@ mod tests {
             configured_symbol: "NQH26".to_string(),
             ..Default::default()
         }
+    }
+
+    fn rollover_contract_metadata(
+        contract_symbol: &str,
+    ) -> the_desk_backend::feed::ContractMetadata {
+        the_desk_backend::feed::ContractMetadata {
+            root_symbol: "NQ".to_string(),
+            contract_symbol: contract_symbol.to_string(),
+            contract_month: Some("2026-03".to_string()),
+            symbol_resolution_mode: "manual".to_string(),
+            symbol_resolution_source: "test".to_string(),
+            configured_symbol: contract_symbol.to_string(),
+            scid_file_exists: true,
+            depth_file_count: 1,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn rollover_status_helper_accepts_same_contract_prior_reference() {
+        let db = Database::open(":memory:").expect("db");
+        db.save_prior_day_full_with_dnva_contract(
+            "2026-03-04",
+            21_100.0,
+            20_900.0,
+            21_000.0,
+            21_050.0,
+            20_950.0,
+            21_000.0,
+            Some(21_025.0),
+            Some(20_975.0),
+            Some(21_000.0),
+            Some("NQ"),
+            Some("NQH26"),
+        )
+        .expect("save prior");
+        let contract = rollover_contract_metadata("NQH26");
+        let status = build_rollover_status_from_db(
+            &db,
+            &contract,
+            Some(&contract),
+            "2026-03-05",
+            Some(1_000.0),
+        )
+        .expect("status");
+
+        assert_eq!(status.status, ContractRolloverStatusKind::Ok);
+        assert_eq!(
+            status.agent_action,
+            ContractRolloverAgentAction::UsePriorLevels
+        );
+        assert_eq!(
+            status
+                .prior_day_reference
+                .as_ref()
+                .and_then(|r| r.contract_symbol.as_deref()),
+            Some("NQH26")
+        );
+        assert!(status.prior_references_authoritative);
+    }
+
+    #[test]
+    fn rollover_status_helper_labels_previous_contract_reference_as_legacy() {
+        let db = Database::open(":memory:").expect("db");
+        db.save_prior_day_full_with_dnva_contract(
+            "2026-03-04",
+            21_100.0,
+            20_900.0,
+            21_000.0,
+            21_050.0,
+            20_950.0,
+            21_000.0,
+            Some(21_025.0),
+            Some(20_975.0),
+            Some(21_000.0),
+            Some("NQ"),
+            Some("NQH26"),
+        )
+        .expect("save prior");
+        let active = rollover_contract_metadata("NQM26");
+        let status =
+            build_rollover_status_from_db(&db, &active, Some(&active), "2026-03-05", Some(1_000.0))
+                .expect("status");
+
+        assert_eq!(status.status, ContractRolloverStatusKind::RolloverDetected);
+        assert_eq!(
+            status.agent_action,
+            ContractRolloverAgentAction::LegacyContextOnly
+        );
+        assert_eq!(
+            status
+                .legacy_contract_reference
+                .as_ref()
+                .and_then(|r| r.contract_symbol.as_deref()),
+            Some("NQH26")
+        );
+        assert!(!status.prior_references_authoritative);
+        assert!(status.should_clear_prior_levels);
     }
 
     fn write_scid_header(file: &mut NamedTempFile) {

@@ -22,13 +22,17 @@ When synthesizing responses, factor in EOD drawdown protection and payout-rule p
 
 On every interaction, regardless of topic:
 
-1. Call `get_session_context` and `get_market_snapshot` to establish session context first (`sessionType`, `sessionSegment`, `tradingDay`).
+1. Call `get_session_context` and `get_market_snapshot` to establish session context first (`sessionType`, `sessionSegment`, `tradingDay`). Check `rolloverStatus` before trusting prior-day H/L/C, prior VA/POC, DNVA/DNP, or any carry-forward level.
 2. Call `get_risk_state` and `get_risk_config` in parallel.
 3. Call `get_account_state`.
 4. Derive current R: `R = lucid_daily_loss_dollars / max_daily_loss_r`.
 5. Check for hard stops: `at_limit`, `consecutive_losses >= max_consecutive_losses`, `drawdown_r >= max_daily_loss_r`. If any are true, lead with the risk-coach hard-stop message before any other analysis.
 
 Then route to specialist tool sets based on the question type.
+
+Rollover handling:
+- If `rolloverStatus.priorReferencesAuthoritative == false` or `rolloverStatus.shouldClearPriorLevels == true`, do not frame prior-day references as actionable current-contract levels. Use `legacyContractReference` only as labeled context, and prefer current-contract/overnight/session levels until a same-contract RTH session or backfill exists.
+- If `rolloverStatus.agentAction` is `runBackfill`, `pinManualOverride`, or `restartMcpServer`, surface that operational action before synthesizing levels.
 
 ## Data-Integrity Gate (Triggered)
 
@@ -207,6 +211,7 @@ Risk output: **Brief footer only.**
 Full parallel sweep:
 - `get_rvol`, `get_tape_pace` (market regime)
 - `get_day_type`
+- `get_contract_rollover_status` (authoritative prior-reference gate)
 - `get_key_levels`, `get_proximity_report` (structural levels)
 - `get_session_history(limit=5)` (multi-session context)
 - `get_pre_session_briefing` (ranked carry-forward memory: recent sessions, patterns, insights, follow-ups; auto-runs one bounded `refresh_memory_state` when SQLite memory maintenance is dirty unless `skipMemoryRefreshIfDirty: true`; response includes `memoryAutoRefreshed`)
@@ -236,6 +241,7 @@ Risk output: **Full session-start protocol.**
 Full parallel sweep:
 - Reuse baseline context and risk calls from `Always Do This First`
 - `get_rvol`, `get_tape_pace` (overnight participation)
+- `get_contract_rollover_status` (authoritative prior-reference gate)
 - `get_key_levels`, `get_proximity_report` (prior RTH carry-forward + overnight references)
 - `get_session_history(limit=5)` (multi-session context)
 - `get_pre_session_briefing` (ranked carry-forward memory: recent sessions, patterns, insights, follow-ups; auto-runs one bounded `refresh_memory_state` when SQLite memory maintenance is dirty unless `skipMemoryRefreshIfDirty: true`; response includes `memoryAutoRefreshed`)

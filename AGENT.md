@@ -195,7 +195,7 @@ Rules:
 
 ## MCP Tools Reference
 
-The MCP server (`src/bin/the-desk-mcp.rs`) exposes 100 MCP tools across 11 categories.
+The MCP server (`src/bin/the-desk-mcp.rs`) exposes 101 MCP tools across 11 categories.
 
 ### Live vs Historical — Quick Reference
 
@@ -218,6 +218,7 @@ The MCP server (`src/bin/the-desk-mcp.rs`) exposes 100 MCP tools across 11 categ
 | | `get_session_context` | Session type (RTH/Globex), segment (Asia/London), trading day, data freshness |
 | | `get_session_summary` | Total tick count, latest tick timestamp, latest pipeline snapshot (health check) |
 | | `get_feed_health` | SCID path status, file metadata, ingest lag, freshness diagnostics |
+| | `get_contract_rollover_status` | Pre-session contract roll validation: active contract, prior reference contract, and whether carry-forward levels are authoritative |
 | | `get_snapshot_at` | Historical pipeline snapshot nearest to a given timestamp |
 | **Structure** | `get_tpo_profile` | POC, value area, opening range, initial balance |
 | | `get_tpo_detail` | Per-price TPO letter detail (which brackets printed where, single prints) |

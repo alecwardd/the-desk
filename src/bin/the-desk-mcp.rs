@@ -18,7 +18,7 @@ use the_desk_backend::db::{
     AccountStateRecord, Database, HistoricalJobRun, ImportedFillRecord, JournalEntry,
     OpenPositionRecord, RawTickBatchRow, ReplaySignalRecord, RiskConfigRecord, SessionRecord,
     SessionScopeFilter, SetupPerformanceSortBy, SetupRuntimeStateRecord, SignalOutcome,
-    TradeImportBatchRecord, TradeRecord, TradeReviewUpdate,
+    TradeImportBatchRecord, TradeRecord, TradeReviewUpdate, RESEARCH_DISTRIBUTION_METRICS,
 };
 use the_desk_backend::depth::{
     aggregate_trade_volume_by_level, build_dom_feature_snapshot, build_dom_summary,
@@ -140,31 +140,6 @@ const RESEARCH_OUTCOME_FIELDS: &[&str] = &[
     "poor_low",
     "excess_high",
     "excess_low",
-];
-const RESEARCH_DISTRIBUTION_METRICS: &[&str] = &[
-    "ib_range",
-    "high",
-    "low",
-    "close",
-    "open_price",
-    "poc",
-    "vah",
-    "val",
-    "ib_high",
-    "ib_low",
-    "ib_mid",
-    "or_high",
-    "or_low",
-    "total_volume",
-    "tick_count",
-    "session_delta",
-    "cumulative_delta",
-    "dnp",
-    "dnva_high",
-    "dnva_low",
-    "vwap_close",
-    "signal_count",
-    "rvol_ratio",
 ];
 const SIGNAL_OUTCOME_SESSION_FIELDS: &[&str] = &[
     "day_type",
@@ -4388,7 +4363,7 @@ impl TheDeskMcp {
     }
 
     #[tool(
-        description = "Historical frequency of DOM behaviors such as persisted bid support, ask resistance, liquidity flips, pulling acceleration, or stacking acceleration. Uses persisted DOM feature snapshots."
+        description = "Historical frequency of DOM behaviors such as persisted bid support, ask resistance, liquidity flips, pulling acceleration, or stacking acceleration. Uses persisted DOM feature snapshots and returns research metadata including sample reliability and truncation status."
     )]
     async fn query_dom_behavior_frequency(
         &self,
@@ -4417,7 +4392,7 @@ impl TheDeskMcp {
     }
 
     #[tool(
-        description = "Historical setup outcome context when a DOM behavior was present near signal fire. Answers questions like whether persistent bid support improved setup follow-through."
+        description = "Historical setup outcome context when a DOM behavior was present near signal fire. Answers questions like whether persistent bid support improved setup follow-through, with research metadata for outcome sample reliability."
     )]
     async fn query_dom_behavior_conditional(
         &self,
@@ -4450,7 +4425,7 @@ impl TheDeskMcp {
     }
 
     #[tool(
-        description = "Historical DOM behavior around a specific event type or level interaction. Helps answer whether persisted support, flips, or pulling acceleration commonly accompanied a class of market events."
+        description = "Historical DOM behavior around a specific event type or level interaction. Helps answer whether persisted support, flips, or pulling acceleration commonly accompanied a class of market events. Returns research metadata and marks capped market-event scans as non-reportable."
     )]
     async fn query_dom_reaction_at_levels(
         &self,
@@ -6741,7 +6716,7 @@ impl TheDeskMcp {
     }
 
     #[tool(
-        description = "Compare current session structure against similar historical sessions. Uses multi-dimensional similarity: IB range, day type, profile shape, balance state, RVOL ratio, session delta sign, single prints direction. Returns the most similar past sessions with their outcomes (close vs IB mid, delta, etc.)."
+        description = "Compare current session structure against similar historical sessions. Uses multi-dimensional similarity: IB range, day type, profile shape, balance state, RVOL ratio, session delta sign, single prints direction. Returns the most similar past sessions, outcomes, and research metadata including rows considered, result cap, and truncation status."
     )]
     async fn compare_sessions(
         &self,
@@ -6811,24 +6786,28 @@ impl TheDeskMcp {
         };
         let db = self.db.lock().map_err(|_| lock_error())?;
         let max = params.max_results.unwrap_or(5) as usize;
-        match research::compare_sessions_multi(&db, &query, max) {
-            Ok(sessions) => Ok(text_result(serde_json::json!({
-                "queryDimensions": {
-                    "ibRange": ib_range,
-                    "dayType": params.current_day_type,
-                    "profileShape": query.profile_shape,
-                    "balanceState": query.balance_state,
-                    "rvolRatio": query.rvol_ratio,
-                },
-                "similarSessions": sessions,
-                "count": sessions.len(),
-            }))),
+        match research::compare_sessions_multi_with_meta(&db, &query, max) {
+            Ok(result) => {
+                let count = result.results.len();
+                Ok(text_result(serde_json::json!({
+                    "queryDimensions": {
+                        "ibRange": ib_range,
+                        "dayType": params.current_day_type,
+                        "profileShape": query.profile_shape,
+                        "balanceState": query.balance_state,
+                        "rvolRatio": query.rvol_ratio,
+                    },
+                    "similarSessions": result.results,
+                    "count": count,
+                    "meta": result.meta,
+                })))
+            }
             Err(e) => Err(db_error(e)),
         }
     }
 
     #[tool(
-        description = "Query how often a market event occurs. Returns total occurrences, sessions with event, per-session average, and percentage of sessions. Structural event types: *_test (level tests), ib_extension_hit, ib_formed, or_formed, new_session_high/low, day_type_change, poor_high/low_detected, excess_high/low_detected, or5_mid_retest, dnp_cross, rvol_spike. Flow event types: absorption_detected/absorption_confirmed/absorption_invalidated (metadata.eventSubtype: absorption/exhaustion/delta_divergence), pinch_detected (metadata.timeframe: 1m/5m/15m/30m), acceleration_zone_created, acceleration_zone_held, large_trade_cluster."
+        description = "Query how often a market event occurs. Returns total occurrences, sessions with event, per-session average, percentage of sessions, and research metadata. Session counts use resolved trading-day/session context under the requested scope; exact duplicate market-event rows are ignored by DB identity constraints, but distinct occurrences of the same phenomenon still count separately. Structural event types: *_test (level tests), ib_extension_hit, ib_formed, or_formed, new_session_high/low, day_type_change, poor_high/low_detected, excess_high/low_detected, or5_mid_retest, dnp_cross, rvol_spike. Flow event types: absorption_detected/absorption_confirmed/absorption_invalidated (metadata.eventSubtype: absorption/exhaustion/delta_divergence), pinch_detected (metadata.timeframe: 1m/5m/15m/30m), acceleration_zone_created, acceleration_zone_held, large_trade_cluster."
     )]
     async fn query_event_frequency(
         &self,
@@ -6858,7 +6837,7 @@ impl TheDeskMcp {
     }
 
     #[tool(
-        description = "Conditional probability query: 'When event X happens N+ times in a session, how often does outcome Y occur?' Example: 'If IB-mid is tested 3+ times, how often do we close above IB-mid?' Returns probability, sample size, and counts."
+        description = "Conditional probability query: 'When event X happens N+ times in a resolved trading-day/session unit, how often does outcome Y occur in the matching session summary?' Example: 'If IB-mid is tested 3+ times, how often do we close above IB-mid?' Returns probability, sample size, counts, and metadata notes for missing summaries or truncation."
     )]
     async fn query_conditional(
         &self,
@@ -6894,7 +6873,7 @@ impl TheDeskMcp {
     }
 
     #[tool(
-        description = "Distribution of a numeric metric from session summaries. Returns mean, median, stddev, percentiles (10/25/75/90), min, max. Metrics: ib_range, session_delta, total_volume, rvol_ratio, tick_count, vwap_close, etc."
+        description = "Distribution of a numeric metric from session summaries. Returns mean, median, population stddev, Type-7 linear-interpolation percentiles (10/25/75/90), min, max, and metadata. Metrics: ib_range, session_delta, total_volume, rvol_ratio, tick_count, vwap_close, etc."
     )]
     async fn query_distribution(
         &self,
@@ -6924,7 +6903,7 @@ impl TheDeskMcp {
     }
 
     #[tool(
-        description = "Distribution of R-results from signal_outcomes for a setup. Answers: 'When setup X fires, what is the distribution of R-results?' Returns mean, median, stddev, percentiles. Requires signal_outcomes to be populated (run backtest or live tracking)."
+        description = "Distribution of R-results from signal_outcomes for a setup. Answers: 'When setup X fires, what is the distribution of R-results?' Returns mean, median, population stddev, Type-7 percentiles, and metadata. Requires signal_outcomes to be populated (run backtest or live tracking)."
     )]
     async fn query_signal_outcome_distribution(
         &self,
@@ -6954,7 +6933,7 @@ impl TheDeskMcp {
     }
 
     #[tool(
-        description = "Conditional win rate for signal outcomes: when setup X fires and session has field=value (e.g. day_type=Trend), what is the win rate? Joins signal_outcomes with session_summaries. Requires signal_outcomes to be populated."
+        description = "Conditional win rate for signal outcomes: when setup X fires and the matching resolved trading-day/session summary has field=value (e.g. day_type=Trend), what is the win rate? Joins signal_outcomes to session_summaries by compound session key and returns research metadata. Requires signal_outcomes to be populated."
     )]
     async fn query_signal_outcome_conditional(
         &self,
@@ -6988,7 +6967,7 @@ impl TheDeskMcp {
     }
 
     #[tool(
-        description = "Outcome excursion diagnostics for signal outcomes. Returns distributions for max favorable excursion (MFE), max adverse excursion (MAE), time-to-outcome (minutes), and MFE/MAE ratio, plus resolved outcome breakdown. Use to evaluate execution quality and target/stop behavior."
+        description = "Outcome excursion diagnostics for signal outcomes. Returns distributions for max favorable excursion (MFE), max adverse excursion (MAE), time-to-outcome (minutes), and MFE/MAE ratio, plus resolved outcome breakdown and top-level research metadata. Use to evaluate execution quality and target/stop behavior."
     )]
     async fn query_signal_outcome_excursions(
         &self,
@@ -10511,6 +10490,12 @@ mod tests {
             "session_delta"
         );
         assert_eq!(
+            parse_distribution_metric("IB_RANGE").expect("metric"),
+            "ib_range"
+        );
+        assert!(RESEARCH_DISTRIBUTION_METRICS.contains(&"ib_range"));
+        assert!(RESEARCH_DISTRIBUTION_METRICS.contains(&"rvol_ratio"));
+        assert_eq!(
             parse_signal_outcome_session_field("balance_state").expect("session field"),
             "balance_state"
         );
@@ -10518,6 +10503,11 @@ mod tests {
             parse_dom_behavior_name("Liquidity_Flip").expect("behavior"),
             "liquidity_flip"
         );
+        assert_eq!(
+            research::RESEARCH_PERCENTILE_METHOD,
+            "linear_interpolation_type7"
+        );
+        assert_eq!(research::RESEARCH_STDDEV_METHOD, "population");
     }
 
     #[test]
@@ -10534,6 +10524,31 @@ mod tests {
         assert!(parse_bounded_limit("limit", Some(0), 20, MAX_RESEARCH_RESULT_LIMIT).is_err());
         assert!(parse_dom_behavior_min_duration(Some(f64::INFINITY)).is_err());
         assert!(parse_dom_behavior_min_duration(Some(-1.0)).is_err());
+    }
+
+    #[test]
+    fn research_json_payloads_expose_metadata_contract() {
+        let db = Database::open(":memory:").expect("db");
+        let mut summary = summary_row("2026-03-05", "RTH", 21_010.0, 20_990.0, 21_000.0);
+        summary.ib_range = 20.0;
+        db.upsert_session_summary(&summary).expect("summary");
+
+        let payload = serde_json::to_value(
+            research::metric_distribution(&db, "ib_range", None, None, None).expect("metric"),
+        )
+        .expect("json");
+        assert_eq!(
+            payload
+                .pointer("/meta/percentileMethod")
+                .and_then(|v| v.as_str()),
+            Some(research::RESEARCH_PERCENTILE_METHOD)
+        );
+        assert_eq!(
+            payload
+                .pointer("/meta/effectiveSampleSize")
+                .and_then(|v| v.as_u64()),
+            Some(1)
+        );
     }
 
     #[test]

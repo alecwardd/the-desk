@@ -1,7 +1,128 @@
-use crate::db::Database;
-use crate::db::SessionScopeFilter;
+use crate::db::{Database, SessionScopeFilter};
 use crate::depth::DomSummary;
 use serde::{Deserialize, Serialize};
+
+/// Named percentile convention used by all research distribution queries.
+///
+/// This is Hyndman/Fan type 7: sort values, compute `h = (n - 1) * p`,
+/// then linearly interpolate between floor(h) and ceil(h). It matches the
+/// default convention used by many analytical tools for inclusive percentiles.
+pub const RESEARCH_PERCENTILE_METHOD: &str = "linear_interpolation_type7";
+
+/// Standard deviation convention used by research distribution queries.
+///
+/// The research tables represent the full historical population currently
+/// available under the requested scope, so variance is divided by `n`.
+pub const RESEARCH_STDDEV_METHOD: &str = "population";
+
+const RESEARCH_SUMMARY_QUERY_LIMIT: usize = 100_000;
+const DOM_FEATURE_RESEARCH_LIMIT: usize = 200_000;
+const MARKET_EVENT_RESEARCH_LIMIT: usize = 100_000;
+
+/// Reliability tier for historical statistics.
+///
+/// Keep these thresholds aligned with `AGENT.md` "Research Sample Size Policy".
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ReliabilityTier {
+    Insufficient,
+    Directional,
+    Reportable,
+}
+
+fn reliability_tier(sample_size: usize) -> ReliabilityTier {
+    match sample_size {
+        0..=19 => ReliabilityTier::Insufficient,
+        20..=29 => ReliabilityTier::Directional,
+        _ => ReliabilityTier::Reportable,
+    }
+}
+
+/// Data-quality metadata attached to research statistics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResearchQueryMeta {
+    pub population_size: usize,
+    pub sample_size: usize,
+    pub effective_sample_size: usize,
+    pub scope: Option<SessionScopeFilter>,
+    pub percentile_method: Option<String>,
+    pub stddev_method: Option<String>,
+    pub reliability_tier: ReliabilityTier,
+    pub rows_scanned: usize,
+    pub truncated: bool,
+    pub notes: Vec<String>,
+}
+
+fn research_meta(
+    population_size: usize,
+    sample_size: usize,
+    scope: Option<&SessionScopeFilter>,
+    rows_scanned: usize,
+) -> ResearchQueryMeta {
+    research_meta_with_effective(
+        population_size,
+        sample_size,
+        sample_size,
+        scope,
+        rows_scanned,
+    )
+}
+
+fn research_meta_with_effective(
+    population_size: usize,
+    sample_size: usize,
+    effective_sample_size: usize,
+    scope: Option<&SessionScopeFilter>,
+    rows_scanned: usize,
+) -> ResearchQueryMeta {
+    ResearchQueryMeta {
+        population_size,
+        sample_size,
+        effective_sample_size,
+        scope: scope.cloned(),
+        percentile_method: None,
+        stddev_method: None,
+        reliability_tier: reliability_tier(effective_sample_size),
+        rows_scanned,
+        truncated: false,
+        notes: Vec::new(),
+    }
+}
+
+fn distribution_meta(
+    sample_size: usize,
+    scope: Option<&SessionScopeFilter>,
+    rows_scanned: usize,
+) -> ResearchQueryMeta {
+    let mut meta = research_meta(sample_size, sample_size, scope, rows_scanned);
+    meta.percentile_method = Some(RESEARCH_PERCENTILE_METHOD.to_string());
+    meta.stddev_method = Some(RESEARCH_STDDEV_METHOD.to_string());
+    meta
+}
+
+fn resolved_research_window<'a>(
+    start_date: Option<&'a str>,
+    end_date: Option<&'a str>,
+    scope: Option<&'a SessionScopeFilter>,
+) -> (Option<&'a str>, Option<&'a str>) {
+    (
+        scope
+            .and_then(|s| s.trading_day_start.as_deref())
+            .or(start_date),
+        scope
+            .and_then(|s| s.trading_day_end.as_deref())
+            .or(end_date),
+    )
+}
+
+fn mark_truncated(meta: &mut ResearchQueryMeta, source: &str, limit: usize) {
+    meta.truncated = true;
+    meta.reliability_tier = ReliabilityTier::Insufficient;
+    meta.notes.push(format!(
+        "{source} scan exceeded {limit} rows; result is truncated and should not be treated as reportable"
+    ));
+}
 
 /// Result of a frequency query: "How often does event X happen?"
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -13,6 +134,7 @@ pub struct FrequencyResult {
     pub total_sessions: i64,
     pub per_session_avg: f64,
     pub pct_sessions_with_event: f64,
+    pub meta: ResearchQueryMeta,
 }
 
 /// Result of a conditional probability query.
@@ -26,6 +148,7 @@ pub struct ConditionalResult {
     pub condition_met_count: i64,
     pub outcome_met_count: i64,
     pub total_sessions: i64,
+    pub meta: ResearchQueryMeta,
 }
 
 /// Result of a distribution query.
@@ -43,6 +166,7 @@ pub struct DistributionResult {
     pub p25: f64,
     pub p75: f64,
     pub p90: f64,
+    pub meta: ResearchQueryMeta,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,6 +180,7 @@ pub struct DomBehaviorFrequencyResult {
     pub pct_sessions_with_behavior: f64,
     pub avg_bias_duration_ms: f64,
     pub avg_flip_count_last_60s: f64,
+    pub meta: ResearchQueryMeta,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,6 +193,7 @@ pub struct DomBehaviorConditionalResult {
     pub win_rate: f64,
     pub avg_r: f64,
     pub avg_bias_duration_ms: f64,
+    pub meta: ResearchQueryMeta,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,6 +206,7 @@ pub struct DomReactionAtLevelsResult {
     pub match_rate: f64,
     pub avg_bias_duration_ms: f64,
     pub avg_pull_stack_bias: f64,
+    pub meta: ResearchQueryMeta,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,9 +227,34 @@ pub struct SignalOutcomeExcursionsResult {
     pub mae_distribution: DistributionResult,
     pub time_to_outcome_minutes_distribution: DistributionResult,
     pub mfe_mae_ratio_distribution: DistributionResult,
+    pub meta: ResearchQueryMeta,
 }
 
-fn distribution_from_values(metric: &str, values: &[f64]) -> DistributionResult {
+fn percentile_type7(sorted: &[f64], p: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    if sorted.len() == 1 {
+        return sorted[0];
+    }
+
+    let clamped = p.clamp(0.0, 100.0) / 100.0;
+    let h = clamped * (sorted.len() - 1) as f64;
+    let lower_idx = h.floor() as usize;
+    let upper_idx = h.ceil() as usize;
+    if lower_idx == upper_idx {
+        return sorted[lower_idx];
+    }
+    let weight = h - lower_idx as f64;
+    sorted[lower_idx] + (sorted[upper_idx] - sorted[lower_idx]) * weight
+}
+
+fn distribution_from_values_with_meta(
+    metric: &str,
+    values: &[f64],
+    scope: Option<&SessionScopeFilter>,
+) -> DistributionResult {
+    let meta = distribution_meta(values.len(), scope, values.len());
     if values.is_empty() {
         return DistributionResult {
             metric: metric.to_string(),
@@ -116,6 +268,7 @@ fn distribution_from_values(metric: &str, values: &[f64]) -> DistributionResult 
             p25: 0.0,
             p75: 0.0,
             p90: 0.0,
+            meta,
         };
     }
 
@@ -127,24 +280,25 @@ fn distribution_from_values(metric: &str, values: &[f64]) -> DistributionResult 
     let variance = sorted.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n as f64;
     let stddev = variance.sqrt();
 
-    let percentile = |p: f64| -> f64 {
-        let idx = (p / 100.0 * (n - 1) as f64).round() as usize;
-        sorted[idx.min(n - 1)]
-    };
-
     DistributionResult {
         metric: metric.to_string(),
         sample_count: n,
         mean,
-        median: percentile(50.0),
+        median: percentile_type7(&sorted, 50.0),
         stddev,
         min: sorted[0],
         max: sorted[n - 1],
-        p10: percentile(10.0),
-        p25: percentile(25.0),
-        p75: percentile(75.0),
-        p90: percentile(90.0),
+        p10: percentile_type7(&sorted, 10.0),
+        p25: percentile_type7(&sorted, 25.0),
+        p75: percentile_type7(&sorted, 75.0),
+        p90: percentile_type7(&sorted, 90.0),
+        meta,
     }
+}
+
+#[cfg(test)]
+fn distribution_from_values(metric: &str, values: &[f64]) -> DistributionResult {
+    distribution_from_values_with_meta(metric, values, None)
 }
 
 fn mean(values: &[f64]) -> Option<f64> {
@@ -194,7 +348,7 @@ pub fn dom_behavior_frequency(
     end_date: Option<&str>,
 ) -> Result<DomBehaviorFrequencyResult, String> {
     let rows = db
-        .list_dom_feature_snapshots_for_research(start_date, end_date, 200_000)
+        .list_dom_feature_snapshots_for_research(start_date, end_date, DOM_FEATURE_RESEARCH_LIMIT)
         .map_err(|e| e.to_string())?;
     let total_sessions = db
         .list_session_summaries_scoped(start_date, end_date, None, None, 10_000, None)
@@ -205,13 +359,13 @@ pub fn dom_behavior_frequency(
     let mut sessions_with_behavior = std::collections::BTreeSet::new();
     let mut durations = Vec::new();
     let mut flips = Vec::new();
-    for (trading_day, _timestamp_ms, payload) in rows {
-        let Some(summary) = parse_dom_summary(&payload) else {
+    for (trading_day, _timestamp_ms, payload) in &rows {
+        let Some(summary) = parse_dom_summary(payload) else {
             continue;
         };
         if dom_behavior_matches(&summary, behavior, min_duration_ms) {
             total_occurrences += 1;
-            sessions_with_behavior.insert(trading_day);
+            sessions_with_behavior.insert(trading_day.clone());
             durations.push(summary.current_bias_duration_ms);
             flips.push(summary.flip_count_last_60s as f64);
         }
@@ -228,6 +382,20 @@ pub fn dom_behavior_frequency(
     } else {
         0.0
     };
+    let mut meta = research_meta_with_effective(
+        total_sessions.max(0) as usize,
+        total_sessions.max(0) as usize,
+        sessions_with.max(0) as usize,
+        None,
+        rows.len(),
+    );
+    if rows.len() >= DOM_FEATURE_RESEARCH_LIMIT {
+        mark_truncated(
+            &mut meta,
+            "DOM feature snapshot",
+            DOM_FEATURE_RESEARCH_LIMIT,
+        );
+    }
 
     Ok(DomBehaviorFrequencyResult {
         behavior: behavior.to_string(),
@@ -238,6 +406,7 @@ pub fn dom_behavior_frequency(
         pct_sessions_with_behavior,
         avg_bias_duration_ms: mean(&durations).unwrap_or(0.0),
         avg_flip_count_last_60s: mean(&flips).unwrap_or(0.0),
+        meta,
     })
 }
 
@@ -250,8 +419,9 @@ pub fn dom_behavior_conditional(
     end_date: Option<&str>,
     scope: Option<&SessionScopeFilter>,
 ) -> Result<DomBehaviorConditionalResult, String> {
+    let (window_start, window_end) = resolved_research_window(start_date, end_date, scope);
     let outcomes = db
-        .list_signal_outcomes_with_context(setup_id, start_date, end_date, scope)
+        .list_signal_outcomes_with_context(setup_id, window_start, window_end, scope)
         .map_err(|e| e.to_string())?;
 
     let mut matched = 0_i64;
@@ -294,6 +464,12 @@ pub fn dom_behavior_conditional(
         },
         avg_r: mean(&r_values).unwrap_or(0.0),
         avg_bias_duration_ms: mean(&durations).unwrap_or(0.0),
+        meta: research_meta(
+            outcomes.len(),
+            matched.max(0) as usize,
+            scope,
+            outcomes.len(),
+        ),
     })
 }
 
@@ -306,8 +482,15 @@ pub fn dom_reaction_at_levels(
     end_date: Option<&str>,
     scope: Option<&SessionScopeFilter>,
 ) -> Result<DomReactionAtLevelsResult, String> {
+    let (window_start, window_end) = resolved_research_window(start_date, end_date, scope);
     let events = db
-        .list_market_events_for_research(event_type, start_date, end_date, scope, 100_000)
+        .list_market_events_for_research(
+            event_type,
+            window_start,
+            window_end,
+            scope,
+            MARKET_EVENT_RESEARCH_LIMIT,
+        )
         .map_err(|e| e.to_string())?;
 
     let mut matched_count = 0_i64;
@@ -334,6 +517,15 @@ pub fn dom_reaction_at_levels(
     }
 
     let sample_count = events.len() as i64;
+    let mut meta = research_meta(
+        sample_count.max(0) as usize,
+        matched_count.max(0) as usize,
+        scope,
+        events.len(),
+    );
+    if events.len() >= MARKET_EVENT_RESEARCH_LIMIT {
+        mark_truncated(&mut meta, "market event", MARKET_EVENT_RESEARCH_LIMIT);
+    }
     Ok(DomReactionAtLevelsResult {
         event_type: event_type.to_string(),
         behavior: behavior.to_string(),
@@ -346,6 +538,7 @@ pub fn dom_reaction_at_levels(
         },
         avg_bias_duration_ms: mean(&durations).unwrap_or(0.0),
         avg_pull_stack_bias: mean(&pull_stack_biases).unwrap_or(0.0),
+        meta,
     })
 }
 
@@ -357,9 +550,13 @@ pub fn event_frequency(
     end_date: Option<&str>,
     scope: Option<&SessionScopeFilter>,
 ) -> Result<FrequencyResult, String> {
-    let (total, sessions_with, total_sessions) = db
-        .count_events_by_type(event_type, start_date, end_date, scope)
+    let (window_start, window_end) = resolved_research_window(start_date, end_date, scope);
+    let stats = db
+        .count_events_by_type_stats(event_type, window_start, window_end, scope)
         .map_err(|e| e.to_string())?;
+    let total = stats.total_occurrences;
+    let sessions_with = stats.sessions_with_event;
+    let total_sessions = stats.total_sessions;
 
     let per_session_avg = if total_sessions > 0 {
         total as f64 / total_sessions as f64
@@ -379,6 +576,23 @@ pub fn event_frequency(
         total_sessions,
         per_session_avg,
         pct_sessions_with_event: pct,
+        meta: {
+            let mut meta = research_meta_with_effective(
+                total_sessions.max(0) as usize,
+                total_sessions.max(0) as usize,
+                sessions_with.max(0) as usize,
+                scope,
+                stats.rows_scanned,
+            );
+            if stats.truncated {
+                mark_truncated(
+                    &mut meta,
+                    "market event frequency",
+                    crate::db::RESEARCH_EVENT_SCAN_LIMIT,
+                );
+            }
+            meta
+        },
     })
 }
 
@@ -397,32 +611,41 @@ pub fn conditional_probability(
     end_date: Option<&str>,
     scope: Option<&SessionScopeFilter>,
 ) -> Result<ConditionalResult, String> {
-    let summary_start = scope
-        .and_then(|s| s.trading_day_start.as_deref())
-        .or(start_date);
-    let summary_end = scope
-        .and_then(|s| s.trading_day_end.as_deref())
-        .or(end_date);
-    let counts = db
-        .event_counts_per_session(event_type, start_date, end_date, scope)
+    let (window_start, window_end) = resolved_research_window(start_date, end_date, scope);
+    let count_stats = db
+        .event_counts_per_session_context_stats(event_type, window_start, window_end, scope)
         .map_err(|e| e.to_string())?;
+    let counts = count_stats.counts;
 
-    let summaries = db
-        .list_session_summaries_scoped(summary_start, summary_end, None, None, 10_000, scope)
+    let mut summaries = db
+        .list_session_summaries_scoped(
+            window_start,
+            window_end,
+            None,
+            scope.and_then(|s| s.session_type.as_deref()),
+            RESEARCH_SUMMARY_QUERY_LIMIT + 1,
+            scope,
+        )
         .map_err(|e| e.to_string())?;
+    let truncated = summaries.len() > RESEARCH_SUMMARY_QUERY_LIMIT;
+    if truncated {
+        summaries.truncate(RESEARCH_SUMMARY_QUERY_LIMIT);
+    }
 
-    let summary_map: std::collections::HashMap<String, &crate::db::SessionSummary> = summaries
-        .iter()
-        .map(|s| (s.session_date.clone(), s))
-        .collect();
+    let summary_map: std::collections::HashMap<(String, String), &crate::db::SessionSummary> =
+        summaries
+            .iter()
+            .map(|s| ((s.session_date.clone(), s.session_type.clone()), s))
+            .collect();
 
     let mut condition_met = 0_i64;
     let mut outcome_met = 0_i64;
+    let mut missing_outcome_sessions = 0_usize;
 
-    for (date, count) in &counts {
+    for (date, session_type, count) in &counts {
         if *count >= min_count {
-            condition_met += 1;
-            if let Some(summary) = summary_map.get(date) {
+            if let Some(summary) = summary_map.get(&(date.clone(), session_type.clone())) {
+                condition_met += 1;
                 let owned: String;
                 let field_val: &str = match outcome_field {
                     "close_vs_ib_mid" => &summary.close_vs_ib_mid,
@@ -453,6 +676,8 @@ pub fn conditional_probability(
                 if field_val == outcome_value {
                     outcome_met += 1;
                 }
+            } else {
+                missing_outcome_sessions += 1;
             }
         }
     }
@@ -463,6 +688,31 @@ pub fn conditional_probability(
         0.0
     };
 
+    let mut meta = research_meta(
+        summaries.len(),
+        condition_met.max(0) as usize,
+        scope,
+        count_stats.rows_scanned + summaries.len(),
+    );
+    meta.truncated = truncated;
+    if count_stats.truncated {
+        mark_truncated(
+            &mut meta,
+            "market event conditional",
+            crate::db::RESEARCH_EVENT_SCAN_LIMIT,
+        );
+    }
+    if truncated {
+        meta.notes.push(format!(
+            "session summary scan exceeded {RESEARCH_SUMMARY_QUERY_LIMIT} rows; results use the first {RESEARCH_SUMMARY_QUERY_LIMIT} rows returned by the database"
+        ));
+    }
+    if missing_outcome_sessions > 0 {
+        meta.notes.push(format!(
+            "{missing_outcome_sessions} condition-matched sessions had no matching session summary for outcome evaluation"
+        ));
+    }
+
     Ok(ConditionalResult {
         condition_description: format!("{event_type} >= {min_count} times per session"),
         outcome_description: format!("{outcome_field} = {outcome_value}"),
@@ -471,6 +721,7 @@ pub fn conditional_probability(
         condition_met_count: condition_met,
         outcome_met_count: outcome_met,
         total_sessions: summaries.len() as i64,
+        meta,
     })
 }
 
@@ -483,14 +734,16 @@ pub fn signal_outcome_distribution(
     end_date: Option<&str>,
     scope: Option<&SessionScopeFilter>,
 ) -> Result<DistributionResult, String> {
+    let (window_start, window_end) = resolved_research_window(start_date, end_date, scope);
     let outcomes = db
-        .list_signal_outcomes_for_research(Some(setup_id), start_date, end_date, scope)
+        .list_signal_outcomes_for_research(Some(setup_id), window_start, window_end, scope)
         .map_err(|e| e.to_string())?;
 
     let values: Vec<f64> = outcomes.into_iter().filter_map(|(_, _, r, _)| r).collect();
-    Ok(distribution_from_values(
+    Ok(distribution_from_values_with_meta(
         &format!("r_result (setup {setup_id})"),
         &values,
+        scope,
     ))
 }
 
@@ -505,30 +758,45 @@ pub fn signal_outcome_conditional(
     end_date: Option<&str>,
     scope: Option<&SessionScopeFilter>,
 ) -> Result<ConditionalResult, String> {
-    let summary_start = scope
-        .and_then(|s| s.trading_day_start.as_deref())
-        .or(start_date);
-    let summary_end = scope
-        .and_then(|s| s.trading_day_end.as_deref())
-        .or(end_date);
+    let (window_start, window_end) = resolved_research_window(start_date, end_date, scope);
     let outcomes = db
-        .list_signal_outcomes_for_research(Some(setup_id), start_date, end_date, scope)
+        .list_signal_outcomes_for_research_with_session_key(
+            Some(setup_id),
+            window_start,
+            window_end,
+            scope,
+        )
         .map_err(|e| e.to_string())?;
 
-    let summaries = db
-        .list_session_summaries_scoped(summary_start, summary_end, None, None, 10_000, scope)
+    let mut summaries = db
+        .list_session_summaries_scoped(
+            window_start,
+            window_end,
+            None,
+            scope.and_then(|s| s.session_type.as_deref()),
+            RESEARCH_SUMMARY_QUERY_LIMIT + 1,
+            scope,
+        )
         .map_err(|e| e.to_string())?;
+    let truncated = summaries.len() > RESEARCH_SUMMARY_QUERY_LIMIT;
+    if truncated {
+        summaries.truncate(RESEARCH_SUMMARY_QUERY_LIMIT);
+    }
 
-    let summary_map: std::collections::HashMap<String, &crate::db::SessionSummary> = summaries
-        .iter()
-        .map(|s| (s.session_date.clone(), s))
-        .collect();
+    let summary_map: std::collections::HashMap<(String, String), &crate::db::SessionSummary> =
+        summaries
+            .iter()
+            .map(|s| ((s.session_date.clone(), s.session_type.clone()), s))
+            .collect();
 
     let mut condition_met = 0_i64;
     let mut outcome_met = 0_i64;
+    let mut missing_outcome_sessions = 0_usize;
 
-    for (_, session_date, r_result, _) in &outcomes {
-        if let Some(summary) = summary_map.get(session_date) {
+    for outcome in &outcomes {
+        if let Some(summary) =
+            summary_map.get(&(outcome.analysis_day.clone(), outcome.session_type.clone()))
+        {
             let field_val: &str = match session_field {
                 "day_type" => &summary.day_type,
                 "profile_shape" => &summary.profile_shape,
@@ -542,11 +810,13 @@ pub fn signal_outcome_conditional(
                 continue;
             }
             condition_met += 1;
-            if let Some(r) = r_result {
-                if *r > 0.0 {
+            if let Some(r) = outcome.r_result {
+                if r > 0.0 {
                     outcome_met += 1;
                 }
             }
+        } else {
+            missing_outcome_sessions += 1;
         }
     }
 
@@ -555,6 +825,24 @@ pub fn signal_outcome_conditional(
     } else {
         0.0
     };
+
+    let mut meta = research_meta(
+        summaries.len(),
+        condition_met.max(0) as usize,
+        scope,
+        outcomes.len() + summaries.len(),
+    );
+    meta.truncated = truncated;
+    if truncated {
+        meta.notes.push(format!(
+            "session summary scan exceeded {RESEARCH_SUMMARY_QUERY_LIMIT} rows; results use the first {RESEARCH_SUMMARY_QUERY_LIMIT} rows returned by the database"
+        ));
+    }
+    if missing_outcome_sessions > 0 {
+        meta.notes.push(format!(
+            "{missing_outcome_sessions} signal outcomes had no matching session summary for conditional evaluation"
+        ));
+    }
 
     Ok(ConditionalResult {
         condition_description: format!(
@@ -566,6 +854,7 @@ pub fn signal_outcome_conditional(
         condition_met_count: condition_met,
         outcome_met_count: outcome_met,
         total_sessions: summaries.len() as i64,
+        meta,
     })
 }
 
@@ -577,8 +866,9 @@ pub fn signal_outcome_excursions(
     end_date: Option<&str>,
     scope: Option<&SessionScopeFilter>,
 ) -> Result<SignalOutcomeExcursionsResult, String> {
+    let (window_start, window_end) = resolved_research_window(start_date, end_date, scope);
     let rows = db
-        .list_signal_outcomes_for_excursions_filtered(setup_id, start_date, end_date, scope)
+        .list_signal_outcomes_for_excursions_filtered(setup_id, window_start, window_end, scope)
         .map_err(|e| e.to_string())?;
 
     let mut target_hit = 0_i64;
@@ -623,13 +913,27 @@ pub fn signal_outcome_excursions(
             time_exit,
             other,
         },
-        mfe_distribution: distribution_from_values("max_favorable_excursion", &mfe_values),
-        mae_distribution: distribution_from_values("max_adverse_excursion", &mae_values),
-        time_to_outcome_minutes_distribution: distribution_from_values(
+        mfe_distribution: distribution_from_values_with_meta(
+            "max_favorable_excursion",
+            &mfe_values,
+            scope,
+        ),
+        mae_distribution: distribution_from_values_with_meta(
+            "max_adverse_excursion",
+            &mae_values,
+            scope,
+        ),
+        time_to_outcome_minutes_distribution: distribution_from_values_with_meta(
             "time_to_outcome_minutes",
             &time_minutes,
+            scope,
         ),
-        mfe_mae_ratio_distribution: distribution_from_values("mfe_mae_ratio", &mfe_mae_ratio),
+        mfe_mae_ratio_distribution: distribution_from_values_with_meta(
+            "mfe_mae_ratio",
+            &mfe_mae_ratio,
+            scope,
+        ),
+        meta: research_meta(rows.len(), rows.len(), scope, rows.len()),
     })
 }
 
@@ -651,8 +955,9 @@ pub fn signal_outcome_by_rvol_regime(
         ("High", 1.15, f64::INFINITY),
     ];
 
+    let (window_start, window_end) = resolved_research_window(start_date, end_date, scope);
     let outcomes = db
-        .list_signal_outcomes_with_rvol(setup_id, start_date, end_date, scope)
+        .list_signal_outcomes_with_rvol(setup_id, window_start, window_end, scope)
         .map_err(|e| e.to_string())?;
 
     let mut results = Vec::new();
@@ -691,6 +996,7 @@ pub fn signal_outcome_by_rvol_regime(
                 condition_met_count: total,
                 outcome_met_count: wins,
                 total_sessions: outcomes.len() as i64,
+                meta: research_meta(outcomes.len(), total.max(0) as usize, scope, outcomes.len()),
             },
         ));
     }
@@ -705,12 +1011,7 @@ pub fn metric_distribution(
     end_date: Option<&str>,
     scope: Option<&SessionScopeFilter>,
 ) -> Result<DistributionResult, String> {
-    let summary_start = scope
-        .and_then(|s| s.trading_day_start.as_deref())
-        .or(start_date);
-    let summary_end = scope
-        .and_then(|s| s.trading_day_end.as_deref())
-        .or(end_date);
+    let (summary_start, summary_end) = resolved_research_window(start_date, end_date, scope);
     let values = db
         .metric_values_scoped(
             metric,
@@ -720,7 +1021,7 @@ pub fn metric_distribution(
             scope,
         )
         .map_err(|e| e.to_string())?;
-    Ok(distribution_from_values(metric, &values))
+    Ok(distribution_from_values_with_meta(metric, &values, scope))
 }
 
 /// User-configurable weights for multi-dimensional session similarity.
@@ -763,6 +1064,13 @@ pub struct SessionSimilarityQuery {
     pub weights: SimilarityWeights,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSimilarityResult {
+    pub results: Vec<serde_json::Value>,
+    pub meta: ResearchQueryMeta,
+}
+
 /// Compare today's session against similar historical sessions using weighted multi-dimensional similarity.
 pub fn compare_sessions(
     db: &Database,
@@ -788,6 +1096,15 @@ pub fn compare_sessions_multi(
     query: &SessionSimilarityQuery,
     max_results: usize,
 ) -> Result<Vec<serde_json::Value>, String> {
+    Ok(compare_sessions_multi_with_meta(db, query, max_results)?.results)
+}
+
+/// Multi-dimensional session similarity with research metadata.
+pub fn compare_sessions_multi_with_meta(
+    db: &Database,
+    query: &SessionSimilarityQuery,
+    max_results: usize,
+) -> Result<SessionSimilarityResult, String> {
     let summaries = db
         .list_session_summaries_scoped(None, None, None, None, 500, None)
         .map_err(|e| e.to_string())?;
@@ -796,7 +1113,10 @@ pub fn compare_sessions_multi(
         summaries.iter().filter(|s| s.ib_range > 0.0).collect();
 
     if filtered.is_empty() {
-        return Ok(Vec::new());
+        return Ok(SessionSimilarityResult {
+            results: Vec::new(),
+            meta: research_meta(0, 0, None, summaries.len()),
+        });
     }
 
     let w = &query.weights;
@@ -887,7 +1207,7 @@ pub fn compare_sessions_multi(
 
     scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
-    Ok(scored
+    let results: Vec<serde_json::Value> = scored
         .into_iter()
         .take(max_results)
         .map(|(score, s)| {
@@ -908,13 +1228,181 @@ pub fn compare_sessions_multi(
                 "low": s.low,
             })
         })
-        .collect())
+        .collect();
+    let mut meta = research_meta(filtered.len(), results.len(), None, summaries.len());
+    meta.notes.push(format!(
+        "session similarity considered {} eligible sessions and returned at most {max_results}",
+        filtered.len()
+    ));
+    if summaries.len() >= 500 {
+        mark_truncated(&mut meta, "session similarity summary", 500);
+    }
+
+    Ok(SessionSimilarityResult { results, meta })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::SignalOutcome;
+    use crate::db::{SessionSummary, SignalOutcome};
+    use crate::depth::DomSummary;
+    use crate::pipelines::event_detector::MarketEvent;
+    use chrono::TimeZone;
+    use chrono_tz::US::Eastern;
+
+    fn assert_close(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() < 1e-9,
+            "expected {expected}, got {actual}"
+        );
+    }
+
+    fn summary(
+        session_date: &str,
+        session_type: &str,
+        ib_range: f64,
+        close_vs_ib_mid: &str,
+    ) -> SessionSummary {
+        SessionSummary {
+            session_date: session_date.into(),
+            session_type: session_type.into(),
+            root_symbol: "NQ".into(),
+            contract_symbol: "NQH26.CME".into(),
+            contract_month: Some("H26".into()),
+            symbol_resolution_mode: "test".into(),
+            carry_forward_levels_valid: true,
+            rollover_warning: None,
+            open_price: 21000.0,
+            high: 21000.0 + ib_range,
+            low: 21000.0,
+            close: 21000.0 + ib_range / 2.0,
+            poc: 21010.0,
+            vah: 21020.0,
+            val: 21000.0,
+            ib_high: 21000.0 + ib_range,
+            ib_low: 21000.0,
+            ib_range,
+            ib_mid: 21000.0 + ib_range / 2.0,
+            or_high: 21005.0,
+            or_low: 20995.0,
+            day_type: if ib_range >= 40.0 { "Trend" } else { "Normal" }.into(),
+            profile_shape: "D".into(),
+            balance_state: "balanced".into(),
+            total_volume: 1000.0 + ib_range,
+            tick_count: 1000,
+            session_delta: ib_range * 10.0,
+            cumulative_delta: ib_range * 10.0,
+            dnp: 21010.0,
+            dnva_high: 21020.0,
+            dnva_low: 21000.0,
+            vwap_close: 21012.0,
+            signal_count: 0,
+            single_prints_direction: String::new(),
+            excess_high: false,
+            excess_low: false,
+            poor_high: false,
+            poor_low: false,
+            rvol_ratio: 1.0,
+            close_vs_ib_mid: close_vs_ib_mid.into(),
+            close_vs_vwap: "above".into(),
+            close_vs_poc: "above".into(),
+            snapshot_json: None,
+        }
+    }
+
+    fn event(
+        session_date: &str,
+        timestamp_ms: f64,
+        session_type: &str,
+        segment: &str,
+        trading_day: &str,
+    ) -> MarketEvent {
+        MarketEvent {
+            session_date: session_date.into(),
+            timestamp_ms,
+            event_type: "ib_mid_test".into(),
+            level_name: Some("ib_mid".into()),
+            price: 21010.0,
+            direction: Some("from_below".into()),
+            sequence_num: None,
+            metadata: None,
+            session_type: session_type.into(),
+            session_segment: segment.into(),
+            trading_day: trading_day.into(),
+        }
+    }
+
+    fn eastern_ms(year: i32, month: u32, day: u32, hour: u32, minute: u32) -> f64 {
+        Eastern
+            .with_ymd_and_hms(year, month, day, hour, minute, 0)
+            .unwrap()
+            .timestamp_millis() as f64
+    }
+
+    fn signal_outcome(
+        signal_id: &str,
+        setup_id: &str,
+        session_date: &str,
+        fired_at_ms: f64,
+        r_result: f64,
+    ) -> SignalOutcome {
+        SignalOutcome {
+            signal_id: signal_id.into(),
+            setup_id: setup_id.into(),
+            setup_name: Some("Setup".into()),
+            session_date: session_date.into(),
+            root_symbol: Some("NQ".into()),
+            contract_symbol: Some("NQH26.CME".into()),
+            source: "backtest".into(),
+            job_id: None,
+            fired_at_ms,
+            fired_price: 21000.0,
+            target_price: Some(21010.0),
+            stop_price: Some(20990.0),
+            outcome: "target_hit".into(),
+            outcome_at_ms: Some(fired_at_ms + 60_000.0),
+            max_favorable_excursion: Some(12.0),
+            max_adverse_excursion: Some(4.0),
+            r_result: Some(r_result),
+            time_to_outcome_ms: Some(60_000.0),
+            rvol_at_fire: Some(1.05),
+            rvol_bucket_at_fire: Some(2),
+        }
+    }
+
+    fn dom_payload(liquidity_bias: &str, duration_ms: f64) -> serde_json::Value {
+        let summary = DomSummary {
+            liquidity_bias: liquidity_bias.into(),
+            current_bias_duration_ms: duration_ms,
+            flip_count_last_60s: 0,
+            context_confidence: "test".into(),
+            liquidity_narrative: "test".into(),
+            ..Default::default()
+        };
+        serde_json::json!({ "domSummary": summary })
+    }
+
+    fn seed_research_fixture(db: &Database) {
+        for row in [
+            summary("2026-03-02", "RTH", 20.0, "above"),
+            summary("2026-03-03", "RTH", 30.0, "below"),
+            summary("2026-03-04", "RTH", 40.0, "above"),
+            summary("2026-03-05", "RTH", 50.0, "below"),
+        ] {
+            db.upsert_session_summary(&row).unwrap();
+        }
+
+        db.insert_market_events_batch(&[
+            event("2026-03-02", 1.0, "RTH", "None", "2026-03-02"),
+            event("2026-03-02", 2.0, "RTH", "None", "2026-03-02"),
+            event("2026-03-02", 2.0, "RTH", "None", "2026-03-02"),
+            event("2026-03-03", 3.0, "RTH", "None", "2026-03-03"),
+            event("2026-03-04", 4.0, "RTH", "None", "2026-03-04"),
+            event("2026-03-04", 5.0, "RTH", "None", "2026-03-04"),
+            event("2026-03-04", 6.0, "RTH", "None", "2026-03-04"),
+        ])
+        .unwrap();
+    }
 
     #[test]
     fn distribution_handles_empty() {
@@ -922,6 +1410,293 @@ mod tests {
         let db = Database::open(file.path().to_string_lossy().as_ref()).unwrap();
         let result = metric_distribution(&db, "ib_range", None, None, None).unwrap();
         assert_eq!(result.sample_count, 0);
+    }
+
+    #[test]
+    fn distribution_rejects_unsupported_metric_at_research_boundary() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = Database::open(file.path().to_string_lossy().as_ref()).unwrap();
+        let err = metric_distribution(&db, "not_a_metric", None, None, None).unwrap_err();
+        assert!(err.contains("unsupported session_summaries metric"));
+    }
+
+    #[test]
+    fn distribution_uses_type7_percentiles_and_population_stddev() {
+        let result = distribution_from_values("fixture", &[10.0, 20.0, 30.0, 40.0]);
+
+        assert_eq!(result.sample_count, 4);
+        assert_close(result.mean, 25.0);
+        assert_close(result.median, 25.0);
+        assert_close(result.stddev, 125.0_f64.sqrt());
+        assert_close(result.p10, 13.0);
+        assert_close(result.p25, 17.5);
+        assert_close(result.p75, 32.5);
+        assert_close(result.p90, 37.0);
+        assert_eq!(
+            result.meta.percentile_method.as_deref(),
+            Some(RESEARCH_PERCENTILE_METHOD)
+        );
+        assert_eq!(
+            result.meta.stddev_method.as_deref(),
+            Some(RESEARCH_STDDEV_METHOD)
+        );
+    }
+
+    #[test]
+    fn golden_frequency_conditional_and_distribution_match_known_fixture() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = Database::open(file.path().to_string_lossy().as_ref()).unwrap();
+        seed_research_fixture(&db);
+
+        let frequency = event_frequency(&db, "ib_mid_test", None, None, None).unwrap();
+        assert_eq!(frequency.total_occurrences, 6);
+        assert_eq!(frequency.sessions_with_event, 3);
+        assert_eq!(frequency.total_sessions, 4);
+        assert_close(frequency.per_session_avg, 1.5);
+        assert_close(frequency.pct_sessions_with_event, 75.0);
+        assert_eq!(frequency.meta.population_size, 4);
+        assert_eq!(
+            frequency.meta.reliability_tier,
+            ReliabilityTier::Insufficient
+        );
+
+        let conditional = conditional_probability(
+            &db,
+            "ib_mid_test",
+            2,
+            "close_vs_ib_mid",
+            "above",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(conditional.sample_size, 2);
+        assert_eq!(conditional.condition_met_count, 2);
+        assert_eq!(conditional.outcome_met_count, 2);
+        assert_close(conditional.probability, 1.0);
+        assert!(conditional.meta.notes.is_empty());
+
+        let distribution = metric_distribution(&db, "ib_range", None, None, None).unwrap();
+        assert_eq!(distribution.sample_count, 4);
+        assert_close(distribution.mean, 35.0);
+        assert_close(distribution.median, 35.0);
+        assert_close(distribution.p25, 27.5);
+        assert_close(distribution.p75, 42.5);
+    }
+
+    #[test]
+    fn scoped_event_aggregation_respects_session_context_and_rollover_filter() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = Database::open(file.path().to_string_lossy().as_ref()).unwrap();
+
+        db.upsert_session_summary(&summary("2026-03-06", "RTH", 20.0, "above"))
+            .unwrap();
+        db.upsert_session_summary(&summary("2026-03-06", "Globex", 12.0, "above"))
+            .unwrap();
+        let mut invalid_roll = summary("2026-03-07", "RTH", 24.0, "below");
+        invalid_roll.carry_forward_levels_valid = false;
+        invalid_roll.rollover_warning = Some("test rollover mismatch".into());
+        db.upsert_session_summary(&invalid_roll).unwrap();
+
+        db.insert_market_events_batch(&[
+            event("2026-03-06", 10.0, "RTH", "None", "2026-03-06"),
+            event("2026-03-06", 11.0, "Globex", "Asia", "2026-03-06"),
+            event("2026-03-06", 12.0, "Globex", "London", "2026-03-06"),
+            event("2026-03-07", 13.0, "RTH", "None", "2026-03-07"),
+        ])
+        .unwrap();
+
+        let asia_scope = SessionScopeFilter {
+            session_type: Some("Globex".into()),
+            session_segment: Some("Asia".into()),
+            include_rollover_sessions: true,
+            ..Default::default()
+        };
+        let asia_counts = db
+            .event_counts_per_session_context("ib_mid_test", None, None, Some(&asia_scope))
+            .unwrap();
+        assert_eq!(asia_counts, vec![("2026-03-06".into(), "Globex".into(), 1)]);
+
+        let rth_scope = SessionScopeFilter {
+            session_type: Some("RTH".into()),
+            include_rollover_sessions: true,
+            ..Default::default()
+        };
+        let rth_frequency =
+            event_frequency(&db, "ib_mid_test", None, None, Some(&rth_scope)).unwrap();
+        assert_eq!(rth_frequency.total_occurrences, 2);
+        assert_eq!(rth_frequency.sessions_with_event, 2);
+        assert_eq!(rth_frequency.total_sessions, 2);
+
+        let no_rollover_scope = SessionScopeFilter {
+            include_rollover_sessions: false,
+            ..rth_scope
+        };
+        let filtered_frequency =
+            event_frequency(&db, "ib_mid_test", None, None, Some(&no_rollover_scope)).unwrap();
+        assert_eq!(filtered_frequency.total_occurrences, 1);
+        assert_eq!(filtered_frequency.sessions_with_event, 1);
+        assert_eq!(filtered_frequency.total_sessions, 1);
+    }
+
+    #[test]
+    fn conditional_probability_joins_globex_event_by_trading_day_not_storage_date() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = Database::open(file.path().to_string_lossy().as_ref()).unwrap();
+
+        db.upsert_session_summary(&summary("2026-03-06", "Globex", 40.0, "above"))
+            .unwrap();
+        db.insert_market_events_batch(&[event(
+            "2026-03-05",
+            eastern_ms(2026, 3, 5, 19, 0),
+            "Globex",
+            "Asia",
+            "2026-03-06",
+        )])
+        .unwrap();
+
+        let scope = SessionScopeFilter {
+            session_type: Some("Globex".into()),
+            trading_day_start: Some("2026-03-06".into()),
+            trading_day_end: Some("2026-03-06".into()),
+            include_rollover_sessions: true,
+            ..Default::default()
+        };
+        let result = conditional_probability(
+            &db,
+            "ib_mid_test",
+            1,
+            "day_type",
+            "Trend",
+            None,
+            None,
+            Some(&scope),
+        )
+        .unwrap();
+        assert_eq!(result.sample_size, 1);
+        assert_eq!(result.outcome_met_count, 1);
+        assert!(result.meta.notes.is_empty());
+    }
+
+    #[test]
+    fn signal_outcome_conditional_uses_compound_session_key() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = Database::open(file.path().to_string_lossy().as_ref()).unwrap();
+
+        let mut rth = summary("2026-03-08", "RTH", 40.0, "above");
+        rth.close_vs_vwap = "above".into();
+        let mut globex = summary("2026-03-08", "Globex", 20.0, "below");
+        globex.close_vs_vwap = "below".into();
+        db.upsert_session_summary(&rth).unwrap();
+        db.upsert_session_summary(&globex).unwrap();
+        db.insert_signal_outcome(&signal_outcome(
+            "sig-rth",
+            "setup-rth",
+            "2026-03-08",
+            eastern_ms(2026, 3, 8, 10, 0),
+            1.0,
+        ))
+        .unwrap();
+
+        let result = signal_outcome_conditional(
+            &db,
+            "setup-rth",
+            "close_vs_vwap",
+            "above",
+            Some("2026-03-08"),
+            Some("2026-03-08"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(result.sample_size, 1);
+        assert_eq!(result.outcome_met_count, 1);
+    }
+
+    #[test]
+    fn signal_outcome_conditional_joins_globex_outcome_by_trading_day() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = Database::open(file.path().to_string_lossy().as_ref()).unwrap();
+
+        db.upsert_session_summary(&summary("2026-03-06", "Globex", 40.0, "above"))
+            .unwrap();
+        db.upsert_session_summary(&summary("2026-03-06", "RTH", 20.0, "below"))
+            .unwrap();
+        db.insert_signal_outcome(&signal_outcome(
+            "sig-globex",
+            "setup-globex",
+            "2026-03-05",
+            eastern_ms(2026, 3, 5, 19, 30),
+            1.0,
+        ))
+        .unwrap();
+
+        let scope = SessionScopeFilter {
+            session_type: Some("Globex".into()),
+            trading_day_start: Some("2026-03-06".into()),
+            trading_day_end: Some("2026-03-06".into()),
+            include_rollover_sessions: true,
+            ..Default::default()
+        };
+        let result = signal_outcome_conditional(
+            &db,
+            "setup-globex",
+            "day_type",
+            "Trend",
+            None,
+            None,
+            Some(&scope),
+        )
+        .unwrap();
+        assert_eq!(result.sample_size, 1);
+        assert_eq!(result.outcome_met_count, 1);
+        assert!(result.meta.notes.is_empty());
+    }
+
+    #[test]
+    fn dom_research_results_include_top_level_metadata() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = Database::open(file.path().to_string_lossy().as_ref()).unwrap();
+        db.upsert_session_summary(&summary("2026-03-09", "RTH", 30.0, "above"))
+            .unwrap();
+        db.insert_dom_feature_snapshot(
+            "NQ.depth",
+            eastern_ms(2026, 3, 9, 10, 0),
+            "2026-03-09",
+            &dom_payload("bid_support", 2_000.0),
+        )
+        .unwrap();
+
+        let result =
+            dom_behavior_frequency(&db, "bid_support_persisted", 1_000.0, None, None).unwrap();
+        assert_eq!(result.total_occurrences, 1);
+        assert_eq!(result.sessions_with_behavior, 1);
+        assert_eq!(result.meta.rows_scanned, 1);
+        assert_eq!(result.meta.effective_sample_size, 1);
+    }
+
+    #[test]
+    fn session_similarity_returns_metadata_wrapper() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = Database::open(file.path().to_string_lossy().as_ref()).unwrap();
+        db.upsert_session_summary(&summary("2026-03-10", "RTH", 20.0, "above"))
+            .unwrap();
+        db.upsert_session_summary(&summary("2026-03-11", "RTH", 40.0, "below"))
+            .unwrap();
+
+        let result = compare_sessions_multi_with_meta(
+            &db,
+            &SessionSimilarityQuery {
+                ib_range: Some(30.0),
+                ..Default::default()
+            },
+            1,
+        )
+        .unwrap();
+        assert_eq!(result.results.len(), 1);
+        assert_eq!(result.meta.population_size, 2);
+        assert_eq!(result.meta.sample_size, 1);
+        assert_eq!(result.meta.rows_scanned, 2);
     }
 
     #[test]
@@ -983,5 +1758,7 @@ mod tests {
         assert_eq!(result.mae_distribution.sample_count, 2);
         assert_eq!(result.time_to_outcome_minutes_distribution.sample_count, 2);
         assert_eq!(result.mfe_mae_ratio_distribution.sample_count, 2);
+        assert_eq!(result.meta.sample_size, 2);
+        assert_eq!(result.meta.effective_sample_size, 2);
     }
 }

@@ -15,12 +15,42 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 use thiserror::Error;
 
+pub const RESEARCH_DISTRIBUTION_METRICS: &[&str] = &[
+    "ib_range",
+    "high",
+    "low",
+    "close",
+    "open_price",
+    "poc",
+    "vah",
+    "val",
+    "ib_high",
+    "ib_low",
+    "ib_mid",
+    "or_high",
+    "or_low",
+    "total_volume",
+    "tick_count",
+    "session_delta",
+    "cumulative_delta",
+    "dnp",
+    "dnva_high",
+    "dnva_low",
+    "vwap_close",
+    "signal_count",
+    "rvol_ratio",
+];
+
+pub const RESEARCH_EVENT_SCAN_LIMIT: usize = 500_000;
+
 #[derive(Debug, Error)]
 pub enum DbError {
     #[error("sqlite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
     #[error("serde error: {0}")]
     Serde(#[from] serde_json::Error),
+    #[error("invalid query: {0}")]
+    InvalidQuery(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -397,6 +427,32 @@ pub struct SignalOutcome {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct SignalOutcomeResearchRow {
+    pub setup_id: String,
+    pub analysis_day: String,
+    pub session_type: String,
+    pub r_result: Option<f64>,
+    pub outcome: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct EventFrequencyStats {
+    pub total_occurrences: i64,
+    pub sessions_with_event: i64,
+    pub total_sessions: i64,
+    pub rows_scanned: usize,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct EventSessionCountsStats {
+    pub counts: Vec<(String, String, i64)>,
+    pub rows_scanned: usize,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SignalOutcomeExcursionRow {
     pub setup_id: String,
     pub setup_name: Option<String>,
@@ -565,14 +621,14 @@ fn resolved_event_row_context(
     session_date_fallback.map(|d| ("Unknown".to_string(), "None".to_string(), d.to_string()))
 }
 
-fn trading_day_if_scope_match_for_event_row(
+fn session_context_if_scope_match_for_event_row(
     timestamp_ms: f64,
     session_type: Option<&str>,
     session_segment: Option<&str>,
     trading_day: Option<&str>,
     session_date_fallback: Option<&str>,
     scope: Option<&SessionScopeFilter>,
-) -> Option<String> {
+) -> Option<(String, String, String)> {
     let (row_session_type, row_session_segment, row_trading_day) = resolved_event_row_context(
         timestamp_ms,
         session_type,
@@ -582,10 +638,10 @@ fn trading_day_if_scope_match_for_event_row(
     )?;
 
     let Some(scope) = scope else {
-        return Some(row_trading_day);
+        return Some((row_session_type, row_session_segment, row_trading_day));
     };
     if scope.is_empty() {
-        return Some(row_trading_day);
+        return Some((row_session_type, row_session_segment, row_trading_day));
     }
     if let Some(filter_type) = scope.session_type.as_deref() {
         let normalized = normalize_session_type_filter(filter_type)?;
@@ -610,7 +666,7 @@ fn trading_day_if_scope_match_for_event_row(
         }
     }
 
-    Some(row_trading_day)
+    Some((row_session_type, row_session_segment, row_trading_day))
 }
 
 fn trading_day_if_scope_match(
@@ -680,6 +736,37 @@ fn analysis_day_for_scope(
     }
 }
 
+fn session_type_name(session_type: crate::SessionType) -> &'static str {
+    match session_type {
+        crate::SessionType::Rth => "RTH",
+        crate::SessionType::Globex => "Globex",
+        crate::SessionType::Unknown => "Unknown",
+    }
+}
+
+fn analysis_session_key_for_scope(
+    session_date: &str,
+    timestamp_ms: f64,
+    scope: Option<&SessionScopeFilter>,
+) -> Option<(String, String)> {
+    if let Some(ctx) = tick_time_context_from_timestamp_ms(timestamp_ms) {
+        let analysis_day = trading_day_if_scope_match(timestamp_ms, scope)?;
+        return Some((
+            analysis_day,
+            session_type_name(ctx.session_type).to_string(),
+        ));
+    }
+
+    if scope.map(|s| !s.is_empty()).unwrap_or(false) {
+        return None;
+    }
+
+    let session_type = scope
+        .and_then(|s| s.session_type.clone())
+        .unwrap_or_else(|| "RTH".to_string());
+    Some((session_date.to_string(), session_type))
+}
+
 fn contract_fields_match_scope(
     root_symbol: Option<&str>,
     contract_symbol: Option<&str>,
@@ -699,6 +786,12 @@ fn contract_fields_match_scope(
         }
     }
     true
+}
+
+fn use_session_date_sql_filter(scope: Option<&SessionScopeFilter>) -> bool {
+    !scope
+        .map(|s| s.trading_day_start.is_some() || s.trading_day_end.is_some())
+        .unwrap_or(false)
 }
 
 impl Default for RiskConfigRecord {
@@ -5297,21 +5390,52 @@ impl Database {
         end_date: Option<&str>,
         scope: Option<&SessionScopeFilter>,
     ) -> Result<(i64, i64, i64), DbError> {
+        let stats = self.count_events_by_type_stats(event_type, start_date, end_date, scope)?;
+        Ok((
+            stats.total_occurrences,
+            stats.sessions_with_event,
+            stats.total_sessions,
+        ))
+    }
+
+    pub fn count_events_by_type_stats(
+        &self,
+        event_type: &str,
+        start_date: Option<&str>,
+        end_date: Option<&str>,
+        scope: Option<&SessionScopeFilter>,
+    ) -> Result<EventFrequencyStats, DbError> {
         let mut event_conditions = vec!["event_type = ?1".to_string()];
         let mut event_bind_values: Vec<Box<dyn rusqlite::types::ToSql>> =
             vec![Box::new(event_type.to_string())];
-        if let Some(sd) = start_date {
-            event_conditions.push(format!("session_date >= ?{}", event_bind_values.len() + 1));
-            event_bind_values.push(Box::new(sd.to_string()));
+        if use_session_date_sql_filter(scope) {
+            if let Some(sd) = start_date {
+                event_conditions.push(format!("session_date >= ?{}", event_bind_values.len() + 1));
+                event_bind_values.push(Box::new(sd.to_string()));
+            }
+            if let Some(ed) = end_date {
+                event_conditions.push(format!("session_date <= ?{}", event_bind_values.len() + 1));
+                event_bind_values.push(Box::new(ed.to_string()));
+            }
         }
-        if let Some(ed) = end_date {
-            event_conditions.push(format!("session_date <= ?{}", event_bind_values.len() + 1));
-            event_bind_values.push(Box::new(ed.to_string()));
+        if let Some(scope) = scope {
+            if let Some(root) = scope.root_symbol.as_deref() {
+                event_conditions.push(format!("root_symbol = ?{}", event_bind_values.len() + 1));
+                event_bind_values.push(Box::new(root.to_string()));
+            }
+            if let Some(contract) = scope.contract_symbol.as_deref() {
+                event_conditions.push(format!(
+                    "contract_symbol = ?{}",
+                    event_bind_values.len() + 1
+                ));
+                event_bind_values.push(Box::new(contract.to_string()));
+            }
         }
         let event_sql = format!(
             "SELECT timestamp_ms, session_date, session_type, session_segment, trading_day
-             FROM market_events WHERE {}",
-            event_conditions.join(" AND ")
+             FROM market_events WHERE {} LIMIT {}",
+            event_conditions.join(" AND "),
+            RESEARCH_EVENT_SCAN_LIMIT + 1
         );
         let mut event_stmt = self.conn.prepare(&event_sql)?;
         let event_params_ref: Vec<&dyn rusqlite::types::ToSql> =
@@ -5325,39 +5449,95 @@ impl Database {
                 row.get::<_, Option<String>>(4)?,
             ))
         })?;
+        let valid_session_keys = if scope.map(|s| !s.include_rollover_sessions).unwrap_or(false) {
+            let summary_start = scope
+                .and_then(|s| s.trading_day_start.as_deref())
+                .or(start_date);
+            let summary_end = scope
+                .and_then(|s| s.trading_day_end.as_deref())
+                .or(end_date);
+            Some(
+                self.list_session_summaries_scoped(
+                    summary_start,
+                    summary_end,
+                    None,
+                    scope.and_then(|s| s.session_type.as_deref()),
+                    100_000,
+                    scope,
+                )?
+                .into_iter()
+                .map(|s| (s.session_date, s.session_type))
+                .collect::<BTreeSet<_>>(),
+            )
+        } else {
+            None
+        };
 
         let mut total_events = 0_i64;
         let mut sessions_with_event = BTreeSet::new();
-        for row in event_rows.filter_map(|r| r.ok()) {
+        let mut event_rows_scanned = 0_usize;
+        let mut truncated = false;
+        for row in event_rows {
+            let row = row?;
+            event_rows_scanned += 1;
+            if event_rows_scanned > RESEARCH_EVENT_SCAN_LIMIT {
+                truncated = true;
+                break;
+            }
             let (ts, session_date, st, seg, td) = row;
-            if let Some(trading_day) = trading_day_if_scope_match_for_event_row(
-                ts,
-                st.as_deref(),
-                seg.as_deref(),
-                td.as_deref(),
-                Some(session_date.as_str()),
-                scope,
-            ) {
+            if let Some((session_type, _session_segment, trading_day)) =
+                session_context_if_scope_match_for_event_row(
+                    ts,
+                    st.as_deref(),
+                    seg.as_deref(),
+                    td.as_deref(),
+                    Some(session_date.as_str()),
+                    scope,
+                )
+            {
+                if let Some(valid_session_keys) = &valid_session_keys {
+                    if !valid_session_keys.contains(&(trading_day.clone(), session_type.clone())) {
+                        continue;
+                    }
+                }
                 total_events += 1;
-                sessions_with_event.insert(trading_day);
+                sessions_with_event.insert((trading_day, session_type));
             }
         }
 
         let mut all_session_conditions = Vec::new();
         let mut all_session_bind_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-        if let Some(sd) = start_date {
-            all_session_conditions.push(format!(
-                "session_date >= ?{}",
-                all_session_bind_values.len() + 1
-            ));
-            all_session_bind_values.push(Box::new(sd.to_string()));
+        if use_session_date_sql_filter(scope) {
+            if let Some(sd) = start_date {
+                all_session_conditions.push(format!(
+                    "session_date >= ?{}",
+                    all_session_bind_values.len() + 1
+                ));
+                all_session_bind_values.push(Box::new(sd.to_string()));
+            }
+            if let Some(ed) = end_date {
+                all_session_conditions.push(format!(
+                    "session_date <= ?{}",
+                    all_session_bind_values.len() + 1
+                ));
+                all_session_bind_values.push(Box::new(ed.to_string()));
+            }
         }
-        if let Some(ed) = end_date {
-            all_session_conditions.push(format!(
-                "session_date <= ?{}",
-                all_session_bind_values.len() + 1
-            ));
-            all_session_bind_values.push(Box::new(ed.to_string()));
+        if let Some(scope) = scope {
+            if let Some(root) = scope.root_symbol.as_deref() {
+                all_session_conditions.push(format!(
+                    "root_symbol = ?{}",
+                    all_session_bind_values.len() + 1
+                ));
+                all_session_bind_values.push(Box::new(root.to_string()));
+            }
+            if let Some(contract) = scope.contract_symbol.as_deref() {
+                all_session_conditions.push(format!(
+                    "contract_symbol = ?{}",
+                    all_session_bind_values.len() + 1
+                ));
+                all_session_bind_values.push(Box::new(contract.to_string()));
+            }
         }
         let all_where_clause = if all_session_conditions.is_empty() {
             String::new()
@@ -5366,7 +5546,8 @@ impl Database {
         };
         let all_sql = format!(
             "SELECT timestamp_ms, session_date, session_type, session_segment, trading_day
-             FROM market_events {all_where_clause}"
+             FROM market_events {all_where_clause} LIMIT {}",
+            RESEARCH_EVENT_SCAN_LIMIT + 1
         );
         let mut all_stmt = self.conn.prepare(&all_sql)?;
         let all_params_ref: Vec<&dyn rusqlite::types::ToSql> =
@@ -5382,17 +5563,31 @@ impl Database {
         })?;
 
         let mut total_sessions = BTreeSet::new();
-        for row in all_rows.filter_map(|r| r.ok()) {
+        let mut all_rows_scanned = 0_usize;
+        for row in all_rows {
+            let row = row?;
+            all_rows_scanned += 1;
+            if all_rows_scanned > RESEARCH_EVENT_SCAN_LIMIT {
+                truncated = true;
+                break;
+            }
             let (ts, session_date, st, seg, td) = row;
-            if let Some(trading_day) = trading_day_if_scope_match_for_event_row(
-                ts,
-                st.as_deref(),
-                seg.as_deref(),
-                td.as_deref(),
-                Some(session_date.as_str()),
-                scope,
-            ) {
-                total_sessions.insert(trading_day);
+            if let Some((session_type, _session_segment, trading_day)) =
+                session_context_if_scope_match_for_event_row(
+                    ts,
+                    st.as_deref(),
+                    seg.as_deref(),
+                    td.as_deref(),
+                    Some(session_date.as_str()),
+                    scope,
+                )
+            {
+                if let Some(valid_session_keys) = &valid_session_keys {
+                    if !valid_session_keys.contains(&(trading_day.clone(), session_type.clone())) {
+                        continue;
+                    }
+                }
+                total_sessions.insert((trading_day, session_type));
             }
         }
 
@@ -5412,14 +5607,16 @@ impl Database {
             scope,
         )?;
         for s in summaries {
-            total_sessions.insert(s.session_date);
+            total_sessions.insert((s.session_date, s.session_type));
         }
 
-        Ok((
-            total_events,
-            sessions_with_event.len() as i64,
-            total_sessions.len() as i64,
-        ))
+        Ok(EventFrequencyStats {
+            total_occurrences: total_events,
+            sessions_with_event: sessions_with_event.len() as i64,
+            total_sessions: total_sessions.len() as i64,
+            rows_scanned: event_rows_scanned + all_rows_scanned,
+            truncated,
+        })
     }
 
     /// Count events of a specific type per session for conditional queries.
@@ -5430,21 +5627,63 @@ impl Database {
         end_date: Option<&str>,
         scope: Option<&SessionScopeFilter>,
     ) -> Result<Vec<(String, i64)>, DbError> {
+        let scoped =
+            self.event_counts_per_session_context(event_type, start_date, end_date, scope)?;
+        let mut by_day: BTreeMap<String, i64> = BTreeMap::new();
+        for (trading_day, _session_type, count) in scoped {
+            *by_day.entry(trading_day).or_insert(0) += count;
+        }
+        Ok(by_day.into_iter().collect())
+    }
+
+    /// Count events per resolved `(trading_day, session_type)` research unit.
+    pub fn event_counts_per_session_context(
+        &self,
+        event_type: &str,
+        start_date: Option<&str>,
+        end_date: Option<&str>,
+        scope: Option<&SessionScopeFilter>,
+    ) -> Result<Vec<(String, String, i64)>, DbError> {
+        Ok(self
+            .event_counts_per_session_context_stats(event_type, start_date, end_date, scope)?
+            .counts)
+    }
+
+    pub fn event_counts_per_session_context_stats(
+        &self,
+        event_type: &str,
+        start_date: Option<&str>,
+        end_date: Option<&str>,
+        scope: Option<&SessionScopeFilter>,
+    ) -> Result<EventSessionCountsStats, DbError> {
         let mut conditions = vec!["event_type = ?1".to_string()];
         let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> =
             vec![Box::new(event_type.to_string())];
-        if let Some(sd) = start_date {
-            conditions.push(format!("session_date >= ?{}", bind_values.len() + 1));
-            bind_values.push(Box::new(sd.to_string()));
+        if use_session_date_sql_filter(scope) {
+            if let Some(sd) = start_date {
+                conditions.push(format!("session_date >= ?{}", bind_values.len() + 1));
+                bind_values.push(Box::new(sd.to_string()));
+            }
+            if let Some(ed) = end_date {
+                conditions.push(format!("session_date <= ?{}", bind_values.len() + 1));
+                bind_values.push(Box::new(ed.to_string()));
+            }
         }
-        if let Some(ed) = end_date {
-            conditions.push(format!("session_date <= ?{}", bind_values.len() + 1));
-            bind_values.push(Box::new(ed.to_string()));
+        if let Some(scope) = scope {
+            if let Some(root) = scope.root_symbol.as_deref() {
+                conditions.push(format!("root_symbol = ?{}", bind_values.len() + 1));
+                bind_values.push(Box::new(root.to_string()));
+            }
+            if let Some(contract) = scope.contract_symbol.as_deref() {
+                conditions.push(format!("contract_symbol = ?{}", bind_values.len() + 1));
+                bind_values.push(Box::new(contract.to_string()));
+            }
         }
         let sql = format!(
             "SELECT timestamp_ms, session_date, session_type, session_segment, trading_day
-             FROM market_events WHERE {}",
-            conditions.join(" AND ")
+             FROM market_events WHERE {} LIMIT {}",
+            conditions.join(" AND "),
+            RESEARCH_EVENT_SCAN_LIMIT + 1
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let params_ref: Vec<&dyn rusqlite::types::ToSql> =
@@ -5458,22 +5697,67 @@ impl Database {
                 row.get::<_, Option<String>>(4)?,
             ))
         })?;
+        let valid_session_keys = if scope.map(|s| !s.include_rollover_sessions).unwrap_or(false) {
+            let summary_start = scope
+                .and_then(|s| s.trading_day_start.as_deref())
+                .or(start_date);
+            let summary_end = scope
+                .and_then(|s| s.trading_day_end.as_deref())
+                .or(end_date);
+            Some(
+                self.list_session_summaries_scoped(
+                    summary_start,
+                    summary_end,
+                    None,
+                    scope.and_then(|s| s.session_type.as_deref()),
+                    100_000,
+                    scope,
+                )?
+                .into_iter()
+                .map(|s| (s.session_date, s.session_type))
+                .collect::<BTreeSet<_>>(),
+            )
+        } else {
+            None
+        };
 
-        let mut by_day: BTreeMap<String, i64> = BTreeMap::new();
-        for row in rows.filter_map(|r| r.ok()) {
+        let mut by_session: BTreeMap<(String, String), i64> = BTreeMap::new();
+        let mut rows_scanned = 0_usize;
+        let mut truncated = false;
+        for row in rows {
+            let row = row?;
+            rows_scanned += 1;
+            if rows_scanned > RESEARCH_EVENT_SCAN_LIMIT {
+                truncated = true;
+                break;
+            }
             let (ts, session_date, st, seg, td) = row;
-            if let Some(trading_day) = trading_day_if_scope_match_for_event_row(
-                ts,
-                st.as_deref(),
-                seg.as_deref(),
-                td.as_deref(),
-                Some(session_date.as_str()),
-                scope,
-            ) {
-                *by_day.entry(trading_day).or_insert(0) += 1;
+            if let Some((session_type, _session_segment, trading_day)) =
+                session_context_if_scope_match_for_event_row(
+                    ts,
+                    st.as_deref(),
+                    seg.as_deref(),
+                    td.as_deref(),
+                    Some(session_date.as_str()),
+                    scope,
+                )
+            {
+                if let Some(valid_session_keys) = &valid_session_keys {
+                    if !valid_session_keys.contains(&(trading_day.clone(), session_type.clone())) {
+                        continue;
+                    }
+                }
+                *by_session.entry((trading_day, session_type)).or_insert(0) += 1;
             }
         }
-        Ok(by_day.into_iter().collect())
+        Ok(EventSessionCountsStats {
+            counts: by_session
+                .into_iter()
+                .map(|((trading_day, session_type), count)| (trading_day, session_type, count))
+                .collect(),
+            rows_scanned,
+            truncated,
+        })
     }
 
     // ------------------------------------------------------------------
@@ -5932,33 +6216,10 @@ impl Database {
         session_type_filter: Option<&str>,
         scope: Option<&SessionScopeFilter>,
     ) -> Result<Vec<f64>, DbError> {
-        let allowed = [
-            "ib_range",
-            "high",
-            "low",
-            "close",
-            "open_price",
-            "poc",
-            "vah",
-            "val",
-            "ib_high",
-            "ib_low",
-            "ib_mid",
-            "or_high",
-            "or_low",
-            "total_volume",
-            "tick_count",
-            "session_delta",
-            "cumulative_delta",
-            "dnp",
-            "dnva_high",
-            "dnva_low",
-            "vwap_close",
-            "signal_count",
-            "rvol_ratio",
-        ];
-        if !allowed.contains(&column) {
-            return Ok(Vec::new());
+        if !RESEARCH_DISTRIBUTION_METRICS.contains(&column) {
+            return Err(DbError::InvalidQuery(format!(
+                "unsupported session_summaries metric: {column}"
+            )));
         }
         let mut conditions = vec![format!("{column} IS NOT NULL")];
         let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -6185,6 +6446,22 @@ impl Database {
         end_date: Option<&str>,
         scope: Option<&SessionScopeFilter>,
     ) -> Result<Vec<(String, String, Option<f64>, String)>, DbError> {
+        Ok(self
+            .list_signal_outcomes_for_research_with_session_key(
+                setup_id, start_date, end_date, scope,
+            )?
+            .into_iter()
+            .map(|row| (row.setup_id, row.analysis_day, row.r_result, row.outcome))
+            .collect())
+    }
+
+    pub fn list_signal_outcomes_for_research_with_session_key(
+        &self,
+        setup_id: Option<&str>,
+        start_date: Option<&str>,
+        end_date: Option<&str>,
+        scope: Option<&SessionScopeFilter>,
+    ) -> Result<Vec<SignalOutcomeResearchRow>, DbError> {
         let mut stmt = self.conn.prepare(
             "SELECT setup_id, session_date, r_result, outcome, fired_at_ms, root_symbol, contract_symbol
              FROM signal_outcomes WHERE outcome != 'pending'",
@@ -6216,7 +6493,8 @@ impl Database {
             ) {
                 continue;
             }
-            let Some(analysis_day) = analysis_day_for_scope(&session_date, fired_at_ms, scope)
+            let Some((analysis_day, session_type)) =
+                analysis_session_key_for_scope(&session_date, fired_at_ms, scope)
             else {
                 continue;
             };
@@ -6230,7 +6508,13 @@ impl Database {
                     continue;
                 }
             }
-            results.push((sid, analysis_day, r_result, outcome));
+            results.push(SignalOutcomeResearchRow {
+                setup_id: sid,
+                analysis_day,
+                session_type,
+                r_result,
+                outcome,
+            });
         }
         Ok(results)
     }

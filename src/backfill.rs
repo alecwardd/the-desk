@@ -1,8 +1,8 @@
-use crate::db::{Database, ReplaySignalRecord, SessionSummary, SignalOutcome};
+use crate::db::{Database, PriorDayReference, ReplaySignalRecord, SessionSummary, SignalOutcome};
 use crate::feed::monotonic::{MonotonicTickGuard, MonotonicTimestampStats};
 use crate::feed::scid_reader::{ScanControl, ScidReader};
 use crate::feed::TradeSide;
-use crate::feed::{load_feed_config, resolve_contract_metadata};
+use crate::feed::{load_feed_config, resolve_contract_metadata, ContractMetadata};
 use crate::pipelines::{EventDetector, FlowEventEmitter, MarketState, PipelineEngine};
 use crate::rollover::{build_contract_rollover_status, PriorReferenceTrust};
 use crate::rules::{RulesEngine, SetupDefinition};
@@ -55,6 +55,19 @@ pub struct BackfillJobParams {
     pub force: bool,
     pub run_rules: bool,
     pub setup_ids: Option<Vec<String>>,
+}
+
+/// Optional replay seed data for hermetic historical-job tests.
+///
+/// `None` RVOL curves preserve production behavior by loading recent curves from SQLite.
+/// `prior_day_references` are explicit seeds inserted before replay; an empty list means
+/// the replay uses whatever references are already present in the database.
+#[derive(Debug, Clone, Default)]
+pub struct BackfillReplayOptions {
+    pub contract_metadata: Option<ContractMetadata>,
+    pub rth_rvol_curves: Option<Vec<Vec<f64>>>,
+    pub globex_rvol_curves: Option<Vec<Vec<f64>>>,
+    pub prior_day_references: Vec<PriorDayReference>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -345,6 +358,27 @@ pub fn run_backfill_job<F>(
 where
     F: FnMut(&BackfillProgress),
 {
+    run_backfill_job_with_options(
+        reader,
+        db,
+        params,
+        &mut on_progress,
+        cancel_flag,
+        BackfillReplayOptions::default(),
+    )
+}
+
+pub fn run_backfill_job_with_options<F>(
+    reader: &ScidReader,
+    db: &Database,
+    params: &BackfillJobParams,
+    mut on_progress: F,
+    cancel_flag: &AtomicBool,
+    options: BackfillReplayOptions,
+) -> Result<BackfillResult, BackfillJobError>
+where
+    F: FnMut(&BackfillProgress),
+{
     let (start_ms, end_ms_exclusive) =
         parse_backfill_date_range(params.start_date.as_deref(), params.end_date.as_deref())?;
     let source = params.job_type.replay_source();
@@ -354,16 +388,37 @@ where
         .ok()
         .map(|cfg| cfg.r_value_points)
         .unwrap_or(50.0);
+    for prior in &options.prior_day_references {
+        db.save_prior_day_full_with_dnva_contract(
+            &prior.date,
+            prior.high,
+            prior.low,
+            prior.close,
+            prior.va_high.unwrap_or(0.0),
+            prior.va_low.unwrap_or(0.0),
+            prior.poc.unwrap_or(0.0),
+            prior.dnva_high,
+            prior.dnva_low,
+            prior.dnp,
+            prior.root_symbol.as_deref(),
+            prior.contract_symbol.as_deref(),
+        )
+        .map_err(runtime_err)?;
+    }
 
-    let rvol_curves = db
-        .recent_session_volume_curves("RTH", 20)
-        .unwrap_or_default();
-    let globex_rvol_curves = db
-        .recent_session_volume_curves("Globex", 20)
-        .unwrap_or_default();
+    let rvol_curves = options.rth_rvol_curves.unwrap_or_else(|| {
+        db.recent_session_volume_curves("RTH", 20)
+            .unwrap_or_default()
+    });
+    let globex_rvol_curves = options.globex_rvol_curves.unwrap_or_else(|| {
+        db.recent_session_volume_curves("Globex", 20)
+            .unwrap_or_default()
+    });
 
     let mut pipeline = PipelineEngine::new();
-    let contract_metadata = resolve_contract_metadata(&load_feed_config());
+    let contract_metadata = options
+        .contract_metadata
+        .unwrap_or_else(|| resolve_contract_metadata(&load_feed_config()));
     pipeline.set_contract_metadata(contract_metadata.clone());
     let mut state = BackfillRunState {
         pipeline,

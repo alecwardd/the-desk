@@ -183,6 +183,9 @@ cargo test
 # Check compilation
 cargo check
 
+# Run end-to-end golden replay verification
+cargo test --test session_replay_golden
+
 # Build MCP server (release)
 cargo build --release --bin the-desk-mcp
 
@@ -199,6 +202,14 @@ Historical jobs are asynchronous:
 2. Poll `get_backfill_status(jobId)`
 3. Inspect the final `result` when status is `completed`
 4. Call `cancel_backfill(jobId)` to stop a long-running replay safely
+
+Golden replay verification lives in `tests/session_replay_golden.rs`. It generates a
+small synthetic SCID fixture, runs the real historical backfill path, and compares
+canonical core session/event output, rules-enabled signals/outcomes, and non-monotonic
+timestamp behavior to `tests/fixtures/session_replay/v1/*.json`.
+Use `THE_DESK_BLESS_GOLDENS=1` only after intentional pipeline changes have been
+reviewed. Private real-data regressions can be run with `THE_DESK_GOLDEN_SCID_DIR`,
+`THE_DESK_GOLDEN_EXPECTED_DIR`, and `cargo test --test session_replay_golden -- --ignored`.
 
 ## Data Flow & Latency
 

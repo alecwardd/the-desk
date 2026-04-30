@@ -326,7 +326,34 @@ cargo test pipelines::event_detector
 # Run research / backfill tests
 cargo test backfill
 cargo test research
+
+# Run end-to-end golden replay drift protection
+cargo test --test session_replay_golden
+
+# Bless reviewed golden replay changes after intentional pipeline behavior changes
+$env:THE_DESK_BLESS_GOLDENS='1'; cargo test --test session_replay_golden
 ```
+
+### Golden Replay Verification
+
+`tests/session_replay_golden.rs` generates a deterministic two-session synthetic `.scid`
+fixture, replays it through `run_backfill_job_with_options`, and compares canonical
+outputs for core session/events, rules-enabled signals/outcomes, and non-monotonic
+timestamp handling against `tests/fixtures/session_replay/v1/*.json`.
+
+Use the ignored private regression test for real Sierra files that must not be committed:
+
+```bash
+$env:THE_DESK_GOLDEN_SCID_DIR='D:\private\scid-goldens'
+$env:THE_DESK_GOLDEN_EXPECTED_DIR='D:\private\the-desk-goldens'
+$env:THE_DESK_GOLDEN_START_DATE='2026-03-02'      # optional
+$env:THE_DESK_GOLDEN_END_DATE='2026-03-06'        # optional
+$env:THE_DESK_GOLDEN_PRICE_SCALE='100'            # optional, use for scaled Rithmic files
+cargo test --test session_replay_golden -- --ignored
+```
+
+Only bless golden changes after reviewing whether the drift is expected domain behavior
+or an accidental regression.
 
 ### MCP logging config
 

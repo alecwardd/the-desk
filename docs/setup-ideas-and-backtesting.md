@@ -89,9 +89,18 @@ That said, the project is in the zone where the next order of improvement is not
 
 ### Weakest points that need addressing
 
-#### 8. No end-to-end session replay test
+#### 8. End-to-end session replay golden test
 
-All pipeline tests are unit level. A multi-day `.scid` golden-file test that asserts "these events at these timestamps with these magnitudes" would catch drift from future refactors — which is the single biggest silent risk to a system like this over 12–24 months.
+Addressed with `tests/session_replay_golden.rs`: a deterministic two-session synthetic `.scid` replay now runs through the real historical backfill path and compares canonical session/event output against `tests/fixtures/session_replay/v1/expected_core.json`. The same test target also includes an ignored private-regression mode for real Sierra files via `THE_DESK_GOLDEN_SCID_DIR` / `THE_DESK_GOLDEN_EXPECTED_DIR`.
+
+Follow-up hardening added a rules-enabled golden (`expected_rules.json`), a non-monotonic timestamp golden (`expected_non_monotonic.json`), explicit comparator tolerances, hermetic prior-day reference seeding, and CI coverage. Future-scoped replay work still worth tracking:
+
+- Depth-aware golden replay for `.depth` / MarketDepthData once depth-derived behavior needs drift protection.
+- Adversarial calendar fixtures: DST transition, holiday-shortened RTH, empty Globex, and early-close sessions.
+- Private real-data provenance: sort or group by first SCID timestamp, or require sortable date-prefixed filenames.
+- Golden failure artifacts under `target/` so reviewers can diff actual vs expected JSON outside the test runner.
+- A small `xtask` or PowerShell helper for blessing goldens without hand-written environment commands.
+- Fixture provenance metadata such as the commit SHA used when a golden was blessed.
 
 ### MCP server construction — specific read
 

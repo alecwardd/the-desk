@@ -132,11 +132,17 @@ impl TpoPipeline {
     }
 
     /// Point of control by highest TPO count.
+    ///
+    /// Ties resolve to the lower price so replay output is stable across
+    /// `HashMap` iteration orders.
     pub fn poc(&self) -> f64 {
         let mut best_price = 0;
         let mut best_count = 0usize;
         for (price, letters) in &self.tpo_letters {
-            if letters.len() > best_count {
+            let count = letters.len();
+            if count > best_count
+                || (count == best_count && (best_count == 0 || *price < best_price))
+            {
                 best_count = letters.len();
                 best_price = *price;
             }
@@ -428,5 +434,16 @@ mod tests {
         let detail = p.tpo_letter_detail(Some(21000.5), Some(21001.5));
         assert_eq!(detail.len(), 1);
         assert_eq!(detail[0].price, 21001.0);
+    }
+
+    #[test]
+    fn poc_tie_breaks_to_lower_price() {
+        let mut p = TpoPipeline::new(0.25);
+        p.add_trade(21000.0, 0);
+        p.add_trade(21000.0, 30);
+        p.add_trade(21001.0, 0);
+        p.add_trade(21001.0, 30);
+
+        assert_eq!(p.poc(), 21000.0);
     }
 }

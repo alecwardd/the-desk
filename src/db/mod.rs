@@ -4388,6 +4388,50 @@ impl Database {
         Ok(())
     }
 
+    /// List replay/backtest playbook signals in deterministic order for golden comparisons.
+    pub fn list_playbook_signals_for_replay(
+        &self,
+        source: Option<&str>,
+        job_id: Option<&str>,
+    ) -> Result<Vec<ReplaySignalRecord>, DbError> {
+        let mut sql = String::from(
+            "SELECT signal_id, timestamp_ms, session_date, root_symbol, contract_symbol,
+                    setup_id, payload, source, job_id
+             FROM playbook_signals WHERE 1=1",
+        );
+        let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        if let Some(source) = source {
+            sql.push_str(&format!(" AND source = ?{}", bind_values.len() + 1));
+            bind_values.push(Box::new(source.to_string()));
+        }
+        if let Some(job_id) = job_id {
+            sql.push_str(&format!(" AND job_id = ?{}", bind_values.len() + 1));
+            bind_values.push(Box::new(job_id.to_string()));
+        }
+        sql.push_str(" ORDER BY timestamp_ms ASC, setup_id ASC, signal_id ASC");
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+            bind_values.iter().map(|b| b.as_ref()).collect();
+        let rows = stmt.query_map(params_ref.as_slice(), |row| {
+            let payload_str: String = row.get(6)?;
+            let payload =
+                serde_json::from_str(&payload_str).unwrap_or_else(|_| serde_json::json!({}));
+            Ok(ReplaySignalRecord {
+                signal_id: row.get(0)?,
+                timestamp_ms: row.get(1)?,
+                session_date: row.get(2)?,
+                root_symbol: row.get(3)?,
+                contract_symbol: row.get(4)?,
+                setup_id: row.get(5)?,
+                payload,
+                source: row.get(7)?,
+                job_id: row.get(8)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     pub fn insert_microstructure_snapshot(
         &self,
         timestamp_ms: f64,
@@ -5196,6 +5240,62 @@ impl Database {
             }
         }
         Ok(out)
+    }
+
+    /// List market events in deterministic replay order for golden-file comparisons.
+    pub fn list_market_events_for_replay(
+        &self,
+        start_date: Option<&str>,
+        end_date: Option<&str>,
+    ) -> Result<Vec<MarketEvent>, DbError> {
+        let mut conditions = Vec::new();
+        let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        if let Some(sd) = start_date {
+            conditions.push(format!("session_date >= ?{}", bind_values.len() + 1));
+            bind_values.push(Box::new(sd.to_string()));
+        }
+        if let Some(ed) = end_date {
+            conditions.push(format!("session_date <= ?{}", bind_values.len() + 1));
+            bind_values.push(Box::new(ed.to_string()));
+        }
+        let where_clause = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", conditions.join(" AND "))
+        };
+        let sql = format!(
+            "SELECT session_date, timestamp_ms, event_type, level_name, price, direction,
+                    sequence_num, metadata_json, session_type, session_segment, trading_day
+             FROM market_events {where_clause}
+             ORDER BY session_date ASC, timestamp_ms ASC, event_type ASC,
+                      COALESCE(level_name, '') ASC, price ASC, COALESCE(direction, '') ASC,
+                      COALESCE(sequence_num, -1) ASC"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+            bind_values.iter().map(|b| b.as_ref()).collect();
+        let rows = stmt.query_map(params_ref.as_slice(), |row| {
+            let metadata_str: Option<String> = row.get(7)?;
+            let metadata = metadata_str.and_then(|s| serde_json::from_str(&s).ok());
+            Ok(MarketEvent {
+                session_date: row.get(0)?,
+                timestamp_ms: row.get(1)?,
+                event_type: row.get(2)?,
+                level_name: row.get(3)?,
+                price: row.get(4)?,
+                direction: row.get(5)?,
+                sequence_num: row.get(6)?,
+                metadata,
+                session_type: row
+                    .get::<_, Option<String>>(8)?
+                    .unwrap_or_else(|| "Unknown".to_string()),
+                session_segment: row
+                    .get::<_, Option<String>>(9)?
+                    .unwrap_or_else(|| "None".to_string()),
+                trading_day: row.get::<_, Option<String>>(10)?.unwrap_or_default(),
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     pub fn latest_microstructure_snapshot(&self) -> Result<Option<serde_json::Value>, DbError> {
@@ -6068,42 +6168,58 @@ impl Database {
     }
 
     /// Remove historical replay artifacts for a session while preserving live rows.
-    /// Uses `unchecked_transaction` which acts as a savepoint when called inside an
-    /// existing transaction (e.g. from `persist_historical_session`).
+    ///
+    /// Uses an explicit savepoint so callers may safely invoke this from inside
+    /// the historical-session transaction used during force replays.
     pub fn purge_historical_session(
         &self,
         session_date: &str,
         sources: &[&str],
     ) -> Result<(), DbError> {
-        let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
-            "DELETE FROM market_events WHERE session_date = ?1",
-            params![session_date],
-        )?;
-        tx.execute(
-            "DELETE FROM session_summaries WHERE session_date = ?1",
-            params![session_date],
-        )?;
-        tx.execute(
-            "DELETE FROM session_volume_curves WHERE session_date = ?1",
-            params![session_date],
-        )?;
-        tx.execute(
-            "DELETE FROM untested_dnps WHERE session_date = ?1",
-            params![session_date],
-        )?;
-        for source in sources {
-            tx.execute(
-                "DELETE FROM playbook_signals WHERE session_date = ?1 AND source = ?2",
-                params![session_date, source],
+        self.conn
+            .execute_batch("SAVEPOINT purge_historical_session")?;
+        let result = (|| -> Result<(), DbError> {
+            self.conn.execute(
+                "DELETE FROM market_events WHERE session_date = ?1",
+                params![session_date],
             )?;
-            tx.execute(
-                "DELETE FROM signal_outcomes WHERE session_date = ?1 AND source = ?2",
-                params![session_date, source],
+            self.conn.execute(
+                "DELETE FROM session_summaries WHERE session_date = ?1",
+                params![session_date],
             )?;
+            self.conn.execute(
+                "DELETE FROM session_volume_curves WHERE session_date = ?1",
+                params![session_date],
+            )?;
+            self.conn.execute(
+                "DELETE FROM untested_dnps WHERE session_date = ?1",
+                params![session_date],
+            )?;
+            for source in sources {
+                self.conn.execute(
+                    "DELETE FROM playbook_signals WHERE session_date = ?1 AND source = ?2",
+                    params![session_date, source],
+                )?;
+                self.conn.execute(
+                    "DELETE FROM signal_outcomes WHERE session_date = ?1 AND source = ?2",
+                    params![session_date, source],
+                )?;
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.conn
+                    .execute_batch("RELEASE purge_historical_session")?;
+                Ok(())
+            }
+            Err(err) => {
+                let _ = self.conn.execute_batch(
+                    "ROLLBACK TO purge_historical_session; RELEASE purge_historical_session",
+                );
+                Err(err)
+            }
         }
-        tx.commit()?;
-        Ok(())
     }
 
     /// Load recent RTH session volumes for RVOL baseline construction.
@@ -6583,6 +6699,60 @@ impl Database {
             })
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// List signal outcomes in deterministic replay order for golden comparisons.
+    pub fn list_signal_outcomes_for_replay(
+        &self,
+        source: Option<&str>,
+        job_id: Option<&str>,
+    ) -> Result<Vec<SignalOutcome>, DbError> {
+        let mut sql = String::from(
+            "SELECT signal_id, setup_id, setup_name, session_date, root_symbol, contract_symbol,
+                    source, job_id, fired_at_ms, fired_price, target_price, stop_price, outcome,
+                    outcome_at_ms, max_favorable_excursion, max_adverse_excursion, r_result,
+                    time_to_outcome_ms, rvol_at_fire, rvol_bucket_at_fire
+             FROM signal_outcomes WHERE 1=1",
+        );
+        let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        if let Some(source) = source {
+            sql.push_str(&format!(" AND source = ?{}", bind_values.len() + 1));
+            bind_values.push(Box::new(source.to_string()));
+        }
+        if let Some(job_id) = job_id {
+            sql.push_str(&format!(" AND job_id = ?{}", bind_values.len() + 1));
+            bind_values.push(Box::new(job_id.to_string()));
+        }
+        sql.push_str(" ORDER BY fired_at_ms ASC, setup_id ASC, signal_id ASC");
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+            bind_values.iter().map(|b| b.as_ref()).collect();
+        let rows = stmt.query_map(params_ref.as_slice(), |row| {
+            Ok(SignalOutcome {
+                signal_id: row.get(0)?,
+                setup_id: row.get(1)?,
+                setup_name: row.get(2)?,
+                session_date: row.get(3)?,
+                root_symbol: row.get(4)?,
+                contract_symbol: row.get(5)?,
+                source: row.get(6)?,
+                job_id: row.get(7)?,
+                fired_at_ms: row.get(8)?,
+                fired_price: row.get(9)?,
+                target_price: row.get(10)?,
+                stop_price: row.get(11)?,
+                outcome: row.get(12)?,
+                outcome_at_ms: row.get(13)?,
+                max_favorable_excursion: row.get(14)?,
+                max_adverse_excursion: row.get(15)?,
+                r_result: row.get(16)?,
+                time_to_outcome_ms: row.get(17)?,
+                rvol_at_fire: row.get(18)?,
+                rvol_bucket_at_fire: row.get(19)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     /// List resolved signal outcomes with r_result for research queries.

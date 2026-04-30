@@ -6,7 +6,7 @@ use crate::memory::{
 };
 use crate::pipelines::event_detector::MarketEvent;
 use crate::risk::RiskState;
-use crate::rules::SetupDefinition;
+use crate::rules::{SetupDefinition, SetupReadiness, SetupState, SetupTransition};
 use crate::tick_time_context_from_timestamp_ms;
 use crate::trading_day_from_timestamp_ms;
 use rusqlite::{params, Connection, Row};
@@ -216,6 +216,70 @@ pub struct RawTickRecord {
 }
 
 pub type RawTickBatchRow = (f64, f64, f64, f64, f64, bool, String, String, String);
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetupStateLogRecord {
+    pub event_id: String,
+    pub timestamp_ms: f64,
+    pub session_date: String,
+    pub root_symbol: Option<String>,
+    pub contract_symbol: Option<String>,
+    pub setup_id: String,
+    pub setup_name: String,
+    pub previous_state: SetupState,
+    pub next_state: SetupState,
+    pub previous_readiness: SetupReadiness,
+    pub next_readiness: SetupReadiness,
+    pub readiness_score: f64,
+    pub met_count: i64,
+    pub total_count: i64,
+    pub met_conditions: Vec<String>,
+    pub missing_conditions: Vec<String>,
+    pub deterministic_all_met: bool,
+    pub requires_discretionary: bool,
+    pub current_price: f64,
+    pub reason: String,
+    pub source: String,
+    pub alert_emitted: bool,
+    pub created_at_ms: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetupRuntimeStateRecord {
+    pub session_date: String,
+    pub root_symbol: Option<String>,
+    pub contract_symbol: Option<String>,
+    pub setup_id: String,
+    pub setup_name: Option<String>,
+    pub state: SetupState,
+    pub readiness: SetupReadiness,
+    pub readiness_score: f64,
+    pub met_count: i64,
+    pub total_count: i64,
+    pub met_conditions: Vec<String>,
+    pub missing_conditions: Vec<String>,
+    pub deterministic_all_met: bool,
+    pub requires_discretionary: bool,
+    pub current_price: f64,
+    pub last_evaluated_at_ms: f64,
+    pub last_transition_at_ms: f64,
+    pub last_alert_emitted_at_ms: Option<f64>,
+    pub source: String,
+    pub updated_at_ms: f64,
+}
+
+fn enum_to_json_string<T: Serialize>(value: &T) -> Result<String, DbError> {
+    match serde_json::to_value(value)? {
+        serde_json::Value::String(s) => Ok(s),
+        other => Ok(other.to_string()),
+    }
+}
+
+fn enum_from_json_string<T: for<'de> Deserialize<'de>>(value: String) -> Result<T, DbError> {
+    Ok(serde_json::from_value(serde_json::Value::String(value))?)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -747,6 +811,9 @@ impl Database {
         }
         if version < 20 {
             self.migrate_v20()?;
+        }
+        if version < 21 {
+            self.migrate_v21()?;
         }
 
         Ok(())
@@ -1750,6 +1817,74 @@ impl Database {
               last_refresh_reason
             ) VALUES (1, NULL, NULL, 1, 1, NULL, '[]', NULL);
             UPDATE schema_version SET version = 20;
+            ",
+        )?;
+        Ok(())
+    }
+
+    /// V21: durable setup runtime state and transition history.
+    fn migrate_v21(&self) -> Result<(), DbError> {
+        self.conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS setup_state_log (
+              event_id TEXT PRIMARY KEY,
+              timestamp_ms REAL NOT NULL,
+              session_date TEXT NOT NULL,
+              root_symbol TEXT NULL,
+              contract_symbol TEXT NULL,
+              setup_id TEXT NOT NULL,
+              setup_name TEXT NOT NULL,
+              previous_state TEXT NOT NULL,
+              next_state TEXT NOT NULL,
+              previous_readiness TEXT NOT NULL,
+              next_readiness TEXT NOT NULL,
+              readiness_score REAL NOT NULL,
+              met_count INTEGER NOT NULL,
+              total_count INTEGER NOT NULL,
+              met_conditions_json TEXT NOT NULL,
+              missing_conditions_json TEXT NOT NULL,
+              deterministic_all_met INTEGER NOT NULL,
+              requires_discretionary INTEGER NOT NULL,
+              current_price REAL NOT NULL,
+              reason TEXT NOT NULL,
+              source TEXT NOT NULL,
+              alert_emitted INTEGER NOT NULL,
+              created_at_ms REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_setup_state_log_session_setup_ts
+              ON setup_state_log(session_date, setup_id, timestamp_ms);
+            CREATE INDEX IF NOT EXISTS idx_setup_state_log_setup_ts
+              ON setup_state_log(setup_id, timestamp_ms);
+
+            CREATE TABLE IF NOT EXISTS setup_runtime_state (
+              session_date TEXT NOT NULL,
+              setup_id TEXT NOT NULL,
+              root_symbol TEXT NULL,
+              contract_symbol TEXT NULL,
+              setup_name TEXT NULL,
+              state TEXT NOT NULL,
+              readiness TEXT NOT NULL,
+              readiness_score REAL NOT NULL,
+              met_count INTEGER NOT NULL,
+              total_count INTEGER NOT NULL,
+              met_conditions_json TEXT NOT NULL,
+              missing_conditions_json TEXT NOT NULL,
+              deterministic_all_met INTEGER NOT NULL,
+              requires_discretionary INTEGER NOT NULL,
+              current_price REAL NOT NULL,
+              last_evaluated_at_ms REAL NOT NULL,
+              last_transition_at_ms REAL NOT NULL,
+              last_alert_emitted_at_ms REAL NULL,
+              source TEXT NOT NULL,
+              updated_at_ms REAL NOT NULL,
+              PRIMARY KEY (session_date, setup_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_setup_runtime_state_session
+              ON setup_runtime_state(session_date, updated_at_ms DESC);
+            CREATE INDEX IF NOT EXISTS idx_setup_runtime_state_setup
+              ON setup_runtime_state(setup_id, updated_at_ms DESC);
+
+            UPDATE schema_version SET version = 21;
             ",
         )?;
         Ok(())
@@ -3710,6 +3845,262 @@ impl Database {
             params![timestamp_ms, serde_json::to_string(payload)?],
         )?;
         Ok(())
+    }
+
+    pub fn insert_setup_state_transition(
+        &self,
+        transition: &SetupTransition,
+        session_date: &str,
+        root_symbol: Option<&str>,
+        contract_symbol: Option<&str>,
+        source: &str,
+    ) -> Result<(), DbError> {
+        let event_id = format!(
+            "{}:{}:{}:{:.0}:{}:{}:{}",
+            source,
+            session_date,
+            transition.setup_id,
+            transition.timestamp_ms,
+            transition.reason,
+            enum_to_json_string(&transition.next_state)?,
+            enum_to_json_string(&transition.next_readiness)?
+        );
+        let created_at_ms = chrono::Utc::now().timestamp_millis() as f64;
+        self.conn.execute(
+            "INSERT OR IGNORE INTO setup_state_log
+             (event_id, timestamp_ms, session_date, root_symbol, contract_symbol, setup_id,
+              setup_name, previous_state, next_state, previous_readiness, next_readiness,
+              readiness_score, met_count, total_count, met_conditions_json,
+              missing_conditions_json, deterministic_all_met, requires_discretionary,
+              current_price, reason, source, alert_emitted, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                     ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
+            params![
+                event_id,
+                transition.timestamp_ms,
+                session_date,
+                root_symbol,
+                contract_symbol,
+                transition.setup_id,
+                transition.setup_name,
+                enum_to_json_string(&transition.previous_state)?,
+                enum_to_json_string(&transition.next_state)?,
+                enum_to_json_string(&transition.previous_readiness)?,
+                enum_to_json_string(&transition.next_readiness)?,
+                transition.readiness_score,
+                transition.met_count as i64,
+                transition.total_count as i64,
+                serde_json::to_string(&transition.met_conditions)?,
+                serde_json::to_string(&transition.missing_conditions)?,
+                transition.deterministic_all_met as i64,
+                transition.requires_discretionary as i64,
+                transition.current_price,
+                transition.reason,
+                source,
+                transition.alert_emitted as i64,
+                created_at_ms,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn upsert_setup_runtime_state(
+        &self,
+        record: &SetupRuntimeStateRecord,
+    ) -> Result<(), DbError> {
+        self.conn.execute(
+            "INSERT INTO setup_runtime_state
+             (session_date, setup_id, root_symbol, contract_symbol, setup_name, state, readiness,
+              readiness_score, met_count, total_count, met_conditions_json,
+              missing_conditions_json, deterministic_all_met, requires_discretionary,
+              current_price, last_evaluated_at_ms, last_transition_at_ms,
+              last_alert_emitted_at_ms, source, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                     ?14, ?15, ?16, ?17, ?18, ?19, ?20)
+             ON CONFLICT(session_date, setup_id) DO UPDATE SET
+              root_symbol = excluded.root_symbol,
+              contract_symbol = excluded.contract_symbol,
+              setup_name = excluded.setup_name,
+              state = excluded.state,
+              readiness = excluded.readiness,
+              readiness_score = excluded.readiness_score,
+              met_count = excluded.met_count,
+              total_count = excluded.total_count,
+              met_conditions_json = excluded.met_conditions_json,
+              missing_conditions_json = excluded.missing_conditions_json,
+              deterministic_all_met = excluded.deterministic_all_met,
+              requires_discretionary = excluded.requires_discretionary,
+              current_price = excluded.current_price,
+              last_evaluated_at_ms = excluded.last_evaluated_at_ms,
+              last_transition_at_ms = excluded.last_transition_at_ms,
+              last_alert_emitted_at_ms = excluded.last_alert_emitted_at_ms,
+              source = excluded.source,
+              updated_at_ms = excluded.updated_at_ms",
+            params![
+                record.session_date,
+                record.setup_id,
+                record.root_symbol,
+                record.contract_symbol,
+                record.setup_name,
+                enum_to_json_string(&record.state)?,
+                enum_to_json_string(&record.readiness)?,
+                record.readiness_score,
+                record.met_count,
+                record.total_count,
+                serde_json::to_string(&record.met_conditions)?,
+                serde_json::to_string(&record.missing_conditions)?,
+                record.deterministic_all_met as i64,
+                record.requires_discretionary as i64,
+                record.current_price,
+                record.last_evaluated_at_ms,
+                record.last_transition_at_ms,
+                record.last_alert_emitted_at_ms,
+                record.source,
+                record.updated_at_ms,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn decode_setup_runtime_state_row(row: &Row<'_>) -> rusqlite::Result<SetupRuntimeStateRecord> {
+        let state: String = row.get(5)?;
+        let readiness: String = row.get(6)?;
+        let met_conditions_json: String = row.get(10)?;
+        let missing_conditions_json: String = row.get(11)?;
+        Ok(SetupRuntimeStateRecord {
+            session_date: row.get(0)?,
+            setup_id: row.get(1)?,
+            root_symbol: row.get(2)?,
+            contract_symbol: row.get(3)?,
+            setup_name: row.get(4)?,
+            state: enum_from_json_string(state).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    5,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?,
+            readiness: enum_from_json_string(readiness).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    6,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?,
+            readiness_score: row.get(7)?,
+            met_count: row.get(8)?,
+            total_count: row.get(9)?,
+            met_conditions: serde_json::from_str(&met_conditions_json).unwrap_or_default(),
+            missing_conditions: serde_json::from_str(&missing_conditions_json).unwrap_or_default(),
+            deterministic_all_met: row.get::<_, i64>(12)? != 0,
+            requires_discretionary: row.get::<_, i64>(13)? != 0,
+            current_price: row.get(14)?,
+            last_evaluated_at_ms: row.get(15)?,
+            last_transition_at_ms: row.get(16)?,
+            last_alert_emitted_at_ms: row.get(17)?,
+            source: row.get(18)?,
+            updated_at_ms: row.get(19)?,
+        })
+    }
+
+    pub fn load_setup_runtime_state_for_session(
+        &self,
+        session_date: &str,
+    ) -> Result<Vec<SetupRuntimeStateRecord>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT session_date, setup_id, root_symbol, contract_symbol, setup_name, state,
+                    readiness, readiness_score, met_count, total_count, met_conditions_json,
+                    missing_conditions_json, deterministic_all_met, requires_discretionary,
+                    current_price, last_evaluated_at_ms, last_transition_at_ms,
+                    last_alert_emitted_at_ms, source, updated_at_ms
+             FROM setup_runtime_state
+             WHERE session_date = ?1
+             ORDER BY updated_at_ms DESC",
+        )?;
+        let rows = stmt.query_map(params![session_date], Self::decode_setup_runtime_state_row)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn query_setup_state_history(
+        &self,
+        setup_id: Option<&str>,
+        session_date: Option<&str>,
+        since_ms: Option<f64>,
+        limit: usize,
+    ) -> Result<Vec<SetupStateLogRecord>, DbError> {
+        let limit = limit.clamp(1, 500) as i64;
+        let mut stmt = self.conn.prepare(
+            "SELECT event_id, timestamp_ms, session_date, root_symbol, contract_symbol, setup_id,
+                    setup_name, previous_state, next_state, previous_readiness, next_readiness,
+                    readiness_score, met_count, total_count, met_conditions_json,
+                    missing_conditions_json, deterministic_all_met, requires_discretionary,
+                    current_price, reason, source, alert_emitted, created_at_ms
+             FROM setup_state_log
+             WHERE (?1 IS NULL OR setup_id = ?1)
+               AND (?2 IS NULL OR session_date = ?2)
+               AND (?3 IS NULL OR timestamp_ms >= ?3)
+             ORDER BY timestamp_ms DESC
+             LIMIT ?4",
+        )?;
+        let rows = stmt.query_map(params![setup_id, session_date, since_ms, limit], |row| {
+            let previous_state: String = row.get(7)?;
+            let next_state: String = row.get(8)?;
+            let previous_readiness: String = row.get(9)?;
+            let next_readiness: String = row.get(10)?;
+            let met_conditions_json: String = row.get(14)?;
+            let missing_conditions_json: String = row.get(15)?;
+            Ok(SetupStateLogRecord {
+                event_id: row.get(0)?,
+                timestamp_ms: row.get(1)?,
+                session_date: row.get(2)?,
+                root_symbol: row.get(3)?,
+                contract_symbol: row.get(4)?,
+                setup_id: row.get(5)?,
+                setup_name: row.get(6)?,
+                previous_state: enum_from_json_string(previous_state).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        7,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?,
+                next_state: enum_from_json_string(next_state).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        8,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?,
+                previous_readiness: enum_from_json_string(previous_readiness).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        9,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?,
+                next_readiness: enum_from_json_string(next_readiness).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        10,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?,
+                readiness_score: row.get(11)?,
+                met_count: row.get(12)?,
+                total_count: row.get(13)?,
+                met_conditions: serde_json::from_str(&met_conditions_json).unwrap_or_default(),
+                missing_conditions: serde_json::from_str(&missing_conditions_json)
+                    .unwrap_or_default(),
+                deterministic_all_met: row.get::<_, i64>(16)? != 0,
+                requires_discretionary: row.get::<_, i64>(17)? != 0,
+                current_price: row.get(18)?,
+                reason: row.get(19)?,
+                source: row.get(20)?,
+                alert_emitted: row.get::<_, i64>(21)? != 0,
+                created_at_ms: row.get(22)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     pub fn insert_playbook_signal(
@@ -6824,6 +7215,92 @@ mod tests {
         assert_eq!(setups.len(), 1);
         assert_eq!(setups[0].id, "active_setup");
         assert!(risk_at_limit);
+    }
+
+    #[test]
+    fn setup_runtime_state_round_trips() {
+        let db = test_db();
+        let record = SetupRuntimeStateRecord {
+            session_date: "2026-03-05".to_string(),
+            root_symbol: Some("NQ".to_string()),
+            contract_symbol: Some("NQH26.CME".to_string()),
+            setup_id: "or5".to_string(),
+            setup_name: Some("OR5".to_string()),
+            state: SetupState::Approaching,
+            readiness: SetupReadiness::DeterministicReady,
+            readiness_score: 1.0,
+            met_count: 3,
+            total_count: 3,
+            met_conditions: vec!["price_vs_vwap=above".to_string(), "min_delta".to_string()],
+            missing_conditions: Vec::new(),
+            deterministic_all_met: true,
+            requires_discretionary: true,
+            current_price: 21010.0,
+            last_evaluated_at_ms: 1_000.0,
+            last_transition_at_ms: 1_000.0,
+            last_alert_emitted_at_ms: Some(1_000.0),
+            source: "live".to_string(),
+            updated_at_ms: 1_001.0,
+        };
+
+        db.upsert_setup_runtime_state(&record)
+            .expect("upsert runtime");
+        let rows = db
+            .load_setup_runtime_state_for_session("2026-03-05")
+            .expect("load runtime");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].setup_id, "or5");
+        assert_eq!(rows[0].readiness, SetupReadiness::DeterministicReady);
+        assert_eq!(rows[0].met_conditions.len(), 2);
+    }
+
+    #[test]
+    fn setup_state_log_dedupes_replay_duplicates() {
+        let db = test_db();
+        let transition = SetupTransition {
+            setup_id: "or5".to_string(),
+            setup_name: "OR5".to_string(),
+            previous_state: SetupState::Approaching,
+            next_state: SetupState::Approaching,
+            previous_readiness: SetupReadiness::Partial,
+            next_readiness: SetupReadiness::DeterministicReady,
+            readiness_score: 1.0,
+            met_count: 3,
+            total_count: 3,
+            met_conditions: vec!["min_delta".to_string()],
+            missing_conditions: Vec::new(),
+            deterministic_all_met: true,
+            requires_discretionary: true,
+            current_price: 21010.0,
+            timestamp_ms: 1_000.0,
+            reason: "deterministicReady".to_string(),
+            alert_emitted: true,
+            last_alert_emitted_at_ms: Some(1_000.0),
+        };
+
+        db.insert_setup_state_transition(
+            &transition,
+            "2026-03-05",
+            Some("NQ"),
+            Some("NQH26.CME"),
+            "startup_replay",
+        )
+        .expect("insert transition");
+        db.insert_setup_state_transition(
+            &transition,
+            "2026-03-05",
+            Some("NQ"),
+            Some("NQH26.CME"),
+            "startup_replay",
+        )
+        .expect("dedupe transition");
+
+        let rows = db
+            .query_setup_state_history(Some("or5"), Some("2026-03-05"), None, 10)
+            .expect("query history");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].next_readiness, SetupReadiness::DeterministicReady);
     }
 
     #[test]

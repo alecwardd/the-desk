@@ -89,26 +89,6 @@ That said, the project is in the zone where the next order of improvement is not
 
 ### Weakest points that need addressing
 
-#### 1. Pipeline contention fallback and startup no-snapshot path are now surfaced
-
-[src/bin/the-desk-mcp.rs](../src/bin/the-desk-mcp.rs) now covers both contention cases. When `get_market_snapshot` falls back to persisted feature state, callers still receive `degradationReason = "pipeline_lock_contended; using persisted_feature_state"` and `freshnessStatus = "contended"`. When the pipeline lock is contended before any persisted feature snapshot is available, the tool now returns a structured degraded payload with `snapshotAvailable = false`, `snapshotSource = "contention_unavailable"`, `freshnessStatus = "contended"`, and a contention-specific `degradationReason` (`"pipeline_lock_contended; no_persisted_feature_state_available_yet"` or the DB-busy variant). `pipelineLockRecentlyContended` is also now latched over a short recent window instead of mirroring only the latest `try_lock()` sample. **Status:** closed.
-
-#### 2. Input validation at the MCP boundary is uneven
-
-Validation is better than the first audit pass implied: there are already explicit guards for time windows and `YYYY-MM-DD` dates. But the coverage is inconsistent across tools, and Serde still gives you type safety more than domain validity. Negative counts, unsupported field names, oversized windows, and impossible enum-like strings can still leak through to DB errors or misleading results. **Fix:** centralize parameter validation per tool family, add allowlists/range checks for bounded numerics and research fields, and keep returning typed `McpError` with actionable messages.
-
-#### 3. Clock skew / duplicate-timestamp defense is now implemented
-
-The gap this note originally called out is now covered. [src/feed/monotonic.rs](../src/feed/monotonic.rs) adds a shared `MonotonicTickGuard` that classifies `equalTimestamp` vs `backwardTimestamp`, counts skipped ticks, and captures bounded samples. Mutating SCID paths now use that guard instead of assuming strict monotonicity: startup warm replay and live tailing in [src/bin/the-desk-mcp.rs](../src/bin/the-desk-mcp.rs), historical replay in [src/backfill.rs](../src/backfill.rs), raw tick ingest in [src/scid_tick_ingest.rs](../src/scid_tick_ingest.rs), and the fallback tail loop in [src/feed/scid_reader.rs](../src/feed/scid_reader.rs).
-
-The observability side is also in place. `get_feed_health` and `validate_data_integrity` now expose `skippedNonMonotonicTicks`, `duplicateTimestampTicks`, `backwardTimestampTicks`, and `lastNonMonotonicTimestampMs`. There is also a dedicated `scan_scid_timestamp_anomalies` MCP tool for file-order historical scans, backed by [src/scid_timestamp_diagnostics.rs](../src/scid_timestamp_diagnostics.rs). That matters because it separates "runtime has skipped bad ticks since startup" from "the SCID file contains older anomalies somewhere in history."
-
-Current status from validation: the recent-date scan path is working as intended and came back clean on the current session window, while a full-file scan did surface older duplicate/backward timestamp regions in the historical SCID file. That is the expected shape: runtime defense is implemented, health reporting exists, and the historical scanner can now prove whether anomalies are present. **Status:** closed.
-
-#### 4. Restart loses in-flight setup state
-
-If the server restarts mid-session, the rules engine's "Approaching / ConditionsMet / Confirmed" states are in-memory only. Agents cannot see that setup X was 80% confirmed 3 minutes ago. **Fix:** persist state machine transitions to a `setup_state_log` table; on restart, replay the last N minutes and rehydrate.
-
 #### 5. Contract rollover awareness
 
 [src/pipelines/levels.rs](../src/pipelines/levels.rs) has `carry_forward_levels_valid` flags, but there is no pre-session tool that proactively warns the agent. **Fix:** add a `validate_contract_rollover()` MCP tool that returns current root vs prior-session root and whether prior-day references should be cleared.

@@ -195,7 +195,7 @@ Rules:
 
 ## MCP Tools Reference
 
-The MCP server (`src/bin/the-desk-mcp.rs`) exposes 54 tools across 11 categories.
+The MCP server (`src/bin/the-desk-mcp.rs`) exposes 100 MCP tools across 11 categories.
 
 ### Live vs Historical — Quick Reference
 
@@ -239,6 +239,10 @@ The MCP server (`src/bin/the-desk-mcp.rs`) exposes 54 tools across 11 categories
 | **Rules** | `evaluate_playbook` | All active setups vs current market state (met/approaching/notActive) |
 | | `get_setup_context` | Full context for a named setup (OR5, delta, RVOL, day type, zones, risk) |
 | | `check_delta_confirmation` | Session + price-level delta confirmation for a trade direction |
+| | `get_setup_state_history` | Durable setup state/progress transitions for restart and lifecycle review |
+| | `acknowledge_setup_prompt` | Mark discretionary confirmation as acknowledged for a setup lifecycle |
+| | `mark_setup_in_trade` | Mark a setup lifecycle as in-trade |
+| | `close_setup_state` | Close a setup lifecycle state |
 | **Risk** | `get_risk_state` | Daily P&L in R, trade count, streaks, drawdown, at-limit status |
 | | `get_risk_config` | R-value, max daily loss, circuit breaker, trade limits |
 | | `save_risk_config` | Persist risk configuration (partial updates supported) |
@@ -287,7 +291,7 @@ The MCP server (`src/bin/the-desk-mcp.rs`) exposes 54 tools across 11 categories
 | **market-structure-analyst** | Live + historical | Live: `get_tpo_profile`, `get_key_levels`, `get_day_type`, `get_rvol`, `get_delta_profile`. Historical: `query_event_frequency`, `query_conditional`, `query_distribution`, `compare_sessions`, `get_session_history`, `get_research_summary` |
 | **orderflow-analyst** | Live + historical | Live: `get_delta_profile`, `get_tape_pace`, `get_footprint`, `get_imbalances`, `get_absorption_events`, DOM tools. Historical: same research tools as market-structure |
 | **levels-analyst** | Live + historical | Live: `get_key_levels`, `get_proximity_report`, `get_or5_status`. Historical: `query_event_frequency`, `query_conditional`, `compare_sessions`, `get_session_history` |
-| **playbook-evaluator** | Live only | `evaluate_playbook`, `get_setup_context`, `get_market_snapshot`, `get_key_levels`, `get_proximity_report` |
+| **playbook-evaluator** | Live only | `evaluate_playbook`, `get_setup_context`, `get_setup_state_history`, `acknowledge_setup_prompt`, `mark_setup_in_trade`, `close_setup_state`, `get_market_snapshot`, `get_key_levels`, `get_proximity_report` |
 | **backtest-analyst** | Historical only | `backfill_history`, `run_backtest`, `get_backfill_status`, `get_backtest_results`, `compare_backtests`, `compare_sessions`, `get_session_history`, `get_research_summary`, all `query_*` research tools |
 | **performance-analyst** | Historical only | `get_setup_performance_matrix`, `get_signal_performance`, `query_signal_outcome_*`, `query_distribution`, `query_conditional`, `get_session_history`, `get_research_summary` |
 | **risk-coach** | Live | `get_risk_state`, `get_risk_config`, `get_account_state`, `get_kelly_position_size`, `record_trade_result`, `save_account_state`, `init_risk_state`, `get_pre_session_briefing`, `refresh_memory_state`, `get_memory_brief`, `get_session_review_context`, `review_trade_entry` |

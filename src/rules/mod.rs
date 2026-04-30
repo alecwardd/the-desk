@@ -3,7 +3,6 @@ pub mod setup_templates;
 use crate::pipelines::MarketState;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
 // Setup state machine
@@ -16,6 +15,18 @@ pub enum SetupState {
     NotActive,
     Approaching,
     ConditionsMet,
+    Confirmed,
+    InTrade,
+    Closed,
+}
+
+/// Readiness describes progress within a lifecycle state.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum SetupReadiness {
+    Inactive,
+    Partial,
+    DeterministicReady,
     Confirmed,
     InTrade,
     Closed,
@@ -248,6 +259,80 @@ pub struct SetupAlert {
     /// Target prices from setup definition.
     #[serde(default)]
     pub target_prices: Vec<f64>,
+}
+
+/// Current deterministic evaluation of a playbook setup.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetupEvaluation {
+    pub setup_id: String,
+    pub setup_name: String,
+    pub state: SetupState,
+    pub readiness: SetupReadiness,
+    pub readiness_score: f64,
+    pub met_conditions: Vec<String>,
+    pub missing_conditions: Vec<String>,
+    pub met_count: usize,
+    pub total_count: usize,
+    pub deterministic_all_met: bool,
+    pub requires_discretionary: bool,
+    pub current_price: f64,
+    pub timestamp_ms: f64,
+}
+
+/// A meaningful state/progress transition to persist.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetupTransition {
+    pub setup_id: String,
+    pub setup_name: String,
+    pub previous_state: SetupState,
+    pub next_state: SetupState,
+    pub previous_readiness: SetupReadiness,
+    pub next_readiness: SetupReadiness,
+    pub readiness_score: f64,
+    pub met_count: usize,
+    pub total_count: usize,
+    pub met_conditions: Vec<String>,
+    pub missing_conditions: Vec<String>,
+    pub deterministic_all_met: bool,
+    pub requires_discretionary: bool,
+    pub current_price: f64,
+    pub timestamp_ms: f64,
+    pub reason: String,
+    pub alert_emitted: bool,
+    pub last_alert_emitted_at_ms: Option<f64>,
+}
+
+/// Serializable runtime snapshot for restart rehydration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetupRuntimeSnapshot {
+    pub setup_id: String,
+    pub setup_name: Option<String>,
+    pub state: SetupState,
+    pub readiness: SetupReadiness,
+    pub readiness_score: f64,
+    pub met_conditions: Vec<String>,
+    pub missing_conditions: Vec<String>,
+    pub met_count: usize,
+    pub total_count: usize,
+    pub deterministic_all_met: bool,
+    pub requires_discretionary: bool,
+    pub current_price: f64,
+    pub last_evaluated_at_ms: f64,
+    pub last_transition_at_ms: f64,
+    pub last_alert_emitted_at_ms: Option<f64>,
+    pub source: String,
+}
+
+/// Full result of evaluating a setup.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetupEvaluationOutcome {
+    pub evaluation: SetupEvaluation,
+    pub alert: Option<SetupAlert>,
+    pub transition: Option<SetupTransition>,
 }
 
 // ---------------------------------------------------------------------------
@@ -678,23 +763,85 @@ fn evaluate_typed_condition(
 // Rules engine
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct SetupRuntime {
     state: SetupState,
-    last_alert_emitted_at: Option<Instant>,
+    readiness: SetupReadiness,
+    readiness_score: f64,
+    met_conditions: Vec<String>,
+    missing_conditions: Vec<String>,
+    met_count: usize,
+    total_count: usize,
+    deterministic_all_met: bool,
+    requires_discretionary: bool,
+    current_price: f64,
+    last_evaluated_at_ms: f64,
+    last_transition_at_ms: f64,
+    last_alert_emitted_at_ms: Option<f64>,
+    setup_name: Option<String>,
 }
 
 impl Default for SetupRuntime {
     fn default() -> Self {
         Self {
             state: SetupState::NotActive,
-            last_alert_emitted_at: None,
+            readiness: SetupReadiness::Inactive,
+            readiness_score: 0.0,
+            met_conditions: Vec::new(),
+            missing_conditions: Vec::new(),
+            met_count: 0,
+            total_count: 0,
+            deterministic_all_met: false,
+            requires_discretionary: false,
+            current_price: 0.0,
+            last_evaluated_at_ms: 0.0,
+            last_transition_at_ms: 0.0,
+            last_alert_emitted_at_ms: None,
+            setup_name: None,
         }
     }
 }
 
+fn condition_label(raw: &str) -> String {
+    serde_json::from_str::<SetupCondition>(raw)
+        .ok()
+        .and_then(|tc| tc.label.or_else(|| Some(format!("{:?}", tc.field))))
+        .unwrap_or_else(|| raw.to_string())
+}
+
+fn manual_readiness(state: &SetupState) -> Option<SetupReadiness> {
+    match state {
+        SetupState::Confirmed => Some(SetupReadiness::Confirmed),
+        SetupState::InTrade => Some(SetupReadiness::InTrade),
+        SetupState::Closed => Some(SetupReadiness::Closed),
+        _ => None,
+    }
+}
+
+fn transition_reason(
+    previous_state: &SetupState,
+    next_state: &SetupState,
+    previous_readiness: &SetupReadiness,
+    next_readiness: &SetupReadiness,
+    conditions_changed: bool,
+) -> Option<String> {
+    if previous_state != next_state {
+        Some("stateChanged".to_string())
+    } else if previous_readiness != next_readiness {
+        if matches!(next_readiness, SetupReadiness::DeterministicReady) {
+            Some("deterministicReady".to_string())
+        } else {
+            Some("readinessChanged".to_string())
+        }
+    } else if conditions_changed {
+        Some("conditionsChanged".to_string())
+    } else {
+        None
+    }
+}
+
 /// Deterministic rules engine that evaluates playbook setups against market state.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct RulesEngine {
     runtimes: HashMap<String, SetupRuntime>,
     prev_market: Option<MarketState>,
@@ -712,156 +859,354 @@ impl RulesEngine {
         self.prev_market = Some(market.clone());
     }
 
-    /// Evaluate deterministic conditions and return alerts on transitions.
+    /// Evaluate deterministic conditions and return full progress metadata.
+    pub fn evaluate_detailed(
+        &mut self,
+        setup: &SetupDefinition,
+        market: &MarketState,
+        risk_at_limit: bool,
+    ) -> SetupEvaluationOutcome {
+        self.evaluate_detailed_at(
+            setup,
+            market,
+            risk_at_limit,
+            chrono::Utc::now().timestamp_millis() as f64,
+        )
+    }
+
+    /// Evaluate deterministic conditions at a market-data timestamp.
+    pub fn evaluate_detailed_at(
+        &mut self,
+        setup: &SetupDefinition,
+        market: &MarketState,
+        risk_at_limit: bool,
+        evaluation_ts_ms: f64,
+    ) -> SetupEvaluationOutcome {
+        let now_ms = evaluation_ts_ms;
+        let setup_id = setup.id.clone();
+        let setup_name = setup.name.clone();
+        if !setup.active {
+            let evaluation = SetupEvaluation {
+                setup_id,
+                setup_name,
+                state: SetupState::NotActive,
+                readiness: SetupReadiness::Inactive,
+                readiness_score: 0.0,
+                met_conditions: Vec::new(),
+                missing_conditions: Vec::new(),
+                met_count: 0,
+                total_count: 0,
+                deterministic_all_met: false,
+                requires_discretionary: false,
+                current_price: market.last_price,
+                timestamp_ms: now_ms,
+            };
+            return SetupEvaluationOutcome {
+                evaluation,
+                alert: None,
+                transition: None,
+            };
+        }
+        let runtime = self.runtimes.entry(setup.id.clone()).or_default();
+        runtime.setup_name = Some(setup.name.clone());
+        let previous_state = runtime.state.clone();
+        let previous_readiness = runtime.readiness.clone();
+        let previous_met = runtime.met_conditions.clone();
+        let previous_missing = runtime.missing_conditions.clone();
+        if risk_at_limit {
+            runtime.state = SetupState::NotActive;
+            runtime.readiness = SetupReadiness::Inactive;
+            runtime.readiness_score = 0.0;
+            runtime.met_conditions.clear();
+            runtime.missing_conditions.clear();
+            runtime.met_count = 0;
+            runtime.total_count = 0;
+            runtime.deterministic_all_met = false;
+            runtime.requires_discretionary = !setup.discretionary_conditions.is_empty();
+            runtime.current_price = market.last_price;
+            runtime.last_evaluated_at_ms = now_ms;
+            let transition = (previous_state != runtime.state
+                || previous_readiness != runtime.readiness)
+                .then(|| {
+                    runtime.last_transition_at_ms = now_ms;
+                    SetupTransition {
+                        setup_id: setup.id.clone(),
+                        setup_name: setup.name.clone(),
+                        previous_state,
+                        next_state: runtime.state.clone(),
+                        previous_readiness,
+                        next_readiness: runtime.readiness.clone(),
+                        readiness_score: runtime.readiness_score,
+                        met_count: runtime.met_count,
+                        total_count: runtime.total_count,
+                        met_conditions: runtime.met_conditions.clone(),
+                        missing_conditions: runtime.missing_conditions.clone(),
+                        deterministic_all_met: false,
+                        requires_discretionary: runtime.requires_discretionary,
+                        current_price: market.last_price,
+                        timestamp_ms: now_ms,
+                        reason: "riskGate".to_string(),
+                        alert_emitted: false,
+                        last_alert_emitted_at_ms: runtime.last_alert_emitted_at_ms,
+                    }
+                });
+            return SetupEvaluationOutcome {
+                evaluation: SetupEvaluation {
+                    setup_id: setup.id.clone(),
+                    setup_name: setup.name.clone(),
+                    state: runtime.state.clone(),
+                    readiness: runtime.readiness.clone(),
+                    readiness_score: runtime.readiness_score,
+                    met_conditions: runtime.met_conditions.clone(),
+                    missing_conditions: runtime.missing_conditions.clone(),
+                    met_count: runtime.met_count,
+                    total_count: runtime.total_count,
+                    deterministic_all_met: false,
+                    requires_discretionary: runtime.requires_discretionary,
+                    current_price: market.last_price,
+                    timestamp_ms: now_ms,
+                },
+                alert: None,
+                transition,
+            };
+        }
+
+        let delta_gate = market.session_delta.abs() >= setup.min_delta;
+
+        let mut met_conditions = Vec::new();
+        let mut missing_conditions = Vec::new();
+        for raw in &setup.conditions {
+            let label = condition_label(raw);
+            let passed = if let Ok(tc) = serde_json::from_str::<SetupCondition>(raw) {
+                evaluate_typed_condition(&tc, market, self.prev_market.as_ref())
+            } else {
+                evaluate_string_condition(raw, market)
+            };
+            if passed {
+                met_conditions.push(label);
+            } else {
+                missing_conditions.push(label);
+            }
+        }
+
+        if delta_gate {
+            met_conditions.push("min_delta".to_string());
+        } else {
+            missing_conditions.push("min_delta".to_string());
+        }
+
+        let total_conditions = setup.conditions.len() + 1;
+        let met_count = met_conditions.len();
+        let all_met = missing_conditions.is_empty();
+
+        let has_discretionary = !setup.discretionary_conditions.is_empty();
+
+        let computed_state = if all_met {
+            if has_discretionary {
+                SetupState::Approaching
+            } else {
+                SetupState::ConditionsMet
+            }
+        } else if met_count > 0 {
+            SetupState::Approaching
+        } else {
+            SetupState::NotActive
+        };
+
+        let computed_readiness = if all_met {
+            SetupReadiness::DeterministicReady
+        } else if met_count > 0 {
+            SetupReadiness::Partial
+        } else {
+            SetupReadiness::Inactive
+        };
+
+        let next = if manual_readiness(&runtime.state).is_some() {
+            runtime.state.clone()
+        } else {
+            computed_state
+        };
+        let next_readiness = manual_readiness(&runtime.state).unwrap_or(computed_readiness);
+        let readiness_score = if total_conditions == 0 {
+            0.0
+        } else {
+            met_count as f64 / total_conditions as f64
+        };
+
+        let mut alert = None;
+        let state_changed = next != runtime.state;
+        let readiness_changed = next_readiness != runtime.readiness;
+        let entering_alert_state = matches!(next, SetupState::ConditionsMet) && state_changed;
+        let entering_discretionary_ready = has_discretionary
+            && all_met
+            && matches!(next_readiness, SetupReadiness::DeterministicReady)
+            && (state_changed || readiness_changed);
+
+        if entering_alert_state || entering_discretionary_ready {
+            let suppress_window_ms = setup.duplicate_suppression_ms.max(250) as f64;
+            let suppressed = runtime
+                .last_alert_emitted_at_ms
+                .map(|last| now_ms - last < suppress_window_ms)
+                .unwrap_or(false);
+
+            if !suppressed {
+                runtime.last_alert_emitted_at_ms = Some(now_ms);
+                let stop_price = setup.stop_logic.get("points").and_then(|v| v.as_f64());
+                let target_prices: Vec<f64> = setup
+                    .targets
+                    .iter()
+                    .filter_map(|t| t.get("price").and_then(|v| v.as_f64()))
+                    .collect();
+
+                let backtest_summary = if setup.backtest_results != serde_json::json!({}) {
+                    Some(setup.backtest_results.clone())
+                } else {
+                    None
+                };
+
+                alert = Some(SetupAlert {
+                    setup_id: setup.id.clone(),
+                    setup_name: setup.name.clone(),
+                    state_transition: next.clone(),
+                    triggered_conditions: met_conditions.clone(),
+                    current_price: market.last_price,
+                    timestamp: now_ms,
+                    discretionary: has_discretionary && all_met,
+                    discretionary_texts: if has_discretionary && all_met {
+                        setup.discretionary_conditions.clone()
+                    } else {
+                        Vec::new()
+                    },
+                    backtest_summary,
+                    stop_price,
+                    target_prices,
+                });
+            }
+        }
+
+        let conditions_changed =
+            previous_met != met_conditions || previous_missing != missing_conditions;
+        let reason = transition_reason(
+            &previous_state,
+            &next,
+            &previous_readiness,
+            &next_readiness,
+            conditions_changed,
+        );
+
+        runtime.state = next.clone();
+        runtime.readiness = next_readiness.clone();
+        runtime.readiness_score = readiness_score;
+        runtime.met_conditions = met_conditions.clone();
+        runtime.missing_conditions = missing_conditions.clone();
+        runtime.met_count = met_count;
+        runtime.total_count = total_conditions;
+        runtime.deterministic_all_met = all_met;
+        runtime.requires_discretionary = has_discretionary;
+        runtime.current_price = market.last_price;
+        runtime.last_evaluated_at_ms = now_ms;
+
+        let transition = reason.map(|reason| {
+            runtime.last_transition_at_ms = now_ms;
+            SetupTransition {
+                setup_id: setup.id.clone(),
+                setup_name: setup.name.clone(),
+                previous_state,
+                next_state: next.clone(),
+                previous_readiness,
+                next_readiness: next_readiness.clone(),
+                readiness_score,
+                met_count,
+                total_count: total_conditions,
+                met_conditions: met_conditions.clone(),
+                missing_conditions: missing_conditions.clone(),
+                deterministic_all_met: all_met,
+                requires_discretionary: has_discretionary,
+                current_price: market.last_price,
+                timestamp_ms: now_ms,
+                reason,
+                alert_emitted: alert.is_some(),
+                last_alert_emitted_at_ms: runtime.last_alert_emitted_at_ms,
+            }
+        });
+
+        SetupEvaluationOutcome {
+            evaluation: SetupEvaluation {
+                setup_id: setup.id.clone(),
+                setup_name: setup.name.clone(),
+                state: next,
+                readiness: next_readiness,
+                readiness_score,
+                met_conditions,
+                missing_conditions,
+                met_count,
+                total_count: total_conditions,
+                deterministic_all_met: all_met,
+                requires_discretionary: has_discretionary,
+                current_price: market.last_price,
+                timestamp_ms: now_ms,
+            },
+            alert,
+            transition,
+        }
+    }
+
+    /// Evaluate deterministic conditions and return alerts on alerting transitions.
     pub fn evaluate(
         &mut self,
         setup: &SetupDefinition,
         market: &MarketState,
         risk_at_limit: bool,
     ) -> Option<SetupAlert> {
-        if !setup.active {
-            return None;
-        }
-        let runtime = self.runtimes.entry(setup.id.clone()).or_default();
-        if risk_at_limit {
-            runtime.state = SetupState::NotActive;
-            return None;
-        }
-
-        let delta_gate = market.session_delta.abs() >= setup.min_delta;
-
-        let mut met_conditions: Vec<String> = setup
-            .conditions
-            .iter()
-            .filter(|cond| evaluate_string_condition(cond, market))
-            .cloned()
-            .collect();
-
-        // Also try parsing conditions as typed SetupConditions from the conditions JSON
-        let typed_conditions: Vec<SetupCondition> = setup
-            .conditions
-            .iter()
-            .filter_map(|s| serde_json::from_str(s).ok())
-            .collect();
-
-        for tc in &typed_conditions {
-            if evaluate_typed_condition(tc, market, self.prev_market.as_ref()) {
-                let label = tc
-                    .label
-                    .clone()
-                    .unwrap_or_else(|| format!("{:?}", tc.field));
-                if !met_conditions.contains(&label) {
-                    met_conditions.push(label);
-                }
-            }
-        }
-
-        if delta_gate {
-            met_conditions.push("min_delta".to_string());
-        }
-
-        let string_conditions_count = setup
-            .conditions
-            .iter()
-            .filter(|c| serde_json::from_str::<SetupCondition>(c).is_err())
-            .count();
-        let typed_conditions_count = typed_conditions.len();
-        let total_conditions = string_conditions_count + typed_conditions_count;
-
-        let string_met = setup
-            .conditions
-            .iter()
-            .filter(|c| serde_json::from_str::<SetupCondition>(c).is_err())
-            .filter(|cond| evaluate_string_condition(cond, market))
-            .count();
-        let typed_met = typed_conditions
-            .iter()
-            .filter(|tc| evaluate_typed_condition(tc, market, self.prev_market.as_ref()))
-            .count();
-
-        let conditions_pass = (string_met + typed_met) == total_conditions;
-        let all_met = conditions_pass && delta_gate;
-
-        let has_discretionary = !setup.discretionary_conditions.is_empty();
-
-        let next = if all_met {
-            if has_discretionary {
-                SetupState::Approaching
-            } else {
-                SetupState::ConditionsMet
-            }
-        } else if !met_conditions.is_empty() {
-            SetupState::Approaching
-        } else {
-            SetupState::NotActive
-        };
-
-        if next != runtime.state {
-            let is_alert = matches!(next, SetupState::ConditionsMet)
-                || (has_discretionary && all_met && matches!(next, SetupState::Approaching));
-
-            if is_alert {
-                let suppress_window =
-                    Duration::from_millis(setup.duplicate_suppression_ms.max(250));
-                if let Some(last_emitted) = runtime.last_alert_emitted_at {
-                    if last_emitted.elapsed() < suppress_window {
-                        runtime.state = next;
-                        return None;
-                    }
-                }
-                runtime.last_alert_emitted_at = Some(Instant::now());
-            }
-
-            let stop_price = setup.stop_logic.get("points").and_then(|v| v.as_f64());
-            let target_prices: Vec<f64> = setup
-                .targets
-                .iter()
-                .filter_map(|t| t.get("price").and_then(|v| v.as_f64()))
-                .collect();
-
-            let backtest_summary = if setup.backtest_results != serde_json::json!({}) {
-                Some(setup.backtest_results.clone())
-            } else {
-                None
-            };
-
-            runtime.state = next.clone();
-            return Some(SetupAlert {
-                setup_id: setup.id.clone(),
-                setup_name: setup.name.clone(),
-                state_transition: next,
-                triggered_conditions: met_conditions,
-                current_price: market.last_price,
-                timestamp: chrono::Utc::now().timestamp_millis() as f64,
-                discretionary: has_discretionary && all_met,
-                discretionary_texts: if has_discretionary && all_met {
-                    setup.discretionary_conditions.clone()
-                } else {
-                    Vec::new()
-                },
-                backtest_summary,
-                stop_price,
-                target_prices,
-            });
-        }
-        None
+        self.evaluate_detailed(setup, market, risk_at_limit).alert
     }
 
+    /// Mark a discretionary prompt as confirmed.
     pub fn acknowledge_prompt(&mut self, setup_id: &str) -> Option<SetupState> {
+        self.acknowledge_prompt_at(setup_id, chrono::Utc::now().timestamp_millis() as f64)
+    }
+
+    /// Mark a discretionary prompt as confirmed at a specific timestamp.
+    pub fn acknowledge_prompt_at(
+        &mut self,
+        setup_id: &str,
+        timestamp_ms: f64,
+    ) -> Option<SetupState> {
         let runtime = self.runtimes.get_mut(setup_id)?;
         runtime.state = SetupState::Confirmed;
+        runtime.readiness = SetupReadiness::Confirmed;
+        runtime.last_transition_at_ms = timestamp_ms;
+        runtime.last_evaluated_at_ms = timestamp_ms;
         Some(runtime.state.clone())
     }
 
+    /// Mark a setup as currently in a trade.
     pub fn mark_in_trade(&mut self, setup_id: &str) -> Option<SetupState> {
+        self.mark_in_trade_at(setup_id, chrono::Utc::now().timestamp_millis() as f64)
+    }
+
+    /// Mark a setup as currently in a trade at a specific timestamp.
+    pub fn mark_in_trade_at(&mut self, setup_id: &str, timestamp_ms: f64) -> Option<SetupState> {
         let runtime = self.runtimes.get_mut(setup_id)?;
         runtime.state = SetupState::InTrade;
+        runtime.readiness = SetupReadiness::InTrade;
+        runtime.last_transition_at_ms = timestamp_ms;
+        runtime.last_evaluated_at_ms = timestamp_ms;
         Some(runtime.state.clone())
     }
 
+    /// Mark a setup's trade lifecycle as closed.
     pub fn close_trade(&mut self, setup_id: &str) -> Option<SetupState> {
+        self.close_trade_at(setup_id, chrono::Utc::now().timestamp_millis() as f64)
+    }
+
+    /// Mark a setup's trade lifecycle as closed at a specific timestamp.
+    pub fn close_trade_at(&mut self, setup_id: &str, timestamp_ms: f64) -> Option<SetupState> {
         let runtime = self.runtimes.get_mut(setup_id)?;
         runtime.state = SetupState::Closed;
+        runtime.readiness = SetupReadiness::Closed;
+        runtime.last_transition_at_ms = timestamp_ms;
+        runtime.last_evaluated_at_ms = timestamp_ms;
         Some(runtime.state.clone())
     }
 
@@ -871,6 +1216,55 @@ impl RulesEngine {
             .get(setup_id)
             .map(|r| r.state.clone())
             .unwrap_or(SetupState::NotActive)
+    }
+
+    /// Get current runtime snapshot for a setup.
+    pub fn runtime_snapshot(&self, setup_id: &str) -> Option<SetupRuntimeSnapshot> {
+        self.runtimes
+            .get(setup_id)
+            .map(|runtime| SetupRuntimeSnapshot {
+                setup_id: setup_id.to_string(),
+                setup_name: runtime.setup_name.clone(),
+                state: runtime.state.clone(),
+                readiness: runtime.readiness.clone(),
+                readiness_score: runtime.readiness_score,
+                met_conditions: runtime.met_conditions.clone(),
+                missing_conditions: runtime.missing_conditions.clone(),
+                met_count: runtime.met_count,
+                total_count: runtime.total_count,
+                deterministic_all_met: runtime.deterministic_all_met,
+                requires_discretionary: runtime.requires_discretionary,
+                current_price: runtime.current_price,
+                last_evaluated_at_ms: runtime.last_evaluated_at_ms,
+                last_transition_at_ms: runtime.last_transition_at_ms,
+                last_alert_emitted_at_ms: runtime.last_alert_emitted_at_ms,
+                source: "memory".to_string(),
+            })
+    }
+
+    /// Rehydrate setup runtime state from persisted snapshots.
+    pub fn rehydrate(&mut self, snapshots: Vec<SetupRuntimeSnapshot>) {
+        for snapshot in snapshots {
+            self.runtimes.insert(
+                snapshot.setup_id.clone(),
+                SetupRuntime {
+                    state: snapshot.state,
+                    readiness: snapshot.readiness,
+                    readiness_score: snapshot.readiness_score,
+                    met_conditions: snapshot.met_conditions,
+                    missing_conditions: snapshot.missing_conditions,
+                    met_count: snapshot.met_count,
+                    total_count: snapshot.total_count,
+                    deterministic_all_met: snapshot.deterministic_all_met,
+                    requires_discretionary: snapshot.requires_discretionary,
+                    current_price: snapshot.current_price,
+                    last_evaluated_at_ms: snapshot.last_evaluated_at_ms,
+                    last_transition_at_ms: snapshot.last_transition_at_ms,
+                    last_alert_emitted_at_ms: snapshot.last_alert_emitted_at_ms,
+                    setup_name: snapshot.setup_name,
+                },
+            );
+        }
     }
 }
 
@@ -888,6 +1282,101 @@ mod tests {
             duplicate_suppression_ms: 1500,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn detailed_evaluation_reports_partial_readiness() {
+        let setup = make_setup(vec!["price_vs_vwap=above", "session_delta=positive"], 100.0);
+        let market = MarketState {
+            last_price: 21010.0,
+            vwap: 21000.0,
+            session_delta: 50.0,
+            ..Default::default()
+        };
+        let mut engine = RulesEngine::default();
+        let outcome = engine.evaluate_detailed(&setup, &market, false);
+
+        assert_eq!(outcome.evaluation.state, SetupState::Approaching);
+        assert_eq!(outcome.evaluation.readiness, SetupReadiness::Partial);
+        assert!(outcome
+            .evaluation
+            .missing_conditions
+            .contains(&"min_delta".to_string()));
+        assert!(outcome.transition.is_some());
+    }
+
+    #[test]
+    fn discretionary_all_met_is_deterministic_ready() {
+        let mut setup = make_setup(vec!["price_vs_vwap=above", "session_delta=positive"], 100.0);
+        setup.discretionary_conditions = vec!["Strong DOM initiation".to_string()];
+        let market = MarketState {
+            last_price: 21010.0,
+            vwap: 21000.0,
+            session_delta: 150.0,
+            ..Default::default()
+        };
+        let mut engine = RulesEngine::default();
+        let outcome = engine.evaluate_detailed(&setup, &market, false);
+
+        assert_eq!(outcome.evaluation.state, SetupState::Approaching);
+        assert_eq!(
+            outcome.evaluation.readiness,
+            SetupReadiness::DeterministicReady
+        );
+        assert!(outcome.alert.as_ref().is_some_and(|a| a.discretionary));
+    }
+
+    #[test]
+    fn approaching_to_deterministic_ready_emits_progress_transition() {
+        let mut setup = make_setup(vec!["price_vs_vwap=above", "session_delta=positive"], 100.0);
+        setup.discretionary_conditions = vec!["Strong DOM initiation".to_string()];
+        let partial_market = MarketState {
+            last_price: 21010.0,
+            vwap: 21000.0,
+            session_delta: 50.0,
+            ..Default::default()
+        };
+        let ready_market = MarketState {
+            last_price: 21010.0,
+            vwap: 21000.0,
+            session_delta: 150.0,
+            ..Default::default()
+        };
+        let mut engine = RulesEngine::default();
+        let _ = engine.evaluate_detailed(&setup, &partial_market, false);
+        let outcome = engine.evaluate_detailed(&setup, &ready_market, false);
+
+        assert_eq!(outcome.evaluation.state, SetupState::Approaching);
+        assert_eq!(
+            outcome.evaluation.readiness,
+            SetupReadiness::DeterministicReady
+        );
+        let transition = outcome.transition.expect("progress transition");
+        assert_eq!(transition.reason, "deterministicReady");
+        assert_eq!(transition.previous_state, SetupState::Approaching);
+        assert_eq!(transition.next_state, SetupState::Approaching);
+    }
+
+    #[test]
+    fn confirmed_state_is_not_overwritten_by_ordinary_evaluation() {
+        let setup = make_setup(vec!["price_vs_vwap=above"], 0.0);
+        let active_market = MarketState {
+            last_price: 21010.0,
+            vwap: 21000.0,
+            ..Default::default()
+        };
+        let inactive_market = MarketState {
+            last_price: 20990.0,
+            vwap: 21000.0,
+            ..Default::default()
+        };
+        let mut engine = RulesEngine::default();
+        let _ = engine.evaluate_detailed(&setup, &active_market, false);
+        engine.acknowledge_prompt(&setup.id).expect("confirm");
+        let outcome = engine.evaluate_detailed(&setup, &inactive_market, false);
+
+        assert_eq!(outcome.evaluation.state, SetupState::Confirmed);
+        assert_eq!(outcome.evaluation.readiness, SetupReadiness::Confirmed);
     }
 
     #[test]

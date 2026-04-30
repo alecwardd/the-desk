@@ -15,8 +15,9 @@ use std::sync::{Arc, Mutex, RwLock};
 use the_desk_backend::backfill;
 use the_desk_backend::db::{
     AccountStateRecord, Database, HistoricalJobRun, ImportedFillRecord, JournalEntry,
-    OpenPositionRecord, RawTickBatchRow, RiskConfigRecord, SessionRecord, SessionScopeFilter,
-    SetupPerformanceSortBy, SignalOutcome, TradeImportBatchRecord, TradeRecord, TradeReviewUpdate,
+    OpenPositionRecord, RawTickBatchRow, ReplaySignalRecord, RiskConfigRecord, SessionRecord,
+    SessionScopeFilter, SetupPerformanceSortBy, SetupRuntimeStateRecord, SignalOutcome,
+    TradeImportBatchRecord, TradeRecord, TradeReviewUpdate,
 };
 use the_desk_backend::depth::{
     aggregate_trade_volume_by_level, build_dom_feature_snapshot, build_dom_summary,
@@ -50,7 +51,10 @@ use the_desk_backend::pipelines::{
 };
 use the_desk_backend::research;
 use the_desk_backend::risk::{RiskConfig, RiskState, RiskTracker};
-use the_desk_backend::rules::{RulesEngine, SetupDefinition};
+use the_desk_backend::rules::{
+    RulesEngine, SetupDefinition, SetupEvaluationOutcome, SetupRuntimeSnapshot, SetupState,
+    SetupTransition,
+};
 use the_desk_backend::scid_tick_ingest::{self, TickIngestParams};
 use the_desk_backend::scid_timestamp_diagnostics;
 use the_desk_backend::{
@@ -207,6 +211,8 @@ pub struct McpFeedRuntimeState {
     pub last_scid_poll_wall_ms: Arc<AtomicU64>,
     pub pipeline_lock_contended_now: Arc<AtomicBool>,
     pub pipeline_last_contended_wall_ms: Arc<AtomicU64>,
+    pub setup_runtime_rehydrated: Arc<AtomicBool>,
+    pub rules_warm_replay_complete: Arc<AtomicBool>,
 }
 
 impl Default for McpFeedRuntimeState {
@@ -225,6 +231,8 @@ impl Default for McpFeedRuntimeState {
             last_scid_poll_wall_ms: Arc::new(AtomicU64::new(0)),
             pipeline_lock_contended_now: Arc::new(AtomicBool::new(false)),
             pipeline_last_contended_wall_ms: Arc::new(AtomicU64::new(0)),
+            setup_runtime_rehydrated: Arc::new(AtomicBool::new(false)),
+            rules_warm_replay_complete: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -2194,6 +2202,21 @@ struct ResolveMemoryFollowupParams {
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+struct SetupStateHistoryParams {
+    setup_id: Option<String>,
+    session_date: Option<String>,
+    minutes: Option<f64>,
+    limit: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct SetupLifecycleParams {
+    setup_id: String,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 struct MemoryBriefParams {
     intent: Option<String>,
     session_id: Option<String>,
@@ -2289,7 +2312,105 @@ impl TheDeskMcp {
         let risk_at_limit = self
             .refresh_playbook_setups_from_db(&db)
             .map_err(db_error)?;
+        let session_date =
+            trading_day_from_timestamp_ms(chrono::Utc::now().timestamp_millis() as f64);
+        let runtime_rows = db
+            .load_setup_runtime_state_for_session(&session_date)
+            .map_err(db_error)?;
+        let snapshots: Vec<SetupRuntimeSnapshot> = runtime_rows
+            .into_iter()
+            .map(|row| SetupRuntimeSnapshot {
+                setup_id: row.setup_id,
+                setup_name: row.setup_name,
+                state: row.state,
+                readiness: row.readiness,
+                readiness_score: row.readiness_score,
+                met_conditions: row.met_conditions,
+                missing_conditions: row.missing_conditions,
+                met_count: row.met_count.max(0) as usize,
+                total_count: row.total_count.max(0) as usize,
+                deterministic_all_met: row.deterministic_all_met,
+                requires_discretionary: row.requires_discretionary,
+                current_price: row.current_price,
+                last_evaluated_at_ms: row.last_evaluated_at_ms,
+                last_transition_at_ms: row.last_transition_at_ms,
+                last_alert_emitted_at_ms: row.last_alert_emitted_at_ms,
+                source: row.source,
+            })
+            .collect();
+        if let Ok(mut rules) = self.rules.lock() {
+            rules.rehydrate(snapshots);
+        }
+        self.feed_runtime
+            .setup_runtime_rehydrated
+            .store(true, Ordering::Release);
         self.playbook_cache.set_risk_at_limit(risk_at_limit);
+        Ok(())
+    }
+
+    fn persist_manual_setup_state_change(
+        &self,
+        setup_id: &str,
+        before: Option<SetupRuntimeSnapshot>,
+        after: SetupRuntimeSnapshot,
+        reason: &str,
+        timestamp_ms: f64,
+    ) -> Result<(), McpError> {
+        let session_date = trading_day_from_timestamp_ms(timestamp_ms);
+        let (root_symbol, contract_symbol, current_price) =
+            if let Ok(pipelines) = self.pipelines.try_lock() {
+                let (bid, ask) = current_best_bid_ask(&self.last_bid, &self.last_ask);
+                let snap = pipelines.snapshot(bid, ask);
+                (snap.root_symbol, snap.contract_symbol, snap.last_price)
+            } else {
+                (String::new(), String::new(), after.current_price)
+            };
+        let transition = SetupTransition {
+            setup_id: setup_id.to_string(),
+            setup_name: after
+                .setup_name
+                .clone()
+                .unwrap_or_else(|| setup_id.to_string()),
+            previous_state: before
+                .as_ref()
+                .map(|s| s.state.clone())
+                .unwrap_or(SetupState::NotActive),
+            next_state: after.state.clone(),
+            previous_readiness: before
+                .as_ref()
+                .map(|s| s.readiness.clone())
+                .unwrap_or(the_desk_backend::rules::SetupReadiness::Inactive),
+            next_readiness: after.readiness.clone(),
+            readiness_score: after.readiness_score,
+            met_count: after.met_count,
+            total_count: after.total_count,
+            met_conditions: after.met_conditions.clone(),
+            missing_conditions: after.missing_conditions.clone(),
+            deterministic_all_met: after.deterministic_all_met,
+            requires_discretionary: after.requires_discretionary,
+            current_price,
+            timestamp_ms,
+            reason: reason.to_string(),
+            alert_emitted: false,
+            last_alert_emitted_at_ms: after.last_alert_emitted_at_ms,
+        };
+        let db = self.db.lock().map_err(|_| lock_error())?;
+        db.insert_setup_state_transition(
+            &transition,
+            &session_date,
+            (!root_symbol.is_empty()).then_some(root_symbol.as_str()),
+            (!contract_symbol.is_empty()).then_some(contract_symbol.as_str()),
+            "manual",
+        )
+        .map_err(db_error)?;
+        let record = runtime_record_from_snapshot(
+            after,
+            &session_date,
+            (!root_symbol.is_empty()).then_some(root_symbol.as_str()),
+            (!contract_symbol.is_empty()).then_some(contract_symbol.as_str()),
+            "manual",
+        );
+        db.upsert_setup_runtime_state(&record).map_err(db_error)?;
         Ok(())
     }
 
@@ -4411,15 +4532,29 @@ impl TheDeskMcp {
         };
 
         let mut setup_statuses: Vec<serde_json::Value> = Vec::new();
-        if let (Ok(pipelines), Ok(mut rules)) = (self.pipelines.try_lock(), self.rules.lock()) {
+        if let (Ok(pipelines), Ok(rules)) = (self.pipelines.try_lock(), self.rules.lock()) {
             let market = pipelines.snapshot(bid, ask);
+            let mut preview_rules = rules.clone();
             for setup in setups.iter() {
-                let _ = rules.evaluate(setup, &market, risk_at_limit);
-                let state = rules.get_state(&setup.id);
+                let outcome = preview_rules.evaluate_detailed(setup, &market, risk_at_limit);
+                let runtime = preview_rules.runtime_snapshot(&setup.id);
                 setup_statuses.push(serde_json::json!({
                     "setupId": setup.id,
                     "setupName": setup.name,
-                    "state": format!("{:?}", state),
+                    "state": outcome.evaluation.state,
+                    "readiness": outcome.evaluation.readiness,
+                    "readinessScore": outcome.evaluation.readiness_score,
+                    "metConditions": outcome.evaluation.met_conditions,
+                    "missingConditions": outcome.evaluation.missing_conditions,
+                    "metCount": outcome.evaluation.met_count,
+                    "totalCount": outcome.evaluation.total_count,
+                    "deterministicAllMet": outcome.evaluation.deterministic_all_met,
+                    "requiresDiscretionary": outcome.evaluation.requires_discretionary,
+                    "lastEvaluatedAtMs": runtime.as_ref().map(|r| r.last_evaluated_at_ms),
+                    "lastTransitionAtMs": runtime.as_ref().map(|r| r.last_transition_at_ms),
+                    "stateSource": runtime.as_ref().map(|r| r.source.clone()).unwrap_or_else(|| "memory".to_string()),
+                    "rehydrated": self.feed_runtime.setup_runtime_rehydrated.load(Ordering::Acquire),
+                    "rulesWarmReplayComplete": self.feed_runtime.rules_warm_replay_complete.load(Ordering::Acquire),
                 }));
             }
         } else {
@@ -4435,7 +4570,136 @@ impl TheDeskMcp {
         Ok(text_result(serde_json::json!({
             "setupStatuses": setup_statuses,
             "recentSignalCount": count,
-            "dataAgeMs": data_age_ms
+            "dataAgeMs": data_age_ms,
+            "rehydrated": self.feed_runtime.setup_runtime_rehydrated.load(Ordering::Acquire),
+            "rulesWarmReplayComplete": self.feed_runtime.rules_warm_replay_complete.load(Ordering::Acquire),
+        })))
+    }
+
+    #[tool(
+        description = "Return recent durable setup state/progress transitions for a setup or session. Use to answer what changed before/after a restart."
+    )]
+    async fn get_setup_state_history(
+        &self,
+        Parameters(params): Parameters<SetupStateHistoryParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let now_ms = chrono::Utc::now().timestamp_millis() as f64;
+        let since_ms = params
+            .minutes
+            .map(|minutes| now_ms - minutes.max(0.0) * 60_000.0);
+        let limit = params.limit.unwrap_or(50).clamp(1, 500) as usize;
+        let db = self.db.lock().map_err(|_| lock_error())?;
+        let rows = db
+            .query_setup_state_history(
+                params.setup_id.as_deref(),
+                params.session_date.as_deref(),
+                since_ms,
+                limit,
+            )
+            .map_err(db_error)?;
+        Ok(text_result(serde_json::json!({
+            "transitions": rows,
+            "count": rows.len(),
+            "rehydrated": self.feed_runtime.setup_runtime_rehydrated.load(Ordering::Acquire),
+            "rulesWarmReplayComplete": self.feed_runtime.rules_warm_replay_complete.load(Ordering::Acquire),
+        })))
+    }
+
+    #[tool(
+        description = "Mark a setup's discretionary prompt as confirmed and persist the lifecycle transition."
+    )]
+    async fn acknowledge_setup_prompt(
+        &self,
+        Parameters(params): Parameters<SetupLifecycleParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let timestamp_ms = chrono::Utc::now().timestamp_millis() as f64;
+        let (before, after) = {
+            let mut rules = self.rules.lock().map_err(|_| lock_error())?;
+            let before = rules.runtime_snapshot(&params.setup_id);
+            rules
+                .acknowledge_prompt_at(&params.setup_id, timestamp_ms)
+                .ok_or_else(|| invalid_params_error("unknown setup_id or no runtime state"))?;
+            let after = rules
+                .runtime_snapshot(&params.setup_id)
+                .ok_or_else(|| invalid_params_error("setup runtime missing after acknowledge"))?;
+            (before, after)
+        };
+        self.persist_manual_setup_state_change(
+            &params.setup_id,
+            before,
+            after.clone(),
+            "manualConfirmed",
+            timestamp_ms,
+        )?;
+        Ok(text_result(serde_json::json!({
+            "setupId": params.setup_id,
+            "state": after.state,
+            "readiness": after.readiness,
+            "persisted": true,
+        })))
+    }
+
+    #[tool(description = "Mark a setup as in-trade and persist the lifecycle transition.")]
+    async fn mark_setup_in_trade(
+        &self,
+        Parameters(params): Parameters<SetupLifecycleParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let timestamp_ms = chrono::Utc::now().timestamp_millis() as f64;
+        let (before, after) = {
+            let mut rules = self.rules.lock().map_err(|_| lock_error())?;
+            let before = rules.runtime_snapshot(&params.setup_id);
+            rules
+                .mark_in_trade_at(&params.setup_id, timestamp_ms)
+                .ok_or_else(|| invalid_params_error("unknown setup_id or no runtime state"))?;
+            let after = rules
+                .runtime_snapshot(&params.setup_id)
+                .ok_or_else(|| invalid_params_error("setup runtime missing after mark in trade"))?;
+            (before, after)
+        };
+        self.persist_manual_setup_state_change(
+            &params.setup_id,
+            before,
+            after.clone(),
+            "manualInTrade",
+            timestamp_ms,
+        )?;
+        Ok(text_result(serde_json::json!({
+            "setupId": params.setup_id,
+            "state": after.state,
+            "readiness": after.readiness,
+            "persisted": true,
+        })))
+    }
+
+    #[tool(description = "Close a setup lifecycle state and persist the transition.")]
+    async fn close_setup_state(
+        &self,
+        Parameters(params): Parameters<SetupLifecycleParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let timestamp_ms = chrono::Utc::now().timestamp_millis() as f64;
+        let (before, after) = {
+            let mut rules = self.rules.lock().map_err(|_| lock_error())?;
+            let before = rules.runtime_snapshot(&params.setup_id);
+            rules
+                .close_trade_at(&params.setup_id, timestamp_ms)
+                .ok_or_else(|| invalid_params_error("unknown setup_id or no runtime state"))?;
+            let after = rules
+                .runtime_snapshot(&params.setup_id)
+                .ok_or_else(|| invalid_params_error("setup runtime missing after close"))?;
+            (before, after)
+        };
+        self.persist_manual_setup_state_change(
+            &params.setup_id,
+            before,
+            after.clone(),
+            "manualClosed",
+            timestamp_ms,
+        )?;
+        Ok(text_result(serde_json::json!({
+            "setupId": params.setup_id,
+            "state": after.state,
+            "readiness": after.readiness,
+            "persisted": true,
         })))
     }
 
@@ -7504,6 +7768,164 @@ fn persist_integrity_check(
     let _ = db.insert_validation_run(now_ms, status, &result);
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SetupPersistencePolicy {
+    Live,
+    StartupReplay,
+}
+
+fn runtime_record_from_snapshot(
+    snapshot: SetupRuntimeSnapshot,
+    session_date: &str,
+    root_symbol: Option<&str>,
+    contract_symbol: Option<&str>,
+    source: &str,
+) -> SetupRuntimeStateRecord {
+    let updated_at_ms = chrono::Utc::now().timestamp_millis() as f64;
+    SetupRuntimeStateRecord {
+        session_date: session_date.to_string(),
+        root_symbol: root_symbol.map(str::to_string),
+        contract_symbol: contract_symbol.map(str::to_string),
+        setup_id: snapshot.setup_id,
+        setup_name: snapshot.setup_name,
+        state: snapshot.state,
+        readiness: snapshot.readiness,
+        readiness_score: snapshot.readiness_score,
+        met_count: snapshot.met_count as i64,
+        total_count: snapshot.total_count as i64,
+        met_conditions: snapshot.met_conditions,
+        missing_conditions: snapshot.missing_conditions,
+        deterministic_all_met: snapshot.deterministic_all_met,
+        requires_discretionary: snapshot.requires_discretionary,
+        current_price: snapshot.current_price,
+        last_evaluated_at_ms: snapshot.last_evaluated_at_ms,
+        last_transition_at_ms: snapshot.last_transition_at_ms,
+        last_alert_emitted_at_ms: snapshot.last_alert_emitted_at_ms,
+        source: source.to_string(),
+        updated_at_ms,
+    }
+}
+
+fn persist_setup_evaluation(
+    db: &Database,
+    outcome: &SetupEvaluationOutcome,
+    runtime_snapshot: Option<SetupRuntimeSnapshot>,
+    market_snapshot: &the_desk_backend::pipelines::MarketState,
+    session_date: &str,
+    policy: SetupPersistencePolicy,
+) {
+    let source = match policy {
+        SetupPersistencePolicy::Live => "live",
+        SetupPersistencePolicy::StartupReplay => "startup_replay",
+    };
+    let root_symbol = Some(market_snapshot.root_symbol.as_str());
+    let contract_symbol = Some(market_snapshot.contract_symbol.as_str());
+
+    if let Some(transition) = &outcome.transition {
+        let _ = db.insert_setup_state_transition(
+            transition,
+            session_date,
+            root_symbol,
+            contract_symbol,
+            source,
+        );
+    }
+
+    let should_persist_runtime = outcome.transition.is_some() || outcome.alert.is_some();
+    if should_persist_runtime {
+        if let Some(runtime_snapshot) = runtime_snapshot {
+            let record = runtime_record_from_snapshot(
+                runtime_snapshot,
+                session_date,
+                root_symbol,
+                contract_symbol,
+                source,
+            );
+            let _ = db.upsert_setup_runtime_state(&record);
+        }
+    }
+
+    if policy != SetupPersistencePolicy::Live {
+        return;
+    }
+
+    if let Some(alert) = &outcome.alert {
+        let signal_id = format!("{}_{}", alert.setup_id, alert.timestamp as u64);
+        let signal = ReplaySignalRecord {
+            signal_id: signal_id.clone(),
+            timestamp_ms: alert.timestamp,
+            session_date: session_date.to_string(),
+            root_symbol: Some(market_snapshot.root_symbol.clone()),
+            contract_symbol: Some(market_snapshot.contract_symbol.clone()),
+            setup_id: alert.setup_id.clone(),
+            payload: serde_json::to_value(alert).unwrap_or_else(|_| serde_json::json!({})),
+            source: "live".to_string(),
+            job_id: None,
+        };
+        let _ = db.insert_playbook_signal_record(&signal);
+        let outcome = SignalOutcome {
+            signal_id,
+            setup_id: alert.setup_id.clone(),
+            setup_name: Some(alert.setup_name.clone()),
+            session_date: session_date.to_string(),
+            root_symbol: Some(market_snapshot.root_symbol.clone()),
+            contract_symbol: Some(market_snapshot.contract_symbol.clone()),
+            source: "live".to_string(),
+            job_id: None,
+            fired_at_ms: alert.timestamp,
+            fired_price: alert.current_price,
+            target_price: alert.target_prices.first().copied(),
+            stop_price: alert.stop_price,
+            outcome: "pending".to_string(),
+            outcome_at_ms: None,
+            max_favorable_excursion: None,
+            max_adverse_excursion: None,
+            r_result: None,
+            time_to_outcome_ms: None,
+            rvol_at_fire: Some(market_snapshot.rvol_ratio),
+            rvol_bucket_at_fire: Some(market_snapshot.rvol_bucket_index as i32),
+        };
+        let _ = db.insert_signal_outcome(&outcome);
+    }
+}
+
+fn evaluate_setups_for_snapshot(
+    rules: &Arc<Mutex<RulesEngine>>,
+    playbook_cache: &Arc<PlaybookRuntimeCache>,
+    db: &Arc<Mutex<Database>>,
+    snapshot: &the_desk_backend::pipelines::MarketState,
+    session_date: &str,
+    evaluation_ts_ms: f64,
+    policy: SetupPersistencePolicy,
+) {
+    let (setups, risk_at_limit) = playbook_cache.snapshot();
+    let persist_items = if let Ok(mut r) = rules.lock() {
+        let mut items = Vec::new();
+        for setup in setups.iter() {
+            let outcome = r.evaluate_detailed_at(setup, snapshot, risk_at_limit, evaluation_ts_ms);
+            let runtime_snapshot = r.runtime_snapshot(&setup.id);
+            items.push((outcome, runtime_snapshot));
+        }
+        r.update_prev_market(snapshot);
+        items
+    } else {
+        return;
+    };
+
+    if let Ok(d) = db.lock() {
+        for (outcome, runtime_snapshot) in persist_items {
+            persist_setup_evaluation(
+                &d,
+                &outcome,
+                runtime_snapshot,
+                snapshot,
+                session_date,
+                policy,
+            );
+        }
+    }
+}
+
 /// Process a single tick through the pipeline engine, event detector, rules engine, and outcome tracker.
 #[allow(clippy::too_many_arguments)]
 fn process_tick(
@@ -7534,7 +7956,7 @@ fn process_tick(
         return;
     }
     let minute = minute_of_session_from_timestamp(timestamp_ms);
-    let (snapshot, _session_date) = {
+    let snapshot = {
         if let Ok(mut p) = pipelines.lock() {
             p.on_trade_with_timestamp(price, volume, is_buy, minute, timestamp_ms);
 
@@ -7553,52 +7975,23 @@ fn process_tick(
                 fe.detect_into(&p, timestamp_ms, &session_date, price, event_buffer);
             }
 
-            (snapshot, session_date)
+            snapshot
         } else {
             return;
         }
     };
+    let setup_trading_day = trading_day_from_timestamp_ms(timestamp_ms);
 
-    // Rules engine: evaluate setups and fire alerts (outside pipeline lock to avoid deadlock)
-    let (setups, risk_at_limit) = playbook_cache.snapshot();
-    if let Ok(mut r) = rules.lock() {
-        for setup in setups.iter() {
-            if let Some(alert) = r.evaluate(setup, &snapshot, risk_at_limit) {
-                if let Ok(d) = db.lock() {
-                    let _ = d.insert_playbook_signal(
-                        timestamp_ms,
-                        &alert.setup_id,
-                        &serde_json::to_value(&alert).unwrap_or_else(|_| serde_json::json!({})),
-                    );
-                    let signal_id = format!("{}_{}", alert.setup_id, timestamp_ms as u64);
-                    let outcome = SignalOutcome {
-                        signal_id: signal_id.clone(),
-                        setup_id: alert.setup_id.clone(),
-                        setup_name: Some(alert.setup_name.clone()),
-                        session_date: session_date_from_timestamp_ms(timestamp_ms),
-                        root_symbol: Some(snapshot.root_symbol.clone()),
-                        contract_symbol: Some(snapshot.contract_symbol.clone()),
-                        source: "live".to_string(),
-                        job_id: None,
-                        fired_at_ms: timestamp_ms,
-                        fired_price: alert.current_price,
-                        target_price: alert.target_prices.first().copied(),
-                        stop_price: alert.stop_price,
-                        outcome: "pending".to_string(),
-                        outcome_at_ms: None,
-                        max_favorable_excursion: None,
-                        max_adverse_excursion: None,
-                        r_result: None,
-                        time_to_outcome_ms: None,
-                        rvol_at_fire: Some(snapshot.rvol_ratio),
-                        rvol_bucket_at_fire: Some(snapshot.rvol_bucket_index as i32),
-                    };
-                    let _ = d.insert_signal_outcome(&outcome);
-                }
-            }
-        }
-        r.update_prev_market(&snapshot);
-    }
+    // Rules engine: evaluate setups and persist progress outside the pipeline lock.
+    evaluate_setups_for_snapshot(
+        rules,
+        playbook_cache,
+        db,
+        &snapshot,
+        &setup_trading_day,
+        timestamp_ms,
+        SetupPersistencePolicy::Live,
+    );
 
     // Outcome tracker: update MFE/MAE and resolve signals
     if let Ok(d) = db.lock() {
@@ -8376,6 +8769,8 @@ fn run_startup_warm_replay(
     reader: &ScidReader,
     pipelines: &Arc<Mutex<PipelineEngine>>,
     flow_emitter: &Arc<Mutex<FlowEventEmitter>>,
+    rules: &Arc<Mutex<RulesEngine>>,
+    playbook_cache: &Arc<PlaybookRuntimeCache>,
     db: &Arc<Mutex<Database>>,
     feed_rt: &McpFeedRuntimeState,
     since_ms: f64,
@@ -8572,6 +8967,39 @@ fn run_startup_warm_replay(
             minute,
             tick.timestamp_ms,
         );
+        if current_session == SessionType::Rth {
+            let cur_bid = if tick.bid > 0.0 {
+                tick.bid
+            } else {
+                tick.price - 0.25
+            };
+            let cur_ask = if tick.ask > 0.0 {
+                tick.ask
+            } else {
+                tick.price + 0.25
+            };
+            let snapshot = pipelines_guard.snapshot(cur_bid, cur_ask);
+            let setup_trading_day = trading_day_from_timestamp_ms(tick.timestamp_ms);
+            drop(pipelines_guard);
+            evaluate_setups_for_snapshot(
+                rules,
+                playbook_cache,
+                db,
+                &snapshot,
+                &setup_trading_day,
+                tick.timestamp_ms,
+                SetupPersistencePolicy::StartupReplay,
+            );
+            pipelines_guard = match pipelines.lock() {
+                Ok(p) => p,
+                Err(_) => {
+                    return StartupWarmReplayResult {
+                        cutover_offset: actual_cutover_offset,
+                        applied_tick_count: 0,
+                    };
+                }
+            };
+        }
         applied_tick_count += 1;
         last_applied_tick = Some(tick.clone());
     }
@@ -8739,10 +9167,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // pipeline and DB state without blocking the MCP listener.
         let pipelines_startup = Arc::clone(&server.pipelines);
         let flow_emitter_startup = Arc::clone(&server.flow_emitter);
+        let rules_startup = Arc::clone(&server.rules);
+        let playbook_cache_startup = Arc::clone(&server.playbook_cache);
         let db_startup = Arc::clone(&server.db);
         let reader_startup = reader.clone();
         let contract_metadata_startup = contract_metadata.clone();
         let feed_rt_startup = (*server.feed_runtime).clone();
+        let feed_rt_startup_status = feed_rt_startup.clone();
 
         tokio::spawn(async move {
             let fallback_cutover_offset = safe_scid_data_offset(&reader_startup);
@@ -8760,6 +9191,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &reader_startup,
                     &pipelines_startup,
                     &flow_emitter_startup,
+                    &rules_startup,
+                    &playbook_cache_startup,
                     &db_startup,
                     &feed_rt_startup,
                     since,
@@ -8779,6 +9212,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "[the-desk-mcp] Startup SCID cutover: offset={}, warm_ticks_applied={}",
                 startup.cutover_offset, startup.applied_tick_count
             );
+            feed_rt_startup_status
+                .rules_warm_replay_complete
+                .store(true, Ordering::Release);
             let _ = startup_cutover_tx.send(startup.cutover_offset);
         });
     } else {
@@ -8786,6 +9222,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "[the-desk-mcp] SCID file not found: {}",
             reader.path().display()
         );
+        server
+            .feed_runtime
+            .rules_warm_replay_complete
+            .store(true, Ordering::Release);
     }
 
     // Background: poll .scid for new ticks and update pipeline engine + DB
@@ -9179,6 +9619,7 @@ mod tests {
     use std::path::Path;
     use tempfile::{tempdir, NamedTempFile};
     use the_desk_backend::db::SessionSummary;
+    use the_desk_backend::rules::SetupReadiness;
 
     fn summary_row(
         session_date: &str,
@@ -9469,6 +9910,17 @@ mod tests {
         assert_eq!(tick_ms_from_bits(tick_ms_to_bits(t)), Some(t));
         assert_eq!(tick_ms_to_bits(0.0), 0);
         assert_eq!(tick_ms_from_bits(0), None);
+    }
+
+    #[test]
+    fn documented_mcp_tool_count_matches_source() {
+        let needle = concat!("#", "[tool");
+        let tool_count = include_str!("the-desk-mcp.rs").matches(needle).count();
+        let expected = format!("{tool_count} MCP tools");
+
+        assert!(include_str!("../../AGENT.md").contains(&expected));
+        assert!(include_str!("../../README.md").contains(&expected));
+        assert!(include_str!("../../CLAUDE.md").contains(&expected));
     }
 
     #[test]
@@ -9896,6 +10348,8 @@ mod tests {
             &reader,
             &server.pipelines,
             &server.flow_emitter,
+            &server.rules,
+            &server.playbook_cache,
             &server.db,
             &server.feed_runtime,
             since,
@@ -9963,6 +10417,8 @@ mod tests {
             &reader,
             &server.pipelines,
             &server.flow_emitter,
+            &server.rules,
+            &server.playbook_cache,
             &server.db,
             &server.feed_runtime,
             since,
@@ -9994,6 +10450,8 @@ mod tests {
             &reader,
             &server.pipelines,
             &server.flow_emitter,
+            &server.rules,
+            &server.playbook_cache,
             &server.db,
             &server.feed_runtime,
             base_ts_ms - 10.0,
@@ -10119,6 +10577,58 @@ mod tests {
     }
 
     #[test]
+    fn playbook_cache_hydration_rehydrates_setup_runtime_state() {
+        let db = Database::open(":memory:").expect("db");
+        db.upsert_setup(&SetupDefinition {
+            id: "rehydrated_setup".to_string(),
+            name: "Rehydrated Setup".to_string(),
+            active: true,
+            ..Default::default()
+        })
+        .expect("insert setup");
+        db.upsert_setup_runtime_state(&SetupRuntimeStateRecord {
+            session_date: the_desk_backend::et_now_trading_day(),
+            root_symbol: Some("NQ".to_string()),
+            contract_symbol: Some("NQH26.CME".to_string()),
+            setup_id: "rehydrated_setup".to_string(),
+            setup_name: Some("Rehydrated Setup".to_string()),
+            state: SetupState::Approaching,
+            readiness: SetupReadiness::DeterministicReady,
+            readiness_score: 1.0,
+            met_count: 1,
+            total_count: 1,
+            met_conditions: vec!["min_delta".to_string()],
+            missing_conditions: Vec::new(),
+            deterministic_all_met: true,
+            requires_discretionary: true,
+            current_price: 21010.0,
+            last_evaluated_at_ms: 1_000.0,
+            last_transition_at_ms: 1_000.0,
+            last_alert_emitted_at_ms: Some(1_000.0),
+            source: "live".to_string(),
+            updated_at_ms: 1_000.0,
+        })
+        .expect("seed runtime");
+
+        let server = TheDeskMcp::new(db, PipelineEngine::new(), ":memory:".into());
+        server
+            .hydrate_playbook_runtime_cache()
+            .expect("hydrate playbook cache");
+        let snapshot = server
+            .rules
+            .lock()
+            .expect("rules lock")
+            .runtime_snapshot("rehydrated_setup")
+            .expect("runtime snapshot");
+
+        assert_eq!(snapshot.readiness, SetupReadiness::DeterministicReady);
+        assert!(server
+            .feed_runtime
+            .setup_runtime_rehydrated
+            .load(Ordering::Acquire));
+    }
+
+    #[test]
     fn process_tick_uses_cached_risk_gate_for_alert_suppression() {
         let server = test_server();
         server
@@ -10163,6 +10673,292 @@ mod tests {
         assert_eq!(format!("{state:?}"), "NotActive");
     }
 
+    #[test]
+    fn process_tick_persists_setup_runtime_and_history() {
+        let server = test_server();
+        server
+            .playbook_cache
+            .replace_active_setups(vec![SetupDefinition {
+                id: "persisted_setup".to_string(),
+                name: "Persisted Setup".to_string(),
+                active: true,
+                min_delta: 0.0,
+                conditions: Vec::new(),
+                ..Default::default()
+            }]);
+        server.playbook_cache.set_risk_at_limit(false);
+        let ts = Utc
+            .with_ymd_and_hms(2026, 3, 5, 15, 0, 0)
+            .single()
+            .expect("timestamp")
+            .timestamp_millis() as f64;
+
+        let mut event_buffer = Vec::new();
+        process_tick(
+            &server.pipelines,
+            &server.detector,
+            &server.flow_emitter,
+            &server.rules,
+            &server.playbook_cache,
+            &server.db,
+            &server.last_bid,
+            &server.last_ask,
+            21_000.0,
+            1.0,
+            true,
+            ts,
+            20_999.75,
+            21_000.25,
+            &mut event_buffer,
+        );
+
+        let db = server.db.lock().expect("db lock");
+        let rows = db
+            .load_setup_runtime_state_for_session(&session_date_from_timestamp_ms(ts))
+            .expect("runtime rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].setup_id, "persisted_setup");
+        assert_eq!(rows[0].last_evaluated_at_ms, ts);
+        let history = db
+            .query_setup_state_history(
+                Some("persisted_setup"),
+                Some(&session_date_from_timestamp_ms(ts)),
+                None,
+                10,
+            )
+            .expect("history");
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].timestamp_ms, ts);
+        let outcomes = db.pending_signal_outcomes().expect("pending outcomes");
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].fired_at_ms, ts);
+        assert_eq!(db.count_playbook_signals().expect("signals"), 1);
+    }
+
+    #[test]
+    fn setup_lifecycle_uses_trading_day_across_globex_manual_and_live_paths() {
+        use chrono::NaiveDate;
+        use chrono_tz::US::Eastern;
+
+        let server = test_server();
+        server
+            .playbook_cache
+            .replace_active_setups(vec![SetupDefinition {
+                id: "globex_setup".to_string(),
+                name: "Globex Setup".to_string(),
+                active: true,
+                min_delta: 0.0,
+                conditions: Vec::new(),
+                ..Default::default()
+            }]);
+        server.playbook_cache.set_risk_at_limit(false);
+        let globex_ts = Eastern
+            .from_local_datetime(
+                &NaiveDate::from_ymd_opt(2026, 3, 5)
+                    .expect("date")
+                    .and_hms_opt(18, 30, 0)
+                    .expect("time"),
+            )
+            .single()
+            .expect("non-ambiguous ET timestamp")
+            .timestamp_millis() as f64;
+        assert_ne!(
+            session_date_from_timestamp_ms(globex_ts),
+            trading_day_from_timestamp_ms(globex_ts)
+        );
+
+        let mut event_buffer = Vec::new();
+        process_tick(
+            &server.pipelines,
+            &server.detector,
+            &server.flow_emitter,
+            &server.rules,
+            &server.playbook_cache,
+            &server.db,
+            &server.last_bid,
+            &server.last_ask,
+            21_000.0,
+            1.0,
+            true,
+            globex_ts,
+            20_999.75,
+            21_000.25,
+            &mut event_buffer,
+        );
+
+        let manual_ts = globex_ts + 60_000.0;
+        let (before, after) = {
+            let mut rules = server.rules.lock().expect("rules lock");
+            let before = rules.runtime_snapshot("globex_setup");
+            rules
+                .acknowledge_prompt_at("globex_setup", manual_ts)
+                .expect("acknowledge setup");
+            let after = rules
+                .runtime_snapshot("globex_setup")
+                .expect("runtime snapshot");
+            (before, after)
+        };
+        server
+            .persist_manual_setup_state_change(
+                "globex_setup",
+                before,
+                after,
+                "manualConfirmed",
+                manual_ts,
+            )
+            .expect("persist manual state");
+
+        let db = server.db.lock().expect("db lock");
+        let trading_day_rows = db
+            .load_setup_runtime_state_for_session(&trading_day_from_timestamp_ms(globex_ts))
+            .expect("trading-day runtime rows");
+        assert_eq!(trading_day_rows.len(), 1);
+        assert_eq!(trading_day_rows[0].setup_id, "globex_setup");
+        assert_eq!(trading_day_rows[0].state, SetupState::Confirmed);
+
+        let calendar_rows = db
+            .load_setup_runtime_state_for_session(&session_date_from_timestamp_ms(globex_ts))
+            .expect("calendar-date runtime rows");
+        assert!(calendar_rows.is_empty());
+    }
+
+    #[test]
+    fn process_tick_skips_runtime_write_when_progress_is_unchanged() {
+        let server = test_server();
+        server
+            .playbook_cache
+            .replace_active_setups(vec![SetupDefinition {
+                id: "coalesced_setup".to_string(),
+                name: "Coalesced Setup".to_string(),
+                active: true,
+                min_delta: 0.0,
+                conditions: Vec::new(),
+                ..Default::default()
+            }]);
+        server.playbook_cache.set_risk_at_limit(false);
+        let ts = Utc
+            .with_ymd_and_hms(2026, 3, 5, 15, 0, 0)
+            .single()
+            .expect("timestamp")
+            .timestamp_millis() as f64;
+        let mut event_buffer = Vec::new();
+
+        process_tick(
+            &server.pipelines,
+            &server.detector,
+            &server.flow_emitter,
+            &server.rules,
+            &server.playbook_cache,
+            &server.db,
+            &server.last_bid,
+            &server.last_ask,
+            21_000.0,
+            1.0,
+            true,
+            ts,
+            20_999.75,
+            21_000.25,
+            &mut event_buffer,
+        );
+        process_tick(
+            &server.pipelines,
+            &server.detector,
+            &server.flow_emitter,
+            &server.rules,
+            &server.playbook_cache,
+            &server.db,
+            &server.last_bid,
+            &server.last_ask,
+            21_000.25,
+            1.0,
+            true,
+            ts + 1_000.0,
+            21_000.0,
+            21_000.5,
+            &mut event_buffer,
+        );
+
+        let db = server.db.lock().expect("db lock");
+        let rows = db
+            .load_setup_runtime_state_for_session(&session_date_from_timestamp_ms(ts))
+            .expect("runtime rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].last_evaluated_at_ms, ts);
+        let history = db
+            .query_setup_state_history(
+                Some("coalesced_setup"),
+                Some(&session_date_from_timestamp_ms(ts)),
+                None,
+                10,
+            )
+            .expect("history");
+        assert_eq!(history.len(), 1);
+        assert_eq!(db.count_playbook_signals().expect("signals"), 1);
+    }
+
+    #[test]
+    fn startup_warm_replay_persists_setup_runtime_without_live_signals() {
+        let server = test_server();
+        server
+            .playbook_cache
+            .replace_active_setups(vec![SetupDefinition {
+                id: "replay_setup".to_string(),
+                name: "Replay Setup".to_string(),
+                active: true,
+                min_delta: 0.0,
+                conditions: Vec::new(),
+                ..Default::default()
+            }]);
+        server.playbook_cache.set_risk_at_limit(false);
+        let mut file = NamedTempFile::new().expect("temp");
+        write_scid_header(&mut file);
+        append_scid_sequence(&mut file, 0, &[21000.0, 21000.25]);
+        let reader = ScidReader::new(file.path());
+        let since = Utc
+            .with_ymd_and_hms(2026, 3, 5, 14, 59, 0)
+            .single()
+            .expect("since timestamp")
+            .timestamp_millis() as f64;
+        let cutover = reader.current_aligned_end_offset().expect("cutover");
+
+        let warm = run_startup_warm_replay(
+            &reader,
+            &server.pipelines,
+            &server.flow_emitter,
+            &server.rules,
+            &server.playbook_cache,
+            &server.db,
+            &server.feed_runtime,
+            since,
+            cutover,
+            &test_contract_metadata(),
+        );
+
+        assert_eq!(warm.applied_tick_count, 2);
+        let trading_day = trading_day_from_timestamp_ms(
+            Utc.with_ymd_and_hms(2026, 3, 5, 15, 0, 0)
+                .single()
+                .expect("base timestamp")
+                .timestamp_millis() as f64,
+        );
+        let db = server.db.lock().expect("db lock");
+        let rows = db
+            .load_setup_runtime_state_for_session(&trading_day)
+            .expect("runtime rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].setup_id, "replay_setup");
+        let history = db
+            .query_setup_state_history(Some("replay_setup"), Some(&trading_day), None, 10)
+            .expect("history");
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].source, "startup_replay");
+        assert_eq!(db.count_playbook_signals().expect("signals"), 0);
+        assert!(db
+            .pending_signal_outcomes()
+            .expect("pending outcomes")
+            .is_empty());
+    }
+
     #[tokio::test]
     async fn evaluate_playbook_reads_cache_snapshot() {
         let server = test_server();
@@ -10183,6 +10979,113 @@ mod tests {
         let result = server.evaluate_playbook().await.expect("evaluate");
         let rendered = format!("{result:?}");
         assert!(rendered.contains("cache_only_setup"));
+        assert_eq!(
+            server
+                .rules
+                .lock()
+                .expect("rules lock")
+                .get_state("cache_only_setup"),
+            SetupState::NotActive
+        );
+
+        let ts = Utc
+            .with_ymd_and_hms(2026, 3, 5, 15, 0, 0)
+            .single()
+            .expect("timestamp")
+            .timestamp_millis() as f64;
+        let mut event_buffer = Vec::new();
+        process_tick(
+            &server.pipelines,
+            &server.detector,
+            &server.flow_emitter,
+            &server.rules,
+            &server.playbook_cache,
+            &server.db,
+            &server.last_bid,
+            &server.last_ask,
+            21_000.0,
+            1.0,
+            true,
+            ts,
+            20_999.75,
+            21_000.25,
+            &mut event_buffer,
+        );
+        assert_eq!(
+            server
+                .db
+                .lock()
+                .expect("db lock")
+                .count_playbook_signals()
+                .expect("signals"),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_setup_lifecycle_persists_runtime_transition_timestamp() {
+        let server = test_server();
+        server
+            .playbook_cache
+            .replace_active_setups(vec![SetupDefinition {
+                id: "manual_setup".to_string(),
+                name: "Manual Setup".to_string(),
+                active: true,
+                min_delta: 0.0,
+                conditions: Vec::new(),
+                ..Default::default()
+            }]);
+        server.playbook_cache.set_risk_at_limit(false);
+        let ts = Utc
+            .with_ymd_and_hms(2026, 3, 5, 15, 0, 0)
+            .single()
+            .expect("timestamp")
+            .timestamp_millis() as f64;
+        let mut event_buffer = Vec::new();
+        process_tick(
+            &server.pipelines,
+            &server.detector,
+            &server.flow_emitter,
+            &server.rules,
+            &server.playbook_cache,
+            &server.db,
+            &server.last_bid,
+            &server.last_ask,
+            21_000.0,
+            1.0,
+            true,
+            ts,
+            20_999.75,
+            21_000.25,
+            &mut event_buffer,
+        );
+
+        server
+            .acknowledge_setup_prompt(Parameters(SetupLifecycleParams {
+                setup_id: "manual_setup".to_string(),
+            }))
+            .await
+            .expect("acknowledge setup");
+
+        let db = server.db.lock().expect("db lock");
+        let latest_history = db
+            .query_setup_state_history(Some("manual_setup"), None, None, 1)
+            .expect("history")
+            .pop()
+            .expect("manual history row");
+        assert_eq!(latest_history.reason, "manualConfirmed");
+
+        let rows = db
+            .load_setup_runtime_state_for_session(&the_desk_backend::et_now_trading_day())
+            .expect("runtime rows");
+        let manual_row = rows
+            .iter()
+            .find(|row| row.setup_id == "manual_setup")
+            .expect("manual runtime row");
+        assert_eq!(
+            manual_row.last_transition_at_ms,
+            latest_history.timestamp_ms
+        );
     }
 
     #[tokio::test]

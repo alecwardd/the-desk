@@ -339,9 +339,48 @@ format = "json"                 # json | compact
 destination = "stderr"          # stderr | file | both | none
 file_path = "C:\\Users\\you\\.the-desk\\logs\\the-desk-mcp.jsonl"
 file_retention_days = 14
-runtime_event_buffer = 500
+runtime_event_buffer = 1000
 runtime_event_suppression_window_ms = 1000
+runtime_event_suppression_heartbeat_ms = 60000
 persist_runtime_events = true
 runtime_event_retention_days = 7
-runtime_event_max_rows = 10000
+runtime_event_max_rows = 50000
 ```
+
+### Stable runtime event names
+
+These are operational diagnostics exposed by `get_runtime_events` and JSON logs. They are intentionally low-volume and never include raw tick streams.
+
+| Event name | Meaning |
+|------------|---------|
+| `mcp.startup` | MCP server initialized and runtime config loaded. |
+| `rollover.status_evaluated` | Contract rollover status was not OK during validation. |
+| `rollover.prior_levels_cleared` | Prior levels were cleared because no authoritative reference was available. |
+| `rollover.startup_prior_levels_cleared` | Startup cleared prior levels before serving tools. |
+| `historical_job.started` | Backfill/backtest worker started. |
+| `historical_job.completed` | Backfill/backtest worker completed successfully. |
+| `historical_job.cancelled` | Backfill/backtest worker was cancelled. |
+| `historical_job.failed` | Backfill/backtest worker failed. |
+| `raw_tick_ingest.started` | Background raw tick ingest started. |
+| `raw_tick_ingest.finished` | Background raw tick ingest completed. |
+| `raw_tick_ingest.failed` | Background raw tick ingest failed. |
+| `scid.file_missing` | Configured `.scid` file was not found. |
+| `scid.warm_replay.started` | Startup warm replay began. |
+| `scid.warm_replay.completed` | Startup warm replay completed. |
+| `scid.warm_replay.failed` | Startup warm replay failed. |
+| `scid.warm_replay.empty` | Startup warm replay found no ticks. |
+| `scid.warm_replay.truncated` | Warm replay stopped before requested cutover offset. |
+| `scid.warm_replay.skipped_all` | Warm replay skipped all candidate ticks as non-monotonic. |
+| `scid.startup_cutover` | Live tail cutover offset was selected. |
+| `scid.tail_reset` | `.scid` file shrank and tail offset was reset. |
+| `scid.tail_realign` | Tail offset was not record-aligned and was realigned. |
+| `scid.poll_failed` | Live `.scid` poll failed. |
+| `scid.non_monotonic_skip_summary` | Warm replay or live tail skipped non-monotonic ticks. |
+| `session.boundary` | Live session boundary crossed. |
+| `session.segment_boundary` | Live delta segment boundary crossed. |
+| `session.rth_close_finalized` | RTH close persisted atomically. |
+| `session.rth_close_finalize_failed` | RTH close finalization failed and needs retry/attention. |
+| `session.rth_close_reconcile_started` | Startup replay reconciled a missing RTH close. |
+| `setup.transition` | Setup lifecycle transition persisted. |
+| `depth.poll_failed` | Depth poll task failed. |
+| `depth.worker_failed` | Depth worker failed while processing/persisting depth state. |

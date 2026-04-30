@@ -1911,9 +1911,9 @@ struct RuntimeEventsParams {
     limit: Option<usize>,
     /// Only include events emitted at or after this Unix epoch millisecond timestamp.
     since_ms: Option<f64>,
-    /// Exact level filter: trace, debug, info, warn, or error.
+    /// Exact level filter: trace, debug, info, warn, or error. Do not combine with minLevel.
     level: Option<String>,
-    /// Minimum level filter: returns events at this level or higher. Prefer this for post-mortems.
+    /// Minimum level filter: returns events at this level or higher. Prefer this for post-mortems; mutually exclusive with level.
     min_level: Option<String>,
     /// Exact category filter, e.g. scid, session, setup, depth, historical_job.
     category: Option<String>,
@@ -6604,6 +6604,11 @@ impl TheDeskMcp {
         Parameters(params): Parameters<RuntimeEventsParams>,
     ) -> Result<CallToolResult, McpError> {
         let limit = params.limit.unwrap_or(50).clamp(1, 500);
+        if params.level.is_some() && params.min_level.is_some() {
+            return Err(invalid_params_error(
+                "level and minLevel are mutually exclusive; use level for exact matches or minLevel for severity-or-higher queries",
+            ));
+        }
         let level = match params.level.as_deref() {
             Some(level) => Some(
                 level
@@ -6622,7 +6627,7 @@ impl TheDeskMcp {
         };
         let filter = RuntimeEventFilter {
             since_ms: params.since_ms,
-            level: if min_level.is_some() { None } else { level },
+            level,
             min_level,
             category: params.category.clone(),
             event_name: params.event_name.clone(),
@@ -10773,6 +10778,19 @@ mod tests {
         assert!(events
             .iter()
             .any(|event| event["eventName"].as_str() == Some("scid.tail_reset")));
+    }
+
+    #[tokio::test]
+    async fn get_runtime_events_rejects_level_and_min_level_together() {
+        let server = test_server();
+        let result = server
+            .get_runtime_events(Parameters(RuntimeEventsParams {
+                level: Some("warn".to_string()),
+                min_level: Some("info".to_string()),
+                ..Default::default()
+            }))
+            .await;
+        assert!(result.is_err());
     }
 
     #[test]

@@ -9,10 +9,11 @@ use std::time::{Duration, SystemTime};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-const DEFAULT_RUNTIME_EVENT_BUFFER: usize = 500;
+const DEFAULT_RUNTIME_EVENT_BUFFER: usize = 1_000;
 const DEFAULT_RUNTIME_EVENT_RETENTION_DAYS: u32 = 7;
-const DEFAULT_RUNTIME_EVENT_MAX_ROWS: usize = 10_000;
+const DEFAULT_RUNTIME_EVENT_MAX_ROWS: usize = 50_000;
 const DEFAULT_RUNTIME_EVENT_SUPPRESSION_WINDOW_MS: u64 = 1_000;
+const DEFAULT_RUNTIME_EVENT_SUPPRESSION_HEARTBEAT_MS: u64 = 60_000;
 const DEFAULT_LOG_FILE_RETENTION_DAYS: u32 = 14;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -135,6 +136,7 @@ pub struct RuntimeEventStore {
     retention_days: u32,
     max_persisted_rows: usize,
     suppression_window_ms: u64,
+    suppression_heartbeat_ms: u64,
 }
 
 impl RuntimeEventStore {
@@ -148,6 +150,7 @@ impl RuntimeEventStore {
             retention_days: config.runtime_event_retention_days,
             max_persisted_rows: config.runtime_event_max_rows,
             suppression_window_ms: config.runtime_event_suppression_window_ms,
+            suppression_heartbeat_ms: config.runtime_event_suppression_heartbeat_ms,
         }
     }
 
@@ -231,13 +234,22 @@ impl RuntimeEventStore {
         let Ok(mut guard) = self.suppression.lock() else {
             return false;
         };
-        let state = guard.entry(event.event_name.clone()).or_default();
+        let key = suppression_key(event);
+        let state = guard.entry(key).or_default();
         if state.last_emitted_wall_ms > 0
             && now_ms.saturating_sub(state.last_emitted_wall_ms) < self.suppression_window_ms
         {
             state.suppressed_count = state.suppressed_count.saturating_add(1);
+            if state.suppression_started_wall_ms == 0 {
+                state.suppression_started_wall_ms = now_ms;
+            }
             state.last_suppressed_wall_ms = now_ms;
-            return true;
+            let heartbeat_due = self.suppression_heartbeat_ms > 0
+                && now_ms.saturating_sub(state.suppression_started_wall_ms)
+                    >= self.suppression_heartbeat_ms;
+            if !heartbeat_due {
+                return true;
+            }
         }
         if state.suppressed_count > 0 {
             let mut fields = event.fields.as_object().cloned().unwrap_or_else(Map::new);
@@ -255,6 +267,7 @@ impl RuntimeEventStore {
             );
             event.fields = Value::Object(fields);
             state.suppressed_count = 0;
+            state.suppression_started_wall_ms = 0;
             state.last_suppressed_wall_ms = 0;
         }
         state.last_emitted_wall_ms = now_ms;
@@ -262,9 +275,19 @@ impl RuntimeEventStore {
     }
 }
 
+fn suppression_key(event: &RuntimeEvent) -> String {
+    format!(
+        "{}|{}|{}",
+        event.event_name,
+        event.root_symbol.as_deref().unwrap_or_default(),
+        event.contract_symbol.as_deref().unwrap_or_default()
+    )
+}
+
 #[derive(Debug, Clone, Default)]
 struct SuppressionState {
     last_emitted_wall_ms: u64,
+    suppression_started_wall_ms: u64,
     suppressed_count: u64,
     last_suppressed_wall_ms: u64,
 }
@@ -351,6 +374,8 @@ pub struct LoggingConfig {
     pub runtime_event_max_rows: usize,
     #[serde(default = "default_runtime_event_suppression_window_ms")]
     pub runtime_event_suppression_window_ms: u64,
+    #[serde(default = "default_runtime_event_suppression_heartbeat_ms")]
+    pub runtime_event_suppression_heartbeat_ms: u64,
     #[serde(default = "default_log_file_retention_days")]
     pub file_retention_days: u32,
 }
@@ -367,6 +392,8 @@ impl Default for LoggingConfig {
             runtime_event_retention_days: default_runtime_event_retention_days(),
             runtime_event_max_rows: default_runtime_event_max_rows(),
             runtime_event_suppression_window_ms: default_runtime_event_suppression_window_ms(),
+            runtime_event_suppression_heartbeat_ms: default_runtime_event_suppression_heartbeat_ms(
+            ),
             file_retention_days: default_log_file_retention_days(),
         }
     }
@@ -699,7 +726,8 @@ pub fn runtime_event_log_json(event: &RuntimeEvent) -> Value {
 
 fn runtime_event_log_text(event: &RuntimeEvent) -> String {
     format!(
-        "{} {} {} {}",
+        "{} {} {} {} {}",
+        chrono::Utc::now().to_rfc3339(),
         event.level.as_str(),
         event.category,
         event.event_name,
@@ -707,6 +735,8 @@ fn runtime_event_log_text(event: &RuntimeEvent) -> String {
     )
 }
 
+/// Derive daily runtime-event file names from the configured base path.
+/// Example: `the-desk-mcp.jsonl` becomes `the-desk-mcp.2026-04-30.jsonl`.
 fn daily_log_path(path: &Path, date: &str) -> PathBuf {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = path
@@ -796,6 +826,10 @@ fn default_runtime_event_max_rows() -> usize {
 
 fn default_runtime_event_suppression_window_ms() -> u64 {
     DEFAULT_RUNTIME_EVENT_SUPPRESSION_WINDOW_MS
+}
+
+fn default_runtime_event_suppression_heartbeat_ms() -> u64 {
+    DEFAULT_RUNTIME_EVENT_SUPPRESSION_HEARTBEAT_MS
 }
 
 fn default_log_file_retention_days() -> u32 {
@@ -926,5 +960,91 @@ mod tests {
             ))
             .is_none());
         assert_eq!(store.stats().recent_event_count, 1);
+    }
+
+    #[test]
+    fn suppression_key_includes_contract_scope() {
+        let config = LoggingConfig {
+            runtime_event_suppression_window_ms: 60_000,
+            destination: "none".to_string(),
+            ..LoggingConfig::default()
+        };
+        let store = RuntimeEventStore::new(&config);
+        let first = RuntimeEvent::new(
+            RuntimeEventLevel::Warn,
+            "scid.tail_reset",
+            "scid",
+            "reset",
+            serde_json::json!({}),
+        )
+        .with_contract(Some("NQ".to_string()), Some("NQH26".to_string()));
+        let second = RuntimeEvent::new(
+            RuntimeEventLevel::Warn,
+            "scid.tail_reset",
+            "scid",
+            "reset",
+            serde_json::json!({}),
+        )
+        .with_contract(Some("NQ".to_string()), Some("NQM26".to_string()));
+        assert!(store.record(first).is_some());
+        assert!(store.record(second).is_some());
+        assert_eq!(store.stats().recent_event_count, 2);
+    }
+
+    #[test]
+    fn suppression_heartbeat_forces_periodic_summary() {
+        let config = LoggingConfig {
+            runtime_event_suppression_window_ms: 60_000,
+            runtime_event_suppression_heartbeat_ms: 1,
+            destination: "none".to_string(),
+            ..LoggingConfig::default()
+        };
+        let store = RuntimeEventStore::new(&config);
+        assert!(store
+            .record(RuntimeEvent::new(
+                RuntimeEventLevel::Warn,
+                "depth.poll_failed",
+                "depth",
+                "failed",
+                serde_json::json!({}),
+            ))
+            .is_some());
+        assert!(store
+            .record(RuntimeEvent::new(
+                RuntimeEventLevel::Warn,
+                "depth.poll_failed",
+                "depth",
+                "failed",
+                serde_json::json!({}),
+            ))
+            .is_none());
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let heartbeat = store
+            .record(RuntimeEvent::new(
+                RuntimeEventLevel::Warn,
+                "depth.poll_failed",
+                "depth",
+                "failed",
+                serde_json::json!({}),
+            ))
+            .expect("heartbeat should force an emission");
+        assert_eq!(
+            heartbeat.fields["suppressedSinceLastEmit"].as_u64(),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn compact_runtime_event_log_starts_with_timestamp() {
+        let event = RuntimeEvent::new(
+            RuntimeEventLevel::Info,
+            "mcp.startup",
+            "mcp",
+            "started",
+            serde_json::json!({}),
+        );
+        let line = runtime_event_log_text(&event);
+        assert!(line.starts_with("20"));
+        assert!(line.contains(" info mcp mcp.startup started"));
     }
 }

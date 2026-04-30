@@ -195,7 +195,7 @@ Rules:
 
 ## MCP Tools Reference
 
-The MCP server (`src/bin/the-desk-mcp.rs`) exposes 102 MCP tools across 11 categories.
+The MCP server (`src/bin/the-desk-mcp.rs`) exposes 103 MCP tools across 11 categories.
 
 ### Live vs Historical — Quick Reference
 
@@ -218,6 +218,7 @@ The MCP server (`src/bin/the-desk-mcp.rs`) exposes 102 MCP tools across 11 categ
 | | `get_session_context` | Session type (RTH/Globex), segment (Asia/London), trading day, data freshness |
 | | `get_session_summary` | Total tick count, latest tick timestamp, latest pipeline snapshot (health check) |
 | | `get_feed_health` | SCID path status, file metadata, ingest lag, freshness diagnostics |
+| | `get_runtime_events` | Recent structured MCP runtime diagnostics for post-mortems |
 | | `get_contract_rollover_status` | Pre-session contract roll validation: active contract, prior reference contract, and whether carry-forward levels are authoritative |
 | | `validate_contract_rollover` | Validation alias for `get_contract_rollover_status` for pre-session safety gates |
 | | `get_snapshot_at` | Historical pipeline snapshot nearest to a given timestamp |
@@ -313,6 +314,9 @@ For development without a live Sierra Chart connection, use `.scid` files from S
 # Run all tests
 cargo test
 
+# Windows recovery when an interrupted test leaves the default target exe locked
+$env:CARGO_TARGET_DIR='target_verify'; cargo test
+
 # Run specific pipeline tests
 cargo test pipelines::tpo
 cargo test pipelines::delta
@@ -322,4 +326,22 @@ cargo test pipelines::event_detector
 # Run research / backfill tests
 cargo test backfill
 cargo test research
+```
+
+### MCP logging config
+
+Structured MCP diagnostics default to JSON on stderr so stdout remains reserved for MCP protocol messages. Optional `~/.the-desk/config.toml` block:
+
+```toml
+[logging]
+level = "info"
+format = "json"                 # json | compact
+destination = "stderr"          # stderr | file | both | none
+file_path = "C:\\Users\\you\\.the-desk\\logs\\the-desk-mcp.jsonl"
+file_retention_days = 14
+runtime_event_buffer = 500
+runtime_event_suppression_window_ms = 1000
+persist_runtime_events = true
+runtime_event_retention_days = 7
+runtime_event_max_rows = 10000
 ```

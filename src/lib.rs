@@ -3,6 +3,7 @@ pub mod db;
 pub mod depth;
 pub mod feed;
 pub mod memory;
+pub mod observability;
 pub mod options;
 pub mod outcome_tracker;
 pub mod pipelines;

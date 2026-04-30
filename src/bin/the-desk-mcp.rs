@@ -44,6 +44,10 @@ use the_desk_backend::memory::{
     save_agent_insight as memory_save_agent_insight, AgentInsightQuery, BehavioralPatternQuery,
     MemoryBriefQuery, MemoryFollowupRecord, MemoryRefreshOptions, SaveAgentInsightInput,
 };
+use the_desk_backend::observability::{
+    init_logging, load_logging_config, RuntimeEvent, RuntimeEventFilter, RuntimeEventLevel,
+    RuntimeEventStore,
+};
 use the_desk_backend::options::{
     fetch_options_snapshot, load_options_config, OptionsCredentials, OptionsSnapshot,
 };
@@ -413,6 +417,7 @@ pub struct TheDeskMcp {
     last_bid: Arc<Mutex<f64>>,
     last_ask: Arc<Mutex<f64>>,
     feed_runtime: Arc<McpFeedRuntimeState>,
+    runtime_events: Arc<RuntimeEventStore>,
     playbook_cache: Arc<PlaybookRuntimeCache>,
     backfill_manager: Arc<AsyncMutex<BackfillManager>>,
     options_cache: Arc<AsyncMutex<OptionsSnapshotCache>>,
@@ -533,6 +538,14 @@ fn text_result(mut json: serde_json::Value) -> CallToolResult {
     CallToolResult::success(vec![Content::text(json.to_string())])
 }
 
+fn runtime_event_json(event: RuntimeEvent, source: &str) -> serde_json::Value {
+    let mut value = serde_json::to_value(event).unwrap_or_else(|_| serde_json::json!({}));
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("source".to_string(), serde_json::json!(source));
+    }
+    value
+}
+
 fn normalize_live_absorption_event(
     evt: &the_desk_backend::pipelines::AbsorptionEvent,
 ) -> serde_json::Value {
@@ -598,6 +611,100 @@ fn normalize_db_absorption_event(row: &serde_json::Value) -> serde_json::Value {
 
 fn no_data(msg: &str) -> CallToolResult {
     CallToolResult::success(vec![Content::text(msg.to_string())])
+}
+
+fn record_runtime_event(
+    runtime_events: &Arc<RuntimeEventStore>,
+    db: Option<&Arc<Mutex<Database>>>,
+    level: RuntimeEventLevel,
+    event_name: &str,
+    category: &str,
+    message: impl Into<String>,
+    fields: serde_json::Value,
+) -> RuntimeEvent {
+    record_runtime_event_scoped(
+        runtime_events,
+        db,
+        level,
+        event_name,
+        category,
+        message,
+        fields,
+        None,
+        None,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_runtime_event_scoped(
+    runtime_events: &Arc<RuntimeEventStore>,
+    db: Option<&Arc<Mutex<Database>>>,
+    level: RuntimeEventLevel,
+    event_name: &str,
+    category: &str,
+    message: impl Into<String>,
+    fields: serde_json::Value,
+    session_date: Option<String>,
+    root_symbol: Option<String>,
+    contract_symbol: Option<String>,
+) -> RuntimeEvent {
+    let event = RuntimeEvent::new(level, event_name, category, message, fields)
+        .with_session_date(session_date)
+        .with_contract(root_symbol, contract_symbol);
+    let recorded = runtime_events.record(event.clone());
+    if let Some(recorded) = &recorded {
+        persist_runtime_event_if_enabled(runtime_events, db, recorded);
+    }
+    recorded.unwrap_or(event)
+}
+
+fn persist_runtime_event_if_enabled(
+    runtime_events: &RuntimeEventStore,
+    db: Option<&Arc<Mutex<Database>>>,
+    event: &RuntimeEvent,
+) {
+    if !runtime_events.persist_runtime_events() {
+        return;
+    }
+    let Some(db) = db else {
+        return;
+    };
+    if let Ok(db) = db.lock() {
+        persist_runtime_event_in_db(runtime_events, &db, event);
+    }
+}
+
+fn persist_runtime_event_in_db(
+    runtime_events: &RuntimeEventStore,
+    db: &Database,
+    event: &RuntimeEvent,
+) {
+    if !runtime_events.persist_runtime_events() {
+        return;
+    }
+    let _ = db.insert_runtime_event(event);
+}
+
+fn prune_runtime_events_if_enabled(runtime_events: &RuntimeEventStore, db: &Database) {
+    if runtime_events.persist_runtime_events() {
+        let _ = db.prune_runtime_events(
+            runtime_events.retention_days(),
+            runtime_events.max_persisted_rows(),
+        );
+    }
+}
+
+fn spawn_runtime_event_pruner(runtime_events: Arc<RuntimeEventStore>, db: Arc<Mutex<Database>>) {
+    tokio::spawn(async move {
+        let interval = Duration::from_secs(60);
+        loop {
+            sleep(interval).await;
+            if let Ok(db) = db.lock() {
+                prune_runtime_events_if_enabled(runtime_events.as_ref(), &db);
+            }
+        }
+    });
 }
 
 fn resolve_session_id(
@@ -1797,6 +1904,25 @@ struct ScanScidTimestampAnomaliesParams {
     persist_result: Option<bool>,
 }
 
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeEventsParams {
+    /// Maximum events to return (default 50, max 500).
+    limit: Option<usize>,
+    /// Only include events emitted at or after this Unix epoch millisecond timestamp.
+    since_ms: Option<f64>,
+    /// Exact level filter: trace, debug, info, warn, or error.
+    level: Option<String>,
+    /// Minimum level filter: returns events at this level or higher. Prefer this for post-mortems.
+    min_level: Option<String>,
+    /// Exact category filter, e.g. scid, session, setup, depth, historical_job.
+    category: Option<String>,
+    /// Exact stable event name filter, e.g. scid.tail_reset.
+    event_name: Option<String>,
+    /// Include persisted SQLite events in addition to the in-memory ring buffer.
+    include_persisted: Option<bool>,
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 struct CancelBackfillParams {
@@ -2274,7 +2400,27 @@ struct ImportTradeFillsParams {
 
 #[tool_router]
 impl TheDeskMcp {
+    #[cfg(test)]
     fn new(db: Database, pipelines: PipelineEngine, db_path: String) -> Self {
+        let logging_config = the_desk_backend::observability::LoggingConfig {
+            destination: "none".to_string(),
+            runtime_event_suppression_window_ms: 0,
+            ..the_desk_backend::observability::LoggingConfig::default()
+        };
+        Self::with_runtime_events(
+            db,
+            pipelines,
+            db_path,
+            Arc::new(RuntimeEventStore::new(&logging_config)),
+        )
+    }
+
+    fn with_runtime_events(
+        db: Database,
+        pipelines: PipelineEngine,
+        db_path: String,
+        runtime_events: Arc<RuntimeEventStore>,
+    ) -> Self {
         Self {
             db: Arc::new(Mutex::new(db)),
             db_path: Arc::new(db_path),
@@ -2285,6 +2431,7 @@ impl TheDeskMcp {
             last_bid: Arc::new(Mutex::new(0.0)),
             last_ask: Arc::new(Mutex::new(0.0)),
             feed_runtime: Arc::new(McpFeedRuntimeState::default()),
+            runtime_events,
             playbook_cache: Arc::new(PlaybookRuntimeCache::default()),
             backfill_manager: Arc::new(AsyncMutex::new(BackfillManager::default())),
             options_cache: Arc::new(AsyncMutex::new(OptionsSnapshotCache::default())),
@@ -2391,14 +2538,22 @@ impl TheDeskMcp {
         )
         .map_err(db_error)?;
         if status.status != the_desk_backend::rollover::ContractRolloverStatusKind::Ok {
-            eprintln!(
-                "[the-desk-mcp] rollover status={:?} action={:?} trust={:?} active_contract={} before_date={} event=rollover_status_evaluated",
-                status.status,
-                status.agent_action,
-                status.prior_reference_trust,
-                status.active_contract_symbol,
-                before_date
+            let event = RuntimeEvent::new(
+                RuntimeEventLevel::Warn,
+                "rollover.status_evaluated",
+                "rollover",
+                "Contract rollover status is not OK.",
+                serde_json::json!({
+                    "status": status.status,
+                    "agentAction": status.agent_action,
+                    "priorReferenceTrust": status.prior_reference_trust,
+                    "activeContract": status.active_contract_symbol,
+                    "beforeDate": before_date,
+                }),
             );
+            if let Some(recorded) = self.runtime_events.record(event) {
+                persist_runtime_event_in_db(&self.runtime_events, db, &recorded);
+            }
         }
         Ok(status)
     }
@@ -2466,6 +2621,29 @@ impl TheDeskMcp {
             "manual",
         );
         db.upsert_setup_runtime_state(&record).map_err(db_error)?;
+        drop(db);
+        record_runtime_event_scoped(
+            &self.runtime_events,
+            Some(&self.db),
+            RuntimeEventLevel::Info,
+            "setup.transition",
+            "setup",
+            "Manual setup lifecycle transition persisted.",
+            serde_json::json!({
+                "setupId": setup_id,
+                "setupName": transition.setup_name,
+                "previousState": transition.previous_state,
+                "nextState": transition.next_state,
+                "previousReadiness": transition.previous_readiness,
+                "nextReadiness": transition.next_readiness,
+                "reason": reason,
+                "currentPrice": current_price,
+                "source": "manual",
+            }),
+            Some(session_date),
+            (!root_symbol.is_empty()).then_some(root_symbol),
+            (!contract_symbol.is_empty()).then_some(contract_symbol),
+        );
         Ok(())
     }
 
@@ -2907,6 +3085,7 @@ impl TheDeskMcp {
 
         let db_path = Arc::clone(&self.db_path);
         let manager = Arc::clone(&self.backfill_manager);
+        let runtime_events = Arc::clone(&self.runtime_events);
         let worker_params = backfill::BackfillJobParams {
             job_id: job_id.clone(),
             job_type,
@@ -2922,6 +3101,19 @@ impl TheDeskMcp {
             let db = match Database::open(db_path.as_str()) {
                 Ok(db) => db,
                 Err(err) => {
+                    record_runtime_event(
+                        &runtime_events,
+                        None,
+                        RuntimeEventLevel::Error,
+                        "historical_job.failed",
+                        "historical_job",
+                        "Historical job could not open SQLite.",
+                        serde_json::json!({
+                            "jobId": &job_id,
+                            "jobType": worker_params.job_type.as_str(),
+                            "error": err.to_string(),
+                        }),
+                    );
                     let mut guard = manager.blocking_lock();
                     if let Some(state) = guard.jobs.get_mut(&job_id) {
                         state.run.status = "failed".to_string();
@@ -2956,11 +3148,20 @@ impl TheDeskMcp {
                 }
             }
 
-            eprintln!(
-                "[the-desk-mcp] historical job {} started ({})",
-                job_id,
-                worker_params.job_type.as_str()
+            let event = RuntimeEvent::new(
+                RuntimeEventLevel::Info,
+                "historical_job.started",
+                "historical_job",
+                "Historical job started.",
+                serde_json::json!({
+                    "jobId": &job_id,
+                    "jobType": worker_params.job_type.as_str(),
+                    "startedAtMs": started_at_ms,
+                }),
             );
+            if let Some(recorded) = runtime_events.record(event) {
+                persist_runtime_event_in_db(&runtime_events, &db, &recorded);
+            }
             let mut last_progress_db_write_ms = started_at_ms;
             let mut last_persisted_records = 0_usize;
             let mut last_persisted_sessions_completed = 0_usize;
@@ -3079,6 +3280,34 @@ impl TheDeskMcp {
                         finished_at_ms: state.run.finished_at_ms,
                     },
                 );
+                let level = match state.run.status.as_str() {
+                    "failed" => RuntimeEventLevel::Error,
+                    "cancelled" => RuntimeEventLevel::Warn,
+                    _ => RuntimeEventLevel::Info,
+                };
+                let event = RuntimeEvent::new(
+                    level,
+                    match state.run.status.as_str() {
+                        "completed" => "historical_job.completed",
+                        "cancelled" => "historical_job.cancelled",
+                        "failed" => "historical_job.failed",
+                        _ => "historical_job.finished",
+                    },
+                    "historical_job",
+                    "Historical job finished.",
+                    serde_json::json!({
+                        "jobId": &job_id,
+                        "jobType": worker_params.job_type.as_str(),
+                        "status": &state.run.status,
+                        "startedAtMs": state.run.started_at_ms,
+                        "finishedAtMs": state.run.finished_at_ms,
+                        "error": &state.run.error,
+                        "warnings": &state.run.warnings,
+                    }),
+                );
+                if let Some(recorded) = runtime_events.record(event) {
+                    persist_runtime_event_in_db(&runtime_events, &db, &recorded);
+                }
             }
             guard.active_job_id = None;
         });
@@ -6324,6 +6553,7 @@ impl TheDeskMcp {
         let now_wall_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
         let pipeline_contended = fr.pipeline_lock_recently_contended(now_wall_ms);
         let monotonicity = fr.monotonicity_snapshot();
+        let runtime_event_stats = self.runtime_events.stats();
 
         Ok(text_result(serde_json::json!({
             "liveDataSource": "scid",
@@ -6356,7 +6586,84 @@ impl TheDeskMcp {
             "duplicateTimestampTicks": monotonicity.duplicate_timestamp_ticks,
             "backwardTimestampTicks": monotonicity.backward_timestamp_ticks,
             "lastNonMonotonicTimestampMs": monotonicity.last_non_monotonic_timestamp_ms,
-            "pipelineLockRecentlyContended": pipeline_contended
+            "pipelineLockRecentlyContended": pipeline_contended,
+            "recentRuntimeEventCount": runtime_event_stats.recent_event_count,
+            "lastRuntimeWarningAtMs": runtime_event_stats.last_warning_at_ms,
+            "lastRuntimeErrorAtMs": runtime_event_stats.last_error_at_ms,
+            "lastRuntimeWarning": &runtime_event_stats.last_warning,
+            "lastRuntimeError": &runtime_event_stats.last_error,
+            "recentRuntimeEventNameCounts": &runtime_event_stats.recent_event_name_counts
+        })))
+    }
+
+    #[tool(
+        description = "Recent MCP runtime diagnostics: structured startup, feed, session-boundary, setup-transition, background-job, and worker events. Use this for post-mortems after get_feed_health/validate_data_integrity flags a problem; not for raw tick data."
+    )]
+    async fn get_runtime_events(
+        &self,
+        Parameters(params): Parameters<RuntimeEventsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let limit = params.limit.unwrap_or(50).clamp(1, 500);
+        let level = match params.level.as_deref() {
+            Some(level) => Some(
+                level
+                    .parse::<RuntimeEventLevel>()
+                    .map_err(invalid_params_error)?,
+            ),
+            None => None,
+        };
+        let min_level = match params.min_level.as_deref() {
+            Some(level) => Some(
+                level
+                    .parse::<RuntimeEventLevel>()
+                    .map_err(invalid_params_error)?,
+            ),
+            None => None,
+        };
+        let filter = RuntimeEventFilter {
+            since_ms: params.since_ms,
+            level: if min_level.is_some() { None } else { level },
+            min_level,
+            category: params.category.clone(),
+            event_name: params.event_name.clone(),
+            limit,
+        };
+
+        let recent_events = self.runtime_events.query(&filter);
+        let include_persisted = params.include_persisted.unwrap_or(false);
+        let persisted_events = if include_persisted {
+            let db = self.db.lock().map_err(|_| lock_error())?;
+            db.query_runtime_events(&filter).map_err(db_error)?
+        } else {
+            Vec::new()
+        };
+
+        let mut events: Vec<serde_json::Value> = recent_events
+            .iter()
+            .cloned()
+            .map(|event| runtime_event_json(event, "memory"))
+            .collect();
+        events.extend(
+            persisted_events
+                .iter()
+                .cloned()
+                .map(|event| runtime_event_json(event, "sqlite")),
+        );
+
+        Ok(text_result(serde_json::json!({
+            "events": events,
+            "recentCount": recent_events.len(),
+            "persistedCount": persisted_events.len(),
+            "includePersisted": include_persisted,
+            "limit": limit,
+            "filters": {
+                "sinceMs": filter.since_ms,
+                "level": filter.level.map(|l| l.as_str()),
+                "minLevel": filter.min_level.map(|l| l.as_str()),
+                "category": filter.category,
+                "eventName": filter.event_name,
+            },
+            "stats": self.runtime_events.stats()
         })))
     }
 
@@ -6563,7 +6870,22 @@ impl TheDeskMcp {
         }
 
         let db_path = Arc::clone(&self.db_path);
+        let runtime_events = Arc::clone(&self.runtime_events);
+        record_runtime_event(
+            &runtime_events,
+            Some(&self.db),
+            RuntimeEventLevel::Info,
+            "raw_tick_ingest.started",
+            "raw_tick_ingest",
+            "Raw tick ingest started in the background.",
+            serde_json::json!({
+                "onlyGaps": only_gaps,
+                "startDate": start_date.clone(),
+                "endDate": end_date.clone(),
+            }),
+        );
         tokio::task::spawn(async move {
+            let runtime_events_blocking = Arc::clone(&runtime_events);
             let res = tokio::task::spawn_blocking(move || {
                 let config = load_feed_config();
                 let contract = resolve_contract_metadata(&config);
@@ -6571,7 +6893,15 @@ impl TheDeskMcp {
                 let db = match Database::open(db_path.as_str()) {
                     Ok(d) => d,
                     Err(e) => {
-                        eprintln!("[the-desk-mcp] ingest_raw_ticks_from_scid: open db failed: {e}");
+                        record_runtime_event(
+                            &runtime_events_blocking,
+                            None,
+                            RuntimeEventLevel::Error,
+                            "raw_tick_ingest.failed",
+                            "raw_tick_ingest",
+                            "Raw tick ingest could not open SQLite.",
+                            serde_json::json!({ "error": e.to_string() }),
+                        );
                         return;
                     }
                 };
@@ -6586,19 +6916,46 @@ impl TheDeskMcp {
                     },
                 ) {
                     Ok((rep, ing)) => {
-                        eprintln!(
-                            "[the-desk-mcp] ingest_raw_ticks_from_scid finished: gaps={} scanned={} submitted={}",
-                            rep.gaps.len(),
-                            ing.as_ref().map(|i| i.scid_records_scanned).unwrap_or(0),
-                            ing.as_ref().map(|i| i.ticks_submitted_to_insert).unwrap_or(0),
-                        );
+                        let event = RuntimeEvent::new(
+                                RuntimeEventLevel::Info,
+                                "raw_tick_ingest.finished",
+                                "raw_tick_ingest",
+                                "Raw tick ingest finished.",
+                                serde_json::json!({
+                                    "gapCount": rep.gaps.len(),
+                                    "recordsScanned": ing.as_ref().map(|i| i.scid_records_scanned).unwrap_or(0),
+                                    "ticksSubmitted": ing.as_ref().map(|i| i.ticks_submitted_to_insert).unwrap_or(0),
+                                }),
+                            );
+                        if let Some(recorded) = runtime_events_blocking.record(event) {
+                            persist_runtime_event_in_db(&runtime_events_blocking, &db, &recorded);
+                        }
                     }
-                    Err(e) => eprintln!("[the-desk-mcp] ingest_raw_ticks_from_scid failed: {e}"),
+                    Err(e) => {
+                        let event = RuntimeEvent::new(
+                                RuntimeEventLevel::Error,
+                                "raw_tick_ingest.failed",
+                                "raw_tick_ingest",
+                                "Raw tick ingest failed.",
+                                serde_json::json!({ "error": e.to_string() }),
+                            );
+                        if let Some(recorded) = runtime_events_blocking.record(event) {
+                            persist_runtime_event_in_db(&runtime_events_blocking, &db, &recorded);
+                        }
+                    }
                 }
             })
             .await;
             if let Err(e) = res {
-                eprintln!("[the-desk-mcp] ingest_raw_ticks_from_scid task: {e}");
+                record_runtime_event(
+                    &runtime_events,
+                    None,
+                    RuntimeEventLevel::Error,
+                    "raw_tick_ingest.failed",
+                    "raw_tick_ingest",
+                    "Raw tick ingest task failed to join.",
+                    serde_json::json!({ "error": e.to_string() }),
+                );
             }
         });
         Ok(text_result(serde_json::json!({
@@ -7710,6 +8067,7 @@ impl TheDeskMcp {
         let recent_monotonic_violation = monotonicity.has_recent_violation(now_ms);
         let (_, active_contract) = self.resolve_contract_cached();
         let server_contract = self.current_pipeline_contract_metadata();
+        let runtime_event_stats = self.runtime_events.stats();
         let mut rollover_lock_failed = false;
         let rollover_status = if let Ok(db) = self.db.lock() {
             Some(self.rollover_status_for_date(
@@ -7756,6 +8114,16 @@ impl TheDeskMcp {
             "recentWindowMs": MONOTONIC_ANOMALY_RECENT_WINDOW_MS,
         });
         invariants_ok &= !recent_monotonic_violation;
+        checks["runtimeEvents"] = serde_json::json!({
+            "passed": true,
+            "detail": "Use get_runtime_events for recent structured MCP diagnostics.",
+            "recentRuntimeEventCount": runtime_event_stats.recent_event_count,
+            "lastRuntimeWarningAtMs": runtime_event_stats.last_warning_at_ms,
+            "lastRuntimeErrorAtMs": runtime_event_stats.last_error_at_ms,
+            "lastRuntimeWarning": &runtime_event_stats.last_warning,
+            "lastRuntimeError": &runtime_event_stats.last_error,
+            "recentRuntimeEventNameCounts": &runtime_event_stats.recent_event_name_counts,
+        });
         for (name, passed, detail) in pipeline_invariants {
             checks[name] = serde_json::json!({
                 "passed": passed,
@@ -7789,6 +8157,12 @@ impl TheDeskMcp {
             "lastDepthTimestampMs": tick_ms_from_bits(
                 fr.last_depth_timestamp_ms_bits.load(Ordering::Acquire),
             ),
+            "recentRuntimeEventCount": runtime_event_stats.recent_event_count,
+            "lastRuntimeWarningAtMs": runtime_event_stats.last_warning_at_ms,
+            "lastRuntimeErrorAtMs": runtime_event_stats.last_error_at_ms,
+            "lastRuntimeWarning": &runtime_event_stats.last_warning,
+            "lastRuntimeError": &runtime_event_stats.last_error,
+            "recentRuntimeEventNameCounts": &runtime_event_stats.recent_event_name_counts,
             "checks": checks
         });
         if let Some(status) = rollover_status {
@@ -7983,6 +8357,7 @@ fn runtime_record_from_snapshot(
 
 fn persist_setup_evaluation(
     db: &Database,
+    runtime_events: Option<&Arc<RuntimeEventStore>>,
     outcome: &SetupEvaluationOutcome,
     runtime_snapshot: Option<SetupRuntimeSnapshot>,
     market_snapshot: &the_desk_backend::pipelines::MarketState,
@@ -8004,6 +8379,32 @@ fn persist_setup_evaluation(
             contract_symbol,
             source,
         );
+        if let Some(runtime_events) = runtime_events {
+            let mut event = RuntimeEvent::new(
+                RuntimeEventLevel::Info,
+                "setup.transition",
+                "setup",
+                "Setup lifecycle transition persisted.",
+                serde_json::json!({
+                    "setupId": &transition.setup_id,
+                    "setupName": &transition.setup_name,
+                    "previousState": &transition.previous_state,
+                    "nextState": &transition.next_state,
+                    "previousReadiness": &transition.previous_readiness,
+                    "nextReadiness": &transition.next_readiness,
+                    "readinessScore": transition.readiness_score,
+                    "reason": &transition.reason,
+                    "alertEmitted": transition.alert_emitted,
+                    "source": source,
+                }),
+            );
+            event.session_date = Some(session_date.to_string());
+            event.root_symbol = Some(market_snapshot.root_symbol.clone());
+            event.contract_symbol = Some(market_snapshot.contract_symbol.clone());
+            if let Some(recorded) = runtime_events.record(event) {
+                persist_runtime_event_in_db(runtime_events, db, &recorded);
+            }
+        }
     }
 
     let should_persist_runtime = outcome.transition.is_some() || outcome.alert.is_some();
@@ -8064,10 +8465,12 @@ fn persist_setup_evaluation(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn evaluate_setups_for_snapshot(
     rules: &Arc<Mutex<RulesEngine>>,
     playbook_cache: &Arc<PlaybookRuntimeCache>,
     db: &Arc<Mutex<Database>>,
+    runtime_events: Option<&Arc<RuntimeEventStore>>,
     snapshot: &the_desk_backend::pipelines::MarketState,
     session_date: &str,
     evaluation_ts_ms: f64,
@@ -8091,6 +8494,7 @@ fn evaluate_setups_for_snapshot(
         for (outcome, runtime_snapshot) in persist_items {
             persist_setup_evaluation(
                 &d,
+                runtime_events,
                 &outcome,
                 runtime_snapshot,
                 snapshot,
@@ -8110,6 +8514,7 @@ fn process_tick(
     rules: &Arc<Mutex<RulesEngine>>,
     playbook_cache: &Arc<PlaybookRuntimeCache>,
     db: &Arc<Mutex<Database>>,
+    runtime_events: &Arc<RuntimeEventStore>,
     last_bid: &Arc<Mutex<f64>>,
     last_ask: &Arc<Mutex<f64>>,
     price: f64,
@@ -8162,6 +8567,7 @@ fn process_tick(
         rules,
         playbook_cache,
         db,
+        Some(runtime_events),
         &snapshot,
         &setup_trading_day,
         timestamp_ms,
@@ -8747,6 +9153,7 @@ enum RthCloseFinalizeError {
 fn finalize_rth_close(
     pipelines: &Arc<Mutex<PipelineEngine>>,
     db: &Arc<Mutex<Database>>,
+    runtime_events: Option<&Arc<RuntimeEventStore>>,
     detector: Option<&Arc<Mutex<EventDetector>>>,
     flow_emitter: Option<&Arc<Mutex<FlowEventEmitter>>>,
     boundary_tick_ts: f64,
@@ -8905,13 +9312,38 @@ fn finalize_rth_close(
         }
     }
 
-    eprintln!(
-        "[the-desk-mcp] RTH close finalized atomically for {session_date}: H={:.2} L={:.2} C={:.2} delta={:.0} signals={signal_count}",
-        close_data.end_state.high,
-        close_data.end_state.low,
-        close_data.end_state.close,
-        close_data.session_delta,
-    );
+    if let Some(runtime_events) = runtime_events {
+        record_runtime_event_scoped(
+            runtime_events,
+            Some(db),
+            RuntimeEventLevel::Info,
+            "session.rth_close_finalized",
+            "session",
+            "RTH close finalized atomically.",
+            serde_json::json!({
+                "high": close_data.end_state.high,
+                "low": close_data.end_state.low,
+                "close": close_data.end_state.close,
+                "sessionDelta": close_data.session_delta,
+                "signalCount": signal_count,
+            }),
+            Some(session_date.clone()),
+            Some(contract_metadata.root_symbol.clone()),
+            Some(contract_metadata.contract_symbol.clone()),
+        );
+    } else {
+        tracing::info!(
+            event_name = "session.rth_close_finalized",
+            category = "session",
+            session_date,
+            high = close_data.end_state.high,
+            low = close_data.end_state.low,
+            close = close_data.end_state.close,
+            session_delta = close_data.session_delta,
+            signal_count,
+            "RTH close finalized atomically."
+        );
+    }
 
     Ok(Some(RthCloseResult {
         session_date,
@@ -8932,6 +9364,7 @@ fn finalize_rth_close(
 fn prepare_for_new_session(
     pipelines: &Arc<Mutex<PipelineEngine>>,
     db: &Arc<Mutex<Database>>,
+    runtime_events: Option<&Arc<RuntimeEventStore>>,
     new_session: SessionType,
     new_segment: DeltaSegment,
     boundary_tick_ts: f64,
@@ -8978,14 +9411,30 @@ fn prepare_for_new_session(
                 p.levels
                     .set_prior_day_contract_context(root_symbol, None, contract_symbol);
                 if let Some(status) = rollover_status {
-                    eprintln!(
-                        "[the-desk-mcp] rollover status={:?} action={:?} trust={:?} active_contract={} lookup_date={} event=prior_levels_cleared",
-                        status.status,
-                        status.agent_action,
-                        status.prior_reference_trust,
-                        status.active_contract_symbol,
-                        lookup_date
-                    );
+                    if let Some(runtime_events) = runtime_events {
+                        let event = RuntimeEvent::new(
+                            RuntimeEventLevel::Warn,
+                            "rollover.prior_levels_cleared",
+                            "rollover",
+                            "Prior levels were cleared at a session boundary.",
+                            serde_json::json!({
+                                "status": status.status,
+                                "agentAction": status.agent_action,
+                                "priorReferenceTrust": status.prior_reference_trust,
+                                "activeContract": status.active_contract_symbol,
+                                "lookupDate": lookup_date,
+                            }),
+                        );
+                        let _ = runtime_events.record(event);
+                    } else {
+                        tracing::warn!(
+                            event_name = "rollover.prior_levels_cleared",
+                            category = "rollover",
+                            active_contract = status.active_contract_symbol,
+                            lookup_date,
+                            "Prior levels were cleared at a session boundary."
+                        );
+                    }
                 }
             }
         }
@@ -9034,6 +9483,7 @@ fn run_startup_warm_replay(
     rules: &Arc<Mutex<RulesEngine>>,
     playbook_cache: &Arc<PlaybookRuntimeCache>,
     db: &Arc<Mutex<Database>>,
+    runtime_events: &Arc<RuntimeEventStore>,
     feed_rt: &McpFeedRuntimeState,
     since_ms: f64,
     requested_cutover_offset: u64,
@@ -9044,9 +9494,18 @@ fn run_startup_warm_replay(
             Ok(batch) => batch,
             Err(e) => {
                 let fallback_offset = safe_scid_data_offset(reader);
-                eprintln!(
-                    "[the-desk-mcp] Backfill error: {e}; live tail will resume from safe offset {}",
-                    fallback_offset
+                record_runtime_event(
+                    runtime_events,
+                    Some(db),
+                    RuntimeEventLevel::Error,
+                    "scid.warm_replay.failed",
+                    "scid",
+                    "Startup warm replay failed; live tail will resume from a safe offset.",
+                    serde_json::json!({
+                        "error": e.to_string(),
+                        "fallbackOffset": fallback_offset,
+                        "requestedCutoverOffset": requested_cutover_offset,
+                    }),
                 );
                 return StartupWarmReplayResult {
                     cutover_offset: fallback_offset,
@@ -9057,18 +9516,33 @@ fn run_startup_warm_replay(
 
     let actual_cutover_offset = replay_batch.next_offset;
     if actual_cutover_offset < requested_cutover_offset {
-        eprintln!(
-            "[the-desk-mcp] Warm replay stopped early at offset {}; live tail will resume there instead of requested cutover {}",
-            actual_cutover_offset,
-            requested_cutover_offset
+        record_runtime_event(
+            runtime_events,
+            Some(db),
+            RuntimeEventLevel::Warn,
+            "scid.warm_replay.truncated",
+            "scid",
+            "Startup warm replay stopped before the requested cutover offset.",
+            serde_json::json!({
+                "actualCutoverOffset": actual_cutover_offset,
+                "requestedCutoverOffset": requested_cutover_offset,
+            }),
         );
     }
 
     let ticks = replay_batch.ticks;
     if ticks.is_empty() {
-        eprintln!(
-            "[the-desk-mcp] No warm-replay ticks since prior Globex open (cutover offset {})",
-            actual_cutover_offset
+        record_runtime_event(
+            runtime_events,
+            Some(db),
+            RuntimeEventLevel::Info,
+            "scid.warm_replay.empty",
+            "scid",
+            "Startup warm replay found no ticks since the prior Globex open.",
+            serde_json::json!({
+                "actualCutoverOffset": actual_cutover_offset,
+                "sinceMs": since_ms,
+            }),
         );
         return StartupWarmReplayResult {
             cutover_offset: actual_cutover_offset,
@@ -9119,6 +9593,7 @@ fn run_startup_warm_replay(
                 let finalize = finalize_rth_close(
                     pipelines,
                     db,
+                    Some(runtime_events),
                     None,
                     Some(flow_emitter),
                     tick.timestamp_ms,
@@ -9140,9 +9615,18 @@ fn run_startup_warm_replay(
                         boundary_count += 1;
                     }
                     Err(err) => {
-                        eprintln!(
-                            "[the-desk-mcp] Warm-replay RTH close finalization failed at {:.0}: {:?}; keeping boundary pinned to RTH so the next post-close tick retries before mixed-session state can accumulate",
-                            tick.timestamp_ms, err
+                        record_runtime_event(
+                            runtime_events,
+                            Some(db),
+                            RuntimeEventLevel::Error,
+                            "session.rth_close_finalize_failed",
+                            "session",
+                            "Warm-replay RTH close finalization failed; keeping boundary pinned for retry.",
+                            serde_json::json!({
+                                "timestampMs": tick.timestamp_ms,
+                                "error": format!("{err:?}"),
+                                "source": "startup_replay",
+                            }),
                         );
                         continue;
                     }
@@ -9158,6 +9642,7 @@ fn run_startup_warm_replay(
                 prepare_for_new_session(
                     pipelines,
                     db,
+                    Some(runtime_events),
                     new_session,
                     new_segment,
                     tick.timestamp_ms,
@@ -9187,6 +9672,7 @@ fn run_startup_warm_replay(
                 prepare_for_new_session(
                     pipelines,
                     db,
+                    Some(runtime_events),
                     new_session,
                     new_segment,
                     tick.timestamp_ms,
@@ -9247,6 +9733,7 @@ fn run_startup_warm_replay(
                 rules,
                 playbook_cache,
                 db,
+                Some(runtime_events),
                 &snapshot,
                 &setup_trading_day,
                 tick.timestamp_ms,
@@ -9268,17 +9755,31 @@ fn run_startup_warm_replay(
 
     let warm_monotonicity = monotonic_guard.into_stats();
     if warm_monotonicity.has_violations() {
-        eprintln!(
-            "[the-desk-mcp] Warm replay skipped {} non-monotonic SCID ticks (duplicate={}, backward={})",
-            warm_monotonicity.skipped_non_monotonic_ticks,
-            warm_monotonicity.duplicate_timestamp_ticks,
-            warm_monotonicity.backward_timestamp_ticks
+        record_runtime_event(
+            runtime_events,
+            Some(db),
+            RuntimeEventLevel::Warn,
+            "scid.non_monotonic_skip_summary",
+            "scid",
+            "Startup warm replay skipped non-monotonic SCID ticks.",
+            serde_json::json!({
+                "skippedNonMonotonicTicks": warm_monotonicity.skipped_non_monotonic_ticks,
+                "duplicateTimestampTicks": warm_monotonicity.duplicate_timestamp_ticks,
+                "backwardTimestampTicks": warm_monotonicity.backward_timestamp_ticks,
+            }),
         );
     }
     let Some(last) = last_applied_tick else {
-        eprintln!(
-            "[the-desk-mcp] Warm replay skipped all {} candidate ticks due to non-monotonic timestamps",
-            ticks.len()
+        record_runtime_event(
+            runtime_events,
+            Some(db),
+            RuntimeEventLevel::Warn,
+            "scid.warm_replay.skipped_all",
+            "scid",
+            "Startup warm replay skipped all candidate ticks due to non-monotonic timestamps.",
+            serde_json::json!({
+                "candidateTicks": ticks.len(),
+            }),
         );
         return StartupWarmReplayResult {
             cutover_offset: actual_cutover_offset,
@@ -9329,12 +9830,22 @@ fn run_startup_warm_replay(
             .and_then(|d| d.has_session_summary_for(&last_session_date, "RTH").ok())
             .unwrap_or(true);
         if past_close && !summary_exists {
-            eprintln!(
-                "[the-desk-mcp] Warm-replay ended mid-RTH for {last_session_date} but wall clock is past 16:00 ET; finalizing close from current pipeline state"
+            record_runtime_event(
+                runtime_events,
+                Some(db),
+                RuntimeEventLevel::Warn,
+                "session.rth_close_reconcile_started",
+                "session",
+                "Warm replay ended mid-RTH after the close; reconciling close from pipeline state.",
+                serde_json::json!({
+                    "sessionDate": &last_session_date,
+                    "lastTickTimestampMs": last.timestamp_ms,
+                }),
             );
             if let Err(err) = finalize_rth_close(
                 pipelines,
                 db,
+                Some(runtime_events),
                 None,
                 Some(flow_emitter),
                 last.timestamp_ms,
@@ -9342,17 +9853,36 @@ fn run_startup_warm_replay(
                 ask,
                 contract_metadata,
             ) {
-                eprintln!(
-                    "[the-desk-mcp] Warm-replay reconciliation close finalization failed for {last_session_date}: {:?}",
-                    err
+                record_runtime_event(
+                    runtime_events,
+                    Some(db),
+                    RuntimeEventLevel::Error,
+                    "session.rth_close_finalize_failed",
+                    "session",
+                    "Warm-replay reconciliation close finalization failed.",
+                    serde_json::json!({
+                        "sessionDate": &last_session_date,
+                        "error": format!("{err:?}"),
+                        "source": "startup_replay_reconciliation",
+                    }),
                 );
             }
         }
     }
 
-    eprintln!(
-        "[the-desk-mcp] Backfill complete: {} ticks, {} session boundaries, last price {:.2}",
-        applied_tick_count, boundary_count, last.price
+    record_runtime_event(
+        runtime_events,
+        Some(db),
+        RuntimeEventLevel::Info,
+        "scid.warm_replay.completed",
+        "scid",
+        "Startup warm replay completed.",
+        serde_json::json!({
+            "appliedTicks": applied_tick_count,
+            "sessionBoundaries": boundary_count,
+            "lastPrice": last.price,
+            "cutoverOffset": actual_cutover_offset,
+        }),
     );
 
     StartupWarmReplayResult {
@@ -9363,8 +9893,35 @@ fn run_startup_warm_replay(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let logging_config = load_logging_config();
+    let mut effective_logging_config = logging_config.clone();
+    let logging_runtime = match init_logging(&logging_config) {
+        Ok(runtime) => runtime,
+        Err(primary_err) => {
+            let fallback = the_desk_backend::observability::LoggingConfig::stderr_only();
+            match init_logging(&fallback) {
+                Ok(runtime) => {
+                    effective_logging_config = fallback;
+                    eprintln!(
+                        "[the-desk-mcp] logging initialization degraded to stderr: {primary_err}"
+                    );
+                    runtime
+                }
+                Err(fallback_err) => {
+                    effective_logging_config = fallback;
+                    eprintln!(
+                        "[the-desk-mcp] logging initialization disabled: primary={primary_err}; fallback={fallback_err}"
+                    );
+                    the_desk_backend::observability::LoggingRuntime::disabled()
+                }
+            }
+        }
+    };
+    let runtime_events = Arc::new(RuntimeEventStore::new(&effective_logging_config));
+
     let db_path = data_dir().join("data.db");
     let db = Database::open(&db_path.to_string_lossy())?;
+    prune_runtime_events_if_enabled(runtime_events.as_ref(), &db);
     let config = load_feed_config();
     let contract_metadata = resolve_contract_metadata(&config);
 
@@ -9420,13 +9977,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         pipelines
             .levels
             .set_prior_day_contract_context(root_symbol, None, contract_symbol);
-        eprintln!(
-            "[the-desk-mcp] rollover status={:?} action={:?} trust={:?} active_contract={} lookup_date={} event=startup_prior_levels_cleared",
-            startup_rollover_status.status,
-            startup_rollover_status.agent_action,
-            startup_rollover_status.prior_reference_trust,
-            startup_rollover_status.active_contract_symbol,
-            today
+        record_runtime_event(
+            &runtime_events,
+            None,
+            RuntimeEventLevel::Warn,
+            "rollover.startup_prior_levels_cleared",
+            "rollover",
+            "Startup prior levels were cleared because no authoritative prior reference was available.",
+            serde_json::json!({
+                "status": startup_rollover_status.status,
+                "agentAction": startup_rollover_status.agent_action,
+                "priorReferenceTrust": startup_rollover_status.prior_reference_trust,
+                "activeContract": startup_rollover_status.active_contract_symbol,
+                "lookupDate": today,
+            }),
         );
     }
 
@@ -9437,7 +10001,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create the server immediately so stdio is ready before backfill starts.
     // The startup backfill runs in a background task and populates pipeline
     // state concurrently with tool serving.
-    let server = TheDeskMcp::new(db, pipelines, db_path.to_string_lossy().to_string());
+    let server = TheDeskMcp::with_runtime_events(
+        db,
+        pipelines,
+        db_path.to_string_lossy().to_string(),
+        Arc::clone(&runtime_events),
+    );
+    spawn_runtime_event_pruner(Arc::clone(&server.runtime_events), Arc::clone(&server.db));
+    // Keep non-blocking file appenders alive for the lifetime of the MCP server.
+    let _ = &logging_runtime;
+    record_runtime_event(
+        &server.runtime_events,
+        Some(&server.db),
+        RuntimeEventLevel::Info,
+        "mcp.startup",
+        "mcp",
+        "The Desk MCP server initialized.",
+        serde_json::json!({
+            "dbPath": db_path.to_string_lossy(),
+            "scidPath": reader.path().display().to_string(),
+            "scidAvailable": scid_available,
+            "contractSymbol": contract_metadata.contract_symbol,
+            "rootSymbol": contract_metadata.root_symbol,
+        }),
+    );
     server.hydrate_playbook_runtime_cache().map_err(|e| {
         std::io::Error::other(format!(
             "failed to hydrate playbook runtime cache from SQLite: {e}"
@@ -9455,6 +10042,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let rules_startup = Arc::clone(&server.rules);
         let playbook_cache_startup = Arc::clone(&server.playbook_cache);
         let db_startup = Arc::clone(&server.db);
+        let runtime_events_startup = Arc::clone(&server.runtime_events);
         let reader_startup = reader.clone();
         let contract_metadata_startup = contract_metadata.clone();
         let feed_rt_startup = (*server.feed_runtime).clone();
@@ -9462,15 +10050,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         tokio::spawn(async move {
             let fallback_cutover_offset = safe_scid_data_offset(&reader_startup);
+            let db_for_replay = Arc::clone(&db_startup);
+            let runtime_events_for_replay = Arc::clone(&runtime_events_startup);
             let startup = tokio::task::spawn_blocking(move || {
                 let since = globex_open_ms(2);
                 let requested_cutover_offset = reader_startup
                     .current_aligned_end_offset()
                     .unwrap_or(safe_scid_data_offset(&reader_startup));
-                eprintln!(
-                    "[the-desk-mcp] Backfilling from {} up to cutover offset {} ...",
-                    reader_startup.path().display(),
-                    requested_cutover_offset
+                record_runtime_event(
+                    &runtime_events_for_replay,
+                    Some(&db_for_replay),
+                    RuntimeEventLevel::Info,
+                    "scid.warm_replay.started",
+                    "scid",
+                    "Startup warm replay started.",
+                    serde_json::json!({
+                        "scidPath": reader_startup.path().display().to_string(),
+                        "sinceMs": since,
+                        "requestedCutoverOffset": requested_cutover_offset,
+                    }),
                 );
                 run_startup_warm_replay(
                     &reader_startup,
@@ -9478,7 +10076,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &flow_emitter_startup,
                     &rules_startup,
                     &playbook_cache_startup,
-                    &db_startup,
+                    &db_for_replay,
+                    &runtime_events_for_replay,
                     &feed_rt_startup,
                     since,
                     requested_cutover_offset,
@@ -9487,15 +10086,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             })
             .await
             .unwrap_or_else(|err| {
-                eprintln!("[the-desk-mcp] startup warm replay task failed: {err}");
+                record_runtime_event(
+                    &runtime_events_startup,
+                    Some(&db_startup),
+                    RuntimeEventLevel::Error,
+                    "scid.warm_replay.failed",
+                    "scid",
+                    "Startup warm replay task failed to join.",
+                    serde_json::json!({
+                        "error": err.to_string(),
+                        "fallbackCutoverOffset": fallback_cutover_offset,
+                    }),
+                );
                 StartupWarmReplayResult {
                     cutover_offset: fallback_cutover_offset,
                     applied_tick_count: 0,
                 }
             });
-            eprintln!(
-                "[the-desk-mcp] Startup SCID cutover: offset={}, warm_ticks_applied={}",
-                startup.cutover_offset, startup.applied_tick_count
+            record_runtime_event(
+                &runtime_events_startup,
+                Some(&db_startup),
+                RuntimeEventLevel::Info,
+                "scid.startup_cutover",
+                "scid",
+                "Startup SCID cutover selected.",
+                serde_json::json!({
+                    "cutoverOffset": startup.cutover_offset,
+                    "warmTicksApplied": startup.applied_tick_count,
+                }),
             );
             feed_rt_startup_status
                 .rules_warm_replay_complete
@@ -9503,9 +10121,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let _ = startup_cutover_tx.send(startup.cutover_offset);
         });
     } else {
-        eprintln!(
-            "[the-desk-mcp] SCID file not found: {}",
-            reader.path().display()
+        record_runtime_event(
+            &server.runtime_events,
+            Some(&server.db),
+            RuntimeEventLevel::Warn,
+            "scid.file_missing",
+            "scid",
+            "Configured SCID file was not found.",
+            serde_json::json!({
+                "scidPath": reader.path().display().to_string(),
+            }),
         );
         server
             .feed_runtime
@@ -9524,6 +10149,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let last_bid_bg = Arc::clone(&server.last_bid);
         let last_ask_bg = Arc::clone(&server.last_ask);
         let db_bg = Arc::clone(&server.db);
+        let runtime_events_bg = Arc::clone(&server.runtime_events);
         let poll_ms = config.flush_poll_ms;
         let price_scale = config.price_scale;
         let reader_path = reader.path().to_path_buf();
@@ -9542,6 +10168,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut last_integrity_check =
                 std::time::Instant::now() - std::time::Duration::from_secs(30);
             let mut monotonic_guard = MonotonicTickGuard::default();
+            let mut last_reported_non_monotonic_skips = 0u64;
+            let mut last_non_monotonic_summary_wall_ms = 0u64;
             // Seed current session and segment from the system clock so we can detect boundaries.
             let now_et = et_minutes_from_timestamp(chrono::Utc::now().timestamp_millis() as f64);
             let mut current_session = now_et.map(classify_session).unwrap_or(SessionType::Unknown);
@@ -9590,11 +10218,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 {
                     Ok(Ok(step)) => step,
                     Ok(Err(err)) => {
-                        eprintln!("[the-desk-mcp] SCID poll step error: {err}");
+                        record_runtime_event(
+                            &runtime_events_bg,
+                            Some(&db_bg),
+                            RuntimeEventLevel::Error,
+                            "scid.poll_failed",
+                            "scid",
+                            "SCID poll step failed.",
+                            serde_json::json!({ "error": err.to_string(), "offset": offset }),
+                        );
                         continue;
                     }
                     Err(err) => {
-                        eprintln!("[the-desk-mcp] SCID poll task failed: {err}");
+                        record_runtime_event(
+                            &runtime_events_bg,
+                            Some(&db_bg),
+                            RuntimeEventLevel::Error,
+                            "scid.poll_failed",
+                            "scid",
+                            "SCID poll task failed to join.",
+                            serde_json::json!({ "error": err.to_string(), "offset": offset }),
+                        );
                         continue;
                     }
                 };
@@ -9615,14 +10259,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         feed_rt_bg
                             .scid_last_shrink_len
                             .store(step.file_len, Ordering::Release);
-                        eprintln!(
-                            "[the-desk-mcp] SCID file shrank below tail offset; reset offset to {}",
-                            step.start_offset
+                        record_runtime_event(
+                            &runtime_events_bg,
+                            Some(&db_bg),
+                            RuntimeEventLevel::Warn,
+                            "scid.tail_reset",
+                            "scid",
+                            "SCID file shrank below tail offset; reset tail offset.",
+                            serde_json::json!({
+                                "startOffset": step.start_offset,
+                                "fileLen": step.file_len,
+                            }),
                         );
                     } else {
-                        eprintln!(
-                            "[the-desk-mcp] SCID tail offset was not record-aligned; realigned to {}",
-                            step.start_offset
+                        record_runtime_event(
+                            &runtime_events_bg,
+                            Some(&db_bg),
+                            RuntimeEventLevel::Warn,
+                            "scid.tail_realign",
+                            "scid",
+                            "SCID tail offset was not record-aligned; realigned.",
+                            serde_json::json!({
+                                "startOffset": step.start_offset,
+                                "fileLen": step.file_len,
+                            }),
                         );
                     }
                 }
@@ -9660,6 +10320,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             match finalize_rth_close(
                                 &pipelines_bg,
                                 &db_bg,
+                                Some(&runtime_events_bg),
                                 Some(&detector_bg),
                                 Some(&flow_emitter_bg),
                                 tick.timestamp_ms,
@@ -9668,15 +10329,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 &contract_metadata,
                             ) {
                                 Ok(_) => {
-                                    eprintln!(
-                                        "[the-desk-mcp] Live boundary: {:?} → {:?} (RTH close finalized)",
-                                        current_session, new_session
+                                    record_runtime_event(
+                                        &runtime_events_bg,
+                                        Some(&db_bg),
+                                        RuntimeEventLevel::Info,
+                                        "session.boundary",
+                                        "session",
+                                        "Live session boundary crossed after RTH close finalization.",
+                                        serde_json::json!({
+                                            "from": format!("{:?}", current_session),
+                                            "to": format!("{:?}", new_session),
+                                            "timestampMs": tick.timestamp_ms,
+                                            "rthCloseFinalized": true,
+                                        }),
                                     );
                                 }
                                 Err(err) => {
-                                    eprintln!(
-                                        "[the-desk-mcp] Live RTH close finalization failed at {:.0}: {:?}; skipping this post-close tick so the next one retries before mixed-session state can accumulate",
-                                        tick.timestamp_ms, err
+                                    record_runtime_event(
+                                        &runtime_events_bg,
+                                        Some(&db_bg),
+                                        RuntimeEventLevel::Error,
+                                        "session.rth_close_finalize_failed",
+                                        "session",
+                                        "Live RTH close finalization failed; skipping post-close tick so the next tick retries.",
+                                        serde_json::json!({
+                                            "timestampMs": tick.timestamp_ms,
+                                            "error": format!("{err:?}"),
+                                            "source": "live_tail",
+                                        }),
                                     );
                                     continue;
                                 }
@@ -9690,6 +10370,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             prepare_for_new_session(
                                 &pipelines_bg,
                                 &db_bg,
+                                Some(&runtime_events_bg),
                                 new_session,
                                 new_segment,
                                 tick.timestamp_ms,
@@ -9701,9 +10382,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             if let Ok(mut fe) = flow_emitter_bg.lock() {
                                 fe.reset();
                             }
-                            eprintln!(
-                                "[the-desk-mcp] Live boundary: {:?} → {:?}",
-                                current_session, new_session
+                            record_runtime_event(
+                                &runtime_events_bg,
+                                Some(&db_bg),
+                                RuntimeEventLevel::Info,
+                                "session.boundary",
+                                "session",
+                                "Live session boundary crossed.",
+                                serde_json::json!({
+                                    "from": format!("{:?}", current_session),
+                                    "to": format!("{:?}", new_session),
+                                    "timestampMs": tick.timestamp_ms,
+                                }),
                             );
                         } else if session_changed
                             && current_session == SessionType::Unknown
@@ -9717,6 +10407,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             prepare_for_new_session(
                                 &pipelines_bg,
                                 &db_bg,
+                                Some(&runtime_events_bg),
                                 new_session,
                                 new_segment,
                                 tick.timestamp_ms,
@@ -9728,7 +10419,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             if let Ok(mut fe) = flow_emitter_bg.lock() {
                                 fe.reset();
                             }
-                            eprintln!("[the-desk-mcp] Live boundary: Unknown → {:?}", new_session);
+                            record_runtime_event(
+                                &runtime_events_bg,
+                                Some(&db_bg),
+                                RuntimeEventLevel::Info,
+                                "session.boundary",
+                                "session",
+                                "Live session boundary crossed from Unknown.",
+                                serde_json::json!({
+                                    "from": "Unknown",
+                                    "to": format!("{:?}", new_session),
+                                    "timestampMs": tick.timestamp_ms,
+                                }),
+                            );
                         } else if !session_changed
                             && new_segment != current_delta_segment
                             && current_delta_segment != DeltaSegment::Unknown
@@ -9736,9 +10439,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         {
                             if let Ok(mut p) = pipelines_bg.lock() {
                                 p.reset_segment(new_segment);
-                                eprintln!(
-                                    "[the-desk-mcp] Segment boundary: {:?} → {:?}",
-                                    current_delta_segment, new_segment
+                                record_runtime_event(
+                                    &runtime_events_bg,
+                                    Some(&db_bg),
+                                    RuntimeEventLevel::Info,
+                                    "session.segment_boundary",
+                                    "session",
+                                    "Live delta segment boundary crossed.",
+                                    serde_json::json!({
+                                        "from": format!("{:?}", current_delta_segment),
+                                        "to": format!("{:?}", new_segment),
+                                        "timestampMs": tick.timestamp_ms,
+                                    }),
                                 );
                             }
                         }
@@ -9759,6 +10471,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         &rules_bg,
                         &playbook_cache_bg,
                         &db_bg,
+                        &runtime_events_bg,
                         &last_bid_bg,
                         &last_ask_bg,
                         tick.price,
@@ -9803,6 +10516,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ticks_this_poll += 1;
                 }
 
+                let monotonicity = feed_rt_bg.monotonicity_snapshot();
+                let new_non_monotonic_skips = monotonicity
+                    .skipped_non_monotonic_ticks
+                    .saturating_sub(last_reported_non_monotonic_skips);
+                let now_wall_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+                if new_non_monotonic_skips > 0
+                    && (last_non_monotonic_summary_wall_ms == 0
+                        || now_wall_ms.saturating_sub(last_non_monotonic_summary_wall_ms) >= 30_000)
+                {
+                    record_runtime_event(
+                        &runtime_events_bg,
+                        Some(&db_bg),
+                        RuntimeEventLevel::Warn,
+                        "scid.non_monotonic_skip_summary",
+                        "scid",
+                        "Live tail skipped non-monotonic SCID ticks.",
+                        serde_json::json!({
+                            "newSkippedNonMonotonicTicks": new_non_monotonic_skips,
+                            "skippedNonMonotonicTicks": monotonicity.skipped_non_monotonic_ticks,
+                            "duplicateTimestampTicks": monotonicity.duplicate_timestamp_ticks,
+                            "backwardTimestampTicks": monotonicity.backward_timestamp_ticks,
+                            "lastNonMonotonicTimestampMs": monotonicity.last_non_monotonic_timestamp_ms,
+                        }),
+                    );
+                    last_reported_non_monotonic_skips = monotonicity.skipped_non_monotonic_ticks;
+                    last_non_monotonic_summary_wall_ms = now_wall_ms;
+                }
+
                 // Flush remaining events
                 if !event_buffer.is_empty() {
                     if let Ok(db) = db_bg.lock() {
@@ -9845,6 +10586,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let last_bid_depth = Arc::clone(&server.last_bid);
         let last_ask_depth = Arc::clone(&server.last_ask);
         let feed_depth_rt = Arc::clone(&server.feed_runtime);
+        let runtime_events_depth = Arc::clone(&server.runtime_events);
 
         tokio::spawn(async move {
             let poll = Duration::from_millis(1_000);
@@ -9862,7 +10604,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let (next_state, work) = match step {
                     Ok(output) => output,
                     Err(err) => {
-                        eprintln!("[the-desk-mcp] Depth poll task failed: {err}");
+                        record_runtime_event(
+                            &runtime_events_depth,
+                            Some(&db_depth),
+                            RuntimeEventLevel::Error,
+                            "depth.poll_failed",
+                            "depth",
+                            "Depth poll task failed to join.",
+                            serde_json::json!({ "error": err.to_string() }),
+                        );
                         state = DepthPollWorkerState::default();
                         sleep(poll).await;
                         continue;
@@ -9883,7 +10633,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     Ok(None) => {}
                     Err(err) => {
-                        eprintln!("[the-desk-mcp] Depth worker error: {err}");
+                        record_runtime_event(
+                            &runtime_events_depth,
+                            Some(&db_depth),
+                            RuntimeEventLevel::Error,
+                            "depth.worker_failed",
+                            "depth",
+                            "Depth worker failed.",
+                            serde_json::json!({ "error": err.to_string() }),
+                        );
                     }
                 }
 
@@ -9982,6 +10740,64 @@ mod tests {
             depth_file_count: 1,
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn get_runtime_events_returns_recent_and_persisted_events() {
+        let server = test_server();
+        record_runtime_event(
+            &server.runtime_events,
+            Some(&server.db),
+            RuntimeEventLevel::Warn,
+            "scid.tail_reset",
+            "scid",
+            "test tail reset",
+            serde_json::json!({ "offset": 512 }),
+        );
+
+        let payload = parse_text_tool_result(
+            server
+                .get_runtime_events(Parameters(RuntimeEventsParams {
+                    limit: Some(10),
+                    min_level: Some("warn".to_string()),
+                    category: Some("scid".to_string()),
+                    include_persisted: Some(true),
+                    ..Default::default()
+                }))
+                .await
+                .expect("runtime events"),
+        );
+        assert_eq!(payload["recentCount"].as_u64(), Some(1));
+        assert_eq!(payload["persistedCount"].as_u64(), Some(1));
+        let events = payload["events"].as_array().expect("events array");
+        assert!(events
+            .iter()
+            .any(|event| event["eventName"].as_str() == Some("scid.tail_reset")));
+    }
+
+    #[test]
+    fn rollover_runtime_event_does_not_relock_held_db_mutex() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let server = test_server();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let db = server.db.lock().expect("db lock");
+            let contract = rollover_contract_metadata("NQM26");
+            let result = server.rollover_status_for_date(
+                &db,
+                &contract,
+                Some(&test_contract_metadata()),
+                "2026-03-06",
+                None,
+            );
+            let _ = tx.send(result.is_ok());
+        });
+
+        assert!(rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("no deadlock"));
     }
 
     fn rollover_contract_metadata(
@@ -10816,6 +11632,7 @@ mod tests {
             &server.rules,
             &server.playbook_cache,
             &server.db,
+            &server.runtime_events,
             &server.feed_runtime,
             since,
             cutover,
@@ -10833,6 +11650,7 @@ mod tests {
                 &server.rules,
                 &server.playbook_cache,
                 &server.db,
+                &server.runtime_events,
                 &server.last_bid,
                 &server.last_ask,
                 tick.price,
@@ -10885,6 +11703,7 @@ mod tests {
             &server.rules,
             &server.playbook_cache,
             &server.db,
+            &server.runtime_events,
             &server.feed_runtime,
             since,
             cutover,
@@ -10918,6 +11737,7 @@ mod tests {
             &server.rules,
             &server.playbook_cache,
             &server.db,
+            &server.runtime_events,
             &server.feed_runtime,
             base_ts_ms - 10.0,
             reader.current_aligned_end_offset().expect("cutover"),
@@ -11116,6 +11936,7 @@ mod tests {
             &server.rules,
             &server.playbook_cache,
             &server.db,
+            &server.runtime_events,
             &server.last_bid,
             &server.last_ask,
             21_000.0,
@@ -11166,6 +11987,7 @@ mod tests {
             &server.rules,
             &server.playbook_cache,
             &server.db,
+            &server.runtime_events,
             &server.last_bid,
             &server.last_ask,
             21_000.0,
@@ -11240,6 +12062,7 @@ mod tests {
             &server.rules,
             &server.playbook_cache,
             &server.db,
+            &server.runtime_events,
             &server.last_bid,
             &server.last_ask,
             21_000.0,
@@ -11315,6 +12138,7 @@ mod tests {
             &server.rules,
             &server.playbook_cache,
             &server.db,
+            &server.runtime_events,
             &server.last_bid,
             &server.last_ask,
             21_000.0,
@@ -11332,6 +12156,7 @@ mod tests {
             &server.rules,
             &server.playbook_cache,
             &server.db,
+            &server.runtime_events,
             &server.last_bid,
             &server.last_ask,
             21_000.25,
@@ -11393,6 +12218,7 @@ mod tests {
             &server.rules,
             &server.playbook_cache,
             &server.db,
+            &server.runtime_events,
             &server.feed_runtime,
             since,
             cutover,
@@ -11466,6 +12292,7 @@ mod tests {
             &server.rules,
             &server.playbook_cache,
             &server.db,
+            &server.runtime_events,
             &server.last_bid,
             &server.last_ask,
             21_000.0,
@@ -11514,6 +12341,7 @@ mod tests {
             &server.rules,
             &server.playbook_cache,
             &server.db,
+            &server.runtime_events,
             &server.last_bid,
             &server.last_ask,
             21_000.0,
@@ -11680,6 +12508,7 @@ mod tests {
             &server.db,
             None,
             None,
+            None,
             boundary_ts,
             21_011.75,
             21_012.25,
@@ -11726,6 +12555,7 @@ mod tests {
             &server.db,
             None,
             None,
+            None,
             boundary_ts,
             21_009.75,
             21_010.25,
@@ -11745,6 +12575,7 @@ mod tests {
         let second = finalize_rth_close(
             &server.pipelines,
             &server.db,
+            None,
             None,
             None,
             boundary_ts,
@@ -11783,6 +12614,7 @@ mod tests {
         let _ = finalize_rth_close(
             &server.pipelines,
             &server.db,
+            None,
             None,
             None,
             rth_ts(16, 0, 1),
@@ -11886,6 +12718,7 @@ mod tests {
         prepare_for_new_session(
             &server.pipelines,
             &server.db,
+            None,
             SessionType::Rth,
             DeltaSegment::Rth,
             rth_ts(9, 30, 0),

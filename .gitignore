@@ -2,6 +2,7 @@
 node_modules/
 target/
 target_alt/
+target_verify/
 
 # Build output
 dist/

@@ -4,6 +4,7 @@ use crate::memory::{
     MemoryFollowupQuery, MemoryFollowupRecord, MemoryMaintenanceState, INSIGHT_DISMISSED,
     INSIGHT_PINNED, INSIGHT_SUPERSEDED,
 };
+use crate::observability::{RuntimeEvent, RuntimeEventFilter, RuntimeEventLevel};
 use crate::pipelines::event_detector::MarketEvent;
 use crate::risk::RiskState;
 use crate::rules::{SetupDefinition, SetupReadiness, SetupState, SetupTransition};
@@ -76,6 +77,23 @@ pub struct SessionEventRecord {
     pub data: serde_json::Value,
     pub session_id: Option<String>,
     pub timestamp: Option<f64>,
+}
+
+fn decode_runtime_event_row(row: &Row<'_>) -> rusqlite::Result<RuntimeEvent> {
+    let level: String = row.get(2)?;
+    let fields_json: String = row.get(9)?;
+    Ok(RuntimeEvent {
+        id: Some(row.get(0)?),
+        emitted_at_ms: row.get(1)?,
+        level: level.parse().unwrap_or(RuntimeEventLevel::Info),
+        event_name: row.get(3)?,
+        category: row.get(4)?,
+        message: row.get(5)?,
+        session_date: row.get(6)?,
+        root_symbol: row.get(7)?,
+        contract_symbol: row.get(8)?,
+        fields: serde_json::from_str(&fields_json).unwrap_or_else(|_| serde_json::json!({})),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -911,6 +929,9 @@ impl Database {
         }
         if version < 22 {
             self.migrate_v22()?;
+        }
+        if version < 23 {
+            self.migrate_v23()?;
         }
 
         Ok(())
@@ -2051,6 +2072,38 @@ impl Database {
               ON prior_day_levels(root_symbol, date);
 
             UPDATE schema_version SET version = 22;
+            ",
+        )?;
+        Ok(())
+    }
+
+    /// V23: persist low-volume runtime diagnostics for MCP post-mortems.
+    fn migrate_v23(&self) -> Result<(), DbError> {
+        self.conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS runtime_events (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              emitted_at_ms REAL NOT NULL,
+              level TEXT NOT NULL,
+              event_name TEXT NOT NULL,
+              category TEXT NOT NULL,
+              message TEXT NOT NULL,
+              session_date TEXT NULL,
+              root_symbol TEXT NULL,
+              contract_symbol TEXT NULL,
+              fields_json TEXT NOT NULL DEFAULT '{}'
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_runtime_events_emitted
+              ON runtime_events(emitted_at_ms DESC);
+            CREATE INDEX IF NOT EXISTS idx_runtime_events_name
+              ON runtime_events(event_name, emitted_at_ms DESC);
+            CREATE INDEX IF NOT EXISTS idx_runtime_events_level
+              ON runtime_events(level, emitted_at_ms DESC);
+            CREATE INDEX IF NOT EXISTS idx_runtime_events_category
+              ON runtime_events(category, emitted_at_ms DESC);
+
+            UPDATE schema_version SET version = 23;
             ",
         )?;
         Ok(())
@@ -5250,6 +5303,101 @@ impl Database {
         Ok(())
     }
 
+    /// Persist a low-volume runtime diagnostic event for MCP post-mortems.
+    pub fn insert_runtime_event(&self, event: &RuntimeEvent) -> Result<i64, DbError> {
+        self.conn.execute(
+            "INSERT INTO runtime_events
+             (emitted_at_ms, level, event_name, category, message, session_date, root_symbol, contract_symbol, fields_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                event.emitted_at_ms,
+                event.level.as_str(),
+                &event.event_name,
+                &event.category,
+                &event.message,
+                event.session_date.as_deref(),
+                event.root_symbol.as_deref(),
+                event.contract_symbol.as_deref(),
+                serde_json::to_string(&event.fields)?,
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Query persisted runtime diagnostic events newest-first.
+    pub fn query_runtime_events(
+        &self,
+        filter: &RuntimeEventFilter,
+    ) -> Result<Vec<RuntimeEvent>, DbError> {
+        let limit = filter.limit.clamp(1, 500) as i64;
+        let level = filter.level.map(|level| level.as_str().to_string());
+        let min_level_rank = filter.min_level.map(|level| level.rank() as i64);
+        let mut stmt = self.conn.prepare(
+            "SELECT id, emitted_at_ms, level, event_name, category, message,
+                    session_date, root_symbol, contract_symbol, fields_json
+             FROM runtime_events
+             WHERE (?1 IS NULL OR emitted_at_ms >= ?1)
+               AND (?2 IS NULL OR level = ?2)
+               AND (?3 IS NULL OR CASE level
+                    WHEN 'trace' THEN 0
+                    WHEN 'debug' THEN 1
+                    WHEN 'info' THEN 2
+                    WHEN 'warn' THEN 3
+                    WHEN 'error' THEN 4
+                    ELSE 2
+                 END >= ?3)
+               AND (?4 IS NULL OR category = ?4)
+               AND (?5 IS NULL OR event_name = ?5)
+             ORDER BY emitted_at_ms DESC
+             LIMIT ?6",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                filter.since_ms,
+                level.as_deref(),
+                min_level_rank,
+                filter.category.as_deref(),
+                filter.event_name.as_deref(),
+                limit,
+            ],
+            decode_runtime_event_row,
+        )?;
+        let mut events = Vec::new();
+        for row in rows {
+            events.push(row?);
+        }
+        Ok(events)
+    }
+
+    /// Prune persisted runtime diagnostics by age and total row count.
+    pub fn prune_runtime_events(
+        &self,
+        retention_days: u32,
+        max_rows: usize,
+    ) -> Result<usize, DbError> {
+        let mut deleted = 0usize;
+        if retention_days > 0 {
+            let cutoff_ms = chrono::Utc::now().timestamp_millis() as f64
+                - (retention_days as f64 * 86_400_000.0);
+            deleted += self.conn.execute(
+                "DELETE FROM runtime_events WHERE emitted_at_ms < ?1",
+                params![cutoff_ms],
+            )?;
+        }
+        if max_rows > 0 {
+            deleted += self.conn.execute(
+                "DELETE FROM runtime_events
+                 WHERE id IN (
+                   SELECT id FROM runtime_events
+                   ORDER BY emitted_at_ms DESC
+                   LIMIT -1 OFFSET ?1
+                 )",
+                params![max_rows as i64],
+            )?;
+        }
+        Ok(deleted)
+    }
+
     /// Batch-insert raw ticks inside a single transaction.
     pub fn insert_raw_ticks_batch(&self, ticks: &[RawTickBatchRow]) -> Result<(), DbError> {
         let tx = self.conn.unchecked_transaction()?;
@@ -7499,6 +7647,48 @@ mod tests {
     fn test_db() -> Database {
         let file = NamedTempFile::new().expect("temp");
         Database::open(file.path().to_string_lossy().as_ref()).expect("open")
+    }
+
+    #[test]
+    fn runtime_events_round_trip_query_and_prune() {
+        let db = test_db();
+        let mut event = RuntimeEvent::new(
+            RuntimeEventLevel::Warn,
+            "scid.tail_reset",
+            "scid",
+            "tail reset",
+            serde_json::json!({ "offset": 128 }),
+        );
+        event.emitted_at_ms = 1_700_000_000_000.0;
+        event.session_date = Some("2026-03-05".to_string());
+        event.root_symbol = Some("NQ".to_string());
+        event.contract_symbol = Some("NQH26.CME".to_string());
+
+        let id = db.insert_runtime_event(&event).expect("insert event");
+        assert!(id > 0);
+
+        let rows = db
+            .query_runtime_events(&RuntimeEventFilter {
+                min_level: Some(RuntimeEventLevel::Warn),
+                category: Some("scid".to_string()),
+                event_name: Some("scid.tail_reset".to_string()),
+                limit: 10,
+                ..RuntimeEventFilter::default()
+            })
+            .expect("query events");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].fields["offset"].as_i64(), Some(128));
+        assert_eq!(rows[0].contract_symbol.as_deref(), Some("NQH26.CME"));
+
+        let deleted = db.prune_runtime_events(1, 10).expect("prune old rows");
+        assert_eq!(deleted, 1);
+        assert!(db
+            .query_runtime_events(&RuntimeEventFilter {
+                limit: 10,
+                ..RuntimeEventFilter::default()
+            })
+            .expect("query empty")
+            .is_empty());
     }
 
     #[test]

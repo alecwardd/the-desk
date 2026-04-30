@@ -388,3 +388,27 @@ Add `the-desk-storage` as the operator-facing maintenance binary for local stora
 - Old raw ticks can be moved out of SQLite while preserving session summaries, market events, signal outcomes, journal/risk records, and research metadata.
 - Full SQLite compaction remains an explicit outside-market-hours operation because large `VACUUM` runs can take hours and temporarily require substantial free space.
 - The maintenance command is local-only and does not change the core architecture: Sierra `.scid` remains the canonical raw market-data source, deterministic Rust pipelines remain Layer 1, and MCP tools continue to expose structured data only.
+
+---
+
+### ADR-016: MCP runtime observability is structured, bounded, and queryable
+
+**Date:** 2026-04-30
+**Status:** Decided
+
+**Context:** The MCP server had ad-hoc stderr diagnostics for SCID tailing, startup replay, session boundaries, historical jobs, depth polling, and setup lifecycle changes. Those messages were hard to filter during post-mortems and not directly available to agents.
+
+**Decision:** Runtime observability uses three coordinated surfaces:
+
+1. Structured JSON runtime events emitted to stderr and/or daily log files, with stdout reserved exclusively for MCP protocol traffic.
+2. A bounded in-memory runtime event buffer with per-event-name suppression to keep flapping errors from evicting the original cause too quickly.
+3. A persisted `runtime_events` SQLite table exposed through `get_runtime_events` for agent-readable post-mortems.
+
+Runtime event persistence is insert-only at emit sites. Retention pruning runs at startup and on a periodic background timer, not during hot feed processing. File logging uses daily rotation and startup-time retention cleanup. Logging initialization is non-fatal: if file logging cannot be initialized, the server falls back to stderr or disables tracing while continuing to serve MCP.
+
+**Alternatives considered:**
+- Continue using `eprintln!` strings — rejected because agents and post-mortems need stable event names and fields.
+- Persist every runtime event and prune per insert — rejected because it adds redundant SQLite deletes near live processing.
+- Send logs to stdout — rejected because MCP stdio owns stdout and non-protocol bytes can corrupt the client connection.
+
+**Consequences:** Operators can query recent runtime issues with `get_runtime_events` and filter by `level`, `minLevel`, `category`, or `eventName`. JSON log payloads expose flattened fields for tools like `jq`, Loki, or Datadog. Event emission must remain low-noise and must not log raw tick streams.

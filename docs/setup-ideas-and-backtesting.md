@@ -89,10 +89,6 @@ That said, the project is in the zone where the next order of improvement is not
 
 ### Weakest points that need addressing
 
-#### 7. Structured logging is ad-hoc
-
-Mix of `println!` and `tracing`. For a professional tool you want JSON-structured logs with stable field names so a post-mortem on yesterday's bad fill can be filtered cleanly. **Fix:** `tracing-subscriber` with JSON layer, standardize event names (`scid.tick`, `pipeline.contention`, `setup.transition`, `event.detected`).
-
 #### 8. No end-to-end session replay test
 
 All pipeline tests are unit level. A multi-day `.scid` golden-file test that asserts "these events at these timestamps with these magnitudes" would catch drift from future refactors — which is the single biggest silent risk to a system like this over 12–24 months.

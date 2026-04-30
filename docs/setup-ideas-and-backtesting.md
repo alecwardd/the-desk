@@ -89,10 +89,6 @@ That said, the project is in the zone where the next order of improvement is not
 
 ### Weakest points that need addressing
 
-#### 6. Research query SQL not audited for statistical soundness
-
-[src/research/mod.rs](../src/research/mod.rs) does frequency / conditional / distribution queries — but the SQL itself needs a dedicated read. Off-by-one in percentile edges, incorrect GROUP BY over session boundaries, or double-counting overlapping events would silently poison the statistics playbooks are built on. **Fix:** dedicated review pass with golden-file tests (known input → known output percentiles).
-
 #### 7. Structured logging is ad-hoc
 
 Mix of `println!` and `tracing`. For a professional tool you want JSON-structured logs with stable field names so a post-mortem on yesterday's bad fill can be filtered cleanly. **Fix:** `tracing-subscriber` with JSON layer, standardize event names (`scid.tick`, `pipeline.contention`, `setup.transition`, `event.detected`).

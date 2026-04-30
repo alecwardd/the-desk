@@ -89,10 +89,6 @@ That said, the project is in the zone where the next order of improvement is not
 
 ### Weakest points that need addressing
 
-#### 5. Contract rollover awareness
-
-**Resolved in rollover hardening.** The MCP surface now includes `get_contract_rollover_status` / `validate_contract_rollover`, `get_pre_session_briefing` carries `rolloverStatus`, and deterministic session prep clears prior-day references unless the current contract has an authoritative same-contract prior row. Remaining long-term enhancement: optional back-adjusted continuous-contract references with explicit adjustment source/confidence.
-
 #### 6. Research query SQL not audited for statistical soundness
 
 [src/research/mod.rs](../src/research/mod.rs) does frequency / conditional / distribution queries — but the SQL itself needs a dedicated read. Off-by-one in percentile edges, incorrect GROUP BY over session boundaries, or double-counting overlapping events would silently poison the statistics playbooks are built on. **Fix:** dedicated review pass with golden-file tests (known input → known output percentiles).

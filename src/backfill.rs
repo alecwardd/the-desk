@@ -4,6 +4,7 @@ use crate::feed::scid_reader::{ScanControl, ScidReader};
 use crate::feed::TradeSide;
 use crate::feed::{load_feed_config, resolve_contract_metadata};
 use crate::pipelines::{EventDetector, FlowEventEmitter, MarketState, PipelineEngine};
+use crate::rollover::{build_contract_rollover_status, PriorReferenceTrust};
 use crate::rules::{RulesEngine, SetupDefinition};
 use crate::{
     classify_delta_segment, session_date_from_timestamp_ms, tick_time_context_from_timestamp_ms,
@@ -507,35 +508,59 @@ where
                 state.segment_buffers = SegmentBuffers::default();
 
                 if new_session == SessionType::Rth || new_session == SessionType::Globex {
-                    if let Some(prior_ref) = db
-                        .load_prior_day_reference_scoped(
+                    let current_contract_reference = db
+                        .load_prior_day_reference_for_contract(
                             &current_date,
-                            Some(contract_metadata.root_symbol.as_str()),
-                            Some(contract_metadata.contract_symbol.as_str()),
+                            contract_metadata.root_symbol.as_str(),
+                            contract_metadata.contract_symbol.as_str(),
                         )
                         .map_err(runtime_err)
-                        .map_err(|e| e.to_string())?
-                    {
-                        state.pipeline.levels.set_prior_day(
-                            prior_ref.high,
-                            prior_ref.low,
-                            prior_ref.close,
-                        );
+                        .map_err(|e| e.to_string())?;
+                    let same_root_reference = db
+                        .load_prior_day_reference_for_root(
+                            &current_date,
+                            contract_metadata.root_symbol.as_str(),
+                        )
+                        .map_err(runtime_err)
+                        .map_err(|e| e.to_string())?;
+                    let rollover_status = build_contract_rollover_status(
+                        &contract_metadata,
+                        Some(&contract_metadata),
+                        current_contract_reference.clone(),
+                        same_root_reference,
+                        None,
+                        15_000.0,
+                    );
+                    if rollover_status.prior_reference_trust == PriorReferenceTrust::Authoritative {
+                        if let Some(prior_ref) = current_contract_reference {
+                            state.pipeline.levels.set_prior_day(
+                                prior_ref.high,
+                                prior_ref.low,
+                                prior_ref.close,
+                            );
+                            state.pipeline.levels.set_prior_day_contract_context(
+                                prior_ref.root_symbol.as_deref(),
+                                prior_ref.contract_symbol.as_deref(),
+                                Some(contract_metadata.contract_symbol.as_str()),
+                            );
+                            if let (Some(vh), Some(vl), Some(pc)) =
+                                (prior_ref.va_high, prior_ref.va_low, prior_ref.poc)
+                            {
+                                state.pipeline.levels.set_prior_profile(vh, vl, pc);
+                            }
+                            if let (Some(dh), Some(dl), Some(dp)) =
+                                (prior_ref.dnva_high, prior_ref.dnva_low, prior_ref.dnp)
+                            {
+                                state.pipeline.levels.set_prior_dnva(dh, dl, dp);
+                            }
+                        }
+                    } else {
+                        state.pipeline.levels.clear_prior_references();
                         state.pipeline.levels.set_prior_day_contract_context(
-                            prior_ref.root_symbol.as_deref(),
-                            prior_ref.contract_symbol.as_deref(),
+                            Some(contract_metadata.root_symbol.as_str()),
+                            None,
                             Some(contract_metadata.contract_symbol.as_str()),
                         );
-                        if let (Some(vh), Some(vl), Some(pc)) =
-                            (prior_ref.va_high, prior_ref.va_low, prior_ref.poc)
-                        {
-                            state.pipeline.levels.set_prior_profile(vh, vl, pc);
-                        }
-                        if let (Some(dh), Some(dl), Some(dp)) =
-                            (prior_ref.dnva_high, prior_ref.dnva_low, prior_ref.dnp)
-                        {
-                            state.pipeline.levels.set_prior_dnva(dh, dl, dp);
-                        }
                     }
                 }
             } else if new_segment != current_delta_segment

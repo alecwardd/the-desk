@@ -197,6 +197,22 @@ impl LevelsPipeline {
         self.prior_day_close = close;
     }
 
+    /// Clear all carry-forward prior-session references when the active
+    /// contract cannot authoritatively use them.
+    pub fn clear_prior_references(&mut self) {
+        self.prior_day_high = 0.0;
+        self.prior_day_low = 0.0;
+        self.prior_day_close = 0.0;
+        self.prior_va_high = 0.0;
+        self.prior_va_low = 0.0;
+        self.prior_poc = 0.0;
+        self.prior_dnva_high = 0.0;
+        self.prior_dnva_low = 0.0;
+        self.prior_dnp = 0.0;
+        self.prior_day_contract_symbol = None;
+        self.carry_forward_levels_valid = false;
+    }
+
     /// Attach contract metadata to the current prior-day references and validate carry-forward use.
     pub fn set_prior_day_contract_context(
         &mut self,
@@ -208,10 +224,16 @@ impl LevelsPipeline {
         self.prior_day_contract_symbol = prior_contract_symbol.map(ToString::to_string);
         self.carry_forward_levels_valid = match (prior_contract_symbol, current_contract_symbol) {
             (Some(prior), Some(current)) => prior == current,
+            (None, Some(_)) => false,
             _ => true,
         };
         self.carry_forward_warning = if self.carry_forward_levels_valid {
             None
+        } else if prior_contract_symbol.is_none() && current_contract_symbol.is_some() {
+            Some(format!(
+                "No authoritative prior-day references are available for active contract {}.",
+                current_contract_symbol.unwrap_or("unknown")
+            ))
         } else {
             Some(format!(
                 "Prior-day references were computed on {} while the active contract is {}.",

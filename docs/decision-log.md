@@ -257,8 +257,6 @@ This is NOT a backtesting engine in the traditional sense — it does not simula
 
 ---
 
-## Pending Decisions
-
 ### ADR-P06: NQ contract rollover handling
 
 **Date:** 2026-03-19
@@ -271,16 +269,16 @@ This is NOT a backtesting engine in the traditional sense — it does not simula
 - `symbol_mode` controls how the active contract is resolved: `manual`, `auto`, or `hybrid`
 - `active_symbol_override` pins a contract when the trader wants explicit control
 - resolved contract metadata is propagated through live snapshots, feed health, historical session summaries, raw ticks, and signal outcomes
-- prior-day carry-forward levels are explicitly flagged invalid when they come from a different contract
+- prior-day carry-forward levels are stored by `(date, root_symbol, contract_symbol)` and only loaded into deterministic pipelines when same-contract references are authoritative
+- `get_contract_rollover_status` / `validate_contract_rollover` expose whether prior references are authoritative, legacy-only, or unavailable before session start
 - research can filter by `contractSymbol` or `rootSymbol`, while `get_session_history` also surfaces rollover boundaries
 
 **Consequences:**
 - roll week is safer because MCP tools now expose the active contract and warning state directly
-- historical storage keeps per-contract truth for newly ingested data
-- operators can verify the resolver state with `get_feed_health` before trusting prior-session references
+- historical storage keeps per-contract truth for newly ingested data and V22 migrates prior-day references away from a date-only key
+- operators can verify the resolver state with `get_feed_health`, `get_contract_rollover_status`, or `validate_contract_rollover` before trusting prior-session references
+- rules and pipeline consumers do not receive non-authoritative prior-day levels after a roll
 - research continuity across contracts is now explicit instead of silently implicit
-
----
 
 ### ADR-013: Databento as preferred Phase 2 options data provider
 

@@ -816,6 +816,9 @@ impl Database {
         if version < 21 {
             self.migrate_v21()?;
         }
+        if version < 22 {
+            self.migrate_v22()?;
+        }
 
         Ok(())
     }
@@ -1886,6 +1889,75 @@ impl Database {
               ON setup_runtime_state(setup_id, updated_at_ms DESC);
 
             UPDATE schema_version SET version = 21;
+            ",
+        )?;
+        Ok(())
+    }
+
+    /// V22: make prior-day carry-forward levels contract-scoped.
+    fn migrate_v22(&self) -> Result<(), DbError> {
+        self.conn.execute_batch(
+            "
+            DROP INDEX IF EXISTS idx_prior_day_levels_contract;
+
+            CREATE TABLE IF NOT EXISTS prior_day_levels_v22 (
+              date TEXT NOT NULL,
+              root_symbol TEXT NOT NULL DEFAULT '',
+              contract_symbol TEXT NOT NULL DEFAULT '',
+              high REAL NOT NULL,
+              low REAL NOT NULL,
+              close REAL NOT NULL,
+              va_high REAL NULL,
+              va_low REAL NULL,
+              poc REAL NULL,
+              dnva_high REAL NULL,
+              dnva_low REAL NULL,
+              dnp REAL NULL,
+              PRIMARY KEY (date, root_symbol, contract_symbol)
+            );
+
+            INSERT OR REPLACE INTO prior_day_levels_v22 (
+              date, root_symbol, contract_symbol, high, low, close,
+              va_high, va_low, poc, dnva_high, dnva_low, dnp
+            )
+            SELECT
+              p.date,
+              COALESCE(NULLIF(p.root_symbol, ''), (
+                SELECT NULLIF(s.root_symbol, '')
+                FROM session_summaries s
+                WHERE s.session_date = p.date
+                  AND s.session_type = 'RTH'
+                ORDER BY NULLIF(s.contract_symbol, '') IS NULL, s.contract_symbol DESC
+                LIMIT 1
+              ), ''),
+              COALESCE(NULLIF(p.contract_symbol, ''), (
+                SELECT NULLIF(s.contract_symbol, '')
+                FROM session_summaries s
+                WHERE s.session_date = p.date
+                  AND s.session_type = 'RTH'
+                ORDER BY NULLIF(s.contract_symbol, '') IS NULL, s.contract_symbol DESC
+                LIMIT 1
+              ), ''),
+              p.high,
+              p.low,
+              p.close,
+              p.va_high,
+              p.va_low,
+              p.poc,
+              p.dnva_high,
+              p.dnva_low,
+              p.dnp
+            FROM prior_day_levels p;
+
+            DROP TABLE prior_day_levels;
+            ALTER TABLE prior_day_levels_v22 RENAME TO prior_day_levels;
+
+            CREATE INDEX IF NOT EXISTS idx_prior_day_levels_contract
+              ON prior_day_levels(contract_symbol, date);
+            CREATE INDEX IF NOT EXISTS idx_prior_day_levels_root
+              ON prior_day_levels(root_symbol, date);
+
+            UPDATE schema_version SET version = 22;
             ",
         )?;
         Ok(())
@@ -3540,9 +3612,10 @@ impl Database {
         close: f64,
     ) -> Result<(), DbError> {
         self.conn.execute(
-            "INSERT INTO prior_day_levels (date, high, low, close)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(date) DO UPDATE SET high=excluded.high, low=excluded.low, close=excluded.close",
+            "INSERT INTO prior_day_levels (date, root_symbol, contract_symbol, high, low, close)
+             VALUES (?1, '', '', ?2, ?3, ?4)
+             ON CONFLICT(date, root_symbol, contract_symbol) DO UPDATE SET
+               high=excluded.high, low=excluded.low, close=excluded.close",
             params![date, high, low, close],
         )?;
         Ok(())
@@ -3560,9 +3633,10 @@ impl Database {
         poc: f64,
     ) -> Result<(), DbError> {
         self.conn.execute(
-            "INSERT INTO prior_day_levels (date, high, low, close, va_high, va_low, poc)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-             ON CONFLICT(date) DO UPDATE SET
+            "INSERT INTO prior_day_levels
+             (date, root_symbol, contract_symbol, high, low, close, va_high, va_low, poc)
+             VALUES (?1, '', '', ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(date, root_symbol, contract_symbol) DO UPDATE SET
                high=excluded.high, low=excluded.low, close=excluded.close,
                va_high=excluded.va_high, va_low=excluded.va_low, poc=excluded.poc",
             params![date, high, low, close, va_high, va_low, poc],
@@ -3605,11 +3679,13 @@ impl Database {
         root_symbol: Option<&str>,
         contract_symbol: Option<&str>,
     ) -> Result<(), DbError> {
+        let root_symbol = root_symbol.unwrap_or_default();
+        let contract_symbol = contract_symbol.unwrap_or_default();
         self.conn.execute(
             "INSERT INTO prior_day_levels
              (date, high, low, close, va_high, va_low, poc, dnva_high, dnva_low, dnp, root_symbol, contract_symbol)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
-             ON CONFLICT(date) DO UPDATE SET
+             ON CONFLICT(date, root_symbol, contract_symbol) DO UPDATE SET
                high=excluded.high, low=excluded.low, close=excluded.close,
                va_high=excluded.va_high, va_low=excluded.va_low, poc=excluded.poc,
                dnva_high=excluded.dnva_high, dnva_low=excluded.dnva_low, dnp=excluded.dnp,
@@ -7476,6 +7552,57 @@ mod tests {
         assert_eq!(result.6, Some(21070.0));
         assert_eq!(result.7, Some(20970.0));
         assert_eq!(result.8, Some(21020.0));
+    }
+
+    #[test]
+    fn prior_day_levels_are_contract_scoped() {
+        let db = test_db();
+        db.save_prior_day_full_with_dnva_contract(
+            "2026-03-04",
+            21_100.0,
+            20_900.0,
+            21_000.0,
+            21_050.0,
+            20_950.0,
+            21_000.0,
+            Some(21_025.0),
+            Some(20_975.0),
+            Some(21_000.0),
+            Some("NQ"),
+            Some("NQH26"),
+        )
+        .expect("save h");
+        db.save_prior_day_full_with_dnva_contract(
+            "2026-03-04",
+            22_100.0,
+            21_900.0,
+            22_000.0,
+            22_050.0,
+            21_950.0,
+            22_000.0,
+            Some(22_025.0),
+            Some(21_975.0),
+            Some(22_000.0),
+            Some("NQ"),
+            Some("NQM26"),
+        )
+        .expect("save m");
+        db.save_prior_day("2026-03-04", 23_100.0, 22_900.0, 23_000.0)
+            .expect("legacy save");
+
+        let h_ref = db
+            .load_prior_day_reference_for_contract("2026-03-05", "NQ", "NQH26")
+            .expect("load h")
+            .expect("h row");
+        let m_ref = db
+            .load_prior_day_reference_for_contract("2026-03-05", "NQ", "NQM26")
+            .expect("load m")
+            .expect("m row");
+
+        assert_eq!(h_ref.high, 21_100.0);
+        assert_eq!(m_ref.high, 22_100.0);
+        assert_eq!(h_ref.contract_symbol.as_deref(), Some("NQH26"));
+        assert_eq!(m_ref.contract_symbol.as_deref(), Some("NQM26"));
     }
 
     #[test]

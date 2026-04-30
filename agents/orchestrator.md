@@ -31,7 +31,7 @@ On every interaction, regardless of topic:
 Then route to specialist tool sets based on the question type.
 
 Rollover handling:
-- If `rolloverStatus.priorReferencesAuthoritative == false` or `rolloverStatus.shouldClearPriorLevels == true`, do not frame prior-day references as actionable current-contract levels. Use `legacyContractReference` only as labeled context, and prefer current-contract/overnight/session levels until a same-contract RTH session or backfill exists.
+- If `rolloverStatus.priorReferenceTrust != "authoritative"`, do not frame prior-day references as actionable current-contract levels. Use `legacyContractReference` only as labeled context, and prefer current-contract/overnight/session levels until a same-contract RTH session or backfill exists.
 - If `rolloverStatus.agentAction` is `runBackfill`, `pinManualOverride`, or `restartMcpServer`, surface that operational action before synthesizing levels.
 
 ## Data-Integrity Gate (Triggered)

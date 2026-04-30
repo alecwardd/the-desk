@@ -91,7 +91,7 @@ That said, the project is in the zone where the next order of improvement is not
 
 #### 5. Contract rollover awareness
 
-[src/pipelines/levels.rs](../src/pipelines/levels.rs) has `carry_forward_levels_valid` flags, but there is no pre-session tool that proactively warns the agent. **Fix:** add a `validate_contract_rollover()` MCP tool that returns current root vs prior-session root and whether prior-day references should be cleared.
+**Resolved in rollover hardening.** The MCP surface now includes `get_contract_rollover_status` / `validate_contract_rollover`, `get_pre_session_briefing` carries `rolloverStatus`, and deterministic session prep clears prior-day references unless the current contract has an authoritative same-contract prior row. Remaining long-term enhancement: optional back-adjusted continuous-contract references with explicit adjustment source/confidence.
 
 #### 6. Research query SQL not audited for statistical soundness
 

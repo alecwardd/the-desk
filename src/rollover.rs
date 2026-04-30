@@ -9,8 +9,11 @@ pub enum ContractRolloverStatusKind {
     Ok,
     RolloverDetected,
     MissingCurrentContractHistory,
+    ManualOverrideMismatch,
     ResolverMismatch,
+    ServerContractUnknown,
     InstrumentMismatch,
+    DataSourceMissing,
 }
 
 /// Recommended deterministic action for an agent or rules caller.
@@ -23,6 +26,15 @@ pub enum ContractRolloverAgentAction {
     RunBackfill,
     PinManualOverride,
     RestartMcpServer,
+}
+
+/// Trust level for prior-session references in the active contract context.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum PriorReferenceTrust {
+    Authoritative,
+    LegacyOnly,
+    None,
 }
 
 /// Compact prior-reference row used in rollover diagnostics.
@@ -78,6 +90,7 @@ pub struct ContractRolloverStatus {
     pub legacy_contract_reference: Option<ContractReferenceSummary>,
     pub current_contract_history_available: bool,
     pub same_root_history_available: bool,
+    pub prior_reference_trust: PriorReferenceTrust,
     pub prior_references_authoritative: bool,
     pub should_clear_prior_levels: bool,
     pub scid_file_exists: bool,
@@ -100,12 +113,13 @@ pub fn build_contract_rollover_status(
 ) -> ContractRolloverStatus {
     let active_root = normalize_symbol(&active.root_symbol);
     let active_contract = normalize_symbol(&active.contract_symbol);
-    let server_root = server.map(|m| normalize_symbol(&m.root_symbol));
-    let server_contract = server.map(|m| normalize_symbol(&m.contract_symbol));
+    let server_root = server.and_then(|m| normalize_non_empty_symbol(&m.root_symbol));
+    let server_contract = server.and_then(|m| normalize_non_empty_symbol(&m.contract_symbol));
     let server_contract_matches_resolver = match (&server_root, &server_contract) {
         (Some(root), Some(contract)) => root == &active_root && contract == &active_contract,
-        _ => true,
+        _ => false,
     };
+    let server_contract_unknown = server_root.is_none() || server_contract.is_none();
 
     let active_ref = active_contract_reference.map(ContractReferenceSummary::from);
     let same_root_ref = same_root_reference.map(ContractReferenceSummary::from);
@@ -121,7 +135,15 @@ pub fn build_contract_rollover_status(
         .cloned();
 
     let mut notes = Vec::new();
-    if !server_contract_matches_resolver {
+    let manual_override_mismatch = active.active_symbol_override.is_some()
+        && active.symbol_resolution_source != "manual_override";
+    if manual_override_mismatch {
+        notes.push("The configured active_symbol_override was not applied; pin or correct the manual override before trusting contract-specific references.".to_string());
+    }
+    if server_contract_unknown {
+        notes.push("The MCP server pipeline contract is unknown; wait for startup binding or restart before trusting live carry-forward state.".to_string());
+    }
+    if !server_contract_unknown && !server_contract_matches_resolver {
         notes.push("The MCP server pipeline contract differs from the freshly resolved feed contract; restart or reload before trusting live carry-forward state.".to_string());
     }
     if !active.scid_file_exists {
@@ -150,48 +172,63 @@ pub fn build_contract_rollover_status(
     let current_contract_history_available = active_ref.is_some();
     let same_root_history_available = same_root_ref.is_some();
 
-    let (status, agent_action, prior_references_authoritative, should_clear_prior_levels) =
-        if !server_contract_matches_resolver {
-            (
-                ContractRolloverStatusKind::ResolverMismatch,
-                ContractRolloverAgentAction::RestartMcpServer,
-                false,
-                true,
-            )
-        } else if same_root_ref
-            .as_ref()
-            .and_then(|reference| reference.root_symbol.as_deref())
-            .map(normalize_symbol)
-            .is_some_and(|root| root != active_root)
-        {
-            (
-                ContractRolloverStatusKind::InstrumentMismatch,
-                ContractRolloverAgentAction::ClearPriorLevels,
-                false,
-                true,
-            )
-        } else if current_contract_history_available {
-            (
-                ContractRolloverStatusKind::Ok,
-                ContractRolloverAgentAction::UsePriorLevels,
-                true,
-                false,
-            )
-        } else if legacy_ref.is_some() {
-            (
-                ContractRolloverStatusKind::RolloverDetected,
-                ContractRolloverAgentAction::LegacyContextOnly,
-                false,
-                true,
-            )
-        } else {
-            (
-                ContractRolloverStatusKind::MissingCurrentContractHistory,
-                ContractRolloverAgentAction::RunBackfill,
-                false,
-                true,
-            )
-        };
+    let (status, agent_action, prior_reference_trust) = if !active.scid_file_exists {
+        (
+            ContractRolloverStatusKind::DataSourceMissing,
+            ContractRolloverAgentAction::PinManualOverride,
+            PriorReferenceTrust::None,
+        )
+    } else if manual_override_mismatch {
+        (
+            ContractRolloverStatusKind::ManualOverrideMismatch,
+            ContractRolloverAgentAction::PinManualOverride,
+            PriorReferenceTrust::None,
+        )
+    } else if server_contract_unknown {
+        (
+            ContractRolloverStatusKind::ServerContractUnknown,
+            ContractRolloverAgentAction::RestartMcpServer,
+            PriorReferenceTrust::None,
+        )
+    } else if !server_contract_matches_resolver {
+        (
+            ContractRolloverStatusKind::ResolverMismatch,
+            ContractRolloverAgentAction::RestartMcpServer,
+            PriorReferenceTrust::None,
+        )
+    } else if same_root_ref
+        .as_ref()
+        .and_then(|reference| reference.root_symbol.as_deref())
+        .map(normalize_symbol)
+        .is_some_and(|root| root != active_root)
+    {
+        (
+            ContractRolloverStatusKind::InstrumentMismatch,
+            ContractRolloverAgentAction::ClearPriorLevels,
+            PriorReferenceTrust::None,
+        )
+    } else if current_contract_history_available {
+        (
+            ContractRolloverStatusKind::Ok,
+            ContractRolloverAgentAction::UsePriorLevels,
+            PriorReferenceTrust::Authoritative,
+        )
+    } else if legacy_ref.is_some() {
+        (
+            ContractRolloverStatusKind::RolloverDetected,
+            ContractRolloverAgentAction::LegacyContextOnly,
+            PriorReferenceTrust::LegacyOnly,
+        )
+    } else {
+        (
+            ContractRolloverStatusKind::MissingCurrentContractHistory,
+            ContractRolloverAgentAction::RunBackfill,
+            PriorReferenceTrust::None,
+        )
+    };
+    let prior_references_authoritative =
+        prior_reference_trust == PriorReferenceTrust::Authoritative;
+    let should_clear_prior_levels = prior_reference_trust != PriorReferenceTrust::Authoritative;
 
     ContractRolloverStatus {
         status,
@@ -206,6 +243,7 @@ pub fn build_contract_rollover_status(
         legacy_contract_reference: legacy_ref,
         current_contract_history_available,
         same_root_history_available,
+        prior_reference_trust,
         prior_references_authoritative,
         should_clear_prior_levels,
         scid_file_exists: active.scid_file_exists,
@@ -219,6 +257,11 @@ pub fn build_contract_rollover_status(
 
 fn normalize_symbol(value: &str) -> String {
     value.trim().to_ascii_uppercase()
+}
+
+fn normalize_non_empty_symbol(value: &str) -> Option<String> {
+    let normalized = normalize_symbol(value);
+    (!normalized.is_empty()).then_some(normalized)
 }
 
 #[cfg(test)]
@@ -357,5 +400,52 @@ mod tests {
             ContractRolloverAgentAction::ClearPriorLevels
         );
         assert!(!status.prior_references_authoritative);
+    }
+
+    #[test]
+    fn missing_server_contract_requires_restart() {
+        let status = build_contract_rollover_status(
+            &metadata("NQH26"),
+            None,
+            Some(reference("2026-03-04", "NQH26")),
+            Some(reference("2026-03-04", "NQH26")),
+            Some(1_000.0),
+            15_000.0,
+        );
+
+        assert_eq!(
+            status.status,
+            ContractRolloverStatusKind::ServerContractUnknown
+        );
+        assert_eq!(
+            status.agent_action,
+            ContractRolloverAgentAction::RestartMcpServer
+        );
+        assert_eq!(status.prior_reference_trust, PriorReferenceTrust::None);
+    }
+
+    #[test]
+    fn manual_override_mismatch_requests_pin_action() {
+        let mut active = metadata("NQM26");
+        active.active_symbol_override = Some("NQH26".to_string());
+        active.symbol_resolution_source = "auto_detected".to_string();
+        let status = build_contract_rollover_status(
+            &active,
+            Some(&active),
+            Some(reference("2026-03-04", "NQM26")),
+            Some(reference("2026-03-04", "NQM26")),
+            Some(1_000.0),
+            15_000.0,
+        );
+
+        assert_eq!(
+            status.status,
+            ContractRolloverStatusKind::ManualOverrideMismatch
+        );
+        assert_eq!(
+            status.agent_action,
+            ContractRolloverAgentAction::PinManualOverride
+        );
+        assert_eq!(status.prior_reference_trust, PriorReferenceTrust::None);
     }
 }

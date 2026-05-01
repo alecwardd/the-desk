@@ -195,7 +195,7 @@ Rules:
 
 ## MCP Tools Reference
 
-The MCP server (`src/bin/the-desk-mcp.rs`) exposes 119 MCP tools across 13 categories.
+The MCP server (`src/bin/the-desk-mcp.rs`) exposes 120 MCP tools across 13 categories.
 
 ### Live vs Historical — Quick Reference
 
@@ -205,8 +205,8 @@ The MCP server (`src/bin/the-desk-mcp.rs`) exposes 119 MCP tools across 13 categ
 
 | Context | Primary tools |
 |---------|---------------|
-| **Live (current session)** | `get_market_snapshot`, `get_session_context`, `get_tpo_profile`, `get_delta_profile`, `get_key_levels`, `get_tape_pace`, `get_footprint`, `get_or5_status`, `get_rvol`, `get_day_type`, `get_rebid_reoffer_zones`, `get_pinch_events`, `get_session_inventory`, `evaluate_playbook`, `get_setup_context`, `check_delta_confirmation`, `get_proximity_report`, `get_imbalances`, `get_absorption_events`, `get_trade_size_profile`, DOM tools |
-| **Historical (backfill data)** | `get_snapshot_at`, `get_footprint_window`, `query_ticks`, `get_session_history`, `get_research_summary`, `query_event_frequency`, `query_conditional`, `query_distribution`, `compare_sessions`, `get_setup_performance_matrix`, `query_signal_outcome_*`, `get_signal_performance`, `backfill_history`, `run_backtest`, `get_backfill_status`, `get_backtest_results`, `compare_backtests`, hypothesis promotion tools |
+| **Live (current session)** | `get_market_snapshot`, `get_context_frame`, `get_session_context`, `get_tpo_profile`, `get_delta_profile`, `get_key_levels`, `get_tape_pace`, `get_footprint`, `get_or5_status`, `get_rvol`, `get_day_type`, `get_rebid_reoffer_zones`, `get_pinch_events`, `get_session_inventory`, `evaluate_playbook`, `get_setup_context`, `check_delta_confirmation`, `get_proximity_report`, `get_imbalances`, `get_absorption_events`, `get_trade_size_profile`, DOM tools |
+| **Historical (backfill data)** | `get_context_frame(timestampMs)`, `get_snapshot_at`, `get_footprint_window`, `query_ticks`, `get_session_history`, `get_research_summary`, `query_event_frequency`, `query_conditional`, `query_distribution`, `compare_sessions`, `get_setup_performance_matrix`, `query_signal_outcome_*`, `get_signal_performance`, `backfill_history`, `run_backtest`, `get_backfill_status`, `get_backtest_results`, `compare_backtests`, hypothesis promotion tools |
 
 **Data dependency:** Historical tools return empty or minimal data until `backfill_history` has populated the database. Call `get_research_summary` first to check session count; if low, run backfill before deep analysis.
 
@@ -222,6 +222,7 @@ The MCP server (`src/bin/the-desk-mcp.rs`) exposes 119 MCP tools across 13 categ
 | | `get_contract_rollover_status` | Pre-session contract roll validation: active contract, prior reference contract, and whether carry-forward levels are authoritative |
 | | `validate_contract_rollover` | Validation alias for `get_contract_rollover_status` for pre-session safety gates |
 | | `get_snapshot_at` | Historical pipeline snapshot nearest to a given timestamp |
+| | `get_context_frame` | Session-relative framing with stable buckets, historical analogs, reliability caveats, and optional setup outcomes |
 | **Structure** | `get_tpo_profile` | POC, value area, opening range, initial balance |
 | | `get_tpo_detail` | Per-price TPO letter detail (which brackets printed where, single prints) |
 | | `get_delta_profile` | Session delta, DNVA, DNP |
@@ -427,6 +428,7 @@ These are operational diagnostics exposed by `get_runtime_events` and JSON logs.
 | `setup.transition` | Setup lifecycle transition persisted. |
 | `depth.poll_failed` | Depth poll task failed. |
 | `depth.worker_failed` | Depth worker failed while processing/persisting depth state. |
+| `context_frame.cache_warm_failed` | Context-frame cache pre-warm failed; live tools still work but the next agent read may pay the query cost. |
 | `attention.signal_emitted` | Attention signal was emitted or refreshed from deterministic market/setup/risk context. |
 | `attention.signal_priority_changed` | Existing attention signal changed priority bucket or score. |
 | `attention.signal_acknowledged` | Trader or agent acknowledged an attention signal. |

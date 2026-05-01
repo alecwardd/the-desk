@@ -101,6 +101,9 @@ const MAX_RESEARCH_MIN_COUNT: i64 = 10_000;
 const MAX_MIN_RESOLVED: i64 = 10_000;
 const MAX_DOM_BEHAVIOR_MIN_DURATION_MS: f64 = 86_400_000.0;
 const CONTRACT_RESOLUTION_CACHE_TTL_MS: u128 = 2_000;
+const CONTEXT_FRAME_CACHE_LIMIT: usize = 128;
+const LIVE_CONTEXT_FRAME_SNAPSHOT_INTERVAL_MS: f64 = 60_000.0;
+static LAST_LIVE_CONTEXT_SNAPSHOT_MS_BITS: AtomicU64 = AtomicU64::new(0);
 const RESEARCH_EVENT_TYPES: &[&str] = &[
     "ib_formed",
     "or_formed",
@@ -437,6 +440,7 @@ pub struct TheDeskMcp {
     backfill_manager: Arc<AsyncMutex<BackfillManager>>,
     options_cache: Arc<AsyncMutex<OptionsSnapshotCache>>,
     contract_cache: Arc<Mutex<ContractResolutionCache>>,
+    context_frame_cache: Arc<Mutex<HashMap<String, research::context_frame::ContextFrame>>>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -1695,6 +1699,21 @@ struct SnapshotAtParams {
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+struct ContextFrameParams {
+    /// Optional historical timestamp to frame. Omit for the current live market frame.
+    #[serde(alias = "timestamp_ms")]
+    timestamp_ms: Option<f64>,
+    /// Optional setup ID to include setup-specific signal outcome context.
+    #[serde(alias = "setup_id")]
+    setup_id: Option<String>,
+    /// Include historical analogs and forward-path stats. Default true.
+    include_historical: Option<bool>,
+    /// Historical matching mode: weightedAnalog (default) or strictBucket.
+    matching_mode: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 struct DomSnapshotAtParams {
     /// Target time as Unix epoch milliseconds for delayed DOM reconstruction.
     timestamp_ms: f64,
@@ -2603,6 +2622,7 @@ impl TheDeskMcp {
             backfill_manager: Arc::new(AsyncMutex::new(BackfillManager::default())),
             options_cache: Arc::new(AsyncMutex::new(OptionsSnapshotCache::default())),
             contract_cache: Arc::new(Mutex::new(ContractResolutionCache::default())),
+            context_frame_cache: Arc::new(Mutex::new(HashMap::new())),
             tool_router: Self::tool_router(),
         }
     }
@@ -3574,6 +3594,132 @@ impl TheDeskMcp {
         }
         Ok(no_data(
             "No market snapshot available yet or database is temporarily busy. Ensure Sierra Chart is running and .scid data is being ingested.",
+        ))
+    }
+
+    #[tool(
+        description = "Context frame for agent interpretation. Call this when you need session-relative framing, stable buckets, historical analogs, forward-path caveats, or setup-linked outcome context; use get_market_snapshot for raw values, get_session_context for session identity, compare_sessions for explicit analog-only research, and get_attention_inbox for what deserves attention now."
+    )]
+    async fn get_context_frame(
+        &self,
+        Parameters(params): Parameters<ContextFrameParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let include_historical = params.include_historical.unwrap_or(true);
+        let setup_id = parse_optional_non_empty_string("setupId", params.setup_id.as_deref())?;
+        let matching_mode = match params
+            .matching_mode
+            .as_deref()
+            .unwrap_or("weightedAnalog")
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "weightedanalog" | "weighted_analog" => {
+                research::context_frame::MatchingMode::WeightedAnalog
+            }
+            "strictbucket" | "strict_bucket" => research::context_frame::MatchingMode::StrictBucket,
+            other => {
+                return Err(invalid_params_error(format!(
+                    "matchingMode must be weightedAnalog or strictBucket, got: {other}"
+                )))
+            }
+        };
+        let (snapshot, options) = if let Some(timestamp_ms) = params.timestamp_ms {
+            if !timestamp_ms.is_finite() || timestamp_ms <= 0.0 {
+                return Err(invalid_params_error(
+                    "timestampMs must be a positive finite epoch-milliseconds value",
+                ));
+            }
+            let (snapshot_ts, payload) = self
+                .db
+                .lock()
+                .map_err(|_| lock_error())?
+                .get_snapshot_near(timestamp_ms)
+                .map_err(db_error)?
+                .ok_or_else(|| {
+                    invalid_params_error(
+                        "No historical pipeline snapshots are available for frameAt(timestampMs)",
+                    )
+                })?;
+            (
+                payload,
+                research::context_frame::ContextFrameOptions {
+                    mode: research::context_frame::ContextFrameMode::Historical,
+                    requested_timestamp_ms: Some(timestamp_ms),
+                    snapshot_timestamp_ms: Some(snapshot_ts),
+                    snapshot_distance_ms: Some((snapshot_ts - timestamp_ms).abs()),
+                    setup_id: setup_id.clone(),
+                    include_historical,
+                    matching_mode: matching_mode.clone(),
+                },
+            )
+        } else if let Some(r) = self.resolve_live_market_view() {
+            (
+                r.snapshot,
+                research::context_frame::ContextFrameOptions {
+                    mode: research::context_frame::ContextFrameMode::Live,
+                    snapshot_timestamp_ms: Some(r.as_of_timestamp_ms),
+                    setup_id: setup_id.clone(),
+                    include_historical,
+                    matching_mode: matching_mode.clone(),
+                    ..Default::default()
+                },
+            )
+        } else {
+            let payload = self
+                .db
+                .lock()
+                .map_err(|_| lock_error())?
+                .latest_feature_state()
+                .map_err(db_error)?
+                .ok_or_else(|| {
+                    invalid_params_error("No live or persisted market snapshot is available")
+                })?;
+            (
+                payload,
+                research::context_frame::ContextFrameOptions {
+                    mode: research::context_frame::ContextFrameMode::Live,
+                    setup_id: setup_id.clone(),
+                    include_historical,
+                    matching_mode: matching_mode.clone(),
+                    ..Default::default()
+                },
+            )
+        };
+
+        let cache_key = research::context_frame::cache_key_for_snapshot(&snapshot, &options);
+        if include_historical {
+            if let Ok(cache) = self.context_frame_cache.lock() {
+                if let Some(cached) = cache.get(&cache_key) {
+                    let mut frame = cached.clone();
+                    frame.meta.cache_status = "hit".to_string();
+                    return Ok(text_result(
+                        serde_json::to_value(frame).unwrap_or_else(|_| serde_json::json!({})),
+                    ));
+                }
+            }
+        }
+
+        let db = self.db.lock().map_err(|_| lock_error())?;
+        let mut frame = research::context_frame::build_context_frame(&db, &snapshot, options)
+            .map_err(db_error)?;
+        frame.meta.cache_status = if include_historical {
+            "miss".to_string()
+        } else {
+            "bypassed".to_string()
+        };
+        if include_historical {
+            if let Ok(mut cache) = self.context_frame_cache.lock() {
+                if cache.len() >= CONTEXT_FRAME_CACHE_LIMIT {
+                    if let Some(first_key) = cache.keys().next().cloned() {
+                        cache.remove(&first_key);
+                    }
+                }
+                cache.insert(cache_key, frame.clone());
+            }
+        }
+        Ok(text_result(
+            serde_json::to_value(frame).unwrap_or_else(|_| serde_json::json!({})),
         ))
     }
 
@@ -9649,6 +9795,85 @@ fn build_live_feature_state_snapshot_payload(
     Some((timestamp_ms, payload))
 }
 
+fn context_frame_warm_event(event_type: &str) -> bool {
+    matches!(event_type, "day_type_change" | "rvol_spike")
+}
+
+fn warm_context_frame_cache(
+    db: &Arc<Mutex<Database>>,
+    cache: &Arc<Mutex<HashMap<String, research::context_frame::ContextFrame>>>,
+    runtime_events: &Arc<RuntimeEventStore>,
+    snapshot: &serde_json::Value,
+    options: research::context_frame::ContextFrameOptions,
+) {
+    let cache_key = research::context_frame::cache_key_for_snapshot(snapshot, &options);
+    match cache.lock() {
+        Ok(cache) => {
+            if cache.get(&cache_key).is_some() {
+                return;
+            }
+        }
+        Err(_) => {
+            record_runtime_event(
+                runtime_events,
+                Some(db),
+                RuntimeEventLevel::Warn,
+                "context_frame.cache_warm_failed",
+                "context_frame",
+                "Context-frame cache warm skipped because the cache lock was unavailable.",
+                serde_json::json!({ "cacheKey": cache_key, "reason": "cache_lock_failed" }),
+            );
+            return;
+        }
+    }
+    let build_result = match db.lock() {
+        Ok(db) => research::context_frame::build_context_frame(&db, snapshot, options),
+        Err(_) => {
+            record_runtime_event(
+                runtime_events,
+                Some(db),
+                RuntimeEventLevel::Warn,
+                "context_frame.cache_warm_failed",
+                "context_frame",
+                "Context-frame cache warm skipped because the database lock was unavailable.",
+                serde_json::json!({ "cacheKey": cache_key, "reason": "db_lock_failed" }),
+            );
+            return;
+        }
+    };
+    let Ok(mut frame) = build_result else {
+        record_runtime_event(
+            runtime_events,
+            Some(db),
+            RuntimeEventLevel::Warn,
+            "context_frame.cache_warm_failed",
+            "context_frame",
+            "Context-frame cache warm failed while building the frame.",
+            serde_json::json!({ "cacheKey": cache_key, "reason": "build_failed" }),
+        );
+        return;
+    };
+    frame.meta.cache_status = "warmed".to_string();
+    let Ok(mut cache) = cache.lock() else {
+        record_runtime_event(
+            runtime_events,
+            Some(db),
+            RuntimeEventLevel::Warn,
+            "context_frame.cache_warm_failed",
+            "context_frame",
+            "Context-frame cache warm built a frame but could not store it.",
+            serde_json::json!({ "cacheKey": cache_key, "reason": "cache_store_lock_failed" }),
+        );
+        return;
+    };
+    if cache.len() >= CONTEXT_FRAME_CACHE_LIMIT {
+        if let Some(first_key) = cache.keys().next().cloned() {
+            cache.remove(&first_key);
+        }
+    }
+    cache.insert(cache_key, frame);
+}
+
 fn persist_feature_state_payload(
     db: &Arc<Mutex<Database>>,
     timestamp_ms: f64,
@@ -9656,7 +9881,26 @@ fn persist_feature_state_payload(
 ) {
     if let Ok(d) = db.lock() {
         let _ = d.upsert_feature_state(timestamp_ms, payload);
+        if should_persist_live_context_snapshot(timestamp_ms) {
+            let context = research::context_frame::snapshot_context_buckets(payload, timestamp_ms);
+            let _ = d.insert_pipeline_snapshot_with_context(timestamp_ms, payload, &context);
+        }
     }
+}
+
+fn should_persist_live_context_snapshot(timestamp_ms: f64) -> bool {
+    if !timestamp_ms.is_finite() || timestamp_ms <= 0.0 {
+        return false;
+    }
+    let last = tick_ms_from_bits(LAST_LIVE_CONTEXT_SNAPSHOT_MS_BITS.load(Ordering::Acquire));
+    if last
+        .map(|last| timestamp_ms - last < LIVE_CONTEXT_FRAME_SNAPSHOT_INTERVAL_MS)
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    LAST_LIVE_CONTEXT_SNAPSHOT_MS_BITS.store(tick_ms_to_bits(timestamp_ms), Ordering::Release);
+    true
 }
 
 /// Persist `feature_state` after `dom_summary` has been updated.
@@ -11183,6 +11427,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let last_ask_bg = Arc::clone(&server.last_ask);
         let db_bg = Arc::clone(&server.db);
         let runtime_events_bg = Arc::clone(&server.runtime_events);
+        let context_frame_cache_bg = Arc::clone(&server.context_frame_cache);
         let poll_ms = config.flush_poll_ms;
         let price_scale = config.price_scale;
         let reader_path = reader.path().to_path_buf();
@@ -11336,10 +11581,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .last_scid_tick_ms_bits
                         .store(tick_ms_to_bits(tick.timestamp_ms), Ordering::Release);
                     // Detect session and segment boundaries during live polling
+                    let mut session_changed_for_context_warm = false;
                     if let Some(et_min) = et_minutes_from_timestamp(tick.timestamp_ms) {
                         let new_session = classify_session(et_min);
                         let new_segment = classify_delta_segment(et_min);
                         let session_changed = new_session != current_session;
+                        session_changed_for_context_warm = session_changed;
                         let exiting_rth = current_session == SessionType::Rth && session_changed;
 
                         if exiting_rth {
@@ -11497,6 +11744,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
 
                     let is_buy = matches!(tick.side, TradeSide::Buy);
+                    let event_start = event_buffer.len();
                     process_tick(
                         &pipelines_bg,
                         &detector_bg,
@@ -11515,6 +11763,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         tick.ask,
                         &mut event_buffer,
                     );
+                    if session_changed_for_context_warm
+                        || event_buffer[event_start..]
+                            .iter()
+                            .any(|event| context_frame_warm_event(&event.event_type))
+                    {
+                        if let Some((timestamp_ms, payload)) =
+                            build_live_feature_state_snapshot_payload(
+                                &pipelines_bg,
+                                &last_bid_bg,
+                                &last_ask_bg,
+                                tick.timestamp_ms,
+                            )
+                        {
+                            warm_context_frame_cache(
+                                &db_bg,
+                                &context_frame_cache_bg,
+                                &runtime_events_bg,
+                                &payload,
+                                research::context_frame::ContextFrameOptions {
+                                    mode: research::context_frame::ContextFrameMode::Live,
+                                    snapshot_timestamp_ms: Some(timestamp_ms),
+                                    include_historical: true,
+                                    ..Default::default()
+                                },
+                            );
+                        }
+                    }
 
                     let bid = if tick.bid > 0.0 {
                         tick.bid

@@ -117,50 +117,16 @@ Follow-up hardening added a rules-enabled golden (`expected_rules.json`), a non-
 
 ### How to make this a higher-level agentic thinking system
 
-The current system is a very good **reactive** partner: agent asks → tools answer. To become a **proactive thinking** partner, four shifts (plus regime):
-
-1. **Push, don't just pull**  
-   Add a **signal bus** — when the event detector fires a notable event (OR5 mid retest, DNP cross, absorption failure, RVOL percentile jump), push a structured message that an orchestrator agent can subscribe to. Right now everything requires the agent to poll. A push model enables "the Desk flagged an absorption failure at 10:47; here is the structure" without the agent having to keep guessing when to check.
-
-   Implementation direction: local MCP remains pull/query, so the robust version is a durable **attention inbox** rather than unsolicited Cursor chat push. The Rust backend composes market events, setup lifecycle, risk state, and periodic absence checks into ranked `attention_signals`; agents call `get_attention_inbox`, `get_signal_detail`, `what_changed_since`, and `get_active_trade_ideas` to reason from that inbox. External pings should stay behind notifier sinks and use short, non-advisory language.
-
-2. **Close the research → playbook loop programmatically**  
-   The pieces exist. What is missing is a **promotion pipeline**:
-   - Idea captured in `setup-ideas-and-backtesting.md` →
-   - Prototyped as a `ResearchHypothesis` struct with condition fields →
-   - Run through `backfill.rs` against N sessions →
-   - Auto-populate win rate, MFE/MAE distribution, day-type breakdown →
-   - If stats clear a threshold, auto-generate a draft entry for `setup_templates.rs` for human review.  
-   Today this is all manual. A `/promote_hypothesis` tool plus a standardized hypothesis schema turns the research doc into an actual funnel.
-
 3. **Session-relative context for the agent**  
    An agent that says "VWAP is at 21450, price is 21468" is info-dense but not *wise*. Wisdom comes from framing: "price 18 pts above VWAP, 1.2σ band, in a Double Distribution day where that condition closed back to VWAP 68% of the time this quarter." Build a **context-framing layer** between pipelines and the MCP tool response — same raw numbers, but every snapshot carries its historical interpretation. This is where the research DB earns its keep.
+
+   **Implementation note (2026-05-01):** `get_context_frame` now provides the v1 version of this layer: stable buckets, weighted analogs, optional setup outcomes, indexed `pipeline_snapshots`, cache warming, and reliability caveats. Future work should focus on two production refinements before expanding the envelope: materialized per-bucket forward-outcome summaries for very large histories, and golden replay snapshots of the JSON envelope after a few live sessions confirm the agent phrasing is stable.
 
 4. **A memory that knows *you***  
    [agents/](../agents/) has role agents (orchestrator, levels-analyst, risk-coach, etc.) but there is no persistent model of **the trader**: best/worst day-types, consecutive-loss behavior, actual hit rate by setup and by time-of-day, typical R deviation. A `trader_profile` table that aggregates [signal_outcomes](../src/db/mod.rs) and recorded trades into a living dossier — and an MCP tool that returns "your edge today given current structure and your last 20 sessions" — is how this becomes a trading *partner* rather than a market-structure oracle.
 
 5. **Regime detection as a first-class concept**  
    "Double Distribution dominated 52 of 81 sessions" is a regime observation. Make regime (trending / balanced / double-dist / non-trend volatile) a **computed pipeline field** on every session, queryable historically, and used by the rules engine to gate which setups are even eligible. Most playbook failures are regime mismatches, not condition failures.
-
-### What to do in the next 2 sprints
-
-**Sprint 1 — harden:**
-
-1. Session-end atomic snapshot  
-2. Pipeline contention → `degradation_reason`  
-3. MCP input validation pass (all tools)  
-4. Clock-skew defense in ingest  
-5. Research SQL audit + golden-file tests  
-
-**Sprint 2 — elevate:**
-
-6. Split `the-desk-mcp.rs` into domain modules  
-7. Add `compare_to_similar_sessions`, `explain_current_setup_state`, `what_changed_since`  
-8. Promotion pipeline for hypotheses → templates  
-9. Context-framing layer (every snapshot carries historical interpretation)  
-10. Signal push bus for proactive agent behavior  
-
-The core is strong. The work from here is about **making the intelligence legible and proactive**, not building more pipelines.
 
 ---
 

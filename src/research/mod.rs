@@ -1,3 +1,4 @@
+pub mod context_frame;
 pub mod hypothesis;
 
 use crate::db::{Database, SessionScopeFilter};
@@ -32,7 +33,7 @@ pub enum ReliabilityTier {
     Reportable,
 }
 
-fn reliability_tier(sample_size: usize) -> ReliabilityTier {
+pub(crate) fn reliability_tier(sample_size: usize) -> ReliabilityTier {
     match sample_size {
         0..=19 => ReliabilityTier::Insufficient,
         20..=29 => ReliabilityTier::Directional,

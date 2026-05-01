@@ -507,6 +507,48 @@ pub struct SessionScopeFilter {
     pub continuous_mode: bool,
 }
 
+/// Denormalized context-frame bucket metadata for indexed pipeline snapshot lookup.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextSnapshotBuckets {
+    pub bucket_definition_version: String,
+    pub trading_day: String,
+    pub session_type: String,
+    pub session_segment: String,
+    pub root_symbol: Option<String>,
+    pub contract_symbol: Option<String>,
+    pub vwap_sigma: String,
+    pub rvol: String,
+    pub time_of_day: String,
+    pub ib_state: String,
+    pub value_area_location: String,
+    pub dnva_location: String,
+    pub day_type: String,
+    pub profile_shape: String,
+    pub balance_state: String,
+    pub single_prints_direction: String,
+}
+
+/// Scope for indexed context-frame snapshot research queries.
+#[derive(Debug, Clone, Default)]
+pub struct ContextSnapshotQuery {
+    pub bucket_definition_version: String,
+    pub session_type: Option<String>,
+    pub session_segment: Option<String>,
+    pub root_symbol: Option<String>,
+    pub contract_symbol: Option<String>,
+    pub day_type: Option<String>,
+    pub profile_shape: Option<String>,
+    pub vwap_sigma: Option<String>,
+    pub rvol: Option<String>,
+    pub time_of_day: Option<String>,
+    pub ib_state: Option<String>,
+    pub value_area_location: Option<String>,
+    pub dnva_location: Option<String>,
+    pub balance_state: Option<String>,
+    pub single_prints_direction: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReplaySignalRecord {
@@ -1135,6 +1177,9 @@ impl Database {
         }
         if version < 25 {
             self.migrate_v25()?;
+        }
+        if version < 26 {
+            self.migrate_v26()?;
         }
 
         Ok(())
@@ -2465,6 +2510,68 @@ impl Database {
               ON research_hypotheses(lifecycle);
 
             UPDATE schema_version SET version = 25;
+            ",
+        )?;
+        Ok(())
+    }
+
+    /// V26: denormalized context-frame bucket columns for indexed intraday snapshot lookup.
+    fn migrate_v26(&self) -> Result<(), DbError> {
+        let columns = [
+            ("bucket_definition_version", "TEXT NULL"),
+            ("trading_day", "TEXT NULL"),
+            ("session_type", "TEXT NULL"),
+            ("session_segment", "TEXT NULL"),
+            ("root_symbol", "TEXT NULL"),
+            ("contract_symbol", "TEXT NULL"),
+            ("vwap_sigma_bucket", "TEXT NULL"),
+            ("rvol_bucket", "TEXT NULL"),
+            ("time_of_day_bucket", "TEXT NULL"),
+            ("ib_state_bucket", "TEXT NULL"),
+            ("value_area_location", "TEXT NULL"),
+            ("dnva_location", "TEXT NULL"),
+            ("day_type", "TEXT NULL"),
+            ("profile_shape", "TEXT NULL"),
+            ("balance_state", "TEXT NULL"),
+            ("single_prints_direction", "TEXT NULL"),
+        ];
+        for (column, def) in columns {
+            let _ = self.conn.execute_batch(&format!(
+                "ALTER TABLE pipeline_snapshots ADD COLUMN {column} {def}"
+            ));
+        }
+        self.conn.execute_batch(
+            "
+            CREATE INDEX IF NOT EXISTS idx_pipeline_snapshots_context_contract
+              ON pipeline_snapshots(
+                bucket_definition_version,
+                contract_symbol,
+                session_type,
+                day_type,
+                profile_shape,
+                timestamp_ms DESC
+              );
+            CREATE INDEX IF NOT EXISTS idx_pipeline_snapshots_context_root
+              ON pipeline_snapshots(
+                bucket_definition_version,
+                root_symbol,
+                session_type,
+                day_type,
+                profile_shape,
+                timestamp_ms DESC
+              );
+            CREATE INDEX IF NOT EXISTS idx_pipeline_snapshots_context_buckets
+              ON pipeline_snapshots(
+                bucket_definition_version,
+                session_type,
+                vwap_sigma_bucket,
+                rvol_bucket,
+                time_of_day_bucket,
+                ib_state_bucket,
+                timestamp_ms DESC
+              );
+
+            UPDATE schema_version SET version = 26;
             ",
         )?;
         Ok(())
@@ -4698,6 +4805,128 @@ impl Database {
             params![timestamp_ms, serde_json::to_string(payload)?],
         )?;
         Ok(())
+    }
+
+    pub fn insert_pipeline_snapshot_with_context(
+        &self,
+        timestamp_ms: f64,
+        payload: &serde_json::Value,
+        context: &ContextSnapshotBuckets,
+    ) -> Result<(), DbError> {
+        self.conn.execute(
+            "INSERT INTO pipeline_snapshots (
+                timestamp_ms, payload, bucket_definition_version, trading_day,
+                session_type, session_segment, root_symbol, contract_symbol,
+                vwap_sigma_bucket, rvol_bucket, time_of_day_bucket, ib_state_bucket,
+                value_area_location, dnva_location, day_type, profile_shape,
+                balance_state, single_prints_direction
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+            params![
+                timestamp_ms,
+                serde_json::to_string(payload)?,
+                context.bucket_definition_version.as_str(),
+                context.trading_day.as_str(),
+                context.session_type.as_str(),
+                context.session_segment.as_str(),
+                context.root_symbol.as_deref(),
+                context.contract_symbol.as_deref(),
+                context.vwap_sigma.as_str(),
+                context.rvol.as_str(),
+                context.time_of_day.as_str(),
+                context.ib_state.as_str(),
+                context.value_area_location.as_str(),
+                context.dnva_location.as_str(),
+                context.day_type.as_str(),
+                context.profile_shape.as_str(),
+                context.balance_state.as_str(),
+                context.single_prints_direction.as_str(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// List persisted pipeline snapshots for historical context-frame research.
+    pub fn list_pipeline_snapshots_for_research(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<(f64, serde_json::Value)>, DbError> {
+        let limit = limit.clamp(1, 500_000) as i64;
+        let mut stmt = self.conn.prepare(
+            "SELECT timestamp_ms, payload
+             FROM pipeline_snapshots
+             ORDER BY timestamp_ms DESC
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], |row| {
+            let timestamp_ms: f64 = row.get(0)?;
+            let payload: String = row.get(1)?;
+            let value = serde_json::from_str::<serde_json::Value>(&payload)
+                .unwrap_or_else(|_| serde_json::json!({}));
+            Ok((timestamp_ms, value))
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// List persisted pipeline snapshots narrowed by denormalized context-frame bucket columns.
+    pub fn list_pipeline_snapshots_for_context(
+        &self,
+        query: &ContextSnapshotQuery,
+        limit: usize,
+    ) -> Result<Vec<(f64, serde_json::Value)>, DbError> {
+        let mut conditions = vec!["bucket_definition_version = ?1".to_string()];
+        let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> =
+            vec![Box::new(query.bucket_definition_version.clone())];
+
+        macro_rules! add_eq {
+            ($field:expr, $column:literal) => {
+                if let Some(value) = $field.as_deref() {
+                    if !value.is_empty() && value != "unknown" {
+                        conditions.push(format!("{} = ?{}", $column, bind_values.len() + 1));
+                        bind_values.push(Box::new(value.to_string()));
+                    }
+                }
+            };
+        }
+
+        add_eq!(query.session_type, "session_type");
+        add_eq!(query.session_segment, "session_segment");
+        add_eq!(query.contract_symbol, "contract_symbol");
+        if query.contract_symbol.is_none() {
+            add_eq!(query.root_symbol, "root_symbol");
+        }
+        add_eq!(query.day_type, "day_type");
+        add_eq!(query.profile_shape, "profile_shape");
+        add_eq!(query.vwap_sigma, "vwap_sigma_bucket");
+        add_eq!(query.rvol, "rvol_bucket");
+        add_eq!(query.time_of_day, "time_of_day_bucket");
+        add_eq!(query.ib_state, "ib_state_bucket");
+        add_eq!(query.value_area_location, "value_area_location");
+        add_eq!(query.dnva_location, "dnva_location");
+        add_eq!(query.balance_state, "balance_state");
+        add_eq!(query.single_prints_direction, "single_prints_direction");
+
+        let sql = format!(
+            "SELECT timestamp_ms, payload
+             FROM pipeline_snapshots
+             WHERE {}
+             ORDER BY timestamp_ms DESC
+             LIMIT ?{}",
+            conditions.join(" AND "),
+            bind_values.len() + 1
+        );
+        bind_values.push(Box::new(limit.clamp(1, 500_000) as i64));
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+            bind_values.iter().map(|b| b.as_ref()).collect();
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_ref.as_slice(), |row| {
+            let timestamp_ms: f64 = row.get(0)?;
+            let payload: String = row.get(1)?;
+            let value = serde_json::from_str::<serde_json::Value>(&payload)
+                .unwrap_or_else(|_| serde_json::json!({}));
+            Ok((timestamp_ms, value))
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
     pub fn insert_setup_state_transition(

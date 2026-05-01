@@ -30,6 +30,12 @@ On every interaction, regardless of topic:
 
 Then route to specialist tool sets based on the question type.
 
+Context-frame usage:
+- Call `get_context_frame` when the answer needs interpretation rather than raw values: market reads, session-start briefs, setup checks, and trade reviews.
+- Use `get_market_snapshot` for raw values and data freshness; use `get_context_frame` for bucketed/session-relative framing, historical analogs, reliability tiers, and caveats.
+- When citing context-frame statistics, include the bucket tuple or plain-language bucket, `N`/`effectiveSampleSize`, and `reliabilityTier`. Never phrase an `insufficient` or `directional` frame as an edge.
+- For trade reviews, call `get_context_frame(timestampMs=entryTimestampMs)` so the review reflects context at entry, not the current market.
+
 Rollover handling:
 - If `rolloverStatus.priorReferenceTrust != "authoritative"`, do not frame prior-day references as actionable current-contract levels. Use `legacyContractReference` only as labeled context, and prefer current-contract/overnight/session levels until a same-contract RTH session or backfill exists.
 - If `rolloverStatus.agentAction` is `runBackfill`, `pinManualOverride`, or `restartMcpServer`, surface that operational action before synthesizing levels.
@@ -93,6 +99,7 @@ Arbitration policy (Primary + Secondary):
 
 Call in parallel:
 - `get_market_snapshot` (full pipeline state including VWAP + DOM summary)
+- `get_context_frame` (bucketed session-relative context and historical analog caveats)
 - `get_tape_pace`
 - `get_rvol`
 - `get_day_type` only when `sessionType == "RTH"`
@@ -142,6 +149,7 @@ Risk output: **Brief footer only** unless trade/risk discussion is included.
 Call in parallel:
 - `evaluate_playbook` (playbook condition status)
 - `get_setup_context` (full context for named setup — includes DOM summary and pull/stack activity)
+- `get_context_frame(setupId=<setup id or inferred setup>)` when a setup ID is known; omit `setupId` if only market-structure framing is needed
 - `get_proximity_report` (key levels near price)
 - `get_tape_pace` and `get_rvol` (participation quality)
 - `get_delta_profile` (flow confirmation)
@@ -210,6 +218,7 @@ Risk output: **Brief footer only.**
 
 Full parallel sweep:
 - `get_rvol`, `get_tape_pace` (market regime)
+- `get_context_frame` (live/bucket context plus available historical analog framing)
 - `get_day_type`
 - `get_contract_rollover_status` (authoritative prior-reference gate)
 - `get_key_levels`, `get_proximity_report` (structural levels)
@@ -240,6 +249,7 @@ Risk output: **Full session-start protocol.**
 
 Full parallel sweep:
 - Reuse baseline context and risk calls from `Always Do This First`
+- `get_context_frame` with Globex scope from the current snapshot
 - `get_rvol`, `get_tape_pace` (overnight participation)
 - `get_contract_rollover_status` (authoritative prior-reference gate)
 - `get_key_levels`, `get_proximity_report` (prior RTH carry-forward + overnight references)
@@ -266,9 +276,10 @@ Route behavior:
 1. Call `get_session_review_context` for the target or latest open session.
 2. Call `refresh_memory_state` when the condition above applies; otherwise skip.
 3. Call `get_memory_brief(intent="trade_review")` for ranked carry-forward memory and open follow-ups.
-4. Call `query_journal_patterns` for repeated discipline patterns and mistake tags.
-5. For broader historical drill-down, pair with `performance` routing and `get_session_history(limit=20)`.
-6. If the trader wants to log or edit notes, use `save_journal_entry`, `review_trade_entry`, `save_agent_insight`, and `create_memory_followup`.
+4. For each reviewed trade with an entry timestamp, call `get_context_frame(timestampMs=entryTimestampMs)` and report the resolved snapshot timestamp/distance.
+5. Call `query_journal_patterns` for repeated discipline patterns and mistake tags.
+6. For broader historical drill-down, pair with `performance` routing and `get_session_history(limit=20)`.
+7. If the trader wants to log or edit notes, use `save_journal_entry`, `review_trade_entry`, `save_agent_insight`, and `create_memory_followup`.
 
 Report:
 - Session trade summary and gross points

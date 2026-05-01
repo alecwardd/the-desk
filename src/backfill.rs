@@ -8,6 +8,7 @@ use crate::feed::scid_reader::{ScanControl, ScidReader};
 use crate::feed::TradeSide;
 use crate::feed::{load_feed_config, resolve_contract_metadata, ContractMetadata};
 use crate::pipelines::{EventDetector, FlowEventEmitter, MarketState, PipelineEngine};
+use crate::research::context_frame::snapshot_context_buckets;
 use crate::research::hypothesis::current_engine_version;
 use crate::rollover::{build_contract_rollover_status, PriorReferenceTrust};
 use crate::rules::{RulesEngine, SetupDefinition, SetupRuntimeSnapshot};
@@ -19,6 +20,8 @@ use chrono::{Duration, NaiveDate, TimeZone};
 use chrono_tz::US::Eastern;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
+
+const CONTEXT_FRAME_SNAPSHOT_INTERVAL_MS: f64 = 60_000.0;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -209,6 +212,7 @@ struct BackfillRunState {
     session_dates: Vec<String>,
     buffers: SessionBuffers,
     segment_buffers: SegmentBuffers,
+    last_context_snapshot_ms: Option<f64>,
 }
 
 pub fn summary_from_state(
@@ -309,6 +313,19 @@ pub fn summary_from_state(
         close_vs_vwap,
         close_vs_poc,
         snapshot_json: serde_json::to_string(state).ok(),
+    }
+}
+
+fn should_persist_context_snapshot(state: &mut BackfillRunState, timestamp_ms: f64) -> bool {
+    if !timestamp_ms.is_finite() || timestamp_ms <= 0.0 {
+        return false;
+    }
+    match state.last_context_snapshot_ms {
+        Some(last) if timestamp_ms - last < CONTEXT_FRAME_SNAPSHOT_INTERVAL_MS => false,
+        _ => {
+            state.last_context_snapshot_ms = Some(timestamp_ms);
+            true
+        }
     }
 }
 
@@ -443,6 +460,7 @@ where
         session_dates: Vec::new(),
         buffers: SessionBuffers::default(),
         segment_buffers: SegmentBuffers::default(),
+        last_context_snapshot_ms: None,
     };
     state
         .pipeline
@@ -568,6 +586,7 @@ where
                 }
                 state.buffers = SessionBuffers::default();
                 state.segment_buffers = SegmentBuffers::default();
+                state.last_context_snapshot_ms = None;
 
                 if new_session == SessionType::Rth || new_session == SessionType::Globex {
                     let current_contract_reference = db
@@ -695,6 +714,12 @@ where
                     .pipeline
                     .snapshot_for_detection(bid, ask, tick.timestamp_ms)
             };
+            if should_persist_context_snapshot(&mut state, tick.timestamp_ms) {
+                let payload = serde_json::to_value(&snapshot).unwrap_or_default();
+                let context = snapshot_context_buckets(&payload, tick.timestamp_ms);
+                let _ =
+                    db.insert_pipeline_snapshot_with_context(tick.timestamp_ms, &payload, &context);
+            }
             state.progress.current_phase = "processing_session".to_string();
 
             tick_events.clear();
@@ -1020,6 +1045,9 @@ where
             let snapshot = state
                 .pipeline
                 .snapshot_for_detection(bid, ask, timestamp_ms);
+            let payload = serde_json::to_value(&snapshot).unwrap_or_default();
+            let context = snapshot_context_buckets(&payload, timestamp_ms);
+            let _ = db.insert_pipeline_snapshot_with_context(timestamp_ms, &payload, &context);
             persist_attention_for_replay(
                 db,
                 params,
@@ -1079,6 +1107,9 @@ where
                 .pipeline
                 .snapshot_for_detection(bid, ask, exit_time_ms)
         };
+        let payload = serde_json::to_value(&snapshot).unwrap_or_default();
+        let context = snapshot_context_buckets(&payload, exit_time_ms);
+        let _ = db.insert_pipeline_snapshot_with_context(exit_time_ms, &payload, &context);
         let summary = summary_from_state(
             &snapshot,
             current_date,

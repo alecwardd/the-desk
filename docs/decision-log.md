@@ -412,3 +412,23 @@ Runtime event persistence is insert-only at emit sites. Retention pruning runs a
 - Send logs to stdout — rejected because MCP stdio owns stdout and non-protocol bytes can corrupt the client connection.
 
 **Consequences:** Operators can query recent runtime issues with `get_runtime_events` and filter by `level`, `minLevel`, `category`, or `eventName`. JSON log payloads expose flattened fields for tools like `jq`, Loki, or Datadog. Event emission must remain low-noise and must not log raw tick streams.
+
+---
+
+### ADR-017: Context frames use stable buckets and weighted analogs
+
+**Date:** 2026-05-01
+**Status:** Decided
+
+**Context:** Raw MCP snapshots are precise but not always decision-useful for an agent. A statement like "price is 18 points above VWAP" needs session-relative interpretation, historical sample-size caveats, and rollover-safe scope before it can become useful coaching context.
+
+**Decision:** Add a deterministic context-framing layer in Rust research infrastructure, exposed by `get_context_frame`. The v1 envelope includes `live`, `buckets`, `intradayForwardStats`, `historicalAnalogs`, optional setup-linked `setupOutcomes`, `caveats`, and `meta`. Bucket definitions are versioned as `context-v1`, blessed on 2026-05-01, and include VWAP-sigma, RVOL, time-of-day, IB state, value-area location, DNVA location, day type, profile shape, balance state, and session scope. Historical matching defaults to weighted analogs, not strict bucket equality, with strict matching reserved for diagnostics.
+
+Initial similarity weights are day type 0.30, profile shape 0.20, VWAP-sigma bucket 0.15, RVOL bucket 0.15, IB state/range bucket 0.10, and single-prints direction 0.10. Weighted analog matching uses a 0.35 distance threshold, then falls back to the nearest 30 analogs when the threshold set is below the reportable sample threshold (`N >= 30`). Rollover-sensitive historical comparisons use same-contract scope when available and suppress or caveat level-derived context when symbol scope is ambiguous. Intraday forward-path stats rely on `pipeline_snapshots` plus end-of-session summaries; snapshots are persisted at a bounded 60-second cadence during live ingest and historical backfill, plus session-final snapshots. Pipeline snapshots denormalize context bucket columns at insert time and use indexed SQL narrowing before JSON payload materialization. The v1 research scan caps are 100,000 session summaries and 200,000 intraday snapshots; these are MVP guardrails and may still be replaced by materialized per-bucket outcome summaries if historical scale grows.
+
+**Alternatives considered:**
+- Strict exact-bucket matching — rejected because VWAP/RVOL/time/day-type buckets create too many sparse cells for the available history.
+- LLM-generated interpretation inside Rust — rejected because Layers 1/2/2.5 must stay deterministic and network-free.
+- Fold context directly into every snapshot only — rejected for v1 so raw tools remain lean and agents can opt into richer framing.
+
+**Consequences:** Agents get prompt-ready context with explicit reliability tiers, sample sizes, bucket provenance, cache status, and caveats. Bucket changes must bump `bucketDefinitionVersion` and record a new decision-log note. Context frames are coaching context only: agents must phrase them as playbook/statistical framing, not advice or trade instructions. Pipeline snapshot retention remains a follow-up storage policy decision; until then, snapshot growth is bounded by cadence but not automatically pruned.

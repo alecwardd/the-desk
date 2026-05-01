@@ -41,6 +41,10 @@ use the_desk_backend::feed::{
     load_feed_config, load_storage_config, resolve_contract_metadata, ContractMetadata, FeedConfig,
     TradeSide,
 };
+use the_desk_backend::mcp::hypotheses::{
+    ActivateDraftSetupParams, HypothesisRunParams, ListHypothesesParams, RegisterHypothesisParams,
+    SetHypothesisLifecycleParams,
+};
 use the_desk_backend::memory::{
     build_memory_brief as memory_build_memory_brief,
     detect_behavioral_patterns as memory_detect_behavioral_patterns,
@@ -60,6 +64,13 @@ use the_desk_backend::pipelines::{
     EventDetector, FlowEventEmitter, MarketEvent, PipelineEngine, PriorSessionData, RvolPipeline,
 };
 use the_desk_backend::research;
+use the_desk_backend::research::hypothesis::{
+    activate_draft_setup as hypothesis_activate_draft_setup,
+    register_hypothesis as hypothesis_register_hypothesis,
+    set_hypothesis_lifecycle as hypothesis_set_lifecycle,
+    summarize_hypothesis_run as hypothesis_summarize_run, HypothesisMetadata,
+    RegisterHypothesisRequest,
+};
 use the_desk_backend::risk::{RiskConfig, RiskState, RiskTracker};
 use the_desk_backend::rollover::{
     build_contract_rollover_status, ContractRolloverStatus, PriorReferenceTrust,
@@ -7479,6 +7490,255 @@ impl TheDeskMcp {
             "onlyGaps": only_gaps,
             "message": "Ingest running in background; use get_raw_tick_ingest_gaps or get_session_summary to verify dbTickCount.",
         })))
+    }
+
+    #[tool(
+        description = "Register or dry-run validate a research hypothesis as an inactive per-version SetupDefinition. First-slice scope is RTH only; use run_backtest with the returned setupId to execute."
+    )]
+    async fn register_hypothesis(
+        &self,
+        Parameters(params): Parameters<RegisterHypothesisParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let metadata: HypothesisMetadata = serde_json::from_value(params.metadata)
+            .map_err(|e| invalid_params_error(e.to_string()))?;
+        let setup_definition: SetupDefinition = serde_json::from_value(params.setup_definition)
+            .map_err(|e| invalid_params_error(e.to_string()))?;
+        let request = RegisterHypothesisRequest {
+            metadata,
+            setup_definition,
+            dry_run: params.dry_run.unwrap_or(false),
+        };
+        let db = self.db.lock().map_err(|_| lock_error())?;
+        let response =
+            hypothesis_register_hypothesis(&db, request).map_err(invalid_params_error)?;
+        drop(db);
+        if response.registered {
+            record_runtime_event(
+                &self.runtime_events,
+                Some(&self.db),
+                RuntimeEventLevel::Info,
+                "hypothesis.registered",
+                "hypothesis",
+                "Hypothesis registered.",
+                serde_json::json!({
+                    "setupId": response.setup_id,
+                    "conditionFingerprint": response.condition_fingerprint,
+                }),
+            );
+        }
+        Ok(text_result(
+            serde_json::to_value(response).unwrap_or_else(|_| serde_json::json!({})),
+        ))
+    }
+
+    #[tool(
+        description = "Summarize one completed hypothesis backtest run by explicit setupId and jobId. Reads signal_outcomes/backtest_runs and returns gate metrics without changing lifecycle."
+    )]
+    async fn summarize_hypothesis_run(
+        &self,
+        Parameters(params): Parameters<HypothesisRunParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let db = self.db.lock().map_err(|_| lock_error())?;
+        let summary =
+            hypothesis_summarize_run(&db, &params.setup_id, &params.job_id).map_err(db_error)?;
+        drop(db);
+        record_runtime_event(
+            &self.runtime_events,
+            Some(&self.db),
+            RuntimeEventLevel::Info,
+            "hypothesis.run_summarized",
+            "hypothesis",
+            "Hypothesis run summarized.",
+            serde_json::json!({
+                "setupId": params.setup_id,
+                "jobId": params.job_id,
+                "passed": summary.gate.passed,
+                "reason": summary.gate.reason,
+            }),
+        );
+        Ok(text_result(
+            serde_json::to_value(summary).unwrap_or_else(|_| serde_json::json!({})),
+        ))
+    }
+
+    #[tool(
+        description = "List registered research hypotheses, optionally filtered by lifecycle (hypothesis/draft/failed/rejectedByHuman/retired/active). Use before proposing new hypotheses to avoid repeating rejected ideas."
+    )]
+    async fn list_hypotheses(
+        &self,
+        Parameters(params): Parameters<ListHypothesesParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let db = self.db.lock().map_err(|_| lock_error())?;
+        let rows = db
+            .list_research_hypotheses(params.lifecycle.as_deref())
+            .map_err(db_error)?;
+        let count = rows.len();
+        Ok(text_result(serde_json::json!({
+            "hypotheses": rows,
+            "count": count,
+            "lifecycle": params.lifecycle,
+        })))
+    }
+
+    #[tool(
+        description = "Evaluate the strict promotion gate for a hypothesis run and transition hypothesis->draft on pass, or hypothesis->failed on fail. Requires explicit setupId and completed jobId."
+    )]
+    async fn propose_draft_setup(
+        &self,
+        Parameters(params): Parameters<HypothesisRunParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let db = self.db.lock().map_err(|_| lock_error())?;
+        let result = match the_desk_backend::research::hypothesis::propose_draft_setup(
+            &db,
+            &params.setup_id,
+            &params.job_id,
+        ) {
+            Ok(result) => result,
+            Err(err) if err.contains("engine_version_drift") => {
+                drop(db);
+                record_runtime_event(
+                    &self.runtime_events,
+                    Some(&self.db),
+                    RuntimeEventLevel::Warn,
+                    "hypothesis.engine_version_drift",
+                    "hypothesis",
+                    "Hypothesis draft proposal rejected because engine version drifted.",
+                    serde_json::json!({
+                        "setupId": params.setup_id,
+                        "jobId": params.job_id,
+                        "error": err.clone(),
+                    }),
+                );
+                return Err(invalid_params_error(err));
+            }
+            Err(err) => return Err(db_error(err)),
+        };
+        drop(db);
+        let passed = result
+            .get("gate")
+            .and_then(|g| g.get("passed"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let reason = result
+            .get("gate")
+            .and_then(|g| g.get("reason"))
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!("unknown"));
+        record_runtime_event(
+            &self.runtime_events,
+            Some(&self.db),
+            if passed {
+                RuntimeEventLevel::Info
+            } else {
+                RuntimeEventLevel::Warn
+            },
+            if passed {
+                "hypothesis.gate_passed"
+            } else {
+                "hypothesis.gate_failed"
+            },
+            "hypothesis",
+            "Hypothesis promotion gate evaluated.",
+            serde_json::json!({
+                "setupId": params.setup_id,
+                "jobId": params.job_id,
+                "passed": passed,
+                "reason": reason,
+            }),
+        );
+        if passed {
+            record_runtime_event(
+                &self.runtime_events,
+                Some(&self.db),
+                RuntimeEventLevel::Info,
+                "hypothesis.promoted_to_draft",
+                "hypothesis",
+                "Hypothesis promoted to inactive draft setup.",
+                serde_json::json!({
+                    "setupId": params.setup_id,
+                    "jobId": params.job_id,
+                }),
+            );
+        }
+        Ok(text_result(result))
+    }
+
+    #[tool(
+        description = "Activate an inactive draft setup after human confirmation. Re-checks cached engine-version freshness before setting active=true."
+    )]
+    async fn activate_draft_setup(
+        &self,
+        Parameters(params): Parameters<ActivateDraftSetupParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let db = self.db.lock().map_err(|_| lock_error())?;
+        let result = match hypothesis_activate_draft_setup(
+            &db,
+            &params.setup_id,
+            &params.trader_confirmation,
+        ) {
+            Ok(result) => result,
+            Err(err) if err.contains("engine_version_drift") => {
+                drop(db);
+                record_runtime_event(
+                    &self.runtime_events,
+                    Some(&self.db),
+                    RuntimeEventLevel::Warn,
+                    "hypothesis.engine_version_drift",
+                    "hypothesis",
+                    "Draft activation rejected because engine version drifted.",
+                    serde_json::json!({
+                        "setupId": params.setup_id,
+                        "error": err.clone(),
+                    }),
+                );
+                return Err(invalid_params_error(err));
+            }
+            Err(err) => return Err(invalid_params_error(err)),
+        };
+        drop(db);
+        record_runtime_event(
+            &self.runtime_events,
+            Some(&self.db),
+            RuntimeEventLevel::Info,
+            "hypothesis.activated",
+            "hypothesis",
+            "Draft setup activated by trader confirmation.",
+            serde_json::json!({ "setupId": params.setup_id }),
+        );
+        self.hydrate_playbook_runtime_cache()?;
+        Ok(text_result(result))
+    }
+
+    #[tool(
+        description = "Manually transition a hypothesis/draft to rejectedByHuman or retired with a required reason. Does not activate setups."
+    )]
+    async fn set_hypothesis_lifecycle(
+        &self,
+        Parameters(params): Parameters<SetHypothesisLifecycleParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let db = self.db.lock().map_err(|_| lock_error())?;
+        let result =
+            hypothesis_set_lifecycle(&db, &params.setup_id, &params.target, &params.reason)
+                .map_err(invalid_params_error)?;
+        drop(db);
+        record_runtime_event(
+            &self.runtime_events,
+            Some(&self.db),
+            RuntimeEventLevel::Info,
+            if params.target == "retired" {
+                "hypothesis.retired"
+            } else {
+                "hypothesis.rejected"
+            },
+            "hypothesis",
+            "Hypothesis lifecycle changed manually.",
+            serde_json::json!({
+                "setupId": params.setup_id,
+                "target": params.target,
+            }),
+        );
+        self.hydrate_playbook_runtime_cache()?;
+        Ok(text_result(result))
     }
 
     #[tool(

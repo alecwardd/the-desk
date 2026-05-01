@@ -7,7 +7,9 @@ use crate::memory::{
 use crate::observability::{RuntimeEvent, RuntimeEventFilter, RuntimeEventLevel};
 use crate::pipelines::event_detector::MarketEvent;
 use crate::risk::RiskState;
-use crate::rules::{SetupDefinition, SetupReadiness, SetupState, SetupTransition};
+use crate::rules::{
+    SetupDefinition, SetupLifecycleStatus, SetupReadiness, SetupState, SetupTransition,
+};
 use crate::tick_time_context_from_timestamp_ms;
 use crate::trading_day_from_timestamp_ms;
 use rusqlite::{params, Connection, Row};
@@ -656,6 +658,48 @@ pub struct HistoricalJobRunUpdate<'a> {
     pub finished_at_ms: Option<f64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResearchHypothesisRecord {
+    pub hypothesis_id: String,
+    pub current_version: i64,
+    pub setup_id: String,
+    pub doc_reference: String,
+    pub prose_summary: String,
+    pub owner: Option<String>,
+    pub lifecycle: String,
+    pub created_at_ms: f64,
+    pub updated_at_ms: f64,
+    pub condition_fingerprint: String,
+    pub session_scope: Vec<String>,
+    pub canonical_run_job_id: Option<String>,
+    pub last_gate_decision: serde_json::Value,
+    pub engine_version: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HypothesisSignalOutcomeRow {
+    pub signal_id: String,
+    pub setup_id: String,
+    pub setup_name: Option<String>,
+    pub session_date: String,
+    pub session_type: Option<String>,
+    pub day_type: Option<String>,
+    pub rvol_bucket_at_fire: Option<i32>,
+    pub fired_at_ms: f64,
+    pub fired_price: f64,
+    pub target_price: Option<f64>,
+    pub stop_price: Option<f64>,
+    pub outcome: String,
+    pub max_favorable_excursion: Option<f64>,
+    pub max_adverse_excursion: Option<f64>,
+    pub r_result: Option<f64>,
+    pub time_to_outcome_ms: Option<f64>,
+    pub root_symbol: Option<String>,
+    pub contract_symbol: Option<String>,
+}
+
 fn default_signal_source() -> String {
     "live".to_string()
 }
@@ -1088,6 +1132,9 @@ impl Database {
         }
         if version < 24 {
             self.migrate_v24()?;
+        }
+        if version < 25 {
+            self.migrate_v25()?;
         }
 
         Ok(())
@@ -2375,6 +2422,54 @@ impl Database {
         Ok(())
     }
 
+    /// V25: hypothesis promotion metadata and setup lifecycle fields.
+    fn migrate_v25(&self) -> Result<(), DbError> {
+        let _ = self
+            .conn
+            .execute_batch("ALTER TABLE setups ADD COLUMN lifecycle_status TEXT NULL");
+        let _ = self
+            .conn
+            .execute_batch("ALTER TABLE setups ADD COLUMN parent_hypothesis_id TEXT NULL");
+
+        self.conn.execute_batch(
+            "
+            UPDATE setups
+            SET lifecycle_status = CASE
+              WHEN active = 1 THEN 'active'
+              WHEN template_source LIKE 'hypothesis:%' THEN 'draft'
+              ELSE 'retired'
+            END
+            WHERE lifecycle_status IS NULL OR lifecycle_status = '';
+
+            CREATE TABLE IF NOT EXISTS research_hypotheses (
+              hypothesis_id TEXT PRIMARY KEY,
+              current_version INTEGER NOT NULL,
+              setup_id TEXT NOT NULL,
+              doc_reference TEXT NOT NULL,
+              prose_summary TEXT NOT NULL,
+              owner TEXT NULL,
+              lifecycle TEXT NOT NULL,
+              created_at_ms REAL NOT NULL,
+              updated_at_ms REAL NOT NULL,
+              condition_fingerprint TEXT NOT NULL,
+              session_scope_json TEXT NOT NULL DEFAULT '[\"rth\"]',
+              canonical_run_job_id TEXT NULL,
+              last_gate_decision_json TEXT NOT NULL DEFAULT '{}',
+              engine_version_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS idx_research_hypotheses_setup
+              ON research_hypotheses(setup_id);
+            CREATE INDEX IF NOT EXISTS idx_research_hypotheses_fingerprint
+              ON research_hypotheses(condition_fingerprint);
+            CREATE INDEX IF NOT EXISTS idx_research_hypotheses_lifecycle
+              ON research_hypotheses(lifecycle);
+
+            UPDATE schema_version SET version = 25;
+            ",
+        )?;
+        Ok(())
+    }
+
     // ------------------------------------------------------------------
     // Setup CRUD
     // ------------------------------------------------------------------
@@ -2428,6 +2523,16 @@ impl Database {
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
         let template_source: Option<String> = row.get(17).ok().flatten();
+        let lifecycle_raw: Option<String> = row.get(18).ok().flatten();
+        let lifecycle_status = match lifecycle_raw.as_deref() {
+            Some("hypothesis") => SetupLifecycleStatus::Hypothesis,
+            Some("draft") => SetupLifecycleStatus::Draft,
+            Some("active") => SetupLifecycleStatus::Active,
+            Some("failed") => SetupLifecycleStatus::Failed,
+            Some("rejectedByHuman") => SetupLifecycleStatus::RejectedByHuman,
+            Some("retired") | None | Some(_) => SetupLifecycleStatus::Retired,
+        };
+        let parent_hypothesis_id: Option<String> = row.get(19).ok().flatten();
 
         Ok(SetupDefinition {
             id: row.get(0)?,
@@ -2448,6 +2553,8 @@ impl Database {
             context_backtest_results: context_backtest,
             discretionary_conditions: discretionary,
             template_source,
+            lifecycle_status,
+            parent_hypothesis_id,
         })
     }
 
@@ -2469,13 +2576,20 @@ impl Database {
             serde_json::to_string(&setup.context_backtest_results).unwrap_or_else(|_| "[]".into());
         let discretionary =
             serde_json::to_string(&setup.discretionary_conditions).unwrap_or_else(|_| "[]".into());
+        let lifecycle_status =
+            if setup.active && setup.lifecycle_status == SetupLifecycleStatus::Retired {
+                SetupLifecycleStatus::Active.as_str()
+            } else {
+                setup.lifecycle_status.as_str()
+            };
 
         self.conn.execute(
             "INSERT INTO setups (id, name, description, active, conditions, min_delta,
                 require_above_vwap, duplicate_suppression_ms, entry_logic, stop_logic,
                 targets, position_sizing, market_context, invalidation,
-                backtest_results, context_backtest_results, discretionary_conditions, template_source)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+                backtest_results, context_backtest_results, discretionary_conditions, template_source,
+                lifecycle_status, parent_hypothesis_id)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
             ON CONFLICT(id) DO UPDATE SET
               name=excluded.name, description=excluded.description,
               active=excluded.active, conditions=excluded.conditions,
@@ -2487,7 +2601,9 @@ impl Database {
               backtest_results=excluded.backtest_results,
               context_backtest_results=excluded.context_backtest_results,
               discretionary_conditions=excluded.discretionary_conditions,
-              template_source=excluded.template_source",
+              template_source=excluded.template_source,
+              lifecycle_status=excluded.lifecycle_status,
+              parent_hypothesis_id=excluded.parent_hypothesis_id",
             params![
                 setup.id,
                 setup.name,
@@ -2507,6 +2623,8 @@ impl Database {
                 context_backtest,
                 discretionary,
                 setup.template_source,
+                lifecycle_status,
+                setup.parent_hypothesis_id,
             ],
         )?;
         Ok(())
@@ -2518,7 +2636,8 @@ impl Database {
                     require_above_vwap, duplicate_suppression_ms,
                     entry_logic, stop_logic, targets, position_sizing,
                     market_context, invalidation, backtest_results,
-                    context_backtest_results, discretionary_conditions, template_source
+                    context_backtest_results, discretionary_conditions, template_source,
+                    lifecycle_status, parent_hypothesis_id
              FROM setups",
         )?;
         let rows = stmt.query_map([], Self::decode_setup_row)?;
@@ -2531,7 +2650,8 @@ impl Database {
                     require_above_vwap, duplicate_suppression_ms,
                     entry_logic, stop_logic, targets, position_sizing,
                     market_context, invalidation, backtest_results,
-                    context_backtest_results, discretionary_conditions, template_source
+                    context_backtest_results, discretionary_conditions, template_source,
+                    lifecycle_status, parent_hypothesis_id
              FROM setups
              WHERE active = 1",
         )?;
@@ -2569,7 +2689,8 @@ impl Database {
                     require_above_vwap, duplicate_suppression_ms,
                     entry_logic, stop_logic, targets, position_sizing,
                     market_context, invalidation, backtest_results,
-                    context_backtest_results, discretionary_conditions, template_source
+                    context_backtest_results, discretionary_conditions, template_source,
+                    lifecycle_status, parent_hypothesis_id
              FROM setups
              WHERE id = ?1
              LIMIT 1",
@@ -2580,6 +2701,231 @@ impl Database {
         } else {
             Ok(None)
         }
+    }
+
+    pub fn update_setup_lifecycle(
+        &self,
+        id: &str,
+        active: bool,
+        lifecycle_status: &str,
+        backtest_results: Option<&serde_json::Value>,
+    ) -> Result<bool, DbError> {
+        let changed = if let Some(results) = backtest_results {
+            self.conn.execute(
+                "UPDATE setups
+                 SET active = ?2, lifecycle_status = ?3, backtest_results = ?4
+                 WHERE id = ?1",
+                params![
+                    id,
+                    i64::from(active),
+                    lifecycle_status,
+                    serde_json::to_string(results)?
+                ],
+            )?
+        } else {
+            self.conn.execute(
+                "UPDATE setups
+                 SET active = ?2, lifecycle_status = ?3
+                 WHERE id = ?1",
+                params![id, i64::from(active), lifecycle_status],
+            )?
+        };
+        Ok(changed > 0)
+    }
+
+    pub fn upsert_research_hypothesis(
+        &self,
+        record: &ResearchHypothesisRecord,
+    ) -> Result<(), DbError> {
+        self.conn.execute(
+            "INSERT INTO research_hypotheses
+             (hypothesis_id, current_version, setup_id, doc_reference, prose_summary, owner,
+              lifecycle, created_at_ms, updated_at_ms, condition_fingerprint, session_scope_json,
+              canonical_run_job_id, last_gate_decision_json, engine_version_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+             ON CONFLICT(hypothesis_id) DO UPDATE SET
+              current_version=MAX(research_hypotheses.current_version, excluded.current_version),
+              setup_id=CASE
+                WHEN excluded.current_version >= research_hypotheses.current_version THEN excluded.setup_id
+                ELSE research_hypotheses.setup_id
+              END,
+              doc_reference=CASE
+                WHEN excluded.current_version >= research_hypotheses.current_version THEN excluded.doc_reference
+                ELSE research_hypotheses.doc_reference
+              END,
+              prose_summary=CASE
+                WHEN excluded.current_version >= research_hypotheses.current_version THEN excluded.prose_summary
+                ELSE research_hypotheses.prose_summary
+              END,
+              owner=CASE
+                WHEN excluded.current_version >= research_hypotheses.current_version THEN excluded.owner
+                ELSE research_hypotheses.owner
+              END,
+              lifecycle=CASE
+                WHEN excluded.current_version >= research_hypotheses.current_version THEN excluded.lifecycle
+                ELSE research_hypotheses.lifecycle
+              END,
+              updated_at_ms=excluded.updated_at_ms,
+              condition_fingerprint=CASE
+                WHEN excluded.current_version >= research_hypotheses.current_version THEN excluded.condition_fingerprint
+                ELSE research_hypotheses.condition_fingerprint
+              END,
+              session_scope_json=CASE
+                WHEN excluded.current_version >= research_hypotheses.current_version THEN excluded.session_scope_json
+                ELSE research_hypotheses.session_scope_json
+              END,
+              canonical_run_job_id=CASE
+                WHEN excluded.current_version >= research_hypotheses.current_version THEN excluded.canonical_run_job_id
+                ELSE research_hypotheses.canonical_run_job_id
+              END,
+              last_gate_decision_json=CASE
+                WHEN excluded.current_version >= research_hypotheses.current_version THEN excluded.last_gate_decision_json
+                ELSE research_hypotheses.last_gate_decision_json
+              END,
+              engine_version_json=CASE
+                WHEN excluded.current_version >= research_hypotheses.current_version THEN excluded.engine_version_json
+                ELSE research_hypotheses.engine_version_json
+              END",
+            params![
+                record.hypothesis_id,
+                record.current_version,
+                record.setup_id,
+                record.doc_reference,
+                record.prose_summary,
+                record.owner,
+                record.lifecycle,
+                record.created_at_ms,
+                record.updated_at_ms,
+                record.condition_fingerprint,
+                serde_json::to_string(&record.session_scope)?,
+                record.canonical_run_job_id,
+                serde_json::to_string(&record.last_gate_decision)?,
+                serde_json::to_string(&record.engine_version)?,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn decode_research_hypothesis_row(row: &Row<'_>) -> rusqlite::Result<ResearchHypothesisRecord> {
+        let session_scope_json: String = row.get(10)?;
+        let last_gate_json: String = row.get(12)?;
+        let engine_version_json: String = row.get(13)?;
+        Ok(ResearchHypothesisRecord {
+            hypothesis_id: row.get(0)?,
+            current_version: row.get(1)?,
+            setup_id: row.get(2)?,
+            doc_reference: row.get(3)?,
+            prose_summary: row.get(4)?,
+            owner: row.get(5)?,
+            lifecycle: row.get(6)?,
+            created_at_ms: row.get(7)?,
+            updated_at_ms: row.get(8)?,
+            condition_fingerprint: row.get(9)?,
+            session_scope: serde_json::from_str(&session_scope_json).unwrap_or_default(),
+            canonical_run_job_id: row.get(11)?,
+            last_gate_decision: serde_json::from_str(&last_gate_json)
+                .unwrap_or_else(|_| serde_json::json!({})),
+            engine_version: serde_json::from_str(&engine_version_json)
+                .unwrap_or_else(|_| serde_json::json!({})),
+        })
+    }
+
+    pub fn get_research_hypothesis(
+        &self,
+        hypothesis_id: &str,
+    ) -> Result<Option<ResearchHypothesisRecord>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT hypothesis_id, current_version, setup_id, doc_reference, prose_summary, owner,
+                    lifecycle, created_at_ms, updated_at_ms, condition_fingerprint,
+                    session_scope_json, canonical_run_job_id, last_gate_decision_json,
+                    engine_version_json
+             FROM research_hypotheses
+             WHERE hypothesis_id = ?1
+             LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![hypothesis_id])?;
+        rows.next()?
+            .map(Self::decode_research_hypothesis_row)
+            .transpose()
+            .map_err(DbError::from)
+    }
+
+    pub fn get_research_hypothesis_by_setup(
+        &self,
+        setup_id: &str,
+    ) -> Result<Option<ResearchHypothesisRecord>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT hypothesis_id, current_version, setup_id, doc_reference, prose_summary, owner,
+                    lifecycle, created_at_ms, updated_at_ms, condition_fingerprint,
+                    session_scope_json, canonical_run_job_id, last_gate_decision_json,
+                    engine_version_json
+             FROM research_hypotheses
+             WHERE setup_id = ?1
+             LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![setup_id])?;
+        rows.next()?
+            .map(Self::decode_research_hypothesis_row)
+            .transpose()
+            .map_err(DbError::from)
+    }
+
+    pub fn list_research_hypotheses(
+        &self,
+        lifecycle: Option<&str>,
+    ) -> Result<Vec<ResearchHypothesisRecord>, DbError> {
+        let sql = if lifecycle.is_some() {
+            "SELECT hypothesis_id, current_version, setup_id, doc_reference, prose_summary, owner,
+                    lifecycle, created_at_ms, updated_at_ms, condition_fingerprint,
+                    session_scope_json, canonical_run_job_id, last_gate_decision_json,
+                    engine_version_json
+             FROM research_hypotheses
+             WHERE lifecycle = ?1
+             ORDER BY updated_at_ms DESC"
+        } else {
+            "SELECT hypothesis_id, current_version, setup_id, doc_reference, prose_summary, owner,
+                    lifecycle, created_at_ms, updated_at_ms, condition_fingerprint,
+                    session_scope_json, canonical_run_job_id, last_gate_decision_json,
+                    engine_version_json
+             FROM research_hypotheses
+             ORDER BY updated_at_ms DESC"
+        };
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = if let Some(lifecycle) = lifecycle {
+            stmt.query_map(params![lifecycle], Self::decode_research_hypothesis_row)?
+        } else {
+            stmt.query_map([], Self::decode_research_hypothesis_row)?
+        };
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn update_research_hypothesis_decision(
+        &self,
+        hypothesis_id: &str,
+        lifecycle: &str,
+        canonical_run_job_id: Option<&str>,
+        last_gate_decision: &serde_json::Value,
+        engine_version: &serde_json::Value,
+        updated_at_ms: f64,
+    ) -> Result<bool, DbError> {
+        let changed = self.conn.execute(
+            "UPDATE research_hypotheses
+             SET lifecycle = ?2,
+                 canonical_run_job_id = COALESCE(?3, canonical_run_job_id),
+                 last_gate_decision_json = ?4,
+                 engine_version_json = ?5,
+                 updated_at_ms = ?6
+             WHERE hypothesis_id = ?1",
+            params![
+                hypothesis_id,
+                lifecycle,
+                canonical_run_job_id,
+                serde_json::to_string(last_gate_decision)?,
+                serde_json::to_string(engine_version)?,
+                updated_at_ms,
+            ],
+        )?;
+        Ok(changed > 0)
     }
 
     // ------------------------------------------------------------------
@@ -7826,6 +8172,67 @@ impl Database {
         Ok(out)
     }
 
+    pub fn list_hypothesis_signal_outcomes(
+        &self,
+        setup_id: &str,
+        job_id: &str,
+        scope: Option<&SessionScopeFilter>,
+    ) -> Result<Vec<HypothesisSignalOutcomeRow>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT so.signal_id, so.setup_id, so.setup_name, so.session_date,
+                    ss.session_type, ss.day_type, so.rvol_bucket_at_fire, so.fired_at_ms,
+                    so.fired_price, so.target_price, so.stop_price, so.outcome,
+                    so.max_favorable_excursion, so.max_adverse_excursion, so.r_result,
+                    so.time_to_outcome_ms, so.root_symbol, so.contract_symbol
+             FROM signal_outcomes so
+             LEFT JOIN session_summaries ss
+               ON ss.session_date = so.session_date
+              AND ss.session_type = COALESCE(?3, ss.session_type)
+             WHERE so.setup_id = ?1 AND so.job_id = ?2
+             ORDER BY so.fired_at_ms ASC",
+        )?;
+        let session_type = scope.and_then(|s| s.session_type.as_deref());
+        let rows = stmt.query_map(params![setup_id, job_id, session_type], |row| {
+            Ok(HypothesisSignalOutcomeRow {
+                signal_id: row.get(0)?,
+                setup_id: row.get(1)?,
+                setup_name: row.get(2)?,
+                session_date: row.get(3)?,
+                session_type: row.get(4)?,
+                day_type: row.get(5)?,
+                rvol_bucket_at_fire: row.get(6)?,
+                fired_at_ms: row.get(7)?,
+                fired_price: row.get(8)?,
+                target_price: row.get(9)?,
+                stop_price: row.get(10)?,
+                outcome: row.get(11)?,
+                max_favorable_excursion: row.get(12)?,
+                max_adverse_excursion: row.get(13)?,
+                r_result: row.get(14)?,
+                time_to_outcome_ms: row.get(15)?,
+                root_symbol: row.get(16)?,
+                contract_symbol: row.get(17)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows.filter_map(|r| r.ok()) {
+            if !contract_fields_match_scope(
+                row.root_symbol.as_deref(),
+                row.contract_symbol.as_deref(),
+                scope,
+            ) {
+                continue;
+            }
+            if let Some(expected) = session_type {
+                if row.session_type.as_deref() != Some(expected) {
+                    continue;
+                }
+            }
+            out.push(row);
+        }
+        Ok(out)
+    }
+
     /// List resolved signal outcomes with RVOL-at-fire context for regime analysis.
     /// Returns `(rvol_at_fire, r_result, outcome)` tuples, filtering to rows where
     /// `rvol_at_fire` is populated.
@@ -8356,6 +8763,50 @@ impl Database {
         Ok(count)
     }
 
+    pub fn count_session_summaries_for_scope(
+        &self,
+        start_date: Option<&str>,
+        end_date: Option<&str>,
+        scope: Option<&SessionScopeFilter>,
+    ) -> Result<i64, DbError> {
+        let mut sql = String::from("SELECT COUNT(1) FROM session_summaries WHERE 1=1");
+        let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        if let Some(session_type) = scope.and_then(|s| s.session_type.as_deref()) {
+            sql.push_str(&format!(" AND session_type = ?{}", bind_values.len() + 1));
+            bind_values.push(Box::new(session_type.to_string()));
+        }
+        if let Some(sd) = scope
+            .and_then(|s| s.trading_day_start.as_deref())
+            .or(start_date)
+        {
+            sql.push_str(&format!(" AND session_date >= ?{}", bind_values.len() + 1));
+            bind_values.push(Box::new(sd.to_string()));
+        }
+        if let Some(ed) = scope
+            .and_then(|s| s.trading_day_end.as_deref())
+            .or(end_date)
+        {
+            sql.push_str(&format!(" AND session_date <= ?{}", bind_values.len() + 1));
+            bind_values.push(Box::new(ed.to_string()));
+        }
+        if let Some(root) = scope.and_then(|s| s.root_symbol.as_deref()) {
+            sql.push_str(&format!(" AND root_symbol = ?{}", bind_values.len() + 1));
+            bind_values.push(Box::new(root.to_string()));
+        }
+        if let Some(contract) = scope.and_then(|s| s.contract_symbol.as_deref()) {
+            sql.push_str(&format!(
+                " AND contract_symbol = ?{}",
+                bind_values.len() + 1
+            ));
+            bind_values.push(Box::new(contract.to_string()));
+        }
+        let mut stmt = self.conn.prepare(&sql)?;
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+            bind_values.iter().map(|b| b.as_ref()).collect();
+        stmt.query_row(params_ref.as_slice(), |row| row.get(0))
+            .map_err(DbError::from)
+    }
+
     /// Atomically persist the session_summaries row and the prior_day_levels
     /// carry-forward for a just-closed RTH (or other) session inside a single
     /// `BEGIN IMMEDIATE` transaction. This is the live counterpart of
@@ -8721,6 +9172,34 @@ impl Database {
         } else {
             Ok(None)
         }
+    }
+
+    pub fn get_backtest_run_for_job_id(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<serde_json::Value>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, created_at_ms, params, metrics, trades
+             FROM backtest_runs
+             WHERE json_extract(params, '$.jobId') = ?1
+             ORDER BY created_at_ms DESC
+             LIMIT 1",
+        )?;
+        let mut rows = stmt.query_map([job_id], |row| {
+            let id: String = row.get(0)?;
+            let created_at_ms: f64 = row.get(1)?;
+            let params_str: String = row.get(2)?;
+            let metrics_str: String = row.get(3)?;
+            let trades_str: String = row.get(4)?;
+            Ok(serde_json::json!({
+                "id": id,
+                "createdAtMs": created_at_ms,
+                "params": serde_json::from_str::<serde_json::Value>(&params_str).unwrap_or_default(),
+                "metrics": serde_json::from_str::<serde_json::Value>(&metrics_str).unwrap_or_default(),
+                "trades": serde_json::from_str::<serde_json::Value>(&trades_str).unwrap_or_default(),
+            }))
+        })?;
+        rows.next().transpose().map_err(DbError::from)
     }
 }
 

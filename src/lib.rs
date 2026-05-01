@@ -3,6 +3,7 @@ pub mod backfill;
 pub mod db;
 pub mod depth;
 pub mod feed;
+pub mod mcp;
 pub mod memory;
 pub mod observability;
 pub mod options;

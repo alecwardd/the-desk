@@ -167,6 +167,7 @@ The core is strong. The work from here is about **making the intelligence legibl
 ## Priority 0 — Regime Overlay
 
 ### IDEA-000: Regime-Gated Setup Selector
+<!-- hypothesis-anchor: IDEA-000 -->
 
 **Status:** Researched
 **Source:** Local 2025-11-28 through 2026-03-06 database study; 0DTE / dealer gamma literature; CME liquidity research
@@ -231,6 +232,49 @@ The regime layer should drive which existing templates are active, not just how 
 > Does gating OR5, IB Extension, and Single Print Continuation to one-sided acceptance regimes improve win rate versus ungated firing?
 
 > Does gating DNVA, VWAP band, and session inventory setups to migration / inventory-clear regimes improve expectancy?
+
+**Typed hypothesis spec example:**
+```json
+{
+  "metadata": {
+    "hypothesisId": "IDEA-000",
+    "version": 1,
+    "docReference": "IDEA-000",
+    "proseSummary": "One-sided acceptance regime gate for continuation-style setups during RTH.",
+    "owner": "user",
+    "sessionScope": ["rth"]
+  },
+  "setupDefinition": {
+    "id": "hyp_IDEA-000_v1",
+    "name": "IDEA-000 One-Sided Acceptance Gate",
+    "description": "Prototype gate: continuation setups are only valid when RTH structure shows one-sided acceptance through value and DNP with elevated participation.",
+    "active": false,
+    "conditions": [
+      "{\"id\":\"c1\",\"field\":\"day_type\",\"operator\":\"equals\",\"value\":\"Trend\",\"label\":\"Trend day context\"}",
+      "{\"id\":\"c2\",\"field\":\"rvol_classification\",\"operator\":\"equals\",\"value\":\"High\",\"label\":\"High RVOL participation\"}",
+      "{\"id\":\"c3\",\"field\":\"price_vs_vwap\",\"operator\":\"above\",\"label\":\"Price accepted above VWAP\"}",
+      "{\"id\":\"c4\",\"field\":\"price_vs_dnp\",\"operator\":\"above\",\"label\":\"Price accepted above DNP\"}"
+    ],
+    "stopLogic": {
+      "mode": "fixed_points",
+      "direction": "long",
+      "points": 12
+    },
+    "targets": [
+      {
+        "mode": "fixed_points",
+        "direction": "long",
+        "points": 18,
+        "label": "1.5R fixed target"
+      }
+    ],
+    "positionSizing": {
+      "r_points": 12
+    },
+    "templateSource": "hypothesis:IDEA-000:v1"
+  }
+}
+```
 
 ---
 

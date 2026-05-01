@@ -1,3 +1,5 @@
+pub mod hypothesis;
+
 use crate::db::{Database, SessionScopeFilter};
 use crate::depth::DomSummary;
 use serde::{Deserialize, Serialize};

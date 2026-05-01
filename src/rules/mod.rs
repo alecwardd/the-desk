@@ -4,6 +4,14 @@ use crate::pipelines::MarketState;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Semantic version for rules-engine condition/evaluator behavior.
+///
+/// Increment this when `ConditionField`, `ConditionOperator`, or evaluator
+/// semantics change in a way that invalidates cached backtest statistics.
+/// Examples: adding/removing condition variants, changing comparison semantics
+/// in `evaluate_typed_condition`, or changing `resolve_price_expression` modes.
+pub const RULES_ENGINE_SCHEMA_VERSION: u32 = 1;
+
 // ---------------------------------------------------------------------------
 // Setup state machine
 // ---------------------------------------------------------------------------
@@ -30,6 +38,33 @@ pub enum SetupReadiness {
     Confirmed,
     InTrade,
     Closed,
+}
+
+/// Durable lifecycle of a setup row outside the live evaluation state machine.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum SetupLifecycleStatus {
+    Hypothesis,
+    Draft,
+    Active,
+    Failed,
+    RejectedByHuman,
+    #[default]
+    Retired,
+}
+
+impl SetupLifecycleStatus {
+    /// Stable database representation for setup lifecycle.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Hypothesis => "hypothesis",
+            Self::Draft => "draft",
+            Self::Active => "active",
+            Self::Failed => "failed",
+            Self::RejectedByHuman => "rejectedByHuman",
+            Self::Retired => "retired",
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -203,6 +238,10 @@ pub struct SetupDefinition {
     pub discretionary_conditions: Vec<String>,
     #[serde(default)]
     pub template_source: Option<String>,
+    #[serde(default)]
+    pub lifecycle_status: SetupLifecycleStatus,
+    #[serde(default)]
+    pub parent_hypothesis_id: Option<String>,
 }
 
 impl Default for SetupDefinition {
@@ -226,6 +265,8 @@ impl Default for SetupDefinition {
             context_backtest_results: Vec::new(),
             discretionary_conditions: Vec::new(),
             template_source: None,
+            lifecycle_status: SetupLifecycleStatus::Retired,
+            parent_hypothesis_id: None,
         }
     }
 }
@@ -369,6 +410,100 @@ fn evaluate_string_condition(condition: &str, market: &MarketState) -> bool {
         "price_vs_ib_low=below" => market.last_price < market.ib_low,
         _ => false,
     }
+}
+
+fn named_level_value(name: &str, market: &MarketState) -> Option<f64> {
+    let value = match name {
+        "vwap" => market.vwap,
+        "poc" => market.poc,
+        "va_high" => market.va_high,
+        "va_low" => market.va_low,
+        "dnva_high" => market.dnva_high,
+        "dnva_low" => market.dnva_low,
+        "dnp" => market.dnp,
+        "prior_high" => market.prior_day_high,
+        "prior_low" => market.prior_day_low,
+        "prior_close" => market.prior_day_close,
+        "prior_va_high" => market.prior_va_high,
+        "prior_va_low" => market.prior_va_low,
+        "prior_poc" => market.prior_poc,
+        "overnight_high" => market.overnight_high,
+        "overnight_low" => market.overnight_low,
+        "or_high" => market.or_high,
+        "or_low" => market.or_low,
+        "ib_high" => market.ib_high,
+        "ib_low" => market.ib_low,
+        "or5_high" => market.or5_high,
+        "or5_low" => market.or5_low,
+        "or5_mid" => market.or5_mid,
+        _ => return None,
+    };
+    (value > 0.0 && value.is_finite()).then_some(value)
+}
+
+fn signed_offset(direction: &str, points: f64, is_stop: bool) -> Option<f64> {
+    // `direction` is the trade direction. A long target is above entry, but a
+    // long stop is below entry; shorts invert that relationship.
+    match direction {
+        "long" | "up" | "above" if is_stop => Some(-points.abs()),
+        "long" | "up" | "above" => Some(points.abs()),
+        "short" | "down" | "below" if is_stop => Some(points.abs()),
+        "short" | "down" | "below" => Some(-points.abs()),
+        _ => None,
+    }
+}
+
+fn resolve_price_expression(
+    expr: &serde_json::Value,
+    market: &MarketState,
+    is_stop: bool,
+) -> Option<f64> {
+    if let Some(price) = expr.get("price").and_then(|v| v.as_f64()) {
+        return Some(price);
+    }
+
+    match expr.get("mode").and_then(|v| v.as_str()).unwrap_or("") {
+        "fixed_points" => {
+            let direction = expr.get("direction").and_then(|v| v.as_str())?;
+            let points = expr
+                .get("points")
+                .or_else(|| expr.get("targetPoints"))
+                .or_else(|| expr.get("stopPoints"))
+                .and_then(|v| v.as_f64())?;
+            signed_offset(direction, points, is_stop).map(|offset| market.last_price + offset)
+        }
+        "named_level_offset" => {
+            let level = expr.get("level").and_then(|v| v.as_str())?;
+            let base = named_level_value(level, market)?;
+            let offset_ticks = expr
+                .get("offsetTicks")
+                .or_else(|| expr.get("offset_ticks"))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            let offset_points = expr
+                .get("offsetPoints")
+                .or_else(|| expr.get("offset_points"))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(offset_ticks * 0.25);
+            Some(base + offset_points)
+        }
+        _ => None,
+    }
+}
+
+fn resolve_stop_price(setup: &SetupDefinition, market: &MarketState) -> Option<f64> {
+    resolve_price_expression(&setup.stop_logic, market, true).or_else(|| {
+        // Backward compatibility for existing setup templates/tests.
+        setup.stop_logic.get("points").and_then(|v| v.as_f64())
+    })
+}
+
+fn resolve_target_prices(setup: &SetupDefinition, market: &MarketState) -> Vec<f64> {
+    setup
+        .targets
+        .iter()
+        .filter_map(|target| resolve_price_expression(target, market, false))
+        .collect()
 }
 
 /// Evaluate a typed condition against current and optional previous market state.
@@ -1051,12 +1186,8 @@ impl RulesEngine {
 
             if !suppressed {
                 runtime.last_alert_emitted_at_ms = Some(now_ms);
-                let stop_price = setup.stop_logic.get("points").and_then(|v| v.as_f64());
-                let target_prices: Vec<f64> = setup
-                    .targets
-                    .iter()
-                    .filter_map(|t| t.get("price").and_then(|v| v.as_f64()))
-                    .collect();
+                let stop_price = resolve_stop_price(setup, market);
+                let target_prices = resolve_target_prices(setup, market);
 
                 let backtest_summary = if setup.backtest_results != serde_json::json!({}) {
                     Some(setup.backtest_results.clone())
@@ -1693,6 +1824,34 @@ mod tests {
         assert!(alert.backtest_summary.is_some());
         assert_eq!(alert.target_prices, vec![21050.0, 21100.0]);
         assert_eq!(alert.stop_price, Some(10.0));
+    }
+
+    #[test]
+    fn alert_resolves_fixed_point_hypothesis_exits() {
+        let setup = SetupDefinition {
+            targets: vec![serde_json::json!({
+                "mode": "fixed_points",
+                "direction": "long",
+                "points": 18.0
+            })],
+            stop_logic: serde_json::json!({
+                "mode": "fixed_points",
+                "direction": "long",
+                "points": 12.0
+            }),
+            ..make_setup(vec!["price_vs_vwap=above"], 0.0)
+        };
+        let market = MarketState {
+            last_price: 21010.0,
+            vwap: 21000.0,
+            ..Default::default()
+        };
+        let mut engine = RulesEngine::default();
+        let alert = engine
+            .evaluate(&setup, &market, false)
+            .expect("should fire");
+        assert_eq!(alert.target_prices, vec![21028.0]);
+        assert_eq!(alert.stop_price, Some(20998.0));
     }
 
     #[test]

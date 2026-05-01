@@ -8,6 +8,7 @@ use crate::feed::scid_reader::{ScanControl, ScidReader};
 use crate::feed::TradeSide;
 use crate::feed::{load_feed_config, resolve_contract_metadata, ContractMetadata};
 use crate::pipelines::{EventDetector, FlowEventEmitter, MarketState, PipelineEngine};
+use crate::research::hypothesis::current_engine_version;
 use crate::rollover::{build_contract_rollover_status, PriorReferenceTrust};
 use crate::rules::{RulesEngine, SetupDefinition, SetupRuntimeSnapshot};
 use crate::{
@@ -1386,6 +1387,7 @@ fn persist_backtest_run(
         "force": params.force,
         "setupIds": params.setup_ids,
         "jobType": params.job_type.as_str(),
+        "engineVersion": current_engine_version(),
     });
     db.insert_backtest_run(&run_id, now_ms, &params_json, &metrics, &trades)
         .map_err(runtime_err)?;

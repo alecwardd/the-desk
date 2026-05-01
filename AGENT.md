@@ -195,7 +195,7 @@ Rules:
 
 ## MCP Tools Reference
 
-The MCP server (`src/bin/the-desk-mcp.rs`) exposes 113 MCP tools across 12 categories.
+The MCP server (`src/bin/the-desk-mcp.rs`) exposes 119 MCP tools across 13 categories.
 
 ### Live vs Historical — Quick Reference
 
@@ -206,7 +206,7 @@ The MCP server (`src/bin/the-desk-mcp.rs`) exposes 113 MCP tools across 12 categ
 | Context | Primary tools |
 |---------|---------------|
 | **Live (current session)** | `get_market_snapshot`, `get_session_context`, `get_tpo_profile`, `get_delta_profile`, `get_key_levels`, `get_tape_pace`, `get_footprint`, `get_or5_status`, `get_rvol`, `get_day_type`, `get_rebid_reoffer_zones`, `get_pinch_events`, `get_session_inventory`, `evaluate_playbook`, `get_setup_context`, `check_delta_confirmation`, `get_proximity_report`, `get_imbalances`, `get_absorption_events`, `get_trade_size_profile`, DOM tools |
-| **Historical (backfill data)** | `get_snapshot_at`, `get_footprint_window`, `query_ticks`, `get_session_history`, `get_research_summary`, `query_event_frequency`, `query_conditional`, `query_distribution`, `compare_sessions`, `get_setup_performance_matrix`, `query_signal_outcome_*`, `get_signal_performance`, `backfill_history`, `run_backtest`, `get_backfill_status`, `get_backtest_results`, `compare_backtests` |
+| **Historical (backfill data)** | `get_snapshot_at`, `get_footprint_window`, `query_ticks`, `get_session_history`, `get_research_summary`, `query_event_frequency`, `query_conditional`, `query_distribution`, `compare_sessions`, `get_setup_performance_matrix`, `query_signal_outcome_*`, `get_signal_performance`, `backfill_history`, `run_backtest`, `get_backfill_status`, `get_backtest_results`, `compare_backtests`, hypothesis promotion tools |
 
 **Data dependency:** Historical tools return empty or minimal data until `backfill_history` has populated the database. Call `get_research_summary` first to check session count; if low, run backfill before deep analysis.
 
@@ -278,6 +278,12 @@ The MCP server (`src/bin/the-desk-mcp.rs`) exposes 113 MCP tools across 12 categ
 | | `compare_sessions` | Multi-dimensional similarity matching against historical sessions |
 | | `get_session_history` | Query past session summaries with optional filters |
 | | `get_research_summary` | Pre-session statistical briefing (session count, IB dist, day types) |
+| **Hypotheses** | `register_hypothesis` | Validate or register an inactive per-version hypothesis setup from a typed `SetupDefinition` plus metadata |
+| | `list_hypotheses` | Query registered hypotheses by lifecycle so agents do not repeat failed/rejected ideas |
+| | `summarize_hypothesis_run` | Summarize one completed hypothesis backtest by explicit `setupId` and `jobId` |
+| | `propose_draft_setup` | Apply the strict promotion gate and transition passing hypotheses to inactive drafts |
+| | `activate_draft_setup` | Activate a draft setup after human confirmation and engine-version freshness check |
+| | `set_hypothesis_lifecycle` | Mark a hypothesis/draft as `rejectedByHuman` or `retired` with a reason |
 | **Backfill** | `backfill_history` | Queue historical backfill job (all 14 pipelines + event detection) |
 | | `run_backtest` | Queue backtest replay job (rules engine over historical data) |
 | | `get_backfill_status` | Poll progress for backfill/backtest jobs |
@@ -305,7 +311,7 @@ The MCP server (`src/bin/the-desk-mcp.rs`) exposes 113 MCP tools across 12 categ
 | **orderflow-analyst** | Live + historical | Live: `get_delta_profile`, `get_tape_pace`, `get_footprint`, `get_imbalances`, `get_absorption_events`, DOM tools. Historical: same research tools as market-structure |
 | **levels-analyst** | Live + historical | Live: `get_key_levels`, `get_proximity_report`, `get_or5_status`. Historical: `query_event_frequency`, `query_conditional`, `compare_sessions`, `get_session_history` |
 | **playbook-evaluator** | Live only | `evaluate_playbook`, `get_setup_context`, `get_setup_state_history`, `acknowledge_setup_prompt`, `mark_setup_in_trade`, `close_setup_state`, `get_market_snapshot`, `get_key_levels`, `get_proximity_report` |
-| **backtest-analyst** | Historical only | `backfill_history`, `run_backtest`, `get_backfill_status`, `get_backtest_results`, `compare_backtests`, `compare_sessions`, `get_session_history`, `get_research_summary`, all `query_*` research tools |
+| **backtest-analyst** | Historical only | `backfill_history`, `run_backtest`, `get_backfill_status`, `get_backtest_results`, `compare_backtests`, `compare_sessions`, `get_session_history`, `get_research_summary`, all `query_*` research tools, `register_hypothesis`, `list_hypotheses`, `summarize_hypothesis_run`, `propose_draft_setup` |
 | **performance-analyst** | Historical only | `get_setup_performance_matrix`, `get_signal_performance`, `query_signal_outcome_*`, `query_distribution`, `query_conditional`, `get_session_history`, `get_research_summary` |
 | **risk-coach** | Live | `get_risk_state`, `get_risk_config`, `get_account_state`, `get_kelly_position_size`, `record_trade_result`, `save_account_state`, `init_risk_state`, `get_pre_session_briefing`, `refresh_memory_state`, `get_memory_brief`, `get_session_review_context`, `review_trade_entry` |
 | **data-integrity-validator** | Both | `validate_data_integrity`, `get_feed_health`, `get_session_summary` |
@@ -428,3 +434,12 @@ These are operational diagnostics exposed by `get_runtime_events` and JSON logs.
 | `attention.signal_invalidated` | Attention signal or linked idea was invalidated. |
 | `attention.notifier_dispatched` | Configured notifier sink dispatched an attention alert. |
 | `attention.notifier_failed` | Reserved for future external notifier sinks (webhook/toast) when dispatch fails. |
+| `hypothesis.registered` | A typed hypothesis setup was registered. |
+| `hypothesis.run_summarized` | A completed hypothesis backtest was summarized. |
+| `hypothesis.gate_passed` | A hypothesis run passed the promotion gate. |
+| `hypothesis.gate_failed` | A hypothesis run failed the promotion gate. |
+| `hypothesis.promoted_to_draft` | A passing hypothesis was promoted to an inactive draft setup. |
+| `hypothesis.activated` | A draft setup was activated after trader confirmation. |
+| `hypothesis.rejected` | A hypothesis or draft was rejected by the trader. |
+| `hypothesis.retired` | A hypothesis or draft was retired. |
+| `hypothesis.engine_version_drift` | Cached hypothesis metrics were stale relative to the current engine version. |

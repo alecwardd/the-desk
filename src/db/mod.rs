@@ -146,8 +146,25 @@ pub struct TradeRecord {
     pub entry_fill_count: i64,
     pub exit_fill_count: i64,
     pub import_batch_id: Option<String>,
+    pub planned_r_points_at_entry: Option<f64>,
+    pub planned_r_dollars_at_entry: Option<f64>,
     pub notes: String,
     pub source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TradeWithSessionContext {
+    pub trade: TradeRecord,
+    pub session_date: Option<String>,
+    pub session_type: Option<String>,
+    pub session_segment: Option<String>,
+    pub trade_account: Option<String>,
+    pub day_type: Option<String>,
+    pub profile_shape: Option<String>,
+    pub balance_state: Option<String>,
+    pub contract_symbol: Option<String>,
+    pub root_symbol: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1180,6 +1197,12 @@ impl Database {
         }
         if version < 26 {
             self.migrate_v26()?;
+        }
+        if version < 27 {
+            self.migrate_v27()?;
+        }
+        if version < 28 {
+            self.migrate_v28()?;
         }
 
         Ok(())
@@ -2577,6 +2600,30 @@ impl Database {
         Ok(())
     }
 
+    /// V27: reserved after removing experimental trader-profile snapshots/session fingerprints.
+    fn migrate_v27(&self) -> Result<(), DbError> {
+        self.conn.execute_batch(
+            "
+            UPDATE schema_version SET version = 27;
+            ",
+        )?;
+        Ok(())
+    }
+
+    /// V28: capture configured planned R at trade entry for future risk-deviation analytics.
+    fn migrate_v28(&self) -> Result<(), DbError> {
+        let columns = [
+            "ALTER TABLE trades ADD COLUMN planned_r_points_at_entry REAL NULL",
+            "ALTER TABLE trades ADD COLUMN planned_r_dollars_at_entry REAL NULL",
+        ];
+        for sql in columns {
+            let _ = self.conn.execute(sql, []);
+        }
+        self.conn
+            .execute_batch("UPDATE schema_version SET version = 28;")?;
+        Ok(())
+    }
+
     // ------------------------------------------------------------------
     // Setup CRUD
     // ------------------------------------------------------------------
@@ -3199,8 +3246,10 @@ impl Database {
             entry_fill_count: row.get(22)?,
             exit_fill_count: row.get(23)?,
             import_batch_id: row.get(24)?,
-            notes: row.get(25)?,
-            source: row.get(26)?,
+            planned_r_points_at_entry: row.get(25)?,
+            planned_r_dollars_at_entry: row.get(26)?,
+            notes: row.get(27)?,
+            source: row.get(28)?,
         })
     }
 
@@ -3212,8 +3261,9 @@ impl Database {
             "INSERT INTO trades (id, session_id, setup_id, instrument, trade_account, entry_time, entry_price,
                 exit_time, exit_price, direction, size, max_open_size, stop_price, target_prices,
                 result_r, gross_points, planned, rules_followed, emotional_state, thesis, review_tags,
-                mistake_tags, entry_fill_count, exit_fill_count, import_batch_id, notes, source)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)",
+                mistake_tags, entry_fill_count, exit_fill_count, import_batch_id,
+                planned_r_points_at_entry, planned_r_dollars_at_entry, notes, source)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)",
             params![
                 trade.id,
                 trade.session_id,
@@ -3240,6 +3290,8 @@ impl Database {
                 trade.entry_fill_count,
                 trade.exit_fill_count,
                 trade.import_batch_id,
+                trade.planned_r_points_at_entry,
+                trade.planned_r_dollars_at_entry,
                 trade.notes,
                 trade.source,
             ],
@@ -3255,8 +3307,9 @@ impl Database {
             "INSERT INTO trades (id, session_id, setup_id, instrument, trade_account, entry_time, entry_price,
                 exit_time, exit_price, direction, size, max_open_size, stop_price, target_prices,
                 result_r, gross_points, planned, rules_followed, emotional_state, thesis, review_tags,
-                mistake_tags, entry_fill_count, exit_fill_count, import_batch_id, notes, source)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)
+                mistake_tags, entry_fill_count, exit_fill_count, import_batch_id,
+                planned_r_points_at_entry, planned_r_dollars_at_entry, notes, source)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)
              ON CONFLICT(id) DO UPDATE SET
                 session_id = excluded.session_id,
                 setup_id = excluded.setup_id,
@@ -3282,6 +3335,8 @@ impl Database {
                 entry_fill_count = excluded.entry_fill_count,
                 exit_fill_count = excluded.exit_fill_count,
                 import_batch_id = excluded.import_batch_id,
+                planned_r_points_at_entry = excluded.planned_r_points_at_entry,
+                planned_r_dollars_at_entry = excluded.planned_r_dollars_at_entry,
                 notes = excluded.notes,
                 source = excluded.source",
             params![
@@ -3310,6 +3365,8 @@ impl Database {
                 trade.entry_fill_count,
                 trade.exit_fill_count,
                 trade.import_batch_id,
+                trade.planned_r_points_at_entry,
+                trade.planned_r_dollars_at_entry,
                 trade.notes,
                 trade.source,
             ],
@@ -3359,7 +3416,7 @@ impl Database {
                     exit_time, exit_price, direction, size, max_open_size, stop_price, target_prices,
                     result_r, gross_points, planned, rules_followed, emotional_state, thesis,
                     review_tags, mistake_tags, entry_fill_count, exit_fill_count, import_batch_id,
-                    notes, source
+                    planned_r_points_at_entry, planned_r_dollars_at_entry, notes, source
              FROM trades WHERE session_id = ?1 ORDER BY entry_time",
         )?;
         let rows = stmt.query_map([session_id], Self::trade_from_row)?;
@@ -3377,7 +3434,7 @@ impl Database {
                     exit_time, exit_price, direction, size, max_open_size, stop_price, target_prices,
                     result_r, gross_points, planned, rules_followed, emotional_state, thesis,
                     review_tags, mistake_tags, entry_fill_count, exit_fill_count, import_batch_id,
-                    notes, source
+                    planned_r_points_at_entry, planned_r_dollars_at_entry, notes, source
              FROM trades WHERE id = ?1",
         )?;
         let mut rows = stmt.query([id])?;
@@ -3394,10 +3451,80 @@ impl Database {
                     exit_time, exit_price, direction, size, max_open_size, stop_price, target_prices,
                     result_r, gross_points, planned, rules_followed, emotional_state, thesis,
                     review_tags, mistake_tags, entry_fill_count, exit_fill_count, import_batch_id,
-                    notes, source
+                    planned_r_points_at_entry, planned_r_dollars_at_entry, notes, source
              FROM trades ORDER BY entry_time DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map([limit as i64], Self::trade_from_row)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Recent trades for one session, used by live memory context only.
+    pub fn list_recent_session_trades(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<TradeRecord>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_id, setup_id, instrument, trade_account, entry_time, entry_price,
+                    exit_time, exit_price, direction, size, max_open_size, stop_price, target_prices,
+                    result_r, gross_points, planned, rules_followed, emotional_state, thesis,
+                    review_tags, mistake_tags, entry_fill_count, exit_fill_count, import_batch_id,
+                    planned_r_points_at_entry, planned_r_dollars_at_entry, notes, source
+             FROM trades WHERE session_id = ?1 ORDER BY entry_time DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![session_id, limit as i64], Self::trade_from_row)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Closed trades joined with session context for memory pattern refresh.
+    ///
+    /// This is intentionally a refresh-path helper. Normal MCP reads should use
+    /// persisted `behavioral_patterns` plus current-session lookups instead of
+    /// scanning historical trades.
+    pub fn list_closed_trades_with_session_context_for_pattern_refresh(
+        &self,
+        limit_sessions: Option<usize>,
+    ) -> Result<Vec<TradeWithSessionContext>, DbError> {
+        let session_limit = limit_sessions.unwrap_or(250).max(1) as i64;
+        let mut stmt = self.conn.prepare(
+            "WITH recent_sessions AS (
+                SELECT id, date, session_type, start_time
+                FROM sessions
+                ORDER BY start_time DESC
+                LIMIT ?1
+             )
+             SELECT
+                t.id, t.session_id, t.setup_id, t.instrument, t.trade_account, t.entry_time, t.entry_price,
+                t.exit_time, t.exit_price, t.direction, t.size, t.max_open_size, t.stop_price, t.target_prices,
+                t.result_r, t.gross_points, t.planned, t.rules_followed, t.emotional_state, t.thesis,
+                t.review_tags, t.mistake_tags, t.entry_fill_count, t.exit_fill_count, t.import_batch_id,
+                t.planned_r_points_at_entry, t.planned_r_dollars_at_entry, t.notes, t.source,
+                rs.date, rs.session_type, ss.day_type, ss.profile_shape, ss.balance_state,
+                ss.contract_symbol, ss.root_symbol
+             FROM trades t
+             LEFT JOIN recent_sessions rs ON rs.id = t.session_id
+             LEFT JOIN session_summaries ss
+               ON ss.session_date = rs.date
+              AND lower(ss.session_type) = lower(rs.session_type)
+             WHERE t.result_r IS NOT NULL
+               AND (t.session_id IS NULL OR rs.id IS NOT NULL)
+             ORDER BY t.entry_time ASC",
+        )?;
+        let rows = stmt.query_map(params![session_limit], |row| {
+            let trade = Self::trade_from_row(row)?;
+            Ok(TradeWithSessionContext {
+                trade_account: trade.trade_account.clone(),
+                trade,
+                session_date: row.get(29)?,
+                session_type: row.get(30)?,
+                session_segment: None,
+                day_type: row.get(31)?,
+                profile_shape: row.get(32)?,
+                balance_state: row.get(33)?,
+                contract_symbol: row.get(34)?,
+                root_symbol: row.get(35)?,
+            })
+        })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
@@ -10092,6 +10219,8 @@ mod tests {
             entry_fill_count: 1,
             exit_fill_count: 0,
             import_batch_id: None,
+            planned_r_points_at_entry: None,
+            planned_r_dollars_at_entry: None,
             notes: String::new(),
             source: "manual".into(),
         };

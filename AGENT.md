@@ -12,7 +12,8 @@ Read these documents in order:
 
 1. **CLAUDE.md** — Project rules, architecture, conventions (READ FIRST)
 2. **README.md** — Architecture overview, project structure, data flow
-3. **Relevant skill** from `skills/` — Domain knowledge for your task
+3. **docs/trader-memory/identity.md** — durable trader identity, doctrine, and guardrails for agent partnership
+4. **Relevant skill** from `skills/` — Domain knowledge for your task
 
 ---
 
@@ -195,7 +196,7 @@ Rules:
 
 ## MCP Tools Reference
 
-The MCP server (`src/bin/the-desk-mcp.rs`) exposes 120 MCP tools across 13 categories.
+The MCP server (`src/bin/the-desk-mcp.rs`) exposes 121 MCP tools across 13 categories.
 
 ### Live vs Historical — Quick Reference
 
@@ -293,6 +294,7 @@ The MCP server (`src/bin/the-desk-mcp.rs`) exposes 120 MCP tools across 13 categ
 | | `compare_backtests` | Compare two or more backtest runs side-by-side |
 | **Memory** | `get_memory_brief` | Ranked carry-forward memory by intent (session_start, setup_check, trade_review, weekly_review). Read-only — call `refresh_memory_state` first when `memoryMaintenance.refreshSuggested` is true or after memory-affecting writes (trades, reviews, imports) in the same flow. |
 | | `get_pre_session_briefing` | Memory brief + account + risk state for session start. When maintenance is dirty, performs one bounded `refresh_memory_state` (patterns + insight lifecycle) before building the brief unless `skipMemoryRefreshIfDirty` is true. Response includes `memoryAutoRefreshed`. |
+| | `get_trader_context_fit` | Typed trader memory envelope by intent. Separates executed-trade memory, setup opportunity, coaching reminders, live post-loss/ordinal state, reliability, and provenance. Memory reports context only and must not adjust sizing by itself. |
 | | `refresh_memory_state` | Explicit refresh of behavioral patterns and/or insight lifecycle; clears dirty flags. Use before `get_memory_brief` when ranked memory must reflect recent journal or trade changes. |
 | | `save_agent_insight` | Persist LLM-authored insight (candidate/validated lifecycle) |
 | | `recall_agent_insights` | Query insights by category, setup, status |
@@ -307,13 +309,13 @@ The MCP server (`src/bin/the-desk-mcp.rs`) exposes 120 MCP tools across 13 categ
 
 | Agent | Primary context | Key tools |
 |-------|------------------|-----------|
-| **orchestrator** | Both — routes by intent | All; first call `get_attention_inbox` / `what_changed_since` when the trader asks what changed or what deserves attention. Routes `historical_research` to backtest-analyst. Memory: `get_pre_session_briefing`, `refresh_memory_state`, `get_memory_brief`, `save_agent_insight`, `recall_agent_insights`, `acknowledge_agent_insight`, `create_memory_followup`, `resolve_memory_followup`, `detect_behavioral_patterns`, `get_behavioral_patterns` |
+| **orchestrator** | Both — routes by intent | All; first call `get_attention_inbox` / `what_changed_since` when the trader asks what changed or what deserves attention. Routes `historical_research` to backtest-analyst. Memory: use `get_pre_session_briefing`, `get_trader_context_fit`, `refresh_memory_state`, `get_memory_brief`, `save_agent_insight`, `recall_agent_insights`, `acknowledge_agent_insight`, `create_memory_followup`, `resolve_memory_followup`, `detect_behavioral_patterns`, `get_behavioral_patterns` |
 | **market-structure-analyst** | Live + historical | Live: `get_tpo_profile`, `get_key_levels`, `get_day_type`, `get_rvol`, `get_delta_profile`. Historical: `query_event_frequency`, `query_conditional`, `query_distribution`, `compare_sessions`, `get_session_history`, `get_research_summary` |
 | **orderflow-analyst** | Live + historical | Live: `get_delta_profile`, `get_tape_pace`, `get_footprint`, `get_imbalances`, `get_absorption_events`, DOM tools. Historical: same research tools as market-structure |
 | **levels-analyst** | Live + historical | Live: `get_key_levels`, `get_proximity_report`, `get_or5_status`. Historical: `query_event_frequency`, `query_conditional`, `compare_sessions`, `get_session_history` |
 | **playbook-evaluator** | Live only | `evaluate_playbook`, `get_setup_context`, `get_setup_state_history`, `acknowledge_setup_prompt`, `mark_setup_in_trade`, `close_setup_state`, `get_market_snapshot`, `get_key_levels`, `get_proximity_report` |
 | **backtest-analyst** | Historical only | `backfill_history`, `run_backtest`, `get_backfill_status`, `get_backtest_results`, `compare_backtests`, `compare_sessions`, `get_session_history`, `get_research_summary`, all `query_*` research tools, `register_hypothesis`, `list_hypotheses`, `summarize_hypothesis_run`, `propose_draft_setup` |
-| **performance-analyst** | Historical only | `get_setup_performance_matrix`, `get_signal_performance`, `query_signal_outcome_*`, `query_distribution`, `query_conditional`, `get_session_history`, `get_research_summary` |
+| **performance-analyst** | Historical only | `get_trader_context_fit`, `get_setup_performance_matrix`, `get_signal_performance`, `query_signal_outcome_*`, `query_distribution`, `query_conditional`, `get_session_history`, `get_research_summary` |
 | **risk-coach** | Live | `get_risk_state`, `get_risk_config`, `get_account_state`, `get_kelly_position_size`, `record_trade_result`, `save_account_state`, `init_risk_state`, `get_pre_session_briefing`, `refresh_memory_state`, `get_memory_brief`, `get_session_review_context`, `review_trade_entry` |
 | **data-integrity-validator** | Both | `validate_data_integrity`, `get_feed_health`, `get_session_summary` |
 

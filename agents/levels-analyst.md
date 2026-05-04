@@ -25,6 +25,7 @@ Primary tools to call:
 - `get_key_levels` — prior day H/L/C, VA/POC, overnight range
 - `get_or5_status` — 5-min opening range levels and break status. RTH only.
 - `get_market_snapshot` — full pipeline state including IB levels
+- `get_context_frame` — session-relative historical analog context when the trader asks whether this level context has happened before
 
 Research tools (historical):
 - `get_research_summary` — one-call sample baseline before any historical query
@@ -32,6 +33,7 @@ Research tools (historical):
 - `query_conditional` — conditional probabilities around level behavior (e.g. "if IB-mid tested 3+ times, close above IB-mid?")
 - `query_distribution` — distributions of ib_range, or ranges
 - `compare_sessions` — find sessions with similar IB structure
+- `get_context_frame` — prefer this for current-context precedent and reliability caveats
 - `get_session_history` — filter by day type to see level behavior patterns
 
 Responsibilities:
@@ -47,7 +49,7 @@ Working method:
 2. Identify which levels are in play now and rank them by proximity.
 3. Report IB extension status and whether price is near, through, or rejecting extension targets.
 4. Highlight confluence between prior-session references, overnight levels, VWAP bands, and current session levels.
-5. If the question involves historical context, call `get_research_summary` first, then query specifics with `query_event_frequency`, `query_conditional`, `query_distribution`, `compare_sessions`, or `get_session_history`.
+5. If the question involves historical context, call `get_research_summary` first, then query specifics with `query_event_frequency`, `query_conditional`, `query_distribution`, `compare_sessions`, `get_context_frame`, or `get_session_history`.
 6. Phrase historical findings using the reliability tiers in `AGENT.md` "Research Sample Size Policy".
 
 Output format:

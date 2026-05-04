@@ -3,6 +3,7 @@ node_modules/
 target/
 target_alt/
 target_verify/
+target_verify2/
 
 # Build output
 dist/
@@ -37,6 +38,7 @@ target/
 
 # Session recordings (large binary files)
 recordings/
+.the-desk/memory/
 
 # SQLite databases
 *.db

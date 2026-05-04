@@ -6,6 +6,8 @@ use serde_json::json;
 use std::collections::HashMap;
 use thiserror::Error;
 
+pub mod trader_context;
+
 pub const INSIGHT_CANDIDATE: &str = "candidate";
 pub const INSIGHT_VALIDATED: &str = "validated";
 pub const INSIGHT_STALE: &str = "stale";
@@ -736,11 +738,16 @@ pub fn detect_behavioral_patterns(
     let mut patterns = Vec::new();
     let mut setup_stats: HashMap<String, (i64, i64, f64)> = HashMap::new();
     let mut bucket_stats: HashMap<String, (i64, i64, f64)> = HashMap::new();
+    let mut setup_bucket_stats: HashMap<(String, String), (i64, i64, f64)> = HashMap::new();
+    let mut setup_day_type_stats: HashMap<(String, String), (i64, i64, f64)> = HashMap::new();
     let mut emotion_stats: HashMap<String, (i64, i64, i64)> = HashMap::new();
     let mut ordinal_stats: HashMap<String, (i64, i64)> = HashMap::new();
     let mut segment_stats: HashMap<String, (i64, i64)> = HashMap::new();
     let mut mistake_tag_counts: HashMap<String, i64> = HashMap::new();
     let mut day_type_stats: HashMap<String, (i64, f64, f64)> = HashMap::new();
+    let mut post_loss_after_one_stats: (i64, i64, f64) = (0, 0, 0.0);
+    let mut post_loss_after_two_plus_stats: (i64, i64, f64) = (0, 0, 0.0);
+    let mut post_loss_setup_stats: HashMap<(String, String), (i64, i64, f64)> = HashMap::new();
     let mut after_loss_rules_broken = 0i64;
     let mut after_loss_total = 0i64;
 
@@ -748,6 +755,7 @@ pub fn detect_behavioral_patterns(
         let trades = db.list_trades_for_session(&session.id)?;
         let session_summary = session_summary_by_record(session, &summaries);
         let day_type = session_summary.map(|summary| summary.day_type.clone());
+        let mut loss_streak = 0i64;
         for (index, trade) in trades.iter().enumerate() {
             if let Some(outcome) = trade_result_sign(trade) {
                 let bucket = time_bucket_from_timestamp_ms(trade.entry_time);
@@ -755,7 +763,36 @@ pub fn detect_behavioral_patterns(
                     .setup_id
                     .clone()
                     .unwrap_or_else(|| "unclassified".to_string());
-                let setup_entry = setup_stats.entry(setup_key).or_insert((0, 0, 0.0));
+
+                let prior_loss_streak = loss_streak;
+                if prior_loss_streak > 0 {
+                    let target = if prior_loss_streak >= 2 {
+                        &mut post_loss_after_two_plus_stats
+                    } else {
+                        &mut post_loss_after_one_stats
+                    };
+                    target.0 += 1;
+                    if outcome > 0 {
+                        target.1 += 1;
+                    }
+                    target.2 += trade.result_r.unwrap_or(0.0);
+
+                    let state_key = if prior_loss_streak >= 2 {
+                        "afterTwoPlusLosses".to_string()
+                    } else {
+                        "afterOneLoss".to_string()
+                    };
+                    let setup_loss_entry = post_loss_setup_stats
+                        .entry((state_key, setup_key.clone()))
+                        .or_insert((0, 0, 0.0));
+                    setup_loss_entry.0 += 1;
+                    if outcome > 0 {
+                        setup_loss_entry.1 += 1;
+                    }
+                    setup_loss_entry.2 += trade.result_r.unwrap_or(0.0);
+                }
+
+                let setup_entry = setup_stats.entry(setup_key.clone()).or_insert((0, 0, 0.0));
                 setup_entry.0 += 1;
                 if outcome > 0 {
                     setup_entry.1 += 1;
@@ -768,6 +805,15 @@ pub fn detect_behavioral_patterns(
                     bucket_entry.1 += 1;
                 }
                 bucket_entry.2 += trade.result_r.unwrap_or(0.0);
+
+                let setup_bucket_entry = setup_bucket_stats
+                    .entry((setup_key.clone(), bucket.clone()))
+                    .or_insert((0, 0, 0.0));
+                setup_bucket_entry.0 += 1;
+                if outcome > 0 {
+                    setup_bucket_entry.1 += 1;
+                }
+                setup_bucket_entry.2 += trade.result_r.unwrap_or(0.0);
 
                 let ordinal_key = if index >= 2 {
                     "trade_3_plus".to_string()
@@ -801,6 +847,15 @@ pub fn detect_behavioral_patterns(
                     day_entry.0 += 1;
                     day_entry.1 += trade.result_r.unwrap_or(0.0);
                     day_entry.2 += trade.gross_points.unwrap_or(0.0);
+
+                    let setup_day_entry = setup_day_type_stats
+                        .entry((setup_key.clone(), day_type.clone()))
+                        .or_insert((0, 0, 0.0));
+                    setup_day_entry.0 += 1;
+                    if outcome > 0 {
+                        setup_day_entry.1 += 1;
+                    }
+                    setup_day_entry.2 += trade.result_r.unwrap_or(0.0);
                 }
 
                 if let Some(ctx) = tick_time_context_from_timestamp_ms(trade.entry_time) {
@@ -820,6 +875,12 @@ pub fn detect_behavioral_patterns(
                     if !trade.planned {
                         segment_entry.1 += 1;
                     }
+                }
+
+                if outcome < 0 {
+                    loss_streak += 1;
+                } else {
+                    loss_streak = 0;
                 }
             }
 
@@ -885,6 +946,139 @@ pub fn detect_behavioral_patterns(
             scope: json!({ "timeBucket": bucket }),
             sample_size: resolved,
             confidence: clamp_unit(Some((resolved as f64 / 20.0).min(1.0)), 0.5),
+            active: true,
+            superseded_by: None,
+        });
+    }
+
+    for ((setup_id, bucket), (resolved, wins, total_r)) in setup_bucket_stats {
+        if resolved < 3 {
+            continue;
+        }
+        let win_rate = wins as f64 / resolved as f64;
+        patterns.push(BehavioralPatternRecord {
+            id: format!("win_rate_by_setup_time_bucket:{setup_id}:{bucket}"),
+            detected_at_ms: now_ms,
+            pattern_type: "win_rate_by_setup_time_bucket".to_string(),
+            description: format!(
+                "{setup_id} in {bucket} resolved {resolved} trades with {:.0}% win rate and {:.2}R average.",
+                win_rate * 100.0,
+                total_r / resolved as f64
+            ),
+            metric: json!({
+                "resolved": resolved,
+                "wins": wins,
+                "losses": resolved - wins,
+                "winRate": win_rate,
+                "avgR": total_r / resolved as f64,
+                "totalR": total_r,
+            }),
+            scope: json!({ "setupId": setup_id, "timeBucket": bucket }),
+            sample_size: resolved,
+            confidence: clamp_unit(Some((resolved as f64 / 20.0).min(1.0)), 0.5),
+            active: true,
+            superseded_by: None,
+        });
+    }
+
+    for ((setup_id, day_type), (resolved, wins, total_r)) in setup_day_type_stats {
+        if resolved < 3 {
+            continue;
+        }
+        let win_rate = wins as f64 / resolved as f64;
+        patterns.push(BehavioralPatternRecord {
+            id: format!("avg_r_by_setup_day_type:{setup_id}:{day_type}"),
+            detected_at_ms: now_ms,
+            pattern_type: "avg_r_by_setup_day_type".to_string(),
+            description: format!(
+                "{setup_id} on {day_type} days resolved {resolved} trades with {:.0}% win rate and {:.2}R average.",
+                win_rate * 100.0,
+                total_r / resolved as f64
+            ),
+            metric: json!({
+                "resolved": resolved,
+                "wins": wins,
+                "losses": resolved - wins,
+                "winRate": win_rate,
+                "avgR": total_r / resolved as f64,
+                "totalR": total_r,
+            }),
+            scope: json!({ "setupId": setup_id, "dayType": day_type }),
+            sample_size: resolved,
+            confidence: clamp_unit(Some((resolved as f64 / 20.0).min(1.0)), 0.5),
+            active: true,
+            superseded_by: None,
+        });
+    }
+
+    for (state, (resolved, wins, total_r)) in [
+        ("afterOneLoss", post_loss_after_one_stats),
+        ("afterTwoPlusLosses", post_loss_after_two_plus_stats),
+    ] {
+        if resolved < 3 {
+            continue;
+        }
+        let win_rate = wins as f64 / resolved as f64;
+        let pattern_type = if state == "afterOneLoss" {
+            "post_loss_after_one"
+        } else {
+            "post_loss_after_two_plus"
+        };
+        patterns.push(BehavioralPatternRecord {
+            id: format!("{pattern_type}:global"),
+            detected_at_ms: now_ms,
+            pattern_type: pattern_type.to_string(),
+            description: format!(
+                "{state} resolved {resolved} follow-up trades with {:.0}% win rate and {:.2}R average.",
+                win_rate * 100.0,
+                total_r / resolved as f64
+            ),
+            metric: json!({
+                "resolved": resolved,
+                "wins": wins,
+                "losses": resolved - wins,
+                "winRate": win_rate,
+                "avgR": total_r / resolved as f64,
+                "totalR": total_r,
+            }),
+            scope: json!({ "postLossState": state }),
+            sample_size: resolved,
+            confidence: clamp_unit(Some((resolved as f64 / 15.0).min(1.0)), 0.5),
+            active: true,
+            superseded_by: None,
+        });
+    }
+
+    for ((state, setup_id), (resolved, wins, total_r)) in post_loss_setup_stats {
+        if resolved < 3 {
+            continue;
+        }
+        let win_rate = wins as f64 / resolved as f64;
+        let pattern_type = if state == "afterOneLoss" {
+            "post_loss_after_one"
+        } else {
+            "post_loss_after_two_plus"
+        };
+        patterns.push(BehavioralPatternRecord {
+            id: format!("{pattern_type}:setup:{setup_id}"),
+            detected_at_ms: now_ms,
+            pattern_type: pattern_type.to_string(),
+            description: format!(
+                "{setup_id} {state} resolved {resolved} follow-up trades with {:.0}% win rate and {:.2}R average.",
+                win_rate * 100.0,
+                total_r / resolved as f64
+            ),
+            metric: json!({
+                "resolved": resolved,
+                "wins": wins,
+                "losses": resolved - wins,
+                "winRate": win_rate,
+                "avgR": total_r / resolved as f64,
+                "totalR": total_r,
+            }),
+            scope: json!({ "postLossState": state, "setupId": setup_id }),
+            sample_size: resolved,
+            confidence: clamp_unit(Some((resolved as f64 / 15.0).min(1.0)), 0.5),
             active: true,
             superseded_by: None,
         });
@@ -1454,6 +1648,8 @@ mod tests {
             entry_fill_count: 1,
             exit_fill_count: 1,
             import_batch_id: None,
+            planned_r_points_at_entry: None,
+            planned_r_dollars_at_entry: None,
             notes: String::new(),
             source: "manual".to_string(),
         })
@@ -1484,6 +1680,8 @@ mod tests {
             entry_fill_count: 1,
             exit_fill_count: 1,
             import_batch_id: None,
+            planned_r_points_at_entry: None,
+            planned_r_dollars_at_entry: None,
             notes: String::new(),
             source: "manual".to_string(),
         })
@@ -1624,6 +1822,8 @@ mod tests {
             entry_fill_count: 1,
             exit_fill_count: 1,
             import_batch_id: None,
+            planned_r_points_at_entry: None,
+            planned_r_dollars_at_entry: None,
             notes: String::new(),
             source: "manual".to_string(),
         })
@@ -1654,6 +1854,8 @@ mod tests {
             entry_fill_count: 1,
             exit_fill_count: 1,
             import_batch_id: None,
+            planned_r_points_at_entry: None,
+            planned_r_dollars_at_entry: None,
             notes: String::new(),
             source: "manual".to_string(),
         })

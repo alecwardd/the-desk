@@ -45,6 +45,11 @@ use the_desk_backend::mcp::hypotheses::{
     ActivateDraftSetupParams, HypothesisRunParams, ListHypothesesParams, RegisterHypothesisParams,
     SetHypothesisLifecycleParams,
 };
+use the_desk_backend::mcp::memory::TraderContextFitParams;
+use the_desk_backend::memory::trader_context::{
+    build_trader_context_fit as memory_build_trader_context_fit, TraderContextFitQuery,
+    TraderContextIntent,
+};
 use the_desk_backend::memory::{
     build_memory_brief as memory_build_memory_brief,
     detect_behavioral_patterns as memory_detect_behavioral_patterns,
@@ -923,6 +928,8 @@ fn build_imported_trade_record(
             })
             .count() as i64,
         import_batch_id: Some(state.fill_refs[0].batch_id.clone()),
+        planned_r_points_at_entry: None,
+        planned_r_dollars_at_entry: None,
         notes: notes.to_string(),
         source: source.to_string(),
     }
@@ -5982,6 +5989,7 @@ impl TheDeskMcp {
             .unwrap_or_else(|| Utc::now().timestamp_millis() as f64);
         let session_id = resolve_session_id(&db, params.session_id.as_deref())?;
         let direction = params.direction.clone();
+        let risk_config = db.load_risk_config().map_err(db_error)?;
         let trade = TradeRecord {
             id: params
                 .id
@@ -6021,6 +6029,8 @@ impl TheDeskMcp {
                 .exit_fill_count
                 .unwrap_or_else(|| i64::from(params.exit_price.is_some())),
             import_batch_id: params.import_batch_id,
+            planned_r_points_at_entry: Some(risk_config.r_value_points),
+            planned_r_dollars_at_entry: Some(risk_config.r_value_dollars),
             notes: params.notes.unwrap_or_default(),
             source: params.source.unwrap_or_else(|| "manual_chat".to_string()),
         };
@@ -6672,21 +6682,123 @@ impl TheDeskMcp {
             &db,
             MemoryBriefQuery {
                 intent: "session_start".to_string(),
+                session_id: params.session_id.clone(),
+                setup_id: params.setup_id.clone(),
+                session_type: params.session_type.clone(),
+                session_segment: params.session_segment.clone(),
+                day_type: params.day_type.clone(),
+                time_bucket: params.time_bucket.clone(),
+                pre_session_note: params.pre_session_note.clone(),
+                limit: params.limit.map(|limit| limit.min(10) as usize),
+                include_recent_sessions: params.include_recent_sessions,
+                include_patterns: Some(false),
+                include_insights: Some(false),
+                include_followups: Some(false),
+            },
+        )
+        .map_err(db_error)?;
+        let trader_context_fit = memory_build_trader_context_fit(
+            &db,
+            TraderContextFitQuery {
+                intent: TraderContextIntent::SessionStart,
                 session_id: params.session_id,
                 setup_id: params.setup_id,
                 session_type: params.session_type,
                 session_segment: params.session_segment,
                 day_type: params.day_type,
                 time_bucket: params.time_bucket,
-                pre_session_note: params.pre_session_note,
-                limit: params.limit.map(|limit| limit.min(10) as usize),
-                include_recent_sessions: params.include_recent_sessions,
-                include_patterns: params.include_patterns,
-                include_insights: params.include_insights,
-                include_followups: params.include_followups,
+                timestamp_ms: Some(Utc::now().timestamp_millis() as f64),
+                include_opportunity: Some(true),
+                include_coaching_memory: Some(true),
+                ..TraderContextFitQuery::default()
             },
         )
         .map_err(db_error)?;
+        let mut memory_brief_json = serde_json::to_value(memory_brief).map_err(db_error)?;
+        if let Some(obj) = memory_brief_json.as_object_mut() {
+            let delegated_patterns = if params.include_patterns.unwrap_or(true) {
+                trader_context_fit
+                    .execution_fit
+                    .get("matchingSlices")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!([]))
+            } else {
+                serde_json::json!([])
+            };
+            let delegated_insights = if params.include_insights.unwrap_or(true) {
+                trader_context_fit
+                    .coaching_memory
+                    .get("insights")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!([]))
+            } else {
+                serde_json::json!([])
+            };
+            let delegated_followups = if params.include_followups.unwrap_or(true) {
+                trader_context_fit
+                    .coaching_memory
+                    .get("followups")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!([]))
+            } else {
+                serde_json::json!([])
+            };
+            if let Some(summary) = obj
+                .get_mut("summary")
+                .and_then(|value| value.as_object_mut())
+            {
+                summary.insert(
+                    "patternCount".to_string(),
+                    serde_json::json!(delegated_patterns.as_array().map(Vec::len).unwrap_or(0)),
+                );
+                summary.insert(
+                    "insightCount".to_string(),
+                    serde_json::json!(delegated_insights.as_array().map(Vec::len).unwrap_or(0)),
+                );
+                summary.insert(
+                    "followupCount".to_string(),
+                    serde_json::json!(delegated_followups.as_array().map(Vec::len).unwrap_or(0)),
+                );
+                summary.insert(
+                    "topPatternType".to_string(),
+                    delegated_patterns
+                        .as_array()
+                        .and_then(|values| values.first())
+                        .and_then(|value| value.get("patternType"))
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                );
+                summary.insert(
+                    "topInsightStatus".to_string(),
+                    delegated_insights
+                        .as_array()
+                        .and_then(|values| values.first())
+                        .and_then(|value| value.get("status"))
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                );
+                if let Some(requested_sections) = summary
+                    .get_mut("requestedSections")
+                    .and_then(|value| value.as_object_mut())
+                {
+                    requested_sections.insert(
+                        "patterns".to_string(),
+                        serde_json::json!(params.include_patterns.unwrap_or(true)),
+                    );
+                    requested_sections.insert(
+                        "insights".to_string(),
+                        serde_json::json!(params.include_insights.unwrap_or(true)),
+                    );
+                    requested_sections.insert(
+                        "followups".to_string(),
+                        serde_json::json!(params.include_followups.unwrap_or(true)),
+                    );
+                }
+            }
+            obj.insert("patterns".to_string(), delegated_patterns);
+            obj.insert("insights".to_string(), delegated_insights);
+            obj.insert("followups".to_string(), delegated_followups);
+        }
         let account_state = db.load_account_state().map_err(db_error)?;
         let risk_state = db.load_risk_state().map_err(db_error)?;
         let (_, active_contract) = self.resolve_contract_cached();
@@ -6699,11 +6811,69 @@ impl TheDeskMcp {
             Some(data_age_ms),
         )?;
         Ok(text_result(serde_json::json!({
-            "memoryBrief": memory_brief,
+            "memoryBrief": memory_brief_json,
+            "traderContextFit": trader_context_fit,
             "accountState": account_state,
             "riskState": risk_state,
             "memoryAutoRefreshed": memory_auto_refreshed,
             "rolloverStatus": rollover_status
+        })))
+    }
+
+    #[tool(
+        description = "Typed trader memory context fit. Separates executed-trade memory, setup opportunity context, coaching reminders, live post-loss/ordinal state, reliability, and provenance. Memory reports context only and must not drive sizing by itself."
+    )]
+    async fn get_trader_context_fit(
+        &self,
+        Parameters(params): Parameters<TraderContextFitParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let live_view = self.resolve_live_market_view();
+        let snapshot = live_view.as_ref().map(|view| &view.snapshot);
+        let intent = params
+            .intent
+            .as_deref()
+            .unwrap_or("setupCheck")
+            .parse::<TraderContextIntent>()
+            .map_err(db_error)?;
+        let query = TraderContextFitQuery {
+            intent,
+            setup_id: params.setup_id,
+            session_id: params.session_id,
+            trade_account: params.trade_account,
+            trading_day: params.trading_day,
+            timestamp_ms: params
+                .timestamp_ms
+                .or_else(|| live_view.as_ref().map(|view| view.as_of_timestamp_ms)),
+            session_type: params.session_type.or_else(|| {
+                snapshot
+                    .and_then(|s| s.get("sessionType"))
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string)
+            }),
+            session_segment: params.session_segment.or_else(|| {
+                snapshot
+                    .and_then(|s| s.get("sessionSegment"))
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string)
+            }),
+            time_bucket: params.time_bucket,
+            day_type: params.day_type.or_else(|| {
+                snapshot
+                    .and_then(|s| s.get("dayType"))
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string)
+            }),
+            profile_shape: params.profile_shape,
+            balance_state: params.balance_state,
+            include_opportunity: params.include_opportunity,
+            include_coaching_memory: params.include_coaching_memory,
+        };
+        let db = self.db.lock().map_err(|_| lock_error())?;
+        let fit = memory_build_trader_context_fit(&db, query).map_err(db_error)?;
+        Ok(text_result(serde_json::json!({
+            "traderContextFit": fit,
+            "snapshotSource": live_view.as_ref().map(|view| view.snapshot_source),
+            "dataAgeMs": live_view.as_ref().map(|view| view.data_age_ms)
         })))
     }
 
@@ -7032,6 +7202,7 @@ impl TheDeskMcp {
         // 1. Insert trade record
         let trade_id = uuid::Uuid::new_v4().to_string();
         let now_ms = chrono::Utc::now().timestamp_millis() as f64;
+        let config = db.load_risk_config().map_err(db_error)?;
         let trade = TradeRecord {
             id: trade_id.clone(),
             session_id: resolve_session_id(&db, None)?,
@@ -7062,6 +7233,8 @@ impl TheDeskMcp {
             entry_fill_count: 1,
             exit_fill_count: 1,
             import_batch_id: None,
+            planned_r_points_at_entry: Some(config.r_value_points),
+            planned_r_dollars_at_entry: Some(config.r_value_dollars),
             notes: params.notes.unwrap_or_default(),
             source: "mcp".to_string(),
         };
@@ -7074,7 +7247,6 @@ impl TheDeskMcp {
 
         // 2. Load current risk state, apply result via RiskTracker, save
         let risk_state = db.load_risk_state().map_err(db_error)?.unwrap_or_default();
-        let config = db.load_risk_config().map_err(db_error)?;
         let mut tracker = RiskTracker::new(RiskConfig {
             max_daily_loss_r: config.max_daily_loss_r,
             max_trades_per_session: config.max_trades_per_session.unwrap_or(8) as usize,

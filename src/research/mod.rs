@@ -33,7 +33,7 @@ pub enum ReliabilityTier {
     Reportable,
 }
 
-pub(crate) fn reliability_tier(sample_size: usize) -> ReliabilityTier {
+pub fn reliability_tier(sample_size: usize) -> ReliabilityTier {
     match sample_size {
         0..=19 => ReliabilityTier::Insufficient,
         20..=29 => ReliabilityTier::Directional,

@@ -37,7 +37,7 @@ Research tools (historical):
 - `query_event_frequency` — how often a specific event occurs per session (e.g. "ib_mid_test", "day_type_change", "new_session_high"). Returns total occurrences, sessions with event, per-session average, and percentage.
 - `query_conditional` — conditional probabilities (e.g. "if IB-mid tested 3+ times, close above IB-mid?"). Supported outcome fields: `close_vs_ib_mid`, `close_vs_vwap`, `close_vs_poc`, `day_type`, `profile_shape`, `balance_state`, `single_prints_direction`, `poor_high`, `poor_low`, `excess_high`, `excess_low`. Boolean fields match `"true"` or `"false"`.
 - `query_distribution` — metric distributions with mean, median, stddev, percentiles. Available metrics: `ib_range`, `session_delta`, `total_volume`, `rvol_ratio`, `vwap_close`, and others.
-- `compare_sessions` — find historically similar sessions by IB range similarity and optional day type filter. Use for explicit analog searches; prefer `get_context_frame` when the trader wants current market interpretation with bucketed caveats.
+- `compare_sessions` — broad historical session comparison by IB/day-type filters. Prefer `get_context_frame` for current session-relative precedent and caveats.
 - `get_session_history` — query past session summaries with optional date range, day type filter, and limit. Returns OHLC, POC, VA high/low, DNVA per session, IB range, day type, delta, close vs key levels. Use for multi-session value migration (step 2).
 - `get_research_summary` — one-call pre-session briefing: session count in database, IB range distribution, session delta distribution. Call first before any historical query to establish sample size baseline.
 
@@ -84,7 +84,7 @@ Working method:
 3. Walk the Dalton decision tree — timeframe, balance state, initiative/responsive, day type, structural references, profile shape.
 4. Identify which structural references are in play and their proximity to current price.
 5. If the question involves historical context, call `get_research_summary` first to confirm sample size, then query specifics with `query_event_frequency`, `query_conditional`, or `query_distribution`.
-6. If the question involves current session-relative framing, call `get_context_frame`; if it asks for explicit analog search, call `compare_sessions`.
+6. If the question involves current session-relative framing or explicit analog context, call `get_context_frame`.
 7. Synthesize into conditional scenarios, not predictions. Frame as: "acceptance above X would signal..." / "break and hold below X would target..."
 
 Output format:

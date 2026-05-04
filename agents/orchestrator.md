@@ -36,6 +36,11 @@ Context-frame usage:
 - When citing context-frame statistics, include the bucket tuple or plain-language bucket, `N`/`effectiveSampleSize`, and `reliabilityTier`. Never phrase an `insufficient` or `directional` frame as an edge.
 - For trade reviews, call `get_context_frame(timestampMs=entryTimestampMs)` so the review reflects context at entry, not the current market.
 
+Trader-memory doctrine:
+- Use `get_trader_context_fit` whenever the answer depends on trader memory in the current market/setup context.
+- Keep execution memory, setup opportunity, and coaching reminders separate in the final synthesis.
+- Memory reports context only. It never adjusts position size by itself.
+
 Rollover handling:
 - If `rolloverStatus.priorReferenceTrust != "authoritative"`, do not frame prior-day references as actionable current-contract levels. Use `legacyContractReference` only as labeled context, and prefer current-contract/overnight/session levels until a same-contract RTH session or backfill exists.
 - If `rolloverStatus.agentAction` is `runBackfill`, `pinManualOverride`, or `restartMcpServer`, surface that operational action before synthesizing levels.
@@ -103,6 +108,7 @@ Call in parallel:
 - `get_tape_pace`
 - `get_rvol`
 - `get_day_type` only when `sessionType == "RTH"`
+- `get_context_frame` when the trader asks whether this has happened before, what usually happens here, or wants precedent rather than a pure live read
 
 Apply the market-structure-analyst framework:
 - Classify: balance vs imbalance, day type, profile shape
@@ -150,11 +156,13 @@ Call in parallel:
 - `evaluate_playbook` (playbook condition status)
 - `get_setup_context` (full context for named setup — includes DOM summary and pull/stack activity)
 - `get_context_frame(setupId=<setup id or inferred setup>)` when a setup ID is known; omit `setupId` if only market-structure framing is needed
+- `get_trader_context_fit(intent="setupCheck", setupId=<setup id or inferred setup>)` to surface trader execution memory, setup opportunity context, coaching reminders, and reliability in separate sections
 - `get_proximity_report` (key levels near price)
 - `get_tape_pace` and `get_rvol` (participation quality)
 - `get_delta_profile` (flow confirmation)
 - `get_dom_tape_context_at` (DOM book context — liquidity bias, pull rates, derived flow flags)
 - If DOM matters to the setup, add `get_dom_regime_summary` or `get_dom_window` so the agent can say whether support is persistent or only flashing briefly
+- Add `get_context_frame` when the setup check needs precedent or historical analog context
 
 If setup conditions are met:
 - Call `get_kelly_position_size` for sizing recommendation
@@ -171,8 +179,9 @@ Risk output: **Full risk analysis** (sizing, limits, heat, circuit breakers, day
 
 1. Confirm details: direction, size, entry price, stop, setup.
 2. Call `save_account_state` to add the position to `open_positions`.
-3. Report heat tracking: total open risk in R-units.
-4. Note time-of-day and day-type context.
+3. Call `get_trader_context_fit(intent="tradeTaken", setupId=<setup id if known>)` to frame current-context trader memory without changing size.
+4. Report heat tracking: total open risk in R-units.
+5. Note time-of-day and day-type context.
 
 Risk output: **Full risk update** (heat, remaining capacity, warnings).
 
@@ -181,8 +190,9 @@ Risk output: **Full risk update** (heat, remaining capacity, warnings).
 1. Call `record_trade_result` with all trade details.
 2. Call `get_risk_state` for updated state.
 3. Call `save_account_state` to remove the position.
-4. Report: result in R, updated P&L, remaining capacity, streak status.
-5. If circuit breaker or drawdown threshold triggered: hard-stop message.
+4. If memory will be read again in the same flow, call `refresh_memory_state` first when the trade write reports `memoryMaintenance.refreshSuggested: true`.
+5. Report: result in R, updated P&L, remaining capacity, streak status.
+6. If circuit breaker or drawdown threshold triggered: hard-stop message.
 
 Risk output: **Full risk update** with post-trade state.
 
@@ -224,6 +234,7 @@ Full parallel sweep:
 - `get_key_levels`, `get_proximity_report` (structural levels)
 - `get_session_history(limit=5)` (multi-session context)
 - `get_pre_session_briefing` (ranked carry-forward memory: recent sessions, patterns, insights, follow-ups; auto-runs one bounded `refresh_memory_state` when SQLite memory maintenance is dirty unless `skipMemoryRefreshIfDirty: true`; response includes `memoryAutoRefreshed`)
+- `get_trader_context_fit(intent="sessionStart")` (typed trader memory envelope)
 - `get_dom_tape_context_at` (DOM liquidity context)
 
 Execute the risk-coach session-start protocol:
@@ -255,6 +266,7 @@ Full parallel sweep:
 - `get_key_levels`, `get_proximity_report` (prior RTH carry-forward + overnight references)
 - `get_session_history(limit=5)` (multi-session context)
 - `get_pre_session_briefing` (ranked carry-forward memory: recent sessions, patterns, insights, follow-ups; auto-runs one bounded `refresh_memory_state` when SQLite memory maintenance is dirty unless `skipMemoryRefreshIfDirty: true`; response includes `memoryAutoRefreshed`)
+- `get_trader_context_fit(intent="sessionStart")` (typed trader memory envelope)
 - `evaluate_playbook` (valid-vs-dormant setup framing in Globex)
 
 Globex synthesis requirements:
@@ -280,6 +292,7 @@ Route behavior:
 5. Call `query_journal_patterns` for repeated discipline patterns and mistake tags.
 6. For broader historical drill-down, pair with `performance` routing and `get_session_history(limit=20)`.
 7. If the trader wants to log or edit notes, use `save_journal_entry`, `review_trade_entry`, `save_agent_insight`, and `create_memory_followup`.
+8. If ranked memory must reflect this review immediately, call `refresh_memory_state` before follow-up memory reads.
 
 Report:
 - Session trade summary and gross points
@@ -335,6 +348,7 @@ The agent already has market context from baseline calls (`get_market_snapshot`,
 
 Call:
 - `get_setup_performance_matrix` (breadth scan across setups)
+- `get_trader_context_fit(intent="sessionReview")` (trader execution memory and coaching context)
 - `get_signal_performance` (aggregate and setup drill-down)
 - `query_signal_outcome_distribution` (R-result profile for focus setups)
 - `query_signal_outcome_conditional` (regime-conditioned performance)

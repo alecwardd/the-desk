@@ -1,0 +1,268 @@
+{
+  "intent": "setupCheck",
+  "currentContext": {
+    "tradingDay": "2026-05-01",
+    "accountScope": "prop-a",
+    "sessionType": "RTH",
+    "sessionSegment": "rth_open",
+    "timeBucket": "rthOpen",
+    "dayType": "trend",
+    "profileShape": null,
+    "balanceState": null,
+    "setupId": "or5"
+  },
+  "executionFit": {
+    "summary": "Scoped execution memory matched this context.",
+    "matchingSlices": [
+      {
+        "id": "win_rate_by_setup:or5",
+        "patternType": "win_rate_by_setup",
+        "description": "win_rate_by_setup:or5",
+        "n": 40,
+        "reliabilityTier": "reportable",
+        "winRate": 0.5,
+        "avgR": -0.25,
+        "scope": {
+          "setupId": "or5"
+        },
+        "queryHint": {
+          "setupId": "or5"
+        },
+        "source": "behavioral_patterns",
+        "caveats": []
+      },
+      {
+        "id": "win_rate_by_setup_time_bucket:or5:rth_open",
+        "patternType": "win_rate_by_setup_time_bucket",
+        "description": "win_rate_by_setup_time_bucket:or5:rth_open",
+        "n": 24,
+        "reliabilityTier": "directional",
+        "winRate": 0.5,
+        "avgR": 0.35,
+        "scope": {
+          "setupId": "or5",
+          "timeBucket": "rth_open"
+        },
+        "queryHint": {
+          "setupId": "or5",
+          "timeBucket": "rth_open"
+        },
+        "source": "behavioral_patterns",
+        "caveats": []
+      },
+      {
+        "id": "post_loss_after_one:setup:or5",
+        "patternType": "post_loss_after_one",
+        "description": "post_loss_after_one:setup:or5",
+        "n": 22,
+        "reliabilityTier": "directional",
+        "winRate": 0.5,
+        "avgR": -0.4,
+        "scope": {
+          "setupId": "or5",
+          "postLossState": "afterOneLoss"
+        },
+        "queryHint": {
+          "setupId": "or5",
+          "postLossState": "afterOneLoss"
+        },
+        "source": "behavioral_patterns",
+        "caveats": []
+      }
+    ],
+    "strongestPositiveEvidence": [
+      {
+        "id": "win_rate_by_setup_time_bucket:or5:rth_open",
+        "patternType": "win_rate_by_setup_time_bucket",
+        "description": "win_rate_by_setup_time_bucket:or5:rth_open",
+        "n": 24,
+        "reliabilityTier": "directional",
+        "winRate": 0.5,
+        "avgR": 0.35,
+        "scope": {
+          "setupId": "or5",
+          "timeBucket": "rth_open"
+        },
+        "queryHint": {
+          "setupId": "or5",
+          "timeBucket": "rth_open"
+        },
+        "source": "behavioral_patterns",
+        "caveats": []
+      }
+    ],
+    "strongestCautionEvidence": [
+      {
+        "id": "win_rate_by_setup:or5",
+        "patternType": "win_rate_by_setup",
+        "description": "win_rate_by_setup:or5",
+        "n": 40,
+        "reliabilityTier": "reportable",
+        "winRate": 0.5,
+        "avgR": -0.25,
+        "scope": {
+          "setupId": "or5"
+        },
+        "queryHint": {
+          "setupId": "or5"
+        },
+        "source": "behavioral_patterns",
+        "caveats": []
+      },
+      {
+        "id": "post_loss_after_one:setup:or5",
+        "patternType": "post_loss_after_one",
+        "description": "post_loss_after_one:setup:or5",
+        "n": 22,
+        "reliabilityTier": "directional",
+        "winRate": 0.5,
+        "avgR": -0.4,
+        "scope": {
+          "setupId": "or5",
+          "postLossState": "afterOneLoss"
+        },
+        "queryHint": {
+          "setupId": "or5",
+          "postLossState": "afterOneLoss"
+        },
+        "source": "behavioral_patterns",
+        "caveats": []
+      }
+    ],
+    "missingData": []
+  },
+  "opportunityFit": {
+    "summary": "Opportunity data is separate from trader execution.",
+    "setupOutcome": null,
+    "contextFrameAnalog": {
+      "available": true,
+      "source": "get_context_frame",
+      "detailAvailableByCalling": "get_context_frame",
+      "caveats": [
+        "Context-frame analogs are not executed-trade memory."
+      ]
+    },
+    "missingData": []
+  },
+  "coachingMemory": {
+    "patterns": [
+      "win_rate_by_setup:or5",
+      "win_rate_by_setup_time_bucket:or5:rth_open",
+      "post_loss_after_one:setup:or5"
+    ],
+    "insights": [
+      {
+        "id": "insight-or5-1",
+        "createdAtMs": 2000.0,
+        "updatedAtMs": 2500.0,
+        "sessionId": "s1",
+        "tradeId": null,
+        "setupId": "or5",
+        "category": "behavioral",
+        "status": "candidate",
+        "summary": "OR5 hesitation improves when first pullback confirms above VWAP.",
+        "evidence": {
+          "patternIds": [
+            "win_rate_by_setup:or5"
+          ]
+        },
+        "tags": [
+          "or5",
+          "execution"
+        ],
+        "scope": {
+          "setupId": "or5",
+          "timeBucket": "rth_open"
+        },
+        "confidence": 0.8,
+        "salience": 0.7,
+        "timesSurfaced": 1,
+        "lastSurfacedMs": 2400.0,
+        "supersededBy": null,
+        "source": "test",
+        "helpfulCount": 1,
+        "irrelevantCount": 0,
+        "wrongCount": 0,
+        "stalePatternEvidence": false
+      }
+    ],
+    "followups": [
+      {
+        "id": "followup-or5-1",
+        "createdAtMs": 3000.0,
+        "resolvedAtMs": null,
+        "sessionId": "s1",
+        "tradeId": null,
+        "source": "test",
+        "title": "Review OR5 entry timing",
+        "detail": "Check whether the entry waited for the first pullback confirmation.",
+        "status": "open",
+        "tags": [
+          "or5"
+        ],
+        "dueContext": {
+          "setupId": "or5"
+        }
+      }
+    ]
+  },
+  "riskContext": {
+    "tradeOrdinalInSession": "first",
+    "postLossStateInSession": null,
+    "openTradePresent": false,
+    "riskDeviation": {
+      "available": false,
+      "availability": {
+        "kind": "preCapture",
+        "reason": "Risk deviation cannot be evaluated for this row; do not infer risk compliance from this absence."
+      }
+    },
+    "ruleAdherenceFlags": []
+  },
+  "reliability": {
+    "overallTier": "directional",
+    "caveats": [
+      "Execution and opportunity samples are reported separately.",
+      "Account-specific live context is scoped, but historical behavioral patterns are currently pooled unless account-scoped pattern slices have been refreshed."
+    ]
+  },
+  "provenance": {
+    "executionSources": [
+      "behavioral_patterns",
+      "trades",
+      "sessions",
+      "session_summaries"
+    ],
+    "opportunitySources": [
+      "signal_outcomes",
+      "context_frame"
+    ],
+    "coachingSources": [
+      "behavioral_patterns",
+      "agent_insights",
+      "memory_followups"
+    ],
+    "evidenceIds": {
+      "patterns": [
+        "win_rate_by_setup:or5",
+        "win_rate_by_setup_time_bucket:or5:rth_open",
+        "post_loss_after_one:setup:or5"
+      ],
+      "insights": [
+        "insight-or5-1"
+      ],
+      "followups": [
+        "followup-or5-1"
+      ]
+    },
+    "evidenceTimestampsMs": {
+      "patternsRefreshedAtMs": null,
+      "insightsLastUpdatedMs": 2500.0
+    },
+    "truncationWarning": null
+  },
+  "maintenance": {
+    "refreshSuggested": true,
+    "dirtyReasons": []
+  }
+}

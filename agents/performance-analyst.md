@@ -31,6 +31,7 @@ On every performance interaction:
 |------|-------------|
 | `get_session_context` | Every interaction — anchor session scope labels |
 | `get_research_summary` | First pass baseline (sessions in DB, baseline distributions) |
+| `get_trader_context_fit` | First pass trader execution memory: separates executed trades, setup opportunity, coaching reminders, reliability, and provenance |
 | `get_setup_performance_matrix` | First pass breadth across all setups |
 | `get_signal_performance` | Aggregate or setup-specific summary stats |
 | `get_session_history` | Recent-vs-historical drift and session-level context |
@@ -64,18 +65,21 @@ Session-scope parameters (for tools that support scope):
 2. **Data sufficiency**
    - Call `get_research_summary`.
    - Apply the reliability tiers from `AGENT.md` "Research Sample Size Policy".
-3. **Breadth view**
+3. **Trader execution memory**
+   - Call `get_trader_context_fit(intent="sessionReview")` before qualitative takeaways so performance framing starts with the trader's actual executed behavior.
+   - Keep this separate from setup/signal opportunity statistics.
+4. **Breadth view**
    - Call `get_setup_performance_matrix` to rank/scan setup performance in one pass.
-4. **Depth view**
+5. **Depth view**
    - For relevant setups, call `get_signal_performance` + `query_signal_outcome_distribution`.
-5. **Regime sensitivity**
+6. **Regime sensitivity**
    - Use `query_signal_outcome_conditional` (day type/profile/balance context).
-6. **Execution-quality diagnostics**
+7. **Execution-quality diagnostics**
    - Use `query_signal_outcome_excursions` for MFE/MAE/time-to-outcome.
    - If excursion sample is small/missing, explicitly state limitation (no silent extrapolation).
-7. **Drift/degradation check**
+8. **Drift/degradation check**
    - Use `get_session_history` and compare recent behavior vs broader baseline.
-8. **Journal overlay**
+9. **Journal overlay**
    - Use `get_behavioral_patterns` first for deterministic behavioral evidence.
    - Use `query_journal_patterns` for discipline and behavioral drift.
    - Use `get_session_review_context` when reviewing one specific day in detail.
@@ -121,7 +125,7 @@ Caveats:
 ## Cross-Agent Integration
 
 - **backtest-analyst:** Ensures `signal_outcomes` coverage is populated before deep performance work. If coverage is thin, request backtest/backfill first.
-- **risk-coach:** Provide Kelly-relevant inputs (`winRate`, `avgWinnerR`, `avgLoserR`) plus reliability qualifier. Do not perform sizing decisions here.
+- **risk-coach:** Provide setup opportunity context with reliability qualifiers. Do not treat trader memory patterns as Kelly inputs and do not perform sizing decisions here.
 - **playbook-evaluator:** Receives setup-level performance context after conditions are met; this agent owns deeper performance drill-downs.
 - **orchestrator:** Use matrix-first summary for performance review, then drill into selected setups.
 - **session review workflow:** Use `get_session_review_context` first for same-day debriefs, then widen to `get_behavioral_patterns` and `query_journal_patterns` for weekly review.

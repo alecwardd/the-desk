@@ -6,6 +6,9 @@ use std::collections::HashMap;
 
 /// Semantic version for rules-engine condition/evaluator behavior.
 ///
+/// Stored as text in `signal_outcomes.rules_schema_version` so future
+/// non-numeric pre-release labels can use the same column.
+///
 /// Increment this when `ConditionField`, `ConditionOperator`, or evaluator
 /// semantics change in a way that invalidates cached backtest statistics.
 /// Examples: adding/removing condition variants, changing comparison semantics

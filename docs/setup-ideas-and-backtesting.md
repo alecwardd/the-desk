@@ -11,6 +11,7 @@ Living document for trade setup ideas, backtesting hypotheses, research findings
 | **Idea** | Concept identified, not yet researched or coded |
 | **Researched** | Supporting evidence gathered, mechanics understood |
 | **Prototyped** | Pipeline or detection logic implemented |
+| **Backtesting-ready** | Instrumentation and setup mechanics are ready for a verified backtest rerun |
 | **Backtesting** | Running through historical .scid data |
 | **Validated** | Backtest results confirm edge; ready for template |
 | **In Playbook** | Added to setup_templates.rs and active |
@@ -50,10 +51,12 @@ These are the highest-signal observations from the local history sample:
 
 ### Instrumentation Caveats
 
-Do not use these fields for serious strategy selection until they are repaired:
-- `signal_outcomes` is currently dominated by one custom setup (`Volume Value Area Traverse`) with clearly broken `time_exit` / excursion behavior
+Do not use these fields for serious strategy selection until they are repaired or rerun under verified instrumentation:
+- `signal_outcomes` instrumentation is repaired as of 2026-05-04, but older rows remain `legacyUnverified` unless a fresh backtest job produces `verified` rows under the current outcome engine
 - `single_prints_direction` in `session_summaries` is currently not useful for statistical slicing
 - `poor_high` / `poor_low` flags are sparse or incomplete in the current stored sample
+
+**Implementation note (2026-05-04):** signal outcome generation now has a verified fire-time contract, auditable schema fields, source/job/quality filters, read-time R recomputation, and `validate_signal_outcome_integrity`. Treat this as an instrumentation repair, not as evidence that old `signal_outcomes` rows are trustworthy. The next evidence-producing step is to rerun target backtests with a fresh `job_id`, confirm `signalOutcomeIntegrity.status` is `ok`, then use only the verified run for setup statistics.
 
 ### Regime-First Conclusion
 
@@ -306,7 +309,7 @@ The regime layer should drive which existing templates are active, not just how 
 
 ### IDEA-011: One-Sided IB Extension Acceptance
 
-**Status:** Researched
+**Status:** Backtesting-ready
 **Source:** Local 2025-11-28 through 2026-03-06 database study
 **Complements:** IB Extension Play (tpl_ib_extension), OR5 Mid Retest (tpl_or5_mid_retest)
 
@@ -349,6 +352,15 @@ The regime layer should drive which existing templates are active, not just how 
 
 **Backtesting Hypothesis:**
 > When the first IB extension remains one-sided for at least 30 minutes and RVOL >= Elevated, what is the R-distribution of trading the first pullback in extension direction?
+
+**Next verified backtest steps (post signal-outcome repair):**
+1. Run `validate_signal_outcome_integrity({ source: "backtest" })` to capture the pre-rerun baseline and confirm old rows are mostly `legacyUnverified`.
+2. Add or verify `ib_extension_state = None | UpOnly | DownOnly | BothSides` plus first extension timestamp/direction in the session or event surface used by the backtest.
+3. Register a numerically backtestable IDEA-011 hypothesis/setup with explicit `direction`, fixed/named-level target logic, numeric stop logic, and finite positive `risk_points`.
+4. Run a fresh backtest with a new `job_id` against the 2025-11-28 through 2026-03-06 RTH window, scoped to `source="backtest"`.
+5. Inspect `backtest_runs.metrics.signalOutcomeIntegrity`; proceed only if `status="ok"` and the relevant setup rows are `verified`.
+6. Query `query_signal_outcome_distribution`, `query_signal_outcome_conditional`, and `query_signal_outcome_excursions` with `jobId=<fresh job>`, `source="backtest"`, and `includeUnverified=false`.
+7. Record the verified expectancy, sample size, R distribution, MFE/MAE, and regime split here before building the broader regime selector.
 
 ---
 
@@ -1159,6 +1171,20 @@ Ordered by expected information value × implementation ease:
 
 ---
 
+## Verified Backtesting Runbook
+
+Use this sequence for any setup study that depends on `signal_outcomes`:
+
+1. **Preflight integrity:** call `validate_signal_outcome_integrity` with the intended `source`, `jobId` if available, and `setupId` if narrowed. `failed` means stop; `warning` means inspect legacy ratios before using the result.
+2. **Use fresh job IDs:** never mix old and new outcome engines in the same statistic. Fresh deterministic backtests should produce a new `job_id` and should store their integrity report in `backtest_runs.metrics.signalOutcomeIntegrity`.
+3. **Prefer verified rows:** while the transition is active, research tools default `includeUnverified=true` for backwards compatibility. For new studies, pass `includeUnverified=false`.
+4. **Pin provenance in notes:** every published result should cite `source`, `job_id`, setup id, date/session scope, outcome engine version, rules schema version, and whether `qualityCounts.verified` covers the full sample.
+5. **Flip defaults later:** after verified reruns exist for the immediate research windows, change the research-tool default from `includeUnverified=true` to verified-only and keep legacy inclusion as an explicit opt-in.
+
+Immediate next target: rerun IDEA-011 under this runbook and promote the verified result into the research snapshot above.
+
+---
+
 ## Research Sources
 
 | Source | Topics | Confidence |
@@ -1180,4 +1206,4 @@ Ordered by expected information value × implementation ease:
 
 ---
 
-*Last updated: 2026-04-16*
+*Last updated: 2026-05-04*

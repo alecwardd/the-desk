@@ -392,8 +392,16 @@ fn golden_setup() -> SetupDefinition {
         active: true,
         conditions: vec!["price_vs_vwap=above".to_string()],
         duplicate_suppression_ms: 3_600_000,
-        targets: vec![serde_json::json!({"price": 21006.0})],
-        stop_logic: serde_json::json!({"points": 10.0}),
+        targets: vec![serde_json::json!({
+            "mode": "fixed_points",
+            "direction": "long",
+            "points": 3.0
+        })],
+        stop_logic: serde_json::json!({
+            "mode": "fixed_points",
+            "direction": "long",
+            "points": 80.0
+        }),
         template_source: Some("golden_replay".to_string()),
         ..Default::default()
     }

@@ -64,7 +64,6 @@ use the_desk_backend::observability::{
 use the_desk_backend::options::{
     fetch_options_snapshot, load_options_config, OptionsCredentials, OptionsSnapshot,
 };
-use the_desk_backend::outcome_tracker;
 use the_desk_backend::pipelines::{
     EventDetector, FlowEventEmitter, MarketEvent, PipelineEngine, PriorSessionData, RvolPipeline,
 };
@@ -92,6 +91,7 @@ use the_desk_backend::{
     trading_day_from_timestamp_ms, DeltaSegment, SessionType, GLOBEX_OPEN_ET, RTH_CLOSE_ET,
     RTH_OPEN_ET,
 };
+use the_desk_backend::{outcome_tracker, outcomes};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::{sleep, Duration};
 
@@ -1487,8 +1487,21 @@ fn normalize_signal_source(raw: &str) -> Option<&'static str> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "live" => Some("live"),
         "backtest" => Some("backtest"),
+        "backfill" => Some("backfill"),
         _ => None,
     }
+}
+
+fn parse_optional_signal_source(source: Option<&str>) -> Result<Option<&'static str>, McpError> {
+    source
+        .map(|raw| {
+            normalize_signal_source(raw).ok_or_else(|| {
+                invalid_params_error(format!(
+                    "source must be one of live|backtest|backfill, got: {raw}"
+                ))
+            })
+        })
+        .transpose()
 }
 
 fn load_contextual_prior_dnva(
@@ -1811,6 +1824,11 @@ struct DomBehaviorConditionalParams {
     min_duration_ms: Option<f64>,
     start_date: Option<String>,
     end_date: Option<String>,
+    source: Option<String>,
+    #[serde(alias = "job_id", alias = "jobId")]
+    job_id: Option<String>,
+    #[serde(alias = "includeUnverified")]
+    include_unverified: Option<bool>,
     #[schemars(schema_with = "schemars_optional_loose_object")]
     scope: Option<serde_json::Value>,
 }
@@ -2074,6 +2092,14 @@ struct SignalOutcomeDistributionParams {
     start_date: Option<String>,
     /// End date filter (YYYY-MM-DD).
     end_date: Option<String>,
+    /// Optional source filter: live | backtest | backfill.
+    source: Option<String>,
+    /// Optional backtest/backfill job ID filter.
+    #[serde(alias = "job_id", alias = "jobId")]
+    job_id: Option<String>,
+    /// Include legacyUnverified/notBacktestable rows during transition (default true).
+    #[serde(alias = "includeUnverified")]
+    include_unverified: Option<bool>,
     /// Optional session/trading-day scope filter.
     #[serde(flatten)]
     session_scope: SessionScopeParams,
@@ -2091,6 +2117,14 @@ struct SignalOutcomeConditionalParams {
     start_date: Option<String>,
     /// End date filter (YYYY-MM-DD).
     end_date: Option<String>,
+    /// Optional source filter: live | backtest | backfill.
+    source: Option<String>,
+    /// Optional backtest/backfill job ID filter.
+    #[serde(alias = "job_id", alias = "jobId")]
+    job_id: Option<String>,
+    /// Include legacyUnverified/notBacktestable rows during transition (default true).
+    #[serde(alias = "includeUnverified")]
+    include_unverified: Option<bool>,
     /// Optional session/trading-day scope filter.
     #[serde(flatten)]
     session_scope: SessionScopeParams,
@@ -2108,6 +2142,14 @@ struct SignalOutcomeExcursionsParams {
     /// End date filter (YYYY-MM-DD).
     #[serde(alias = "end_date")]
     end_date: Option<String>,
+    /// Optional source filter: live | backtest | backfill.
+    source: Option<String>,
+    /// Optional backtest/backfill job ID filter.
+    #[serde(alias = "job_id", alias = "jobId")]
+    job_id: Option<String>,
+    /// Include legacyUnverified/notBacktestable rows during transition (default true).
+    #[serde(alias = "includeUnverified")]
+    include_unverified: Option<bool>,
     /// Optional session/trading-day scope filter.
     #[serde(flatten)]
     session_scope: SessionScopeParams,
@@ -2192,6 +2234,19 @@ struct SignalPerformanceParams {
     /// Optional session/trading-day scope filter.
     #[serde(flatten)]
     session_scope: SessionScopeParams,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct SignalOutcomeIntegrityParams {
+    /// Optional source filter: "live", "backtest", or "backfill".
+    source: Option<String>,
+    /// Optional backtest job ID filter.
+    #[serde(alias = "job_id", alias = "jobId")]
+    job_id: Option<String>,
+    /// Optional setup ID filter.
+    #[serde(alias = "setup_id", alias = "setupId")]
+    setup_id: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -5040,6 +5095,7 @@ impl TheDeskMcp {
         let behavior = parse_dom_behavior_name(&params.behavior)?;
         let setup_id = parse_optional_non_empty_string("setupId", params.setup_id.as_deref())?;
         let min_duration_ms = parse_dom_behavior_min_duration(params.min_duration_ms)?;
+        let source = parse_optional_signal_source(params.source.as_deref())?;
         let db = self.db.lock().map_err(|_| lock_error())?;
         let result = research::dom_behavior_conditional(
             &db,
@@ -5049,6 +5105,9 @@ impl TheDeskMcp {
             params.start_date.as_deref(),
             params.end_date.as_deref(),
             scope.as_ref(),
+            source,
+            params.job_id.as_deref(),
+            params.include_unverified.unwrap_or(true),
         )
         .map_err(db_error)?;
         Ok(text_result(
@@ -8369,6 +8428,7 @@ impl TheDeskMcp {
         )?;
         let scope = build_session_scope_filter(&params.session_scope)?;
         let setup_id = parse_non_empty_string("setupId", &params.setup_id)?;
+        let source = parse_optional_signal_source(params.source.as_deref())?;
         let db = self.db.lock().map_err(|_| lock_error())?;
         match research::signal_outcome_distribution(
             &db,
@@ -8376,6 +8436,9 @@ impl TheDeskMcp {
             params.start_date.as_deref(),
             params.end_date.as_deref(),
             scope.as_ref(),
+            source,
+            params.job_id.as_deref(),
+            params.include_unverified.unwrap_or(true),
         ) {
             Ok(result) => Ok(text_result(
                 serde_json::to_value(&result).unwrap_or_default(),
@@ -8401,6 +8464,7 @@ impl TheDeskMcp {
         let setup_id = parse_non_empty_string("setupId", &params.setup_id)?;
         let session_field = parse_signal_outcome_session_field(&params.session_field)?;
         let field_value = parse_non_empty_string("fieldValue", &params.field_value)?;
+        let source = parse_optional_signal_source(params.source.as_deref())?;
         let db = self.db.lock().map_err(|_| lock_error())?;
         match research::signal_outcome_conditional(
             &db,
@@ -8410,6 +8474,9 @@ impl TheDeskMcp {
             params.start_date.as_deref(),
             params.end_date.as_deref(),
             scope.as_ref(),
+            source,
+            params.job_id.as_deref(),
+            params.include_unverified.unwrap_or(true),
         ) {
             Ok(result) => Ok(text_result(
                 serde_json::to_value(&result).unwrap_or_default(),
@@ -8433,6 +8500,7 @@ impl TheDeskMcp {
         )?;
         let scope = build_session_scope_filter(&params.session_scope)?;
         let setup_id = parse_optional_non_empty_string("setupId", params.setup_id.as_deref())?;
+        let source = parse_optional_signal_source(params.source.as_deref())?;
         let db = self.db.lock().map_err(|_| lock_error())?;
         match research::signal_outcome_excursions(
             &db,
@@ -8440,6 +8508,9 @@ impl TheDeskMcp {
             params.start_date.as_deref(),
             params.end_date.as_deref(),
             scope.as_ref(),
+            source,
+            params.job_id.as_deref(),
+            params.include_unverified.unwrap_or(true),
         ) {
             Ok(result) => Ok(text_result(
                 serde_json::to_value(&result).unwrap_or_default(),
@@ -8557,6 +8628,37 @@ impl TheDeskMcp {
             scope.as_ref(),
         ) {
             Ok(result) => Ok(text_result(result)),
+            Err(e) => Err(db_error(e)),
+        }
+    }
+
+    #[tool(
+        description = "Validate signal_outcomes integrity for research/backtest trust. Returns quality counts, failed invariant counts, legacy ratio, and ok/warning/failed status. Filter by source, jobId, or setupId before running setup studies."
+    )]
+    async fn validate_signal_outcome_integrity(
+        &self,
+        Parameters(params): Parameters<SignalOutcomeIntegrityParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let source = params
+            .source
+            .as_deref()
+            .map(|raw| {
+                let normalized = raw.trim().to_ascii_lowercase();
+                match normalized.as_str() {
+                    "live" | "backtest" | "backfill" => Ok(normalized),
+                    _ => Err(invalid_params_error(format!(
+                        "source must be one of live|backtest|backfill, got: {raw}"
+                    ))),
+                }
+            })
+            .transpose()?;
+        let db = self.db.lock().map_err(|_| lock_error())?;
+        match db.signal_outcome_integrity_report(
+            source.as_deref(),
+            params.job_id.as_deref(),
+            params.setup_id.as_deref(),
+        ) {
+            Ok(report) => Ok(text_result(report)),
             Err(e) => Err(db_error(e)),
         }
     }
@@ -9219,6 +9321,18 @@ impl TheDeskMcp {
             "lastRuntimeError": &runtime_event_stats.last_error,
             "recentRuntimeEventNameCounts": &runtime_event_stats.recent_event_name_counts,
         });
+        if let Ok(db) = self.db.lock() {
+            if let Ok(report) = db.signal_outcome_integrity_report(None, None, None) {
+                let passed = report.get("status").and_then(|v| v.as_str()) != Some("failed");
+                checks["signalOutcomes"] = serde_json::json!({
+                    "passed": passed,
+                    "status": report.get("status"),
+                    "totalRows": report.get("totalRows"),
+                    "qualityCounts": report.get("qualityCounts"),
+                });
+                invariants_ok &= passed;
+            }
+        }
         for (name, passed, detail) in pipeline_invariants {
             checks[name] = serde_json::json!({
                 "passed": passed,
@@ -9450,9 +9564,11 @@ fn runtime_record_from_snapshot(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn persist_setup_evaluation(
     db: &Database,
     runtime_events: Option<&Arc<RuntimeEventStore>>,
+    setup: &SetupDefinition,
     outcome: &SetupEvaluationOutcome,
     runtime_snapshot: Option<SetupRuntimeSnapshot>,
     market_snapshot: &the_desk_backend::pipelines::MarketState,
@@ -9534,7 +9650,7 @@ fn persist_setup_evaluation(
             job_id: None,
         };
         let _ = db.insert_playbook_signal_record(&signal);
-        let outcome = SignalOutcome {
+        let mut outcome = SignalOutcome {
             signal_id,
             setup_id: alert.setup_id.clone(),
             setup_name: Some(alert.setup_name.clone()),
@@ -9555,7 +9671,19 @@ fn persist_setup_evaluation(
             time_to_outcome_ms: None,
             rvol_at_fire: Some(market_snapshot.rvol_ratio),
             rvol_bucket_at_fire: Some(market_snapshot.rvol_bucket_index as i32),
+            direction: None,
+            entry_price: None,
+            risk_points: None,
+            exit_price: None,
+            outcome_quality: outcomes::QUALITY_LEGACY_UNVERIFIED.to_string(),
+            quality_flags: Vec::new(),
+            outcome_engine_version: None,
+            rules_schema_version: None,
+            setup_template_hash: None,
+            last_observed_price: None,
+            last_observed_at_ms: None,
         };
+        outcomes::initialize_outcome(&mut outcome, setup);
         let _ = db.insert_signal_outcome(&outcome);
     }
 }
@@ -9577,7 +9705,7 @@ fn evaluate_setups_for_snapshot(
         for setup in setups.iter() {
             let outcome = r.evaluate_detailed_at(setup, snapshot, risk_at_limit, evaluation_ts_ms);
             let runtime_snapshot = r.runtime_snapshot(&setup.id);
-            items.push((outcome, runtime_snapshot));
+            items.push((setup.clone(), outcome, runtime_snapshot));
         }
         r.update_prev_market(snapshot);
         items
@@ -9586,10 +9714,11 @@ fn evaluate_setups_for_snapshot(
     };
 
     if let Ok(d) = db.lock() {
-        for (outcome, runtime_snapshot) in persist_items {
+        for (setup, outcome, runtime_snapshot) in persist_items {
             persist_setup_evaluation(
                 &d,
                 runtime_events,
+                &setup,
                 &outcome,
                 runtime_snapshot,
                 snapshot,
@@ -9909,7 +10038,7 @@ fn process_tick(
 
     // Outcome tracker: update MFE/MAE and resolve signals
     if let Ok(d) = db.lock() {
-        let _ = outcome_tracker::on_tick(&d, price, timestamp_ms, None);
+        let _ = outcome_tracker::on_tick(&d, price, timestamp_ms);
         if !new_attention_events.is_empty() {
             compose_and_persist_attention(
                 &d,
@@ -12890,6 +13019,7 @@ mod tests {
     fn normalize_signal_source_validates_values() {
         assert_eq!(normalize_signal_source("live"), Some("live"));
         assert_eq!(normalize_signal_source("backtest"), Some("backtest"));
+        assert_eq!(normalize_signal_source("backfill"), Some("backfill"));
         assert_eq!(normalize_signal_source("paper"), None);
     }
 
@@ -13510,9 +13640,16 @@ mod tests {
             .expect("history");
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].timestamp_ms, ts);
-        let outcomes = db.pending_signal_outcomes().expect("pending outcomes");
-        assert_eq!(outcomes.len(), 1);
-        assert_eq!(outcomes[0].fired_at_ms, ts);
+        let outcome_rows = db
+            .list_signal_outcomes_for_replay(Some("live"), None)
+            .expect("signal outcomes");
+        assert_eq!(outcome_rows.len(), 1);
+        assert_eq!(outcome_rows[0].fired_at_ms, ts);
+        assert_eq!(
+            outcome_rows[0].outcome_quality,
+            outcomes::QUALITY_NOT_BACKTESTABLE
+        );
+        assert_eq!(outcome_rows[0].outcome, "not_backtestable");
         assert_eq!(db.count_playbook_signals().expect("signals"), 1);
     }
 

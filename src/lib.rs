@@ -8,6 +8,7 @@ pub mod memory;
 pub mod observability;
 pub mod options;
 pub mod outcome_tracker;
+pub mod outcomes;
 pub mod pipelines;
 pub mod recording;
 pub mod research;

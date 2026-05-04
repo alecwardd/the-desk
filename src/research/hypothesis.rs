@@ -2,6 +2,7 @@ use crate::db::{
     stable_hash_hex, Database, HypothesisSignalOutcomeRow, ResearchHypothesisRecord,
     SessionScopeFilter,
 };
+use crate::outcomes;
 use crate::rules::{
     ConditionField, SetupCondition, SetupDefinition, SetupLifecycleStatus,
     RULES_ENGINE_SCHEMA_VERSION,
@@ -631,7 +632,7 @@ fn summarize_rows(
     let total = rows.len();
     let pending = rows.iter().filter(|r| r.outcome == "pending").count();
     let resolved = total.saturating_sub(pending);
-    let r_values: Vec<f64> = rows.iter().filter_map(|r| r.r_result).collect();
+    let r_values: Vec<f64> = rows.iter().filter_map(recomputed_row_r).collect();
     let expectancy = if r_values.is_empty() {
         0.0
     } else {
@@ -639,7 +640,7 @@ fn summarize_rows(
     };
     let win_rate = if resolved > 0 {
         rows.iter()
-            .filter(|r| r.outcome == "target_hit" || r.r_result.map(|v| v > 0.0).unwrap_or(false))
+            .filter(|r| r.outcome == "target_hit" || recomputed_row_r(r).is_some_and(|v| v > 0.0))
             .count() as f64
             / resolved as f64
     } else {
@@ -659,19 +660,20 @@ fn summarize_rows(
     let mut tod = BTreeMap::new();
     let mut segment = BTreeMap::new();
     for row in &rows {
+        let r_result = recomputed_row_r(row);
         add_breakdown(
             &mut day_type,
             row.day_type
                 .clone()
                 .unwrap_or_else(|| "unknown".to_string()),
-            row.r_result,
+            r_result,
         );
         add_breakdown(
             &mut rvol,
             row.rvol_bucket_at_fire
                 .map(|b| format!("bucket_{b}"))
                 .unwrap_or_else(|| "unknown".to_string()),
-            row.r_result,
+            r_result,
         );
         let ctx = tick_time_context_from_timestamp_ms(row.fired_at_ms);
         let bucket = ctx
@@ -681,12 +683,12 @@ fn summarize_rows(
                 format!("rth_{start}_to_{}", start + 30)
             })
             .unwrap_or_else(|| "unknown".to_string());
-        add_breakdown(&mut tod, bucket, row.r_result);
+        add_breakdown(&mut tod, bucket, r_result);
         add_breakdown(
             &mut segment,
             ctx.map(|c| format!("{:?}", c.session_segment))
                 .unwrap_or_else(|| "unknown".to_string()),
-            row.r_result,
+            r_result,
         );
     }
 
@@ -727,6 +729,17 @@ fn summarize_rows(
         gate,
         warnings,
     })
+}
+
+fn recomputed_row_r(row: &HypothesisSignalOutcomeRow) -> Option<f64> {
+    outcomes::recompute_r_result_fields(
+        row.direction.as_deref(),
+        row.entry_price,
+        row.fired_price,
+        row.exit_price,
+        row.risk_points,
+    )
+    .or(row.r_result)
 }
 
 fn gate_decision(
@@ -1092,6 +1105,17 @@ mod tests {
             time_to_outcome_ms: Some(60_000.0),
             rvol_at_fire: Some(1.2),
             rvol_bucket_at_fire: Some(rvol_bucket),
+            direction: Some("long".to_string()),
+            entry_price: Some(21000.0),
+            risk_points: Some(12.0),
+            exit_price: Some(21018.0),
+            outcome_quality: "verified".to_string(),
+            quality_flags: Vec::new(),
+            outcome_engine_version: Some("test".to_string()),
+            rules_schema_version: Some("test".to_string()),
+            setup_template_hash: Some("test".to_string()),
+            last_observed_price: Some(21018.0),
+            last_observed_at_ms: Some(1_772_720_060_000.0),
         })
         .expect("insert outcome");
     }
@@ -1413,6 +1437,17 @@ mod tests {
             time_to_outcome_ms: None,
             rvol_at_fire: Some(1.2),
             rvol_bucket_at_fire: Some(12),
+            direction: Some("long".to_string()),
+            entry_price: Some(21000.0),
+            risk_points: Some(12.0),
+            exit_price: None,
+            outcome_quality: "verified".to_string(),
+            quality_flags: Vec::new(),
+            outcome_engine_version: Some("test".to_string()),
+            rules_schema_version: Some("test".to_string()),
+            setup_template_hash: Some("test".to_string()),
+            last_observed_price: Some(21000.0),
+            last_observed_at_ms: Some(1_772_720_000_000.0),
         })
         .expect("insert outcome");
         let summary =

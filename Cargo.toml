@@ -22,6 +22,7 @@ zstd = "0.13"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["json", "env-filter", "fmt"] }
 tracing-appender = "0.2.5"
+sha2 = "0.11.0"
 
 [dev-dependencies]
 tempfile = "3"

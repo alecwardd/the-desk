@@ -196,7 +196,7 @@ Rules:
 
 ## MCP Tools Reference
 
-The MCP server (`src/bin/the-desk-mcp.rs`) exposes 121 MCP tools across 13 categories.
+The MCP server (`src/bin/the-desk-mcp.rs`) exposes 122 MCP tools across 13 categories.
 
 ### Live vs Historical — Quick Reference
 

@@ -5,6 +5,7 @@ use crate::memory::{
     INSIGHT_PINNED, INSIGHT_SUPERSEDED,
 };
 use crate::observability::{RuntimeEvent, RuntimeEventFilter, RuntimeEventLevel};
+use crate::outcomes::{self, OutcomeDirection};
 use crate::pipelines::event_detector::MarketEvent;
 use crate::risk::RiskState;
 use crate::rules::{
@@ -460,6 +461,28 @@ pub struct SignalOutcome {
     pub rvol_at_fire: Option<f64>,
     #[serde(default)]
     pub rvol_bucket_at_fire: Option<i32>,
+    #[serde(default)]
+    pub direction: Option<String>,
+    #[serde(default)]
+    pub entry_price: Option<f64>,
+    #[serde(default)]
+    pub risk_points: Option<f64>,
+    #[serde(default)]
+    pub exit_price: Option<f64>,
+    #[serde(default = "default_outcome_quality")]
+    pub outcome_quality: String,
+    #[serde(default)]
+    pub quality_flags: Vec<String>,
+    #[serde(default)]
+    pub outcome_engine_version: Option<String>,
+    #[serde(default)]
+    pub rules_schema_version: Option<String>,
+    #[serde(default)]
+    pub setup_template_hash: Option<String>,
+    #[serde(default)]
+    pub last_observed_price: Option<f64>,
+    #[serde(default)]
+    pub last_observed_at_ms: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -470,6 +493,12 @@ pub struct SignalOutcomeResearchRow {
     pub session_type: String,
     pub r_result: Option<f64>,
     pub outcome: String,
+    pub direction: Option<String>,
+    pub entry_price: Option<f64>,
+    pub fired_price: f64,
+    pub exit_price: Option<f64>,
+    pub risk_points: Option<f64>,
+    pub outcome_quality: String,
 }
 
 #[derive(Debug, Clone)]
@@ -498,6 +527,9 @@ pub struct SignalOutcomeExcursionRow {
     pub max_adverse_excursion: Option<f64>,
     pub time_to_outcome_ms: Option<f64>,
     pub fired_at_ms: f64,
+    pub source: String,
+    pub job_id: Option<String>,
+    pub outcome_quality: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -757,10 +789,19 @@ pub struct HypothesisSignalOutcomeRow {
     pub time_to_outcome_ms: Option<f64>,
     pub root_symbol: Option<String>,
     pub contract_symbol: Option<String>,
+    pub direction: Option<String>,
+    pub entry_price: Option<f64>,
+    pub risk_points: Option<f64>,
+    pub exit_price: Option<f64>,
+    pub outcome_quality: String,
 }
 
 fn default_signal_source() -> String {
     "live".to_string()
+}
+
+fn default_outcome_quality() -> String {
+    "legacyUnverified".to_string()
 }
 
 fn default_include_rollover_sessions() -> bool {
@@ -1203,6 +1244,9 @@ impl Database {
         }
         if version < 28 {
             self.migrate_v28()?;
+        }
+        if version < 29 {
+            self.migrate_v29()?;
         }
 
         Ok(())
@@ -2621,6 +2665,51 @@ impl Database {
         }
         self.conn
             .execute_batch("UPDATE schema_version SET version = 28;")?;
+        Ok(())
+    }
+
+    /// V29: auditable signal outcome verification metadata.
+    fn migrate_v29(&self) -> Result<(), DbError> {
+        let columns = [
+            "ALTER TABLE signal_outcomes ADD COLUMN direction TEXT NULL",
+            "ALTER TABLE signal_outcomes ADD COLUMN entry_price REAL NULL",
+            "ALTER TABLE signal_outcomes ADD COLUMN risk_points REAL NULL",
+            "ALTER TABLE signal_outcomes ADD COLUMN exit_price REAL NULL",
+            "ALTER TABLE signal_outcomes ADD COLUMN outcome_quality TEXT NOT NULL DEFAULT 'legacyUnverified'",
+            "ALTER TABLE signal_outcomes ADD COLUMN quality_flags TEXT NULL",
+            "ALTER TABLE signal_outcomes ADD COLUMN outcome_engine_version TEXT NULL",
+            "ALTER TABLE signal_outcomes ADD COLUMN rules_schema_version TEXT NULL",
+            "ALTER TABLE signal_outcomes ADD COLUMN setup_template_hash TEXT NULL",
+            "ALTER TABLE signal_outcomes ADD COLUMN last_observed_price REAL NULL",
+            "ALTER TABLE signal_outcomes ADD COLUMN last_observed_at_ms REAL NULL",
+        ];
+        for sql in columns {
+            let _ = self.conn.execute(sql, []);
+        }
+        self.conn.execute_batch(
+            "
+            UPDATE signal_outcomes
+            SET entry_price = COALESCE(entry_price, fired_price),
+                time_to_outcome_ms = CASE
+                  WHEN outcome_at_ms IS NOT NULL
+                   AND fired_at_ms IS NOT NULL
+                   AND outcome_at_ms >= fired_at_ms
+                  THEN outcome_at_ms - fired_at_ms
+                  ELSE time_to_outcome_ms
+                END,
+                exit_price = CASE
+                  WHEN exit_price IS NOT NULL THEN exit_price
+                  WHEN outcome = 'target_hit' THEN target_price
+                  WHEN outcome = 'stop_hit' THEN stop_price
+                  ELSE exit_price
+                END;
+            CREATE INDEX IF NOT EXISTS idx_signal_outcomes_quality
+              ON signal_outcomes(outcome_quality);
+            CREATE INDEX IF NOT EXISTS idx_signal_outcomes_job_quality
+              ON signal_outcomes(job_id, outcome_quality);
+            UPDATE schema_version SET version = 29;
+            ",
+        )?;
         Ok(())
     }
 
@@ -8145,6 +8234,33 @@ impl Database {
     // Signal outcomes (research infrastructure)
     // ------------------------------------------------------------------
 
+    fn encode_quality_flags(flags: &[String]) -> String {
+        serde_json::to_string(flags).unwrap_or_else(|_| "[]".to_string())
+    }
+
+    fn decode_quality_flags(raw: Option<String>) -> Vec<String> {
+        raw.and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    fn recomputed_r_or_stored(
+        direction: Option<&str>,
+        entry_price: Option<f64>,
+        fired_price: f64,
+        exit_price: Option<f64>,
+        risk_points: Option<f64>,
+        stored_r: Option<f64>,
+    ) -> Option<f64> {
+        outcomes::recompute_r_result_fields(
+            direction,
+            entry_price,
+            fired_price,
+            exit_price,
+            risk_points,
+        )
+        .or(stored_r)
+    }
+
     /// Insert a new pending signal outcome.
     pub fn insert_signal_outcome(&self, o: &SignalOutcome) -> Result<(), DbError> {
         self.conn.execute(
@@ -8152,8 +8268,11 @@ impl Database {
              (signal_id, setup_id, setup_name, session_date, root_symbol, contract_symbol, source, job_id,
               fired_at_ms, fired_price, target_price, stop_price, outcome, outcome_at_ms,
               max_favorable_excursion, max_adverse_excursion, r_result, time_to_outcome_ms,
-              rvol_at_fire, rvol_bucket_at_fire)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+              rvol_at_fire, rvol_bucket_at_fire, direction, entry_price, risk_points, exit_price,
+              outcome_quality, quality_flags, outcome_engine_version, rules_schema_version,
+              setup_template_hash, last_observed_price, last_observed_at_ms)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,
+                     ?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31)",
             params![
                 o.signal_id,
                 o.setup_id,
@@ -8175,6 +8294,53 @@ impl Database {
                 o.time_to_outcome_ms,
                 o.rvol_at_fire,
                 o.rvol_bucket_at_fire,
+                o.direction,
+                o.entry_price,
+                o.risk_points,
+                o.exit_price,
+                o.outcome_quality,
+                Self::encode_quality_flags(&o.quality_flags),
+                o.outcome_engine_version,
+                o.rules_schema_version,
+                o.setup_template_hash,
+                o.last_observed_price,
+                o.last_observed_at_ms,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Persist the mutable outcome state produced by the deterministic outcome engine.
+    pub fn update_signal_outcome_state(&self, o: &SignalOutcome) -> Result<(), DbError> {
+        self.conn.execute(
+            "UPDATE signal_outcomes
+             SET outcome=?2, outcome_at_ms=?3,
+                 max_favorable_excursion=?4, max_adverse_excursion=?5,
+                 r_result=?6, time_to_outcome_ms=?7,
+                 direction=?8, entry_price=?9, risk_points=?10, exit_price=?11,
+                 outcome_quality=?12, quality_flags=?13,
+                 outcome_engine_version=?14, rules_schema_version=?15,
+                 setup_template_hash=?16, last_observed_price=?17, last_observed_at_ms=?18
+             WHERE signal_id=?1",
+            params![
+                o.signal_id,
+                o.outcome,
+                o.outcome_at_ms,
+                o.max_favorable_excursion,
+                o.max_adverse_excursion,
+                o.r_result,
+                o.time_to_outcome_ms,
+                o.direction,
+                o.entry_price,
+                o.risk_points,
+                o.exit_price,
+                o.outcome_quality,
+                Self::encode_quality_flags(&o.quality_flags),
+                o.outcome_engine_version,
+                o.rules_schema_version,
+                o.setup_template_hash,
+                o.last_observed_price,
+                o.last_observed_at_ms,
             ],
         )?;
         Ok(())
@@ -8191,21 +8357,16 @@ impl Database {
         mae: f64,
         r_result: Option<f64>,
     ) -> Result<(), DbError> {
-        let time_to = outcome_at_ms;
         self.conn.execute(
             "UPDATE signal_outcomes SET outcome=?2, outcome_at_ms=?3,
              max_favorable_excursion=?4, max_adverse_excursion=?5,
-             r_result=?6, time_to_outcome_ms=?7
+             r_result=?6,
+             time_to_outcome_ms=CASE
+               WHEN fired_at_ms IS NOT NULL AND ?3 >= fired_at_ms THEN ?3 - fired_at_ms
+               ELSE NULL
+             END
              WHERE signal_id=?1",
-            params![
-                signal_id,
-                outcome,
-                outcome_at_ms,
-                mfe,
-                mae,
-                r_result,
-                time_to
-            ],
+            params![signal_id, outcome, outcome_at_ms, mfe, mae, r_result],
         )?;
         Ok(())
     }
@@ -8218,47 +8379,72 @@ impl Database {
         result_r: f64,
         timestamp_ms: f64,
     ) -> Result<Option<String>, DbError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT signal_id, max_favorable_excursion, max_adverse_excursion
-             FROM signal_outcomes
-             WHERE setup_id = ?1 AND outcome = 'pending'
-             ORDER BY fired_at_ms DESC LIMIT 1",
-        )?;
-        let mut rows = stmt.query(rusqlite::params![setup_id])?;
-        if let Some(row) = rows.next()? {
-            let signal_id: String = row.get(0)?;
-            let mfe: f64 = row.get(1).unwrap_or(0.0);
-            let mae: f64 = row.get(2).unwrap_or(0.0);
-            let outcome = if result_r > 0.0 {
-                "target_hit"
-            } else {
-                "stop_hit"
-            };
-            self.resolve_signal_outcome(
-                &signal_id,
-                outcome,
-                timestamp_ms,
-                mfe,
-                mae,
-                Some(result_r),
-            )?;
-            Ok(Some(signal_id))
+        let Some(mut signal) = self
+            .pending_signal_outcomes()?
+            .into_iter()
+            .filter(|signal| signal.setup_id == setup_id)
+            .max_by(|a, b| {
+                a.fired_at_ms
+                    .partial_cmp(&b.fired_at_ms)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+        else {
+            return Ok(None);
+        };
+
+        let risk = signal.risk_points.unwrap_or(0.0);
+        let entry = signal.entry_price.unwrap_or(signal.fired_price);
+        let exit_price = signal
+            .direction
+            .as_deref()
+            .and_then(OutcomeDirection::parse)
+            .filter(|_| risk.is_finite() && risk > 0.0)
+            .map(|direction| match direction {
+                OutcomeDirection::Long => entry + (result_r * risk),
+                OutcomeDirection::Short => entry - (result_r * risk),
+            });
+        signal.outcome = if result_r > 0.0 {
+            "target_hit".to_string()
         } else {
-            Ok(None)
+            "stop_hit".to_string()
+        };
+        signal.outcome_at_ms = Some(timestamp_ms);
+        signal.exit_price = exit_price;
+        signal.time_to_outcome_ms = Some((timestamp_ms - signal.fired_at_ms).max(0.0));
+        signal.r_result = Some(result_r);
+        if signal.outcome_quality == outcomes::QUALITY_VERIFIED && signal.exit_price.is_none() {
+            signal.outcome_quality = outcomes::QUALITY_INVALID.to_string();
+            signal
+                .quality_flags
+                .push("manualExitPriceUnknown".to_string());
         }
+        self.update_signal_outcome_state(&signal)?;
+        Ok(Some(signal.signal_id))
     }
 
-    /// Update MFE/MAE for a pending signal without resolving.
-    pub fn update_signal_outcome_mfe_mae(
+    /// Update pending progress fields without rewriting the full outcome contract.
+    pub fn update_signal_outcome_progress(
         &self,
         signal_id: &str,
-        mfe: f64,
-        mae: f64,
+        mfe: Option<f64>,
+        mae: Option<f64>,
+        last_observed_price: Option<f64>,
+        last_observed_at_ms: Option<f64>,
     ) -> Result<(), DbError> {
         self.conn.execute(
-            "UPDATE signal_outcomes SET max_favorable_excursion=?2, max_adverse_excursion=?3
+            "UPDATE signal_outcomes
+             SET max_favorable_excursion=?2,
+                 max_adverse_excursion=?3,
+                 last_observed_price=?4,
+                 last_observed_at_ms=?5
              WHERE signal_id=?1 AND outcome='pending'",
-            rusqlite::params![signal_id, mfe, mae],
+            rusqlite::params![
+                signal_id,
+                mfe,
+                mae,
+                last_observed_price,
+                last_observed_at_ms
+            ],
         )?;
         Ok(())
     }
@@ -8277,7 +8463,10 @@ impl Database {
             "SELECT signal_id, setup_id, setup_name, session_date, source, job_id,
                     fired_at_ms, fired_price, target_price, stop_price, outcome, outcome_at_ms,
                     max_favorable_excursion, max_adverse_excursion, r_result, time_to_outcome_ms,
-                    rvol_at_fire, rvol_bucket_at_fire
+                    rvol_at_fire, rvol_bucket_at_fire, direction, entry_price, risk_points,
+                    exit_price, outcome_quality, quality_flags, outcome_engine_version,
+                    rules_schema_version, setup_template_hash, last_observed_price,
+                    last_observed_at_ms
              FROM signal_outcomes WHERE outcome = 'pending'",
         );
         let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -8314,6 +8503,19 @@ impl Database {
                 time_to_outcome_ms: row.get(15)?,
                 rvol_at_fire: row.get(16)?,
                 rvol_bucket_at_fire: row.get(17)?,
+                direction: row.get(18)?,
+                entry_price: row.get(19)?,
+                risk_points: row.get(20)?,
+                exit_price: row.get(21)?,
+                outcome_quality: row
+                    .get::<_, Option<String>>(22)?
+                    .unwrap_or_else(default_outcome_quality),
+                quality_flags: Self::decode_quality_flags(row.get(23)?),
+                outcome_engine_version: row.get(24)?,
+                rules_schema_version: row.get(25)?,
+                setup_template_hash: row.get(26)?,
+                last_observed_price: row.get(27)?,
+                last_observed_at_ms: row.get(28)?,
             })
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
@@ -8329,7 +8531,10 @@ impl Database {
             "SELECT signal_id, setup_id, setup_name, session_date, root_symbol, contract_symbol,
                     source, job_id, fired_at_ms, fired_price, target_price, stop_price, outcome,
                     outcome_at_ms, max_favorable_excursion, max_adverse_excursion, r_result,
-                    time_to_outcome_ms, rvol_at_fire, rvol_bucket_at_fire
+                    time_to_outcome_ms, rvol_at_fire, rvol_bucket_at_fire, direction, entry_price,
+                    risk_points, exit_price, outcome_quality, quality_flags,
+                    outcome_engine_version, rules_schema_version, setup_template_hash,
+                    last_observed_price, last_observed_at_ms
              FROM signal_outcomes WHERE 1=1",
         );
         let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -8368,6 +8573,19 @@ impl Database {
                 time_to_outcome_ms: row.get(17)?,
                 rvol_at_fire: row.get(18)?,
                 rvol_bucket_at_fire: row.get(19)?,
+                direction: row.get(20)?,
+                entry_price: row.get(21)?,
+                risk_points: row.get(22)?,
+                exit_price: row.get(23)?,
+                outcome_quality: row
+                    .get::<_, Option<String>>(24)?
+                    .unwrap_or_else(default_outcome_quality),
+                quality_flags: Self::decode_quality_flags(row.get(25)?),
+                outcome_engine_version: row.get(26)?,
+                rules_schema_version: row.get(27)?,
+                setup_template_hash: row.get(28)?,
+                last_observed_price: row.get(29)?,
+                last_observed_at_ms: row.get(30)?,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -8382,12 +8600,45 @@ impl Database {
         end_date: Option<&str>,
         scope: Option<&SessionScopeFilter>,
     ) -> Result<Vec<(String, String, Option<f64>, String)>, DbError> {
+        self.list_signal_outcomes_for_research_filtered(
+            setup_id, start_date, end_date, scope, None, None, true,
+        )
+    }
+
+    #[allow(clippy::type_complexity)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn list_signal_outcomes_for_research_filtered(
+        &self,
+        setup_id: Option<&str>,
+        start_date: Option<&str>,
+        end_date: Option<&str>,
+        scope: Option<&SessionScopeFilter>,
+        source: Option<&str>,
+        job_id: Option<&str>,
+        include_unverified: bool,
+    ) -> Result<Vec<(String, String, Option<f64>, String)>, DbError> {
         Ok(self
-            .list_signal_outcomes_for_research_with_session_key(
-                setup_id, start_date, end_date, scope,
+            .list_signal_outcomes_for_research_with_session_key_filtered(
+                setup_id,
+                start_date,
+                end_date,
+                scope,
+                source,
+                job_id,
+                include_unverified,
             )?
             .into_iter()
-            .map(|row| (row.setup_id, row.analysis_day, row.r_result, row.outcome))
+            .map(|row| {
+                let r_result = Self::recomputed_r_or_stored(
+                    row.direction.as_deref(),
+                    row.entry_price,
+                    row.fired_price,
+                    row.exit_price,
+                    row.risk_points,
+                    row.r_result,
+                );
+                (row.setup_id, row.analysis_day, r_result, row.outcome)
+            })
             .collect())
     }
 
@@ -8398,8 +8649,26 @@ impl Database {
         end_date: Option<&str>,
         scope: Option<&SessionScopeFilter>,
     ) -> Result<Vec<SignalOutcomeResearchRow>, DbError> {
+        self.list_signal_outcomes_for_research_with_session_key_filtered(
+            setup_id, start_date, end_date, scope, None, None, true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn list_signal_outcomes_for_research_with_session_key_filtered(
+        &self,
+        setup_id: Option<&str>,
+        start_date: Option<&str>,
+        end_date: Option<&str>,
+        scope: Option<&SessionScopeFilter>,
+        source: Option<&str>,
+        job_id: Option<&str>,
+        include_unverified: bool,
+    ) -> Result<Vec<SignalOutcomeResearchRow>, DbError> {
         let mut stmt = self.conn.prepare(
-            "SELECT setup_id, session_date, r_result, outcome, fired_at_ms, root_symbol, contract_symbol
+            "SELECT setup_id, session_date, r_result, outcome, fired_at_ms, root_symbol, contract_symbol,
+                    source, job_id, direction, entry_price, fired_price, exit_price, risk_points,
+                    outcome_quality
              FROM signal_outcomes WHERE outcome != 'pending'",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -8411,16 +8680,53 @@ impl Database {
                 row.get::<_, f64>(4)?,
                 row.get::<_, Option<String>>(5)?,
                 row.get::<_, Option<String>>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<String>>(9)?,
+                row.get::<_, Option<f64>>(10)?,
+                row.get::<_, f64>(11)?,
+                row.get::<_, Option<f64>>(12)?,
+                row.get::<_, Option<f64>>(13)?,
+                row.get::<_, Option<String>>(14)?,
             ))
         })?;
         let mut results = Vec::new();
         for row in rows.filter_map(|r| r.ok()) {
-            let (sid, session_date, r_result, outcome, fired_at_ms, root_symbol, contract_symbol) =
-                row;
+            let (
+                sid,
+                session_date,
+                r_result,
+                outcome,
+                fired_at_ms,
+                root_symbol,
+                contract_symbol,
+                row_source,
+                row_job_id,
+                direction,
+                entry_price,
+                fired_price,
+                exit_price,
+                risk_points,
+                outcome_quality,
+            ) = row;
             if let Some(filter_id) = setup_id {
                 if sid != filter_id {
                     continue;
                 }
+            }
+            if let Some(source) = source {
+                if row_source != source {
+                    continue;
+                }
+            }
+            if let Some(job_id) = job_id {
+                if row_job_id.as_deref() != Some(job_id) {
+                    continue;
+                }
+            }
+            let outcome_quality = outcome_quality.unwrap_or_else(default_outcome_quality);
+            if !include_unverified && outcome_quality != outcomes::QUALITY_VERIFIED {
+                continue;
             }
             if !contract_fields_match_scope(
                 root_symbol.as_deref(),
@@ -8450,6 +8756,12 @@ impl Database {
                 session_type,
                 r_result,
                 outcome,
+                direction,
+                entry_price,
+                fired_price,
+                exit_price,
+                risk_points,
+                outcome_quality,
             });
         }
         Ok(results)
@@ -8462,11 +8774,30 @@ impl Database {
         end_date: Option<&str>,
         scope: Option<&SessionScopeFilter>,
     ) -> Result<Vec<SignalOutcome>, DbError> {
+        self.list_signal_outcomes_with_context_filtered(
+            setup_id, start_date, end_date, scope, None, None, true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn list_signal_outcomes_with_context_filtered(
+        &self,
+        setup_id: Option<&str>,
+        start_date: Option<&str>,
+        end_date: Option<&str>,
+        scope: Option<&SessionScopeFilter>,
+        source: Option<&str>,
+        job_id: Option<&str>,
+        include_unverified: bool,
+    ) -> Result<Vec<SignalOutcome>, DbError> {
         let mut stmt = self.conn.prepare(
             "SELECT signal_id, setup_id, setup_name, session_date, root_symbol, contract_symbol,
                     source, job_id, fired_at_ms, fired_price, target_price, stop_price, outcome,
                     outcome_at_ms, max_favorable_excursion, max_adverse_excursion, r_result,
-                    time_to_outcome_ms, rvol_at_fire, rvol_bucket_at_fire
+                    time_to_outcome_ms, rvol_at_fire, rvol_bucket_at_fire, direction, entry_price,
+                    risk_points, exit_price, outcome_quality, quality_flags,
+                    outcome_engine_version, rules_schema_version, setup_template_hash,
+                    last_observed_price, last_observed_at_ms
              FROM signal_outcomes WHERE outcome != 'pending'",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -8491,6 +8822,19 @@ impl Database {
                 time_to_outcome_ms: row.get(17)?,
                 rvol_at_fire: row.get(18)?,
                 rvol_bucket_at_fire: row.get(19)?,
+                direction: row.get(20)?,
+                entry_price: row.get(21)?,
+                risk_points: row.get(22)?,
+                exit_price: row.get(23)?,
+                outcome_quality: row
+                    .get::<_, Option<String>>(24)?
+                    .unwrap_or_else(default_outcome_quality),
+                quality_flags: Self::decode_quality_flags(row.get(25)?),
+                outcome_engine_version: row.get(26)?,
+                rules_schema_version: row.get(27)?,
+                setup_template_hash: row.get(28)?,
+                last_observed_price: row.get(29)?,
+                last_observed_at_ms: row.get(30)?,
             })
         })?;
 
@@ -8500,6 +8844,19 @@ impl Database {
                 if outcome.setup_id != filter_id {
                     continue;
                 }
+            }
+            if let Some(source) = source {
+                if outcome.source != source {
+                    continue;
+                }
+            }
+            if let Some(job_id) = job_id {
+                if outcome.job_id.as_deref() != Some(job_id) {
+                    continue;
+                }
+            }
+            if !include_unverified && outcome.outcome_quality != outcomes::QUALITY_VERIFIED {
+                continue;
             }
             if !contract_fields_match_scope(
                 outcome.root_symbol.as_deref(),
@@ -8539,7 +8896,9 @@ impl Database {
                     ss.session_type, ss.day_type, so.rvol_bucket_at_fire, so.fired_at_ms,
                     so.fired_price, so.target_price, so.stop_price, so.outcome,
                     so.max_favorable_excursion, so.max_adverse_excursion, so.r_result,
-                    so.time_to_outcome_ms, so.root_symbol, so.contract_symbol
+                    so.time_to_outcome_ms, so.root_symbol, so.contract_symbol,
+                    so.direction, so.entry_price, so.risk_points, so.exit_price,
+                    so.outcome_quality
              FROM signal_outcomes so
              LEFT JOIN session_summaries ss
                ON ss.session_date = so.session_date
@@ -8568,6 +8927,13 @@ impl Database {
                 time_to_outcome_ms: row.get(15)?,
                 root_symbol: row.get(16)?,
                 contract_symbol: row.get(17)?,
+                direction: row.get(18)?,
+                entry_price: row.get(19)?,
+                risk_points: row.get(20)?,
+                exit_price: row.get(21)?,
+                outcome_quality: row
+                    .get::<_, Option<String>>(22)?
+                    .unwrap_or_else(default_outcome_quality),
             })
         })?;
         let mut out = Vec::new();
@@ -8667,10 +9033,26 @@ impl Database {
         end_date: Option<&str>,
         scope: Option<&SessionScopeFilter>,
     ) -> Result<Vec<SignalOutcomeExcursionRow>, DbError> {
+        self.list_signal_outcomes_for_excursions_filtered_with_quality(
+            setup_id, start_date, end_date, scope, None, None, true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn list_signal_outcomes_for_excursions_filtered_with_quality(
+        &self,
+        setup_id: Option<&str>,
+        start_date: Option<&str>,
+        end_date: Option<&str>,
+        scope: Option<&SessionScopeFilter>,
+        source: Option<&str>,
+        job_id: Option<&str>,
+        include_unverified: bool,
+    ) -> Result<Vec<SignalOutcomeExcursionRow>, DbError> {
         let mut stmt = self.conn.prepare(
             "SELECT setup_id, setup_name, session_date, fired_at_ms, outcome,
                     max_favorable_excursion, max_adverse_excursion, time_to_outcome_ms,
-                    root_symbol, contract_symbol
+                    root_symbol, contract_symbol, source, job_id, outcome_quality
              FROM signal_outcomes
              WHERE outcome != 'pending'",
         )?;
@@ -8686,6 +9068,9 @@ impl Database {
                 row.get::<_, Option<f64>>(7)?,
                 row.get::<_, Option<String>>(8)?,
                 row.get::<_, Option<String>>(9)?,
+                row.get::<_, String>(10)?,
+                row.get::<_, Option<String>>(11)?,
+                row.get::<_, Option<String>>(12)?,
             ))
         })?;
 
@@ -8702,11 +9087,28 @@ impl Database {
                 tto_ms,
                 root_symbol,
                 contract_symbol,
+                row_source,
+                row_job_id,
+                outcome_quality,
             ) = row;
             if let Some(filter_id) = setup_id {
                 if sid != filter_id {
                     continue;
                 }
+            }
+            if let Some(source) = source {
+                if row_source != source {
+                    continue;
+                }
+            }
+            if let Some(job_id) = job_id {
+                if row_job_id.as_deref() != Some(job_id) {
+                    continue;
+                }
+            }
+            let outcome_quality = outcome_quality.unwrap_or_else(default_outcome_quality);
+            if !include_unverified && outcome_quality != outcomes::QUALITY_VERIFIED {
+                continue;
             }
             if !contract_fields_match_scope(
                 root_symbol.as_deref(),
@@ -8737,6 +9139,9 @@ impl Database {
                 max_adverse_excursion: mae,
                 time_to_outcome_ms: tto_ms,
                 fired_at_ms,
+                source: row_source,
+                job_id: row_job_id,
+                outcome_quality,
             });
         }
         Ok(results)
@@ -8781,7 +9186,8 @@ impl Database {
             format!("WHERE {}", conditions.join(" AND "))
         };
         let sql = format!(
-            "SELECT session_date, fired_at_ms, outcome, r_result, root_symbol, contract_symbol
+            "SELECT session_date, fired_at_ms, outcome, r_result, root_symbol, contract_symbol,
+                    direction, entry_price, fired_price, exit_price, risk_points, outcome_quality
              FROM signal_outcomes {where_clause}"
         );
         let mut stmt = self.conn.prepare(&sql)?;
@@ -8795,6 +9201,12 @@ impl Database {
                 row.get::<_, Option<f64>>(3)?,
                 row.get::<_, Option<String>>(4)?,
                 row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<f64>>(7)?,
+                row.get::<_, f64>(8)?,
+                row.get::<_, Option<f64>>(9)?,
+                row.get::<_, Option<f64>>(10)?,
+                row.get::<_, Option<String>>(11)?,
             ))
         })?;
 
@@ -8810,9 +9222,23 @@ impl Database {
         let mut winner_count = 0_i64;
         let mut loser_sum = 0.0_f64;
         let mut loser_count = 0_i64;
+        let mut quality_counts: BTreeMap<String, i64> = BTreeMap::new();
 
         for row in rows.filter_map(|r| r.ok()) {
-            let (session_date, fired_at_ms, outcome, r_result, root_symbol, contract_symbol) = row;
+            let (
+                session_date,
+                fired_at_ms,
+                outcome,
+                stored_r_result,
+                root_symbol,
+                contract_symbol,
+                direction,
+                entry_price,
+                fired_price,
+                exit_price,
+                risk_points,
+                outcome_quality,
+            ) = row;
             if !contract_fields_match_scope(
                 root_symbol.as_deref(),
                 contract_symbol.as_deref(),
@@ -8847,6 +9273,16 @@ impl Database {
             } else if outcome == "time_exit" {
                 time_exit += 1;
             }
+            let quality = outcome_quality.unwrap_or_else(default_outcome_quality);
+            *quality_counts.entry(quality).or_default() += 1;
+            let r_result = Self::recomputed_r_or_stored(
+                direction.as_deref(),
+                entry_price,
+                fired_price,
+                exit_price,
+                risk_points,
+                stored_r_result,
+            );
             if let Some(r) = r_result {
                 r_sum += r;
                 r_count += 1;
@@ -8883,10 +9319,14 @@ impl Database {
             "targetHit": target_hit,
             "stopHit": stop_hit,
             "timeExit": time_exit,
-            "winRate": if resolved > 0 { target_hit as f64 / resolved as f64 } else { 0.0 },
+            "winRate": if r_count > 0 { winner_count as f64 / r_count as f64 } else { 0.0 },
+            "targetHitRate": if resolved > 0 { target_hit as f64 / resolved as f64 } else { 0.0 },
+            "stopHitRate": if resolved > 0 { stop_hit as f64 / resolved as f64 } else { 0.0 },
+            "timeExitRate": if resolved > 0 { time_exit as f64 / resolved as f64 } else { 0.0 },
             "avgR": avg_r,
             "avgWinnerR": avg_winner_r,
             "avgLoserR": avg_loser_r,
+            "qualityCounts": quality_counts,
         });
         if let Some(setup_id) = setup_id {
             result["setupId"] = serde_json::json!(setup_id);
@@ -8927,10 +9367,12 @@ impl Database {
             winner_count: i64,
             loser_sum: f64,
             loser_count: i64,
+            quality_counts: BTreeMap<String, i64>,
         }
 
         let mut sql = String::from(
-            "SELECT setup_id, setup_name, session_date, fired_at_ms, outcome, r_result, root_symbol, contract_symbol
+            "SELECT setup_id, setup_name, session_date, fired_at_ms, outcome, r_result, root_symbol, contract_symbol,
+                    direction, entry_price, fired_price, exit_price, risk_points, outcome_quality
              FROM signal_outcomes WHERE 1=1",
         );
         let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -8955,6 +9397,12 @@ impl Database {
                 row.get::<_, Option<f64>>(5)?,
                 row.get::<_, Option<String>>(6)?,
                 row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<f64>>(9)?,
+                row.get::<_, f64>(10)?,
+                row.get::<_, Option<f64>>(11)?,
+                row.get::<_, Option<f64>>(12)?,
+                row.get::<_, Option<String>>(13)?,
             ))
         })?;
 
@@ -8969,6 +9417,12 @@ impl Database {
                 r_result,
                 root_symbol,
                 contract_symbol,
+                direction,
+                entry_price,
+                fired_price,
+                exit_price,
+                risk_points,
+                outcome_quality,
             ) = row;
             if !contract_fields_match_scope(
                 root_symbol.as_deref(),
@@ -9009,6 +9463,16 @@ impl Database {
             } else if outcome == "time_exit" {
                 agg.time_exit += 1;
             }
+            let quality = outcome_quality.unwrap_or_else(default_outcome_quality);
+            *agg.quality_counts.entry(quality).or_default() += 1;
+            let r_result = Self::recomputed_r_or_stored(
+                direction.as_deref(),
+                entry_price,
+                fired_price,
+                exit_price,
+                risk_points,
+                r_result,
+            );
             if let Some(r) = r_result {
                 agg.r_sum += r;
                 agg.r_count += 1;
@@ -9028,8 +9492,8 @@ impl Database {
                 if agg.resolved < min_resolved {
                     return None;
                 }
-                let win_rate = if agg.resolved > 0 {
-                    agg.target_hit as f64 / agg.resolved as f64
+                let win_rate = if agg.r_count > 0 {
+                    agg.winner_count as f64 / agg.r_count as f64
                 } else {
                     0.0
                 };
@@ -9058,9 +9522,13 @@ impl Database {
                     "stopHit": agg.stop_hit,
                     "timeExit": agg.time_exit,
                     "winRate": win_rate,
+                    "targetHitRate": if agg.resolved > 0 { agg.target_hit as f64 / agg.resolved as f64 } else { 0.0 },
+                    "stopHitRate": if agg.resolved > 0 { agg.stop_hit as f64 / agg.resolved as f64 } else { 0.0 },
+                    "timeExitRate": if agg.resolved > 0 { agg.time_exit as f64 / agg.resolved as f64 } else { 0.0 },
                     "avgR": avg_r,
                     "avgWinnerR": avg_winner_r,
                     "avgLoserR": avg_loser_r,
+                    "qualityCounts": agg.quality_counts,
                 }))
             })
             .collect();
@@ -9099,6 +9567,120 @@ impl Database {
             rows.truncate(limit);
         }
         Ok(rows)
+    }
+
+    pub fn signal_outcome_integrity_report(
+        &self,
+        source: Option<&str>,
+        job_id: Option<&str>,
+        setup_id: Option<&str>,
+    ) -> Result<serde_json::Value, DbError> {
+        let mut rows = self.list_signal_outcomes_for_replay(source, job_id)?;
+        if let Some(setup_id) = setup_id {
+            rows.retain(|row| row.setup_id == setup_id);
+        }
+
+        let total = rows.len();
+        let mut by_quality: BTreeMap<String, i64> = BTreeMap::new();
+        let mut by_outcome: BTreeMap<String, i64> = BTreeMap::new();
+        let mut by_setup: BTreeMap<String, i64> = BTreeMap::new();
+        let mut invalid_elapsed = 0_i64;
+        let mut missing_exit_price = 0_i64;
+        let mut missing_direction = 0_i64;
+        let mut missing_risk = 0_i64;
+        let mut impossible_r_sign = 0_i64;
+
+        for row in &rows {
+            *by_quality.entry(row.outcome_quality.clone()).or_default() += 1;
+            *by_outcome.entry(row.outcome.clone()).or_default() += 1;
+            *by_setup.entry(row.setup_id.clone()).or_default() += 1;
+
+            if row.outcome != "pending"
+                && row.outcome != "not_backtestable"
+                && row.exit_price.is_none()
+            {
+                missing_exit_price += 1;
+            }
+            if row.outcome_quality == outcomes::QUALITY_VERIFIED {
+                if row.direction.is_none() {
+                    missing_direction += 1;
+                }
+                if row
+                    .risk_points
+                    .filter(|v| v.is_finite() && *v > 0.0)
+                    .is_none()
+                {
+                    missing_risk += 1;
+                }
+                if let (Some(outcome_at), Some(time_to)) =
+                    (row.outcome_at_ms, row.time_to_outcome_ms)
+                {
+                    if (time_to - (outcome_at - row.fired_at_ms)).abs() > 1e-6 || time_to < 0.0 {
+                        invalid_elapsed += 1;
+                    }
+                }
+                if let Some(r) = Self::recomputed_r_or_stored(
+                    row.direction.as_deref(),
+                    row.entry_price,
+                    row.fired_price,
+                    row.exit_price,
+                    row.risk_points,
+                    row.r_result,
+                ) {
+                    if (row.outcome == "target_hit" && r < 0.0)
+                        || (row.outcome == "stop_hit" && r > 0.0)
+                    {
+                        impossible_r_sign += 1;
+                    }
+                }
+            }
+        }
+
+        let legacy = *by_quality
+            .get(outcomes::QUALITY_LEGACY_UNVERIFIED)
+            .unwrap_or(&0) as f64;
+        let legacy_ratio = if total > 0 {
+            legacy / total as f64
+        } else {
+            0.0
+        };
+        let failed = invalid_elapsed > 0
+            || missing_exit_price > 0
+            || missing_direction > 0
+            || missing_risk > 0
+            || impossible_r_sign > 0;
+        let warning = legacy_ratio > 0.05;
+        let status = if failed {
+            "failed"
+        } else if warning {
+            "warning"
+        } else {
+            "ok"
+        };
+
+        Ok(serde_json::json!({
+            "status": status,
+            "totalRows": total,
+            "filters": {
+                "source": source,
+                "jobId": job_id,
+                "setupId": setup_id,
+            },
+            "thresholds": {
+                "legacyUnverifiedRatioWarn": 0.05,
+            },
+            "qualityCounts": by_quality,
+            "outcomeCounts": by_outcome,
+            "setupCounts": by_setup,
+            "legacyUnverifiedRatio": legacy_ratio,
+            "checks": {
+                "invalidElapsedTime": invalid_elapsed,
+                "missingExitPrice": missing_exit_price,
+                "missingDirection": missing_direction,
+                "missingRiskPoints": missing_risk,
+                "impossibleRSign": impossible_r_sign,
+            }
+        }))
     }
 
     /// Count playbook signals fired between `start_ms` and `end_ms` (inclusive
@@ -10548,6 +11130,17 @@ mod tests {
             time_to_outcome_ms: None,
             rvol_at_fire: None,
             rvol_bucket_at_fire: None,
+            direction: None,
+            entry_price: None,
+            risk_points: None,
+            exit_price: None,
+            outcome_quality: default_outcome_quality(),
+            quality_flags: Vec::new(),
+            outcome_engine_version: None,
+            rules_schema_version: None,
+            setup_template_hash: None,
+            last_observed_price: None,
+            last_observed_at_ms: None,
         })
         .expect("live outcome");
         db.insert_signal_outcome(&SignalOutcome {
@@ -10571,6 +11164,17 @@ mod tests {
             time_to_outcome_ms: None,
             rvol_at_fire: None,
             rvol_bucket_at_fire: None,
+            direction: None,
+            entry_price: None,
+            risk_points: None,
+            exit_price: None,
+            outcome_quality: default_outcome_quality(),
+            quality_flags: Vec::new(),
+            outcome_engine_version: None,
+            rules_schema_version: None,
+            setup_template_hash: None,
+            last_observed_price: None,
+            last_observed_at_ms: None,
         })
         .expect("backfill outcome");
 
@@ -10940,6 +11544,17 @@ mod tests {
             time_to_outcome_ms: None,
             rvol_at_fire: None,
             rvol_bucket_at_fire: None,
+            direction: None,
+            entry_price: None,
+            risk_points: None,
+            exit_price: None,
+            outcome_quality: default_outcome_quality(),
+            quality_flags: Vec::new(),
+            outcome_engine_version: None,
+            rules_schema_version: None,
+            setup_template_hash: None,
+            last_observed_price: None,
+            last_observed_at_ms: None,
         })
         .expect("insert pending");
         db.insert_signal_outcome(&SignalOutcome {
@@ -10963,6 +11578,17 @@ mod tests {
             time_to_outcome_ms: Some(500.0),
             rvol_at_fire: None,
             rvol_bucket_at_fire: None,
+            direction: None,
+            entry_price: None,
+            risk_points: None,
+            exit_price: None,
+            outcome_quality: default_outcome_quality(),
+            quality_flags: Vec::new(),
+            outcome_engine_version: None,
+            rules_schema_version: None,
+            setup_template_hash: None,
+            last_observed_price: None,
+            last_observed_at_ms: None,
         })
         .expect("insert winner");
         db.insert_signal_outcome(&SignalOutcome {
@@ -10986,6 +11612,17 @@ mod tests {
             time_to_outcome_ms: Some(900.0),
             rvol_at_fire: None,
             rvol_bucket_at_fire: None,
+            direction: None,
+            entry_price: None,
+            risk_points: None,
+            exit_price: None,
+            outcome_quality: default_outcome_quality(),
+            quality_flags: Vec::new(),
+            outcome_engine_version: None,
+            rules_schema_version: None,
+            setup_template_hash: None,
+            last_observed_price: None,
+            last_observed_at_ms: None,
         })
         .expect("insert time exit");
 
@@ -11043,6 +11680,17 @@ mod tests {
                 time_to_outcome_ms: None,
                 rvol_at_fire: None,
                 rvol_bucket_at_fire: None,
+                direction: None,
+                entry_price: None,
+                risk_points: None,
+                exit_price: None,
+                outcome_quality: default_outcome_quality(),
+                quality_flags: Vec::new(),
+                outcome_engine_version: None,
+                rules_schema_version: None,
+                setup_template_hash: None,
+                last_observed_price: None,
+                last_observed_at_ms: None,
             })
             .expect("insert");
         };
@@ -11088,6 +11736,169 @@ mod tests {
     }
 
     #[test]
+    fn signal_outcome_integrity_reports_verified_quality() {
+        let db = test_db();
+        db.insert_signal_outcome(&SignalOutcome {
+            signal_id: "verified-row".into(),
+            setup_id: "setup".into(),
+            setup_name: Some("Setup".into()),
+            session_date: "2026-03-05".into(),
+            root_symbol: Some("NQ".into()),
+            contract_symbol: Some("NQH26.CME".into()),
+            source: "backtest".into(),
+            job_id: Some("job-verified".into()),
+            fired_at_ms: 1_000.0,
+            fired_price: 21000.0,
+            target_price: Some(21010.0),
+            stop_price: Some(20990.0),
+            outcome: "target_hit".into(),
+            outcome_at_ms: Some(2_000.0),
+            max_favorable_excursion: Some(10.0),
+            max_adverse_excursion: Some(0.0),
+            r_result: Some(1.0),
+            time_to_outcome_ms: Some(1_000.0),
+            rvol_at_fire: None,
+            rvol_bucket_at_fire: None,
+            direction: Some("long".into()),
+            entry_price: Some(21000.0),
+            risk_points: Some(10.0),
+            exit_price: Some(21010.0),
+            outcome_quality: outcomes::QUALITY_VERIFIED.into(),
+            quality_flags: Vec::new(),
+            outcome_engine_version: Some(outcomes::OUTCOME_ENGINE_VERSION.into()),
+            rules_schema_version: Some("test".into()),
+            setup_template_hash: Some("hash".into()),
+            last_observed_price: Some(21010.0),
+            last_observed_at_ms: Some(2_000.0),
+        })
+        .expect("insert verified");
+
+        let report = db
+            .signal_outcome_integrity_report(Some("backtest"), Some("job-verified"), None)
+            .expect("report");
+
+        assert_eq!(report["status"], "ok");
+        assert_eq!(report["qualityCounts"]["verified"], 1);
+        assert_eq!(report["checks"]["invalidElapsedTime"], 0);
+        assert_eq!(report["checks"]["missingExitPrice"], 0);
+    }
+
+    fn verified_pending_outcome(signal_id: &str) -> SignalOutcome {
+        SignalOutcome {
+            signal_id: signal_id.into(),
+            setup_id: "setup".into(),
+            setup_name: Some("Setup".into()),
+            session_date: "2026-03-05".into(),
+            root_symbol: Some("NQ".into()),
+            contract_symbol: Some("NQH26.CME".into()),
+            source: "live".into(),
+            job_id: None,
+            fired_at_ms: 1_000.0,
+            fired_price: 21000.0,
+            target_price: Some(21020.0),
+            stop_price: Some(20990.0),
+            outcome: "pending".into(),
+            outcome_at_ms: None,
+            max_favorable_excursion: None,
+            max_adverse_excursion: None,
+            r_result: None,
+            time_to_outcome_ms: None,
+            rvol_at_fire: None,
+            rvol_bucket_at_fire: None,
+            direction: Some("long".into()),
+            entry_price: Some(21000.0),
+            risk_points: Some(10.0),
+            exit_price: None,
+            outcome_quality: outcomes::QUALITY_VERIFIED.into(),
+            quality_flags: Vec::new(),
+            outcome_engine_version: Some(outcomes::OUTCOME_ENGINE_VERSION.into()),
+            rules_schema_version: Some("test".into()),
+            setup_template_hash: Some("hash".into()),
+            last_observed_price: Some(21000.0),
+            last_observed_at_ms: Some(1_000.0),
+        }
+    }
+
+    #[test]
+    fn performance_matrix_recomputes_r_over_stored_writer_value() {
+        let db = test_db();
+        let mut row = verified_pending_outcome("override-r");
+        row.outcome = "target_hit".into();
+        row.outcome_at_ms = Some(2_000.0);
+        row.exit_price = Some(21020.0);
+        row.r_result = Some(1.5);
+        row.time_to_outcome_ms = Some(1_000.0);
+        db.insert_signal_outcome(&row).expect("insert");
+
+        let matrix = db
+            .setup_performance_matrix_filtered(
+                None,
+                None,
+                Some("live"),
+                None,
+                None,
+                0,
+                SetupPerformanceSortBy::AvgR,
+                10,
+            )
+            .expect("matrix");
+
+        assert_eq!(matrix[0]["avgR"].as_f64(), Some(2.0));
+        assert_eq!(matrix[0]["qualityCounts"]["verified"], 1);
+    }
+
+    #[test]
+    fn manual_bridge_derives_exit_price_from_reported_r() {
+        let db = test_db();
+        db.insert_signal_outcome(&verified_pending_outcome("manual-bridge"))
+            .expect("insert pending");
+
+        let resolved_id = db
+            .resolve_pending_signal_by_setup_id("setup", 1.0, 2_500.0)
+            .expect("resolve")
+            .expect("resolved id");
+
+        assert_eq!(resolved_id, "manual-bridge");
+        let rows = db
+            .list_signal_outcomes_for_replay(Some("live"), None)
+            .expect("rows");
+        assert_eq!(rows[0].outcome, "target_hit");
+        assert_eq!(rows[0].exit_price, Some(21010.0));
+        assert_eq!(rows[0].time_to_outcome_ms, Some(1_500.0));
+        assert_eq!(rows[0].r_result, Some(1.0));
+        assert_eq!(rows[0].outcome_quality, outcomes::QUALITY_VERIFIED);
+    }
+
+    #[test]
+    fn live_tracker_matches_shared_engine_resolution() {
+        let db = test_db();
+        let live_row = verified_pending_outcome("live-engine");
+        let mut expected = live_row.clone();
+        db.insert_signal_outcome(&live_row).expect("insert pending");
+
+        let resolutions =
+            crate::outcome_tracker::on_tick_filtered(&db, 21021.0, 2_000.0, Some("live"), None)
+                .expect("live tick");
+        assert_eq!(resolutions.len(), 1);
+
+        let _ = outcomes::apply_tick(&mut expected, 21021.0, 2_000.0);
+        let actual = db
+            .list_signal_outcomes_for_replay(Some("live"), None)
+            .expect("rows")
+            .pop()
+            .expect("row");
+
+        assert_eq!(actual.outcome, expected.outcome);
+        assert_eq!(actual.exit_price, expected.exit_price);
+        assert_eq!(actual.r_result, expected.r_result);
+        assert_eq!(actual.time_to_outcome_ms, expected.time_to_outcome_ms);
+        assert_eq!(
+            actual.max_favorable_excursion,
+            expected.max_favorable_excursion
+        );
+    }
+
+    #[test]
     fn excursion_rows_respect_scope_filters() {
         let db = test_db();
         let asia_ts = Eastern
@@ -11122,6 +11933,17 @@ mod tests {
             time_to_outcome_ms: Some(120_000.0),
             rvol_at_fire: None,
             rvol_bucket_at_fire: None,
+            direction: None,
+            entry_price: None,
+            risk_points: None,
+            exit_price: None,
+            outcome_quality: default_outcome_quality(),
+            quality_flags: Vec::new(),
+            outcome_engine_version: None,
+            rules_schema_version: None,
+            setup_template_hash: None,
+            last_observed_price: None,
+            last_observed_at_ms: None,
         })
         .expect("insert asia");
         db.insert_signal_outcome(&SignalOutcome {
@@ -11145,6 +11967,17 @@ mod tests {
             time_to_outcome_ms: Some(180_000.0),
             rvol_at_fire: None,
             rvol_bucket_at_fire: None,
+            direction: None,
+            entry_price: None,
+            risk_points: None,
+            exit_price: None,
+            outcome_quality: default_outcome_quality(),
+            quality_flags: Vec::new(),
+            outcome_engine_version: None,
+            rules_schema_version: None,
+            setup_template_hash: None,
+            last_observed_price: None,
+            last_observed_at_ms: None,
         })
         .expect("insert rth");
 

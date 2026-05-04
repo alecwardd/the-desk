@@ -565,7 +565,7 @@
       "setupName": "Golden Price Above VWAP",
       "signalId": "golden-rules_golden_price_above_vwap_1772548500000",
       "source": "backtest",
-      "stopPrice": 10.0,
+      "stopPrice": 20923.0,
       "targetPrice": 21006.0,
       "timeToOutcomeMs": 7200000.0
     },
@@ -574,11 +574,11 @@
       "firedAtMs": 1772635320000.0,
       "firedPrice": 21104.0,
       "jobId": "golden-rules",
-      "maxAdverseExcursion": 0.0,
-      "maxFavorableExcursion": 0.0,
+      "maxAdverseExcursion": 10.0,
+      "maxFavorableExcursion": 2.0,
       "outcome": "time_exit",
       "outcomeAtMs": 1772657940000.0,
-      "rResult": 0.0625,
+      "rResult": -0.0625,
       "rootSymbol": "NQ",
       "rvolAtFire": 1.0,
       "rvolBucketAtFire": 2,
@@ -587,8 +587,8 @@
       "setupName": "Golden Price Above VWAP",
       "signalId": "golden-rules_golden_price_above_vwap_1772635320000",
       "source": "backtest",
-      "stopPrice": 10.0,
-      "targetPrice": 21006.0,
+      "stopPrice": 21024.0,
+      "targetPrice": 21107.0,
       "timeToOutcomeMs": 22620000.0
     }
   ]

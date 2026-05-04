@@ -1004,6 +1004,17 @@ mod tests {
             time_to_outcome_ms: Some(60_000.0),
             rvol_at_fire: None,
             rvol_bucket_at_fire: None,
+            direction: Some("long".to_string()),
+            entry_price: Some(21_000.0),
+            risk_points: Some(10.0),
+            exit_price: Some(if r_result > 0.0 { 21_010.0 } else { 20_990.0 }),
+            outcome_quality: "verified".to_string(),
+            quality_flags: Vec::new(),
+            outcome_engine_version: Some("test".to_string()),
+            rules_schema_version: Some("test".to_string()),
+            setup_template_hash: Some("test".to_string()),
+            last_observed_price: Some(21_000.0),
+            last_observed_at_ms: Some(fired_at_ms),
         }
     }
 

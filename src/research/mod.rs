@@ -3,6 +3,7 @@ pub mod hypothesis;
 
 use crate::db::{Database, SessionScopeFilter};
 use crate::depth::DomSummary;
+use crate::outcomes;
 use serde::{Deserialize, Serialize};
 
 /// Named percentile convention used by all research distribution queries.
@@ -233,6 +234,24 @@ pub struct SignalOutcomeExcursionsResult {
     pub meta: ResearchQueryMeta,
 }
 
+fn recomputed_r_or_stored(
+    direction: Option<&str>,
+    entry_price: Option<f64>,
+    fired_price: f64,
+    exit_price: Option<f64>,
+    risk_points: Option<f64>,
+    stored_r: Option<f64>,
+) -> Option<f64> {
+    outcomes::recompute_r_result_fields(
+        direction,
+        entry_price,
+        fired_price,
+        exit_price,
+        risk_points,
+    )
+    .or(stored_r)
+}
+
 fn percentile_type7(sorted: &[f64], p: f64) -> f64 {
     if sorted.is_empty() {
         return 0.0;
@@ -413,6 +432,7 @@ pub fn dom_behavior_frequency(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn dom_behavior_conditional(
     db: &Database,
     behavior: &str,
@@ -421,10 +441,21 @@ pub fn dom_behavior_conditional(
     start_date: Option<&str>,
     end_date: Option<&str>,
     scope: Option<&SessionScopeFilter>,
+    source: Option<&str>,
+    job_id: Option<&str>,
+    include_unverified: bool,
 ) -> Result<DomBehaviorConditionalResult, String> {
     let (window_start, window_end) = resolved_research_window(start_date, end_date, scope);
     let outcomes = db
-        .list_signal_outcomes_with_context(setup_id, window_start, window_end, scope)
+        .list_signal_outcomes_with_context_filtered(
+            setup_id,
+            window_start,
+            window_end,
+            scope,
+            source,
+            job_id,
+            include_unverified,
+        )
         .map_err(|e| e.to_string())?;
 
     let mut matched = 0_i64;
@@ -447,7 +478,14 @@ pub fn dom_behavior_conditional(
         }
         matched += 1;
         durations.push(summary.current_bias_duration_ms);
-        if let Some(r) = outcome.r_result {
+        if let Some(r) = recomputed_r_or_stored(
+            outcome.direction.as_deref(),
+            outcome.entry_price,
+            outcome.fired_price,
+            outcome.exit_price,
+            outcome.risk_points,
+            outcome.r_result,
+        ) {
             r_values.push(r);
             if r > 0.0 {
                 wins += 1;
@@ -730,19 +768,43 @@ pub fn conditional_probability(
 
 /// Distribution of R-results from signal_outcomes for a setup.
 /// Answers: "When setup X fires, what is the distribution of R-results?"
+#[allow(clippy::too_many_arguments)]
 pub fn signal_outcome_distribution(
     db: &Database,
     setup_id: &str,
     start_date: Option<&str>,
     end_date: Option<&str>,
     scope: Option<&SessionScopeFilter>,
+    source: Option<&str>,
+    job_id: Option<&str>,
+    include_unverified: bool,
 ) -> Result<DistributionResult, String> {
     let (window_start, window_end) = resolved_research_window(start_date, end_date, scope);
     let outcomes = db
-        .list_signal_outcomes_for_research(Some(setup_id), window_start, window_end, scope)
+        .list_signal_outcomes_for_research_with_session_key_filtered(
+            Some(setup_id),
+            window_start,
+            window_end,
+            scope,
+            source,
+            job_id,
+            include_unverified,
+        )
         .map_err(|e| e.to_string())?;
 
-    let values: Vec<f64> = outcomes.into_iter().filter_map(|(_, _, r, _)| r).collect();
+    let values: Vec<f64> = outcomes
+        .into_iter()
+        .filter_map(|row| {
+            recomputed_r_or_stored(
+                row.direction.as_deref(),
+                row.entry_price,
+                row.fired_price,
+                row.exit_price,
+                row.risk_points,
+                row.r_result,
+            )
+        })
+        .collect();
     Ok(distribution_from_values_with_meta(
         &format!("r_result (setup {setup_id})"),
         &values,
@@ -752,6 +814,7 @@ pub fn signal_outcome_distribution(
 
 /// Conditional win rate: when setup X fires and session has field=value, what is the win rate?
 /// Joins signal_outcomes (via session_date from fired_at_ms) with session_summaries.
+#[allow(clippy::too_many_arguments)]
 pub fn signal_outcome_conditional(
     db: &Database,
     setup_id: &str,
@@ -760,14 +823,20 @@ pub fn signal_outcome_conditional(
     start_date: Option<&str>,
     end_date: Option<&str>,
     scope: Option<&SessionScopeFilter>,
+    source: Option<&str>,
+    job_id: Option<&str>,
+    include_unverified: bool,
 ) -> Result<ConditionalResult, String> {
     let (window_start, window_end) = resolved_research_window(start_date, end_date, scope);
     let outcomes = db
-        .list_signal_outcomes_for_research_with_session_key(
+        .list_signal_outcomes_for_research_with_session_key_filtered(
             Some(setup_id),
             window_start,
             window_end,
             scope,
+            source,
+            job_id,
+            include_unverified,
         )
         .map_err(|e| e.to_string())?;
 
@@ -813,7 +882,14 @@ pub fn signal_outcome_conditional(
                 continue;
             }
             condition_met += 1;
-            if let Some(r) = outcome.r_result {
+            if let Some(r) = recomputed_r_or_stored(
+                outcome.direction.as_deref(),
+                outcome.entry_price,
+                outcome.fired_price,
+                outcome.exit_price,
+                outcome.risk_points,
+                outcome.r_result,
+            ) {
                 if r > 0.0 {
                     outcome_met += 1;
                 }
@@ -862,16 +938,28 @@ pub fn signal_outcome_conditional(
 }
 
 /// Distribution diagnostics for setup outcome excursions (MFE/MAE/time-to-outcome).
+#[allow(clippy::too_many_arguments)]
 pub fn signal_outcome_excursions(
     db: &Database,
     setup_id: Option<&str>,
     start_date: Option<&str>,
     end_date: Option<&str>,
     scope: Option<&SessionScopeFilter>,
+    source: Option<&str>,
+    job_id: Option<&str>,
+    include_unverified: bool,
 ) -> Result<SignalOutcomeExcursionsResult, String> {
     let (window_start, window_end) = resolved_research_window(start_date, end_date, scope);
     let rows = db
-        .list_signal_outcomes_for_excursions_filtered(setup_id, window_start, window_end, scope)
+        .list_signal_outcomes_for_excursions_filtered_with_quality(
+            setup_id,
+            window_start,
+            window_end,
+            scope,
+            source,
+            job_id,
+            include_unverified,
+        )
         .map_err(|e| e.to_string())?;
 
     let mut target_hit = 0_i64;
@@ -1370,6 +1458,17 @@ mod tests {
             time_to_outcome_ms: Some(60_000.0),
             rvol_at_fire: Some(1.05),
             rvol_bucket_at_fire: Some(2),
+            direction: Some("long".to_string()),
+            entry_price: Some(21000.0),
+            risk_points: Some(10.0),
+            exit_price: Some(if r_result > 0.0 { 21010.0 } else { 20990.0 }),
+            outcome_quality: "verified".to_string(),
+            quality_flags: Vec::new(),
+            outcome_engine_version: Some("test".to_string()),
+            rules_schema_version: Some("test".to_string()),
+            setup_template_hash: Some("test".to_string()),
+            last_observed_price: Some(21000.0),
+            last_observed_at_ms: Some(fired_at_ms),
         }
     }
 
@@ -1610,6 +1709,9 @@ mod tests {
             Some("2026-03-08"),
             Some("2026-03-08"),
             None,
+            None,
+            None,
+            true,
         )
         .unwrap();
         assert_eq!(result.sample_size, 1);
@@ -1649,6 +1751,9 @@ mod tests {
             None,
             None,
             Some(&scope),
+            None,
+            None,
+            true,
         )
         .unwrap();
         assert_eq!(result.sample_size, 1);
@@ -1727,6 +1832,17 @@ mod tests {
             time_to_outcome_ms: Some(60_000.0),
             rvol_at_fire: None,
             rvol_bucket_at_fire: None,
+            direction: Some("long".to_string()),
+            entry_price: Some(21000.0),
+            risk_points: Some(10.0),
+            exit_price: Some(21010.0),
+            outcome_quality: "verified".to_string(),
+            quality_flags: Vec::new(),
+            outcome_engine_version: Some("test".to_string()),
+            rules_schema_version: Some("test".to_string()),
+            setup_template_hash: Some("test".to_string()),
+            last_observed_price: Some(21010.0),
+            last_observed_at_ms: Some(2_000.0),
         })
         .unwrap();
         db.insert_signal_outcome(&SignalOutcome {
@@ -1750,10 +1866,22 @@ mod tests {
             time_to_outcome_ms: Some(120_000.0),
             rvol_at_fire: None,
             rvol_bucket_at_fire: None,
+            direction: Some("long".to_string()),
+            entry_price: Some(21000.0),
+            risk_points: Some(10.0),
+            exit_price: Some(21002.0),
+            outcome_quality: "verified".to_string(),
+            quality_flags: Vec::new(),
+            outcome_engine_version: Some("test".to_string()),
+            rules_schema_version: Some("test".to_string()),
+            setup_template_hash: Some("test".to_string()),
+            last_observed_price: Some(21002.0),
+            last_observed_at_ms: Some(4_000.0),
         })
         .unwrap();
 
-        let result = signal_outcome_excursions(&db, Some("s1"), None, None, None).unwrap();
+        let result =
+            signal_outcome_excursions(&db, Some("s1"), None, None, None, None, None, true).unwrap();
         assert_eq!(result.sample_count, 2);
         assert_eq!(result.outcome_breakdown.target_hit, 1);
         assert_eq!(result.outcome_breakdown.time_exit, 1);

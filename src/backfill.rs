@@ -216,6 +216,66 @@ struct BackfillRunState {
     last_context_snapshot_ms: Option<f64>,
 }
 
+/// Classify whether the session reached no, one-sided, or both-sided 0.5x IB extension.
+pub fn ib_extension_state_from_range(ib_high: f64, ib_low: f64, high: f64, low: f64) -> String {
+    if ib_high <= 0.0 || ib_low <= 0.0 || ib_high <= ib_low {
+        return "None".to_string();
+    }
+    let ib_range = ib_high - ib_low;
+    let up_extension = high >= ib_high + ib_range * crate::pipelines::IB_EXTENSION_RATIO;
+    let down_extension = low <= ib_low - ib_range * crate::pipelines::IB_EXTENSION_RATIO;
+    match (up_extension, down_extension) {
+        (true, true) => "BothSides",
+        (true, false) => "UpOnly",
+        (false, true) => "DownOnly",
+        (false, false) => "None",
+    }
+    .to_string()
+}
+
+pub fn apply_ib_extension_observation(
+    summary: &mut SessionSummary,
+    direction: &str,
+    timestamp_ms: f64,
+) {
+    if summary
+        .first_ib_extension_timestamp_ms
+        .map(|first| timestamp_ms < first)
+        .unwrap_or(true)
+    {
+        summary.first_ib_extension_direction = Some(direction.to_string());
+        summary.first_ib_extension_timestamp_ms = Some(timestamp_ms);
+    }
+
+    summary.ib_extension_state = match (summary.ib_extension_state.as_str(), direction) {
+        ("BothSides", _) => "BothSides",
+        ("UpOnly", "down") | ("DownOnly", "up") => "BothSides",
+        (_, "up") => "UpOnly",
+        (_, "down") => "DownOnly",
+        (state, _) => state,
+    }
+    .to_string();
+}
+
+pub fn apply_ib_extension_events(
+    summary: &mut SessionSummary,
+    events: &[crate::pipelines::event_detector::MarketEvent],
+) {
+    for event in events
+        .iter()
+        .filter(|event| event.event_type == "ib_extension_hit")
+    {
+        let Some(direction) =
+            crate::pipelines::event_detector::ib_extension_direction_from_metadata(
+                event.metadata.as_ref(),
+            )
+        else {
+            continue;
+        };
+        apply_ib_extension_observation(summary, direction, event.timestamp_ms);
+    }
+}
+
 pub fn summary_from_state(
     state: &MarketState,
     session_date: &str,
@@ -290,6 +350,14 @@ pub fn summary_from_state(
             0.0
         },
         ib_mid,
+        ib_extension_state: ib_extension_state_from_range(
+            state.ib_high,
+            state.ib_low,
+            state.session_high,
+            state.session_low,
+        ),
+        first_ib_extension_direction: None,
+        first_ib_extension_timestamp_ms: None,
         or_high: state.or_high,
         or_low: state.or_low,
         day_type: format!("{:?}", state.day_type),
@@ -1135,7 +1203,7 @@ where
         let payload = serde_json::to_value(&snapshot).unwrap_or_default();
         let context = snapshot_context_buckets(&payload, exit_time_ms);
         let _ = db.insert_pipeline_snapshot_with_context(exit_time_ms, &payload, &context);
-        let summary = summary_from_state(
+        let mut summary = summary_from_state(
             &snapshot,
             current_date,
             "RTH",
@@ -1144,6 +1212,7 @@ where
             state.buffers.session_volume,
             state.buffers.replay_signals.len() as i64,
         );
+        apply_ib_extension_events(&mut summary, &state.buffers.event_buffer);
         db.persist_historical_session(
             current_date,
             params.force,
@@ -1443,6 +1512,71 @@ mod tests {
         assert_eq!(summary.close_vs_ib_mid, "above");
         assert_eq!(summary.close_vs_vwap, "above");
         assert_eq!(summary.close_vs_poc, "above");
+    }
+
+    #[test]
+    fn summary_classifies_ib_extension_state_from_session_range() {
+        let state = MarketState {
+            last_price: 21060.0,
+            session_high: 21060.0,
+            session_low: 20990.0,
+            ib_high: 21020.0,
+            ib_low: 20980.0,
+            ..Default::default()
+        };
+
+        let summary = summary_from_state(&state, "2026-02-26", "RTH", 21000.0, 1000, 5000.0, 0);
+        assert_eq!(summary.ib_extension_state, "UpOnly");
+        assert_eq!(summary.first_ib_extension_direction, None);
+        assert_eq!(summary.first_ib_extension_timestamp_ms, None);
+    }
+
+    #[test]
+    fn ib_extension_events_capture_first_direction_and_both_sides() {
+        let state = MarketState {
+            last_price: 21060.0,
+            session_high: 21060.0,
+            session_low: 20940.0,
+            ib_high: 21020.0,
+            ib_low: 20980.0,
+            ..Default::default()
+        };
+        let mut summary = summary_from_state(&state, "2026-02-26", "RTH", 21000.0, 1000, 5000.0, 0);
+        assert_eq!(summary.ib_extension_state, "BothSides");
+        let events = vec![
+            crate::pipelines::event_detector::MarketEvent {
+                session_date: "2026-02-26".to_string(),
+                timestamp_ms: 1_000.0,
+                event_type: "ib_extension_hit".to_string(),
+                level_name: Some("ib_ext_0.5x_high".to_string()),
+                price: 21040.0,
+                direction: Some("up".to_string()),
+                sequence_num: None,
+                metadata: Some(serde_json::json!({"extensionDirection": "up"})),
+                session_type: "RTH".to_string(),
+                session_segment: "None".to_string(),
+                trading_day: "2026-02-26".to_string(),
+            },
+            crate::pipelines::event_detector::MarketEvent {
+                session_date: "2026-02-26".to_string(),
+                timestamp_ms: 2_000.0,
+                event_type: "ib_extension_hit".to_string(),
+                level_name: Some("ib_ext_0.5x_low".to_string()),
+                price: 20960.0,
+                direction: Some("down".to_string()),
+                sequence_num: None,
+                metadata: Some(serde_json::json!({"extensionDirection": "down"})),
+                session_type: "RTH".to_string(),
+                session_segment: "None".to_string(),
+                trading_day: "2026-02-26".to_string(),
+            },
+        ];
+
+        apply_ib_extension_events(&mut summary, &events);
+
+        assert_eq!(summary.ib_extension_state, "BothSides");
+        assert_eq!(summary.first_ib_extension_direction.as_deref(), Some("up"));
+        assert_eq!(summary.first_ib_extension_timestamp_ms, Some(1_000.0));
     }
 
     #[test]

@@ -432,3 +432,20 @@ Initial similarity weights are day type 0.30, profile shape 0.20, VWAP-sigma buc
 - Fold context directly into every snapshot only — rejected for v1 so raw tools remain lean and agents can opt into richer framing.
 
 **Consequences:** Agents get prompt-ready context with explicit reliability tiers, sample sizes, bucket provenance, cache status, and caveats. Bucket changes must bump `bucketDefinitionVersion` and record a new decision-log note. Context frames are coaching context only: agents must phrase them as playbook/statistical framing, not advice or trade instructions. Pipeline snapshot retention remains a follow-up storage policy decision; until then, snapshot growth is bounded by cadence but not automatically pruned.
+
+---
+
+### ADR-018: IDEA-011 uses first-class IB extension state, not poor-high/low
+
+**Date:** 2026-05-04
+**Status:** Decided
+
+**Context:** The next regime/backtest path is IDEA-011, which tests one-sided IB extension acceptance. Poor-high and poor-low flags are known instrumentation caveats, but they are not required to classify IDEA-011 and would expand the scope into a separate TPO definition pass.
+
+**Decision:** Add deterministic session-level IB extension fields to `session_summaries`: `ib_extension_state` (`None`, `UpOnly`, `DownOnly`, `BothSides`), `first_ib_extension_direction`, and `first_ib_extension_timestamp_ms`. The state uses the existing 0.5x IB extension contract and is enriched from `ib_extension_hit` event metadata (`extensionDirection: "up" | "down"`) in both historical backfill and live RTH close finalization.
+
+**Alternatives considered:**
+- Repair poor-high/poor-low before IDEA-011 — rejected because it is not on the immediate backtest dependency path.
+- Infer one-sided extension only from event counts — rejected because live/legacy summaries benefit from a range-derived fallback when event rows are missing.
+
+**Consequences:** IDEA-011 can filter sessions directly by queryable regime fields without depending on sparse poor-high/poor-low flags. Poor-high/poor-low remain explicitly deferred until a dedicated TPO semantics pass defines and validates their exact rule.

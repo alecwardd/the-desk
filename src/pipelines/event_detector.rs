@@ -9,6 +9,19 @@ const NQ_TICK: f64 = 0.25;
 const PROXIMITY_TICKS: f64 = 2.0;
 const PROXIMITY: f64 = PROXIMITY_TICKS * NQ_TICK;
 const MIN_EVENT_GAP_MS: f64 = 60_000.0;
+pub const IB_EXTENSION_RATIO: f64 = 0.5;
+pub const IB_EXTENSION_DIRECTION_METADATA_KEY: &str = "extensionDirection";
+pub const IB_EXTENSION_DIRECTION_UP: &str = "up";
+pub const IB_EXTENSION_DIRECTION_DOWN: &str = "down";
+
+pub fn ib_extension_direction_from_metadata(metadata: Option<&serde_json::Value>) -> Option<&str> {
+    metadata?
+        .get(IB_EXTENSION_DIRECTION_METADATA_KEY)?
+        .as_str()
+        .filter(|direction| {
+            *direction == IB_EXTENSION_DIRECTION_UP || *direction == IB_EXTENSION_DIRECTION_DOWN
+        })
+}
 
 /// A structured market event detected during pipeline processing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -362,15 +375,15 @@ impl EventDetector {
                 let extensions = [
                     (
                         "ib_ext_0.5x_high",
-                        state.ib_high + ib_range * 0.5,
-                        0.5,
-                        "up",
+                        state.ib_high + ib_range * IB_EXTENSION_RATIO,
+                        IB_EXTENSION_RATIO,
+                        IB_EXTENSION_DIRECTION_UP,
                     ),
                     (
                         "ib_ext_0.5x_low",
-                        state.ib_low - ib_range * 0.5,
-                        0.5,
-                        "down",
+                        state.ib_low - ib_range * IB_EXTENSION_RATIO,
+                        IB_EXTENSION_RATIO,
+                        IB_EXTENSION_DIRECTION_DOWN,
                     ),
                     ("ib_ext_1.0x_high", state.ib_high + ib_range, 1.0, "up"),
                     ("ib_ext_1.0x_low", state.ib_low - ib_range, 1.0, "down"),

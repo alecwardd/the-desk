@@ -18,7 +18,7 @@ mod vwap;
 pub use absorption::{AbsorptionEvent, AbsorptionPipeline, RecentSignalSnapshot};
 pub use day_type::{BalanceState, DayType, DayTypeClassifier, ProfileShape, SinglePrintsDirection};
 pub use delta::DeltaPipeline;
-pub use event_detector::{EventDetector, MarketEvent};
+pub use event_detector::{EventDetector, MarketEvent, IB_EXTENSION_RATIO};
 pub use flow_event_emitter::FlowEventEmitter;
 pub use footprint::{FootprintLevel, FootprintPipeline};
 pub use levels::{KeyLevel, KeyLevelType, LevelsPipeline, ProximityLevel};

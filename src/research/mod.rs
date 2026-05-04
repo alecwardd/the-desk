@@ -696,6 +696,11 @@ pub fn conditional_probability(
                     "profile_shape" => &summary.profile_shape,
                     "balance_state" => &summary.balance_state,
                     "single_prints_direction" => &summary.single_prints_direction,
+                    "ib_extension_state" => &summary.ib_extension_state,
+                    "first_ib_extension_direction" => summary
+                        .first_ib_extension_direction
+                        .as_deref()
+                        .unwrap_or(""),
                     "poor_high" => {
                         owned = summary.poor_high.to_string();
                         &owned
@@ -876,6 +881,11 @@ pub fn signal_outcome_conditional(
                 "close_vs_ib_mid" => &summary.close_vs_ib_mid,
                 "close_vs_vwap" => &summary.close_vs_vwap,
                 "single_prints_direction" => &summary.single_prints_direction,
+                "ib_extension_state" => &summary.ib_extension_state,
+                "first_ib_extension_direction" => summary
+                    .first_ib_extension_direction
+                    .as_deref()
+                    .unwrap_or(""),
                 _ => continue,
             };
             if field_val != field_value {
@@ -1374,6 +1384,9 @@ mod tests {
             ib_low: 21000.0,
             ib_range,
             ib_mid: 21000.0 + ib_range / 2.0,
+            ib_extension_state: "None".into(),
+            first_ib_extension_direction: None,
+            first_ib_extension_timestamp_ms: None,
             or_high: 21005.0,
             or_low: 20995.0,
             day_type: if ib_range >= 40.0 { "Trend" } else { "Normal" }.into(),

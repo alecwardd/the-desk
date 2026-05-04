@@ -163,6 +163,8 @@ const RESEARCH_OUTCOME_FIELDS: &[&str] = &[
     "profile_shape",
     "balance_state",
     "single_prints_direction",
+    "ib_extension_state",
+    "first_ib_extension_direction",
     "poor_high",
     "poor_low",
     "excess_high",
@@ -175,6 +177,8 @@ const SIGNAL_OUTCOME_SESSION_FIELDS: &[&str] = &[
     "close_vs_ib_mid",
     "close_vs_vwap",
     "single_prints_direction",
+    "ib_extension_state",
+    "first_ib_extension_direction",
 ];
 const DOM_BEHAVIOR_NAMES: &[&str] = &[
     "bid_support_persisted",
@@ -2058,7 +2062,7 @@ struct ConditionalParams {
     event_type: String,
     /// Minimum event count per session to satisfy the condition.
     min_count: Option<i64>,
-    /// Session summary field to check (e.g. "close_vs_ib_mid", "close_vs_vwap", "day_type").
+    /// Session summary field to check (e.g. "close_vs_ib_mid", "ib_extension_state", "day_type").
     outcome_field: String,
     /// Value to match (e.g. "above", "below", "Trend").
     outcome_value: String,
@@ -8586,6 +8590,9 @@ impl TheDeskMcp {
                             "closeVsIbMid": s.close_vs_ib_mid,
                             "closeVsVwap": s.close_vs_vwap,
                             "closeVsPoc": s.close_vs_poc,
+                            "ibExtensionState": s.ib_extension_state,
+                            "firstIbExtensionDirection": s.first_ib_extension_direction,
+                            "firstIbExtensionTimestampMs": s.first_ib_extension_timestamp_ms,
                             "rvolRatio": s.rvol_ratio,
                             "poorHigh": s.poor_high, "poorLow": s.poor_low,
                             "excessHigh": s.excess_high, "excessLow": s.excess_low,
@@ -10725,6 +10732,7 @@ enum RthCloseFinalizeError {
 fn finalize_rth_close(
     pipelines: &Arc<Mutex<PipelineEngine>>,
     db: &Arc<Mutex<Database>>,
+    pending_events: &[MarketEvent],
     runtime_events: Option<&Arc<RuntimeEventStore>>,
     detector: Option<&Arc<Mutex<EventDetector>>>,
     flow_emitter: Option<&Arc<Mutex<FlowEventEmitter>>>,
@@ -10804,6 +10812,12 @@ fn finalize_rth_close(
         close_data.total_volume,
         signal_count,
     );
+    if let Ok(d) = db.lock() {
+        if let Ok(flushed_events) = d.list_ib_extension_events_for_session(&session_date, "RTH") {
+            backfill::apply_ib_extension_events(&mut summary, &flushed_events);
+        }
+    }
+    backfill::apply_ib_extension_events(&mut summary, pending_events);
 
     // Stamp contract metadata so the persisted row matches the active contract
     // even if the snapshot was built before set_contract_metadata propagated.
@@ -11165,6 +11179,7 @@ fn run_startup_warm_replay(
                 let finalize = finalize_rth_close(
                     pipelines,
                     db,
+                    &[],
                     Some(runtime_events),
                     None,
                     Some(flow_emitter),
@@ -11417,6 +11432,7 @@ fn run_startup_warm_replay(
             if let Err(err) = finalize_rth_close(
                 pipelines,
                 db,
+                &[],
                 Some(runtime_events),
                 None,
                 Some(flow_emitter),
@@ -11902,6 +11918,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             match finalize_rth_close(
                                 &pipelines_bg,
                                 &db_bg,
+                                &event_buffer,
                                 Some(&runtime_events_bg),
                                 Some(&detector_bg),
                                 Some(&flow_emitter_bg),
@@ -12302,6 +12319,9 @@ mod tests {
             ib_low: 0.0,
             ib_range: 0.0,
             ib_mid: 0.0,
+            ib_extension_state: "None".to_string(),
+            first_ib_extension_direction: None,
+            first_ib_extension_timestamp_ms: None,
             or_high: 0.0,
             or_low: 0.0,
             day_type: String::new(),
@@ -14137,6 +14157,7 @@ mod tests {
         let result = finalize_rth_close(
             &server.pipelines,
             &server.db,
+            &[],
             None,
             None,
             None,
@@ -14172,6 +14193,57 @@ mod tests {
         assert!(!p.levels.rth_started());
     }
 
+    #[test]
+    fn finalize_rth_close_persists_pending_ib_extension_event_context() {
+        let server = test_server();
+        warm_rth_session(&server, &[21_000.0, 21_005.0, 21_010.0]);
+        let first_extension_ts = rth_ts(10, 31, 0);
+        let pending_events = vec![MarketEvent {
+            session_date: "2026-03-05".to_string(),
+            timestamp_ms: first_extension_ts,
+            event_type: "ib_extension_hit".to_string(),
+            level_name: Some("ib_ext_0.5x_high".to_string()),
+            price: 21_020.0,
+            direction: Some("from_below".to_string()),
+            sequence_num: None,
+            metadata: Some(serde_json::json!({"extensionDirection": "up"})),
+            session_type: "RTH".to_string(),
+            session_segment: "None".to_string(),
+            trading_day: "2026-03-05".to_string(),
+        }];
+
+        finalize_rth_close(
+            &server.pipelines,
+            &server.db,
+            &pending_events,
+            None,
+            None,
+            None,
+            rth_ts(16, 0, 1),
+            21_009.75,
+            21_010.25,
+            &test_contract_metadata(),
+        )
+        .expect("close finalize")
+        .expect("close result");
+
+        let summaries = server
+            .db
+            .lock()
+            .expect("db")
+            .list_session_summaries(None, None, None, Some("RTH"), 5)
+            .expect("summaries");
+        assert_eq!(summaries[0].ib_extension_state, "UpOnly");
+        assert_eq!(
+            summaries[0].first_ib_extension_direction.as_deref(),
+            Some("up")
+        );
+        assert_eq!(
+            summaries[0].first_ib_extension_timestamp_ms,
+            Some(first_extension_ts)
+        );
+    }
+
     /// Restart idempotency: calling `finalize_rth_close` again after the
     /// session has been reset must be a no-op (returns None) and must not
     /// clobber the persisted summary or write a duplicate row.
@@ -14184,6 +14256,7 @@ mod tests {
         let _ = finalize_rth_close(
             &server.pipelines,
             &server.db,
+            &[],
             None,
             None,
             None,
@@ -14206,6 +14279,7 @@ mod tests {
         let second = finalize_rth_close(
             &server.pipelines,
             &server.db,
+            &[],
             None,
             None,
             None,
@@ -14245,6 +14319,7 @@ mod tests {
         let _ = finalize_rth_close(
             &server.pipelines,
             &server.db,
+            &[],
             None,
             None,
             None,

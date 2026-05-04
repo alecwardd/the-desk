@@ -388,6 +388,9 @@ pub struct SessionSummary {
     pub ib_low: f64,
     pub ib_range: f64,
     pub ib_mid: f64,
+    pub ib_extension_state: String,
+    pub first_ib_extension_direction: Option<String>,
+    pub first_ib_extension_timestamp_ms: Option<f64>,
     pub or_high: f64,
     pub or_low: f64,
     pub day_type: String,
@@ -1247,6 +1250,9 @@ impl Database {
         }
         if version < 29 {
             self.migrate_v29()?;
+        }
+        if version < 30 {
+            self.migrate_v30()?;
         }
 
         Ok(())
@@ -2710,6 +2716,21 @@ impl Database {
             UPDATE schema_version SET version = 29;
             ",
         )?;
+        Ok(())
+    }
+
+    /// V30: session-level IB extension state for regime-gated backtests.
+    fn migrate_v30(&self) -> Result<(), DbError> {
+        let columns = [
+            "ALTER TABLE session_summaries ADD COLUMN ib_extension_state TEXT NOT NULL DEFAULT 'None'",
+            "ALTER TABLE session_summaries ADD COLUMN first_ib_extension_direction TEXT NULL",
+            "ALTER TABLE session_summaries ADD COLUMN first_ib_extension_timestamp_ms REAL NULL",
+        ];
+        for sql in columns {
+            let _ = self.conn.execute(sql, []);
+        }
+        self.conn
+            .execute_batch("UPDATE schema_version SET version = 30;")?;
         Ok(())
     }
 
@@ -7337,6 +7358,42 @@ impl Database {
         Ok(())
     }
 
+    pub fn list_ib_extension_events_for_session(
+        &self,
+        session_date: &str,
+        session_type: &str,
+    ) -> Result<Vec<MarketEvent>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT timestamp_ms, level_name, price, direction, sequence_num, metadata_json,
+                    session_type, session_segment, trading_day
+             FROM market_events
+             WHERE session_date = ?1
+               AND COALESCE(NULLIF(session_type, ''), 'Unknown') = ?2
+               AND event_type = 'ib_extension_hit'
+             ORDER BY timestamp_ms ASC",
+        )?;
+        let rows = stmt.query_map(params![session_date, session_type], |row| {
+            let timestamp_ms: f64 = row.get(0)?;
+            let metadata_str: Option<String> = row.get(5)?;
+            let metadata: Option<serde_json::Value> =
+                metadata_str.and_then(|s| serde_json::from_str(&s).ok());
+            Ok(MarketEvent {
+                session_date: session_date.to_string(),
+                timestamp_ms,
+                event_type: "ib_extension_hit".to_string(),
+                level_name: row.get(1)?,
+                price: row.get(2)?,
+                direction: row.get(3)?,
+                sequence_num: row.get(4)?,
+                metadata,
+                session_type: row.get(6)?,
+                session_segment: row.get(7)?,
+                trading_day: row.get(8)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     /// Count events of a given type, optionally filtered by date range.
     pub fn count_events_by_type(
         &self,
@@ -7731,8 +7788,9 @@ impl Database {
               session_delta, cumulative_delta, dnp, dnva_high, dnva_low,
               vwap_close, signal_count, single_prints_direction,
               excess_high, excess_low, poor_high, poor_low, rvol_ratio,
-              close_vs_ib_mid, close_vs_vwap, close_vs_poc, snapshot_json)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35,?36,?37,?38,?39,?40,?41,?42,?43)
+              close_vs_ib_mid, close_vs_vwap, close_vs_poc, snapshot_json,
+              ib_extension_state, first_ib_extension_direction, first_ib_extension_timestamp_ms)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35,?36,?37,?38,?39,?40,?41,?42,?43,?44,?45,?46)
              ON CONFLICT(session_date, session_type) DO UPDATE SET
               session_type=excluded.session_type, root_symbol=excluded.root_symbol,
               contract_symbol=excluded.contract_symbol, contract_month=excluded.contract_month,
@@ -7754,7 +7812,10 @@ impl Database {
                poor_high=excluded.poor_high, poor_low=excluded.poor_low,
                rvol_ratio=excluded.rvol_ratio, close_vs_ib_mid=excluded.close_vs_ib_mid,
                close_vs_vwap=excluded.close_vs_vwap, close_vs_poc=excluded.close_vs_poc,
-               snapshot_json=excluded.snapshot_json",
+               snapshot_json=excluded.snapshot_json,
+               ib_extension_state=excluded.ib_extension_state,
+               first_ib_extension_direction=excluded.first_ib_extension_direction,
+               first_ib_extension_timestamp_ms=excluded.first_ib_extension_timestamp_ms",
             params![
                 s.session_date, s.session_type, s.root_symbol, s.contract_symbol, s.contract_month,
                 s.symbol_resolution_mode, i64::from(s.carry_forward_levels_valid), s.rollover_warning,
@@ -7766,6 +7827,7 @@ impl Database {
                 i64::from(s.excess_high), i64::from(s.excess_low),
                 i64::from(s.poor_high), i64::from(s.poor_low), s.rvol_ratio,
                 s.close_vs_ib_mid, s.close_vs_vwap, s.close_vs_poc, s.snapshot_json,
+                s.ib_extension_state, s.first_ib_extension_direction, s.first_ib_extension_timestamp_ms,
             ],
         )?;
         Ok(())
@@ -8106,7 +8168,8 @@ impl Database {
                     session_delta, cumulative_delta, dnp, dnva_high, dnva_low,
                     vwap_close, signal_count, single_prints_direction,
                     excess_high, excess_low, poor_high, poor_low, rvol_ratio,
-                    close_vs_ib_mid, close_vs_vwap, close_vs_poc, snapshot_json
+                    close_vs_ib_mid, close_vs_vwap, close_vs_poc, snapshot_json,
+                    ib_extension_state, first_ib_extension_direction, first_ib_extension_timestamp_ms
              FROM session_summaries {where_clause}
              ORDER BY session_date DESC LIMIT ?{}",
             bind_values.len() + 1
@@ -8163,6 +8226,11 @@ impl Database {
                 close_vs_vwap: row.get::<_, Option<String>>(40)?.unwrap_or_default(),
                 close_vs_poc: row.get::<_, Option<String>>(41)?.unwrap_or_default(),
                 snapshot_json: row.get(42)?,
+                ib_extension_state: row
+                    .get::<_, Option<String>>(43)?
+                    .unwrap_or_else(|| "None".to_string()),
+                first_ib_extension_direction: row.get(44)?,
+                first_ib_extension_timestamp_ms: row.get(45)?,
             })
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
@@ -11045,6 +11113,9 @@ mod tests {
             ib_low: 20997.0,
             ib_range: 10.0,
             ib_mid: 21002.0,
+            ib_extension_state: "None".into(),
+            first_ib_extension_direction: None,
+            first_ib_extension_timestamp_ms: None,
             or_high: 21004.0,
             or_low: 20999.0,
             day_type: "Normal".into(),

@@ -350,6 +350,11 @@ The regime layer should drive which existing templates are active, not just how 
 - Store the first extension timestamp and direction
 - Use it as a hard filter for IB continuation and OR5 continuation logic
 
+**Implementation status (2026-05-04):**
+- `session_summaries` now stores `ib_extension_state`, `first_ib_extension_direction`, and `first_ib_extension_timestamp_ms` for RTH sessions.
+- Backfill and live RTH close both derive the state from the 0.5x IB extension contract and enrich first direction/timestamp from `ib_extension_hit` event metadata when available.
+- Poor-high / poor-low instrumentation remains intentionally deferred. IDEA-011 does not depend on those flags; revisit them in the TPO definition pass before using them for regime slicing.
+
 **Backtesting Hypothesis:**
 > When the first IB extension remains one-sided for at least 30 minutes and RVOL >= Elevated, what is the R-distribution of trading the first pullback in extension direction?
 

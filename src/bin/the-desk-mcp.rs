@@ -6867,6 +6867,7 @@ impl TheDeskMcp {
             balance_state: params.balance_state,
             include_opportunity: params.include_opportunity,
             include_coaching_memory: params.include_coaching_memory,
+            context_snapshot: snapshot.cloned(),
         };
         let db = self.db.lock().map_err(|_| lock_error())?;
         let fit = memory_build_trader_context_fit(&db, query).map_err(db_error)?;

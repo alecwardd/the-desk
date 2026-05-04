@@ -36,13 +36,13 @@ todos:
     content: Wire orchestrator, risk-coach, and performance-analyst to use `get_trader_context_fit`; lead risk-coach changes with the rule that memory never adjusts sizing by itself.
     status: completed
   - id: phase2-opportunity-overlay
-    content: Add optional opportunity detail from existing `signal_outcomes`, setup performance tools, and `get_context_frame`, while keeping signal/backtest opportunity separate from executed-trade memory.
-    status: pending
+    content: Add optional opportunity detail from existing `signal_outcomes` plus compact `get_context_frame`-backed analog metadata when snapshot context is available; include deterministic `executionConflict` without blending signal opportunity into executed-trade memory.
+    status: completed
   - id: phase3-memory-capsules
     content: Add short deterministic markdown capsules under `~/.the-desk/memory/` with freshness policy, trigger wiring, and no auto-read outside session-start/session-review flows.
     status: cancelled
   - id: phase4-context-frame-extension
-    content: Extend existing `get_context_frame` analog output only if a measured gap remains; do not create `src/memory/analog.rs`, `session_fingerprints`, or parallel analog MCP tools.
+    content: Extend existing `get_context_frame` analog output only if a measured gap remains after Phase 2 compact metadata, such as needing full analog session lists or event replay inline; do not create `src/memory/analog.rs`, `session_fingerprints`, or parallel analog MCP tools.
     status: pending
   - id: validation
     content: Validate with unit tests, behavioral-pattern tests, MCP response-shape tests, hand-rolled JSON fixture snapshot tests, prompt checks, targeted cargo tests, and full `cargo test` before implementation is complete.
@@ -933,7 +933,7 @@ Snapshot test:
 
 Goal: enrich `opportunityFit` without blending it into executed-trade memory.
 
-Use existing capabilities:
+Decision: Phase 2 is an additive overlay on the Phase 1 contract. It must not create a second execution aggregator, and it must not call MCP tools from inside MCP handlers. Reuse the same underlying Rust/SQLite helpers that power these tools:
 
 - `get_signal_performance`
 - `get_setup_performance_matrix`
@@ -942,7 +942,33 @@ Use existing capabilities:
 - `query_signal_outcome_excursions`
 - `get_context_frame`
 
-The context-fit tool may include compact opportunity facts only when requested and within budget.
+### Source Decisions
+
+`setupOutcome`:
+
+- Source of truth is `signal_outcomes`, not `trades` and not `behavioral_patterns`.
+- Implement via a shared Rust helper rather than tool-to-tool calls. Prefer extracting/reusing the existing `research::context_frame` setup-outcome logic (`SetupOutcomeContext` / `build_setup_outcomes`) or a DB-backed helper with the same math.
+- The default scope is `setupId` plus session scope that is already present on `TraderContextFitQuery` (`sessionType`, `sessionSegment` when available). Do not infer day-type or time-bucket filters unless the source query actually supports them.
+- Include `setupId`, `n`/`sampleSize`, `resolved`, `pending` when available, `winRate`, `avgR`, `medianR` when available, `avgMfe`/`avgMae` when available, `reliabilityTier`, `source`, `scope`, and caveats.
+- If `setupId` is missing, return `setupOutcome: null` and add a `missingData` entry explaining that setup-level opportunity context requires a setup ID.
+
+`contextFrameAnalog`:
+
+- Keep the existing Phase 1 capability pointer as the fallback.
+- Optional compact embedding is allowed only when the caller path already has a market snapshot or explicit historical timestamp. In that case, call the internal `research::context_frame::build_context_frame` helper directly and copy a compact summary from `historicalAnalogs` / `intradayForwardStats`; do not call the `get_context_frame` MCP tool from another MCP tool.
+- Compact means metadata and headline probabilities only: `available`, `source`, `effectiveSampleSize`, `reliabilityTier`, `matchingMode`, `topKFallbackUsed`, `closeBackToVwap`, and caveats. Do not embed analog session lists inside `TraderContextFit`.
+- If no snapshot/timestamp is available, keep `available: true`, `detailAvailableByCalling: "get_context_frame"`, and the caveat that analog context is market precedent, not executed-trade memory.
+
+`executionConflict`:
+
+- Deterministic Rust output, never prompt-side inference.
+- Compare opportunity stats against execution stats only when both sides have comparable `avgR` values and both pass the comparison floor.
+- Opportunity side floor: `setupOutcome.sampleSize >= 20` and non-null `avgR`.
+- Execution side floor: choose the highest-ranked non-post-loss execution slice in `executionFit.matchingSlices` with `n >= 20` and non-null `avgR`; include its `id`, `patternType`, `n`, `avgR`, and `reliabilityTier` as `comparedExecutionSlice`.
+- Detection rule: `detected = true` only when the signs differ and the absolute `avgR` gap is at least `0.20R`. This avoids noisy `+0.01R` vs `-0.01R` conflicts.
+- Preserve both reliability tiers. Do not collapse the conflict into a traffic light, and do not let conflict output imply size changes.
+
+The context-fit tool may include compact opportunity facts only when `includeOpportunity` is true and within budget.
 
 Example:
 
@@ -951,24 +977,42 @@ Example:
   "setupOutcome": {
     "setupId": "tpl_dnva_retest",
     "n": 32,
+    "resolved": 32,
+    "pending": 0,
     "reliabilityTier": "reportable",
+    "winRate": 0.56,
     "avgR": 0.18,
     "medianR": 0.05,
-    "source": "signal_outcomes"
+    "source": "signal_outcomes",
+    "scope": {
+      "setupId": "tpl_dnva_retest",
+      "sessionType": "RTH"
+    },
+    "caveats": []
   },
   "contextFrameAnalog": {
     "available": true,
     "source": "get_context_frame",
-    "sampleSize": 24,
+    "effectiveSampleSize": 24,
     "reliabilityTier": "directional",
+    "matchingMode": "weightedAnalog",
+    "topKFallbackUsed": false,
     "caveats": ["Analog context is market precedent, not executed-trade memory."]
   },
   "executionConflict": {
     "detected": true,
+    "comparedExecutionSlice": {
+      "id": "win_rate_by_setup:tpl_dnva_retest",
+      "patternType": "win_rate_by_setup",
+      "n": 24,
+      "avgR": -0.30,
+      "reliabilityTier": "directional"
+    },
     "executionAvgR": -0.30,
-    "executionN": 14,
+    "executionN": 24,
     "opportunityAvgR": 0.18,
     "opportunityN": 32,
+    "gapR": 0.48,
     "interpretation": "Setup signal historically positive; trader's executed result negative."
   },
   "caveats": [
@@ -977,7 +1021,14 @@ Example:
 }
 ```
 
-`executionConflict` is deterministic Rust output, not prompt-side inference. It should be emitted only when both execution and opportunity samples pass the configured floor for comparison, with separate reliability tiers preserved on each side.
+### Phase 2 Implementation Order
+
+1. Add a small internal opportunity helper in or under `src/memory/trader_context.rs`, reusing `signal_outcomes` aggregation logic and `crate::research::reliability_tier`.
+2. Populate `opportunityFit.setupOutcome` for setup-scoped queries when `includeOpportunity` is true.
+3. Add `executionConflict` using the deterministic comparison rule above.
+4. Decide whether to embed compact `contextFrameAnalog` now or leave the existing pointer. If embedding, only do it in caller paths that already have snapshot/timestamp context.
+5. Extend the existing fixture or add `tests/fixtures/trader_context_fit/setup_check_or5_opportunity.json` with a positive signal-outcome setup record and negative execution slice so the conflict contract is pinned.
+6. Add negative tests for missing `setupId`, insufficient opportunity sample, insufficient execution sample, and non-material sign differences.
 
 Do not add `src/memory/analog.rs` or `session_fingerprints` here. `get_context_frame` already has weighted analogs.
 
@@ -1126,7 +1177,7 @@ unless `get_context_frame` cannot reasonably support the needed behavior.
 3. Phase 1 PR1: add `db.list_closed_trades_with_session_context_for_pattern_refresh`, add `list_recent_session_trades`, extend `detect_behavioral_patterns` with intersected slices, and add pattern/ranking regression tests. No new MCP tool in this PR.
 4. Phase 1 PR2: add `src/memory/trader_context.rs`, hand-written empty/non-empty JSON fixtures, `get_trader_context_fit`, `get_pre_session_briefing` memory-section delegation, and agent wiring.
 5. Run targeted tests, then full `cargo test`.
-6. Add Phase 2 opportunity details after Phase 1 output is stable in real use.
+6. Phase 2 PR: add `setupOutcome` from `signal_outcomes`, deterministic `executionConflict`, and optional compact context-frame analog metadata only when a snapshot/timestamp is available; pin with an opportunity fixture.
 7. Defer Phase 3 markdown capsules until at least five real sessions of Phase 1 usage show they are needed.
 8. Defer Phase 4 with a measurement loop: record `docs/trader-memory/measured-gaps.md` entries when `get_context_frame` falls short; revisit after three concrete entries.
 
@@ -1142,7 +1193,9 @@ The first shippable version is done when:
 - No second full trade-stat aggregator exists on the MCP read path.
 - Pattern refresh helper is not used by the normal MCP read path.
 - Opportunity stats come only from setup/signal/context-frame historical data.
-- Phase 2 conflict detection, when implemented, is deterministic Rust output rather than prompt inference.
+- Phase 2 `setupOutcome`, when implemented, comes from `signal_outcomes` and reports source, scope, `n`, reliability tier, and caveats.
+- Phase 2 `executionConflict`, when implemented, is deterministic Rust output rather than prompt inference, uses sample/reliability floors on both sides, and preserves both source statistics.
+- Phase 2 context-frame analog embedding, if implemented, is compact metadata copied from internal `build_context_frame` output; no MCP tool calls are made from another MCP tool.
 - Coaching memory comes from existing insight/pattern/follow-up infrastructure.
 - Insights with inactive pattern evidence are flagged.
 - New trades capture planned R-at-entry when available, without backfilling old rows from current config.

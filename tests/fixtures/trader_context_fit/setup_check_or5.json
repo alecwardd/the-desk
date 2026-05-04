@@ -142,7 +142,27 @@
         "Context-frame analogs are not executed-trade memory."
       ]
     },
-    "missingData": []
+    "executionConflict": {
+      "detected": false,
+      "reason": "insufficientOpportunitySample",
+      "comparedExecutionSlice": null,
+      "executionAvgR": null,
+      "executionN": null,
+      "opportunityAvgR": null,
+      "opportunityN": 0,
+      "opportunityReliabilityTier": null,
+      "gapR": null
+    },
+    "caveats": [
+      "Opportunity stats describe setup signals, not trader execution."
+    ],
+    "missingData": [
+      {
+        "kind": "noSignalOutcomes",
+        "setupId": "or5",
+        "reason": "No signal_outcomes rows matched this setup and scope."
+      }
+    ]
   },
   "coachingMemory": {
     "patterns": [

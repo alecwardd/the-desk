@@ -1,0 +1,169 @@
+{
+  "intent": "setupCheck",
+  "currentContext": {
+    "tradingDay": "2026-05-01",
+    "accountScope": "allAccounts",
+    "sessionType": "RTH",
+    "sessionSegment": null,
+    "timeBucket": null,
+    "dayType": null,
+    "profileShape": null,
+    "balanceState": null,
+    "setupId": "or5"
+  },
+  "executionFit": {
+    "summary": "Scoped execution memory matched this context.",
+    "matchingSlices": [
+      {
+        "id": "win_rate_by_setup:or5",
+        "patternType": "win_rate_by_setup",
+        "description": "win_rate_by_setup:or5",
+        "n": 40,
+        "reliabilityTier": "reportable",
+        "winRate": 0.5,
+        "avgR": -0.25,
+        "scope": {
+          "setupId": "or5"
+        },
+        "queryHint": {
+          "setupId": "or5"
+        },
+        "source": "behavioral_patterns",
+        "caveats": []
+      }
+    ],
+    "strongestPositiveEvidence": [],
+    "strongestCautionEvidence": [
+      {
+        "id": "win_rate_by_setup:or5",
+        "patternType": "win_rate_by_setup",
+        "description": "win_rate_by_setup:or5",
+        "n": 40,
+        "reliabilityTier": "reportable",
+        "winRate": 0.5,
+        "avgR": -0.25,
+        "scope": {
+          "setupId": "or5"
+        },
+        "queryHint": {
+          "setupId": "or5"
+        },
+        "source": "behavioral_patterns",
+        "caveats": []
+      }
+    ],
+    "missingData": []
+  },
+  "opportunityFit": {
+    "summary": "Opportunity data is separate from trader execution.",
+    "setupOutcome": {
+      "setupId": "or5",
+      "n": 32,
+      "sampleSize": 32,
+      "totalSignals": 32,
+      "resolved": 32,
+      "pending": 0,
+      "reliabilityTier": "reportable",
+      "winRate": 0.625,
+      "avgR": 0.25,
+      "medianR": 1.0,
+      "avgMfe": 1.05,
+      "avgMae": -0.5,
+      "source": "signal_outcomes",
+      "scope": {
+        "setupId": "or5",
+        "sessionType": "RTH"
+      },
+      "caveats": []
+    },
+    "contextFrameAnalog": {
+      "available": true,
+      "source": "get_context_frame",
+      "detailAvailableByCalling": "get_context_frame",
+      "caveats": [
+        "Context-frame analogs are not executed-trade memory."
+      ]
+    },
+    "executionConflict": {
+      "detected": true,
+      "reason": "signMismatch",
+      "comparedExecutionSlice": {
+        "id": "win_rate_by_setup:or5",
+        "patternType": "win_rate_by_setup",
+        "n": 40,
+        "avgR": -0.25,
+        "reliabilityTier": "reportable"
+      },
+      "executionAvgR": -0.25,
+      "executionN": 40,
+      "opportunityAvgR": 0.25,
+      "opportunityN": 32,
+      "opportunityReliabilityTier": "reportable",
+      "gapR": 0.5,
+      "interpretation": "Setup signal historically positive; trader's executed result negative."
+    },
+    "caveats": [
+      "Opportunity stats describe setup signals, not trader execution."
+    ],
+    "missingData": []
+  },
+  "coachingMemory": {
+    "patterns": [
+      "win_rate_by_setup:or5"
+    ],
+    "insights": [],
+    "followups": []
+  },
+  "riskContext": {
+    "tradeOrdinalInSession": null,
+    "postLossStateInSession": null,
+    "openTradePresent": false,
+    "riskDeviation": {
+      "available": false,
+      "availability": {
+        "kind": "missingFields",
+        "reason": "No current session supplied for live risk-memory context."
+      }
+    },
+    "ruleAdherenceFlags": []
+  },
+  "reliability": {
+    "overallTier": "directional",
+    "caveats": [
+      "Execution and opportunity samples are reported separately."
+    ]
+  },
+  "provenance": {
+    "executionSources": [
+      "behavioral_patterns",
+      "trades",
+      "sessions",
+      "session_summaries"
+    ],
+    "opportunitySources": [
+      "signal_outcomes",
+      "context_frame"
+    ],
+    "coachingSources": [
+      "behavioral_patterns",
+      "agent_insights",
+      "memory_followups"
+    ],
+    "evidenceIds": {
+      "patterns": [
+        "win_rate_by_setup:or5"
+      ],
+      "insights": [],
+      "followups": []
+    },
+    "evidenceTimestampsMs": {
+      "patternsRefreshedAtMs": null,
+      "insightsLastUpdatedMs": null
+    },
+    "truncationWarning": null
+  },
+  "maintenance": {
+    "refreshSuggested": true,
+    "dirtyReasons": []
+  }
+}

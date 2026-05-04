@@ -1,9 +1,12 @@
-use crate::db::{Database, TradeRecord};
+use crate::db::{Database, SessionScopeFilter, TradeRecord};
 use crate::memory::{
     time_bucket_from_timestamp_ms, AgentInsightQuery, BehavioralPatternQuery,
     BehavioralPatternRecord, MemoryError, MemoryFollowupQuery,
 };
-use crate::research::{reliability_tier, ReliabilityTier};
+use crate::research::{
+    context_frame::{build_context_frame, ContextFrameMode, ContextFrameOptions},
+    reliability_tier, ReliabilityTier,
+};
 use crate::trading_day_from_timestamp_ms;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -11,6 +14,8 @@ use std::collections::HashSet;
 use std::str::FromStr;
 
 const PATTERN_LOAD_CAP: usize = 300;
+const OPPORTUNITY_COMPARISON_FLOOR: usize = 20;
+const EXECUTION_CONFLICT_MIN_GAP_R: f64 = 0.20;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -57,6 +62,8 @@ pub struct TraderContextFitQuery {
     pub balance_state: Option<String>,
     pub include_opportunity: Option<bool>,
     pub include_coaching_memory: Option<bool>,
+    #[serde(skip)]
+    pub context_snapshot: Option<serde_json::Value>,
 }
 
 impl Default for TraderContextFitQuery {
@@ -76,6 +83,7 @@ impl Default for TraderContextFitQuery {
             balance_state: None,
             include_opportunity: Some(true),
             include_coaching_memory: Some(true),
+            context_snapshot: None,
         }
     }
 }
@@ -247,6 +255,331 @@ fn post_loss_state_from_recent_trades(trades_desc: &[TradeRecord]) -> Option<&'s
         1 => Some("afterOneLoss"),
         _ => Some("afterTwoPlusLosses"),
     }
+}
+
+fn median(values: &mut [f64]) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mid = values.len() / 2;
+    if values.len().is_multiple_of(2) {
+        Some((values[mid - 1] + values[mid]) / 2.0)
+    } else {
+        Some(values[mid])
+    }
+}
+
+fn mean(values: &[f64]) -> Option<f64> {
+    (!values.is_empty()).then(|| round_metric(values.iter().sum::<f64>() / values.len() as f64))
+}
+
+fn round_metric(value: f64) -> f64 {
+    (value * 1_000_000.0).round() / 1_000_000.0
+}
+
+fn numeric_json(value: f64) -> serde_json::Value {
+    serde_json::Number::from_f64(round_metric(value))
+        .map(serde_json::Value::Number)
+        .unwrap_or(serde_json::Value::Null)
+}
+
+fn reliability_caveat(n: usize, tier: &ReliabilityTier) -> Option<String> {
+    match tier {
+        ReliabilityTier::Insufficient => Some(format!(
+            "N={n} is below the reportable floor; treat setup opportunity as low-confidence context."
+        )),
+        ReliabilityTier::Directional => {
+            Some(format!("N={n} is directional; include caveats with any opportunity read."))
+        }
+        ReliabilityTier::Reportable => None,
+    }
+}
+
+fn session_scope_from_query(query: &TraderContextFitQuery) -> SessionScopeFilter {
+    SessionScopeFilter {
+        session_type: query.session_type.clone(),
+        session_segment: query.session_segment.clone(),
+        ..SessionScopeFilter::default()
+    }
+}
+
+fn opportunity_scope_json(query: &TraderContextFitQuery) -> serde_json::Value {
+    let mut scope = serde_json::Map::new();
+    if let Some(setup_id) = &query.setup_id {
+        scope.insert("setupId".to_string(), json!(setup_id));
+    }
+    if let Some(session_type) = &query.session_type {
+        scope.insert("sessionType".to_string(), json!(session_type));
+    }
+    if let Some(session_segment) = &query.session_segment {
+        scope.insert("sessionSegment".to_string(), json!(session_segment));
+    }
+    serde_json::Value::Object(scope)
+}
+
+fn build_setup_outcome(
+    db: &Database,
+    query: &TraderContextFitQuery,
+) -> Result<(serde_json::Value, Vec<serde_json::Value>), MemoryError> {
+    let Some(setup_id) = query.setup_id.as_deref() else {
+        return Ok((
+            serde_json::Value::Null,
+            vec![json!({
+                "kind": "missingSetupId",
+                "reason": "Setup-level opportunity context requires setupId."
+            })],
+        ));
+    };
+    if db.get_setup(setup_id)?.is_none() {
+        return Ok((
+            serde_json::Value::Null,
+            vec![json!({
+                "kind": "unknownSetup",
+                "setupId": setup_id,
+                "reason": "No setup definition exists for this setupId."
+            })],
+        ));
+    }
+
+    let scope = session_scope_from_query(query);
+    let performance =
+        db.signal_performance_filtered(Some(setup_id), None, None, None, None, Some(&scope))?;
+    let total = performance
+        .get("totalSignals")
+        .and_then(|value| value.as_i64())
+        .unwrap_or(0);
+    if total == 0 {
+        return Ok((
+            serde_json::Value::Null,
+            vec![json!({
+                "kind": "noSignalOutcomes",
+                "setupId": setup_id,
+                "reason": "No signal_outcomes rows matched this setup and scope."
+            })],
+        ));
+    }
+
+    let resolved = performance
+        .get("resolved")
+        .and_then(|value| value.as_i64())
+        .unwrap_or(0)
+        .max(0) as usize;
+    let pending = performance
+        .get("pending")
+        .and_then(|value| value.as_i64())
+        .unwrap_or(0)
+        .max(0) as usize;
+    let outcomes =
+        db.list_signal_outcomes_with_context(Some(setup_id), None, None, Some(&scope))?;
+    let mut r_values: Vec<f64> = outcomes.iter().filter_map(|row| row.r_result).collect();
+    let mfe_values: Vec<f64> = outcomes
+        .iter()
+        .filter_map(|row| row.max_favorable_excursion)
+        .collect();
+    let mae_values: Vec<f64> = outcomes
+        .iter()
+        .filter_map(|row| row.max_adverse_excursion)
+        .collect();
+    let tier = reliability_tier(resolved);
+    let mut caveats = Vec::new();
+    if let Some(caveat) = reliability_caveat(resolved, &tier) {
+        caveats.push(caveat);
+    }
+    if pending > 0 {
+        caveats.push("Pending setup signals are reported separately and excluded from resolved opportunity statistics.".to_string());
+    }
+
+    Ok((
+        json!({
+            "setupId": setup_id,
+            "n": resolved,
+            "sampleSize": resolved,
+            "totalSignals": total.max(0) as usize,
+            "resolved": resolved,
+            "pending": pending,
+            "reliabilityTier": tier_string(&tier),
+            "winRate": (resolved > 0).then(|| performance.get("winRate").and_then(|value| value.as_f64())).flatten(),
+            "avgR": (!r_values.is_empty()).then(|| performance.get("avgR").and_then(|value| value.as_f64()).map(round_metric)).flatten(),
+            "medianR": median(&mut r_values),
+            "avgMfe": mean(&mfe_values),
+            "avgMae": mean(&mae_values),
+            "source": "signal_outcomes",
+            "scope": opportunity_scope_json(query),
+            "caveats": caveats,
+        }),
+        Vec::new(),
+    ))
+}
+
+fn compact_context_frame_analog(db: &Database, query: &TraderContextFitQuery) -> serde_json::Value {
+    let Some(snapshot) = &query.context_snapshot else {
+        return json!({
+            "available": true,
+            "source": "get_context_frame",
+            "detailAvailableByCalling": "get_context_frame",
+            "caveats": ["Context-frame analogs are not executed-trade memory."]
+        });
+    };
+
+    let frame = match build_context_frame(
+        db,
+        snapshot,
+        ContextFrameOptions {
+            mode: ContextFrameMode::Live,
+            snapshot_timestamp_ms: query.timestamp_ms,
+            setup_id: query.setup_id.clone(),
+            include_historical: true,
+            ..ContextFrameOptions::default()
+        },
+    ) {
+        Ok(frame) => frame,
+        Err(error) => {
+            return json!({
+                "available": false,
+                "source": "get_context_frame",
+                "detailAvailableByCalling": "get_context_frame",
+                "error": {
+                    "kind": "contextFrameUnavailable",
+                    "message": error,
+                },
+                "caveats": ["Context-frame analogs are not executed-trade memory."]
+            });
+        }
+    };
+
+    let analog = frame
+        .historical_analogs
+        .as_ref()
+        .or(frame.intraday_forward_stats.as_ref());
+    let Some(analog) = analog else {
+        let mut caveats = vec!["Context-frame analogs are not executed-trade memory.".to_string()];
+        caveats.extend(frame.caveats);
+        return json!({
+            "available": false,
+            "source": "get_context_frame",
+            "detailAvailableByCalling": "get_context_frame",
+            "caveats": caveats,
+        });
+    };
+    let mut caveats = vec!["Context-frame analogs are not executed-trade memory.".to_string()];
+    caveats.extend(frame.caveats);
+    json!({
+        "available": true,
+        "source": "get_context_frame",
+        "detailAvailableByCalling": "get_context_frame",
+        "analogSource": analog.source,
+        "effectiveSampleSize": analog.meta.effective_sample_size,
+        "sampleSize": analog.meta.sample_size,
+        "reliabilityTier": tier_string(&analog.meta.reliability_tier),
+        "matchingMode": analog.meta.matching_mode,
+        "topKFallbackUsed": analog.meta.top_k_fallback_used,
+        "closeBackToVwap": analog.close_back_to_vwap,
+        "caveats": caveats,
+    })
+}
+
+fn select_execution_comparison_slice(
+    patterns: &[BehavioralPatternRecord],
+    query: &TraderContextFitQuery,
+) -> Option<serde_json::Value> {
+    patterns
+        .iter()
+        .filter(|pattern| scope_match_score(pattern, query) > 0)
+        .find(|pattern| {
+            !pattern.pattern_type.contains("post_loss")
+                && (pattern.sample_size.max(0) as usize) >= OPPORTUNITY_COMPARISON_FLOOR
+                && metric_f64(pattern, "avgR").is_some()
+        })
+        .map(pattern_to_evidence)
+}
+
+fn build_execution_conflict(
+    setup_outcome: &serde_json::Value,
+    execution_slice: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let opportunity_reliability_tier = setup_outcome
+        .get("reliabilityTier")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let opportunity_n = setup_outcome
+        .get("sampleSize")
+        .or_else(|| setup_outcome.get("n"))
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0) as usize;
+    let opportunity_avg_r = setup_outcome.get("avgR").and_then(|value| value.as_f64());
+    let opportunity_avg_r_json = opportunity_avg_r
+        .map(numeric_json)
+        .unwrap_or(serde_json::Value::Null);
+    if opportunity_n < OPPORTUNITY_COMPARISON_FLOOR || opportunity_avg_r.is_none() {
+        return json!({
+            "detected": false,
+            "reason": "insufficientOpportunitySample",
+            "comparedExecutionSlice": null,
+            "executionAvgR": null,
+            "executionN": null,
+            "opportunityAvgR": opportunity_avg_r_json,
+            "opportunityN": opportunity_n,
+            "opportunityReliabilityTier": opportunity_reliability_tier,
+            "gapR": null,
+        });
+    }
+
+    let Some(execution_slice) = execution_slice else {
+        return json!({
+            "detected": false,
+            "reason": "insufficientExecutionSample",
+            "comparedExecutionSlice": null,
+            "executionAvgR": null,
+            "executionN": null,
+            "opportunityAvgR": opportunity_avg_r_json,
+            "opportunityN": opportunity_n,
+            "opportunityReliabilityTier": opportunity_reliability_tier,
+            "gapR": null,
+        });
+    };
+    let execution_avg_r = execution_slice
+        .get("avgR")
+        .and_then(|value| value.as_f64())
+        .unwrap_or(0.0);
+    let execution_n = execution_slice
+        .get("n")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0) as usize;
+    let opportunity_avg_r = opportunity_avg_r.unwrap_or(0.0);
+    let gap_r = (opportunity_avg_r - execution_avg_r).abs();
+    let signs_differ = opportunity_avg_r.signum() != execution_avg_r.signum()
+        && opportunity_avg_r != 0.0
+        && execution_avg_r != 0.0;
+    let detected = signs_differ && gap_r >= EXECUTION_CONFLICT_MIN_GAP_R;
+    let interpretation = if detected && opportunity_avg_r > 0.0 && execution_avg_r < 0.0 {
+        "Setup signal historically positive; trader's executed result negative."
+    } else if detected && opportunity_avg_r < 0.0 && execution_avg_r > 0.0 {
+        "Trader execution has outperformed weak setup signal history."
+    } else if signs_differ {
+        "Opportunity and execution signs differ, but the average-R gap is below the conflict threshold."
+    } else {
+        "Opportunity and execution averages do not materially conflict."
+    };
+
+    json!({
+        "detected": detected,
+        "reason": if detected { "signMismatch" } else if signs_differ { "nonMaterialGap" } else { "sameDirection" },
+        "comparedExecutionSlice": {
+            "id": execution_slice.get("id").cloned().unwrap_or(serde_json::Value::Null),
+            "patternType": execution_slice.get("patternType").cloned().unwrap_or(serde_json::Value::Null),
+            "n": execution_n,
+            "avgR": numeric_json(execution_avg_r),
+            "reliabilityTier": execution_slice.get("reliabilityTier").cloned().unwrap_or(serde_json::Value::Null),
+        },
+        "executionAvgR": numeric_json(execution_avg_r),
+        "executionN": execution_n,
+        "opportunityAvgR": numeric_json(opportunity_avg_r),
+        "opportunityN": opportunity_n,
+        "opportunityReliabilityTier": opportunity_reliability_tier,
+        "gapR": numeric_json(gap_r),
+        "interpretation": interpretation,
+    })
 }
 
 fn current_risk_context(
@@ -444,6 +777,41 @@ pub fn build_trader_context_fit(
         );
     }
 
+    let include_opportunity = query.include_opportunity.unwrap_or(true);
+    let (setup_outcome, mut opportunity_missing_data) = if include_opportunity {
+        build_setup_outcome(db, &query)?
+    } else {
+        (serde_json::Value::Null, Vec::new())
+    };
+    let context_frame_analog = if include_opportunity {
+        compact_context_frame_analog(db, &query)
+    } else {
+        json!({
+            "available": false,
+            "source": "get_context_frame",
+            "caveats": ["Opportunity context was not requested."]
+        })
+    };
+    let execution_conflict = if include_opportunity {
+        let conflict_slice = select_execution_comparison_slice(&patterns, &query);
+        build_execution_conflict(&setup_outcome, conflict_slice.as_ref())
+    } else {
+        json!({
+            "detected": false,
+            "reason": "opportunityNotRequested",
+            "comparedExecutionSlice": null,
+            "executionAvgR": null,
+            "executionN": null,
+            "opportunityAvgR": null,
+            "opportunityN": null,
+            "opportunityReliabilityTier": null,
+            "gapR": null,
+        })
+    };
+    if !include_opportunity {
+        opportunity_missing_data.clear();
+    }
+
     let risk_context = current_risk_context(db, &query)?;
 
     Ok(TraderContextFit {
@@ -467,15 +835,16 @@ pub fn build_trader_context_fit(
             "missingData": [],
         }),
         opportunity_fit: json!({
-            "summary": "Opportunity data is separate from trader execution.",
-            "setupOutcome": null,
-            "contextFrameAnalog": {
-                "available": true,
-                "source": "get_context_frame",
-                "detailAvailableByCalling": "get_context_frame",
-                "caveats": ["Context-frame analogs are not executed-trade memory."]
+            "summary": if include_opportunity { "Opportunity data is separate from trader execution." } else { "Opportunity data was not requested." },
+            "setupOutcome": setup_outcome,
+            "contextFrameAnalog": context_frame_analog,
+            "executionConflict": execution_conflict,
+            "caveats": if include_opportunity {
+                vec!["Opportunity stats describe setup signals, not trader execution."]
+            } else {
+                vec!["Opportunity context was not requested."]
             },
-            "missingData": []
+            "missingData": opportunity_missing_data
         }),
         coaching_memory: json!({
             "patterns": pattern_ids,
@@ -512,7 +881,7 @@ pub fn build_trader_context_fit(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{Database, SessionRecord, TradeRecord};
+    use crate::db::{Database, SessionRecord, SignalOutcome, TradeRecord};
     use crate::memory::{
         AgentInsightRecord, BehavioralPatternRecord, MemoryFollowupRecord, INSIGHT_CANDIDATE,
     };
@@ -593,6 +962,77 @@ mod tests {
             planned_r_dollars_at_entry: None,
             notes: String::new(),
             source: "test".to_string(),
+        }
+    }
+
+    fn seed_setup(db: &Database, id: &str) {
+        db.upsert_setup(&SetupDefinition {
+            id: id.to_string(),
+            name: id.to_string(),
+            active: true,
+            ..SetupDefinition::default()
+        })
+        .expect("setup");
+    }
+
+    fn signal_outcome_for_date(
+        id: &str,
+        setup_id: &str,
+        session_date: &str,
+        fired_at_ms: f64,
+        outcome: &str,
+        r_result: f64,
+    ) -> SignalOutcome {
+        SignalOutcome {
+            signal_id: id.to_string(),
+            setup_id: setup_id.to_string(),
+            setup_name: Some(setup_id.to_string()),
+            session_date: session_date.to_string(),
+            root_symbol: None,
+            contract_symbol: None,
+            source: "test".to_string(),
+            job_id: None,
+            fired_at_ms,
+            fired_price: 21_000.0,
+            target_price: Some(21_010.0),
+            stop_price: Some(20_990.0),
+            outcome: outcome.to_string(),
+            outcome_at_ms: Some(fired_at_ms + 60_000.0),
+            max_favorable_excursion: Some(if r_result > 0.0 { 1.5 } else { 0.3 }),
+            max_adverse_excursion: Some(if r_result > 0.0 { -0.2 } else { -1.0 }),
+            r_result: Some(r_result),
+            time_to_outcome_ms: Some(60_000.0),
+            rvol_at_fire: None,
+            rvol_bucket_at_fire: None,
+        }
+    }
+
+    fn signal_outcome(
+        id: &str,
+        setup_id: &str,
+        fired_at_ms: f64,
+        outcome: &str,
+        r_result: f64,
+    ) -> SignalOutcome {
+        signal_outcome_for_date(id, setup_id, "2026-05-01", fired_at_ms, outcome, r_result)
+    }
+
+    fn seed_positive_or5_signal_outcomes(db: &Database) {
+        let base_ms = 1_777_644_000_000.0;
+        for idx in 0..32 {
+            let (outcome, r_result) = if idx < 20 {
+                ("target_hit", 1.0)
+            } else {
+                ("stop_hit", -1.0)
+            };
+            db.insert_signal_outcome(&signal_outcome(
+                &format!("or5-signal-{idx}"),
+                "or5",
+                base_ms + (idx as f64 * 60_000.0),
+                outcome,
+                r_result,
+            ))
+            .expect("signal outcome");
         }
     }
 
@@ -803,13 +1243,7 @@ mod tests {
     fn setup_check_or5_matches_json_fixture() {
         let db = test_db();
         db.upsert_session(&session("s1")).expect("session");
-        db.upsert_setup(&SetupDefinition {
-            id: "or5".to_string(),
-            name: "OR5".to_string(),
-            active: true,
-            ..SetupDefinition::default()
-        })
-        .expect("setup");
+        seed_setup(&db, "or5");
         db.upsert_behavioral_pattern(&pattern(
             "win_rate_by_setup:or5",
             "win_rate_by_setup",
@@ -899,5 +1333,326 @@ mod tests {
         ))
         .expect("fixture json");
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn setup_check_or5_opportunity_matches_json_fixture() {
+        let db = test_db();
+        seed_setup(&db, "or5");
+        db.upsert_behavioral_pattern(&pattern(
+            "win_rate_by_setup:or5",
+            "win_rate_by_setup",
+            40,
+            -0.25,
+            json!({ "setupId": "or5" }),
+        ))
+        .expect("pattern");
+        seed_positive_or5_signal_outcomes(&db);
+
+        let fit = build_trader_context_fit(
+            &db,
+            TraderContextFitQuery {
+                intent: TraderContextIntent::SetupCheck,
+                setup_id: Some("or5".to_string()),
+                trading_day: Some("2026-05-01".to_string()),
+                session_type: Some("RTH".to_string()),
+                include_opportunity: Some(true),
+                include_coaching_memory: Some(false),
+                ..TraderContextFitQuery::default()
+            },
+        )
+        .expect("fit");
+
+        let actual = serde_json::to_value(fit).expect("actual json");
+        let expected: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/trader_context_fit/setup_check_or5_opportunity.json"
+        ))
+        .expect("fixture json");
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn opportunity_context_reports_missing_setup_id() {
+        let db = test_db();
+        let fit = build_trader_context_fit(
+            &db,
+            TraderContextFitQuery {
+                setup_id: None,
+                include_opportunity: Some(true),
+                include_coaching_memory: Some(false),
+                ..TraderContextFitQuery::default()
+            },
+        )
+        .expect("fit");
+
+        let missing_kind = fit
+            .opportunity_fit
+            .get("missingData")
+            .and_then(|value| value.as_array())
+            .and_then(|values| values.first())
+            .and_then(|value| value.get("kind"))
+            .and_then(|value| value.as_str());
+        assert_eq!(missing_kind, Some("missingSetupId"));
+    }
+
+    #[test]
+    fn opportunity_context_reports_unknown_setup_id() {
+        let db = test_db();
+        let fit = build_trader_context_fit(
+            &db,
+            TraderContextFitQuery {
+                setup_id: Some("typo-setup".to_string()),
+                include_opportunity: Some(true),
+                include_coaching_memory: Some(false),
+                ..TraderContextFitQuery::default()
+            },
+        )
+        .expect("fit");
+
+        let missing_kind = fit
+            .opportunity_fit
+            .get("missingData")
+            .and_then(|value| value.as_array())
+            .and_then(|values| values.first())
+            .and_then(|value| value.get("kind"))
+            .and_then(|value| value.as_str());
+        assert_eq!(missing_kind, Some("unknownSetup"));
+    }
+
+    #[test]
+    fn opportunity_outcomes_span_history_not_just_query_trading_day() {
+        let db = test_db();
+        seed_setup(&db, "or5");
+        for idx in 0..30 {
+            db.insert_signal_outcome(&signal_outcome_for_date(
+                &format!("april-signal-{idx}"),
+                "or5",
+                "2026-04-01",
+                1_775_052_000_000.0 + (idx as f64 * 60_000.0),
+                "target_hit",
+                1.0,
+            ))
+            .expect("april signal");
+        }
+        for idx in 0..5 {
+            db.insert_signal_outcome(&signal_outcome_for_date(
+                &format!("may-signal-{idx}"),
+                "or5",
+                "2026-05-01",
+                1_777_644_000_000.0 + (idx as f64 * 60_000.0),
+                "stop_hit",
+                -1.0,
+            ))
+            .expect("may signal");
+        }
+
+        let fit = build_trader_context_fit(
+            &db,
+            TraderContextFitQuery {
+                setup_id: Some("or5".to_string()),
+                trading_day: Some("2026-05-01".to_string()),
+                session_type: Some("RTH".to_string()),
+                include_coaching_memory: Some(false),
+                ..TraderContextFitQuery::default()
+            },
+        )
+        .expect("fit");
+
+        assert_eq!(
+            fit.opportunity_fit
+                .get("setupOutcome")
+                .and_then(|value| value.get("n"))
+                .and_then(|value| value.as_u64()),
+            Some(35)
+        );
+        assert!(
+            fit.opportunity_fit
+                .get("setupOutcome")
+                .and_then(|value| value.get("scope"))
+                .and_then(|value| value.get("tradingDay"))
+                .is_none(),
+            "opportunity scope should not report tradingDay as a filter"
+        );
+    }
+
+    #[test]
+    fn execution_conflict_requires_sufficient_opportunity_and_execution_samples() {
+        let db = test_db();
+        seed_setup(&db, "or5");
+        db.upsert_behavioral_pattern(&pattern(
+            "win_rate_by_setup:or5",
+            "win_rate_by_setup",
+            40,
+            -0.25,
+            json!({ "setupId": "or5" }),
+        ))
+        .expect("pattern");
+        for idx in 0..10 {
+            db.insert_signal_outcome(&signal_outcome(
+                &format!("small-signal-{idx}"),
+                "or5",
+                1_777_644_000_000.0 + (idx as f64 * 60_000.0),
+                "target_hit",
+                1.0,
+            ))
+            .expect("signal");
+        }
+
+        let small_opportunity = build_trader_context_fit(
+            &db,
+            TraderContextFitQuery {
+                setup_id: Some("or5".to_string()),
+                trading_day: Some("2026-05-01".to_string()),
+                session_type: Some("RTH".to_string()),
+                include_coaching_memory: Some(false),
+                ..TraderContextFitQuery::default()
+            },
+        )
+        .expect("fit");
+        assert_eq!(
+            small_opportunity
+                .opportunity_fit
+                .get("executionConflict")
+                .and_then(|value| value.get("reason"))
+                .and_then(|value| value.as_str()),
+            Some("insufficientOpportunitySample")
+        );
+
+        let db = test_db();
+        seed_setup(&db, "or5");
+        seed_positive_or5_signal_outcomes(&db);
+        let no_execution = build_trader_context_fit(
+            &db,
+            TraderContextFitQuery {
+                setup_id: Some("or5".to_string()),
+                trading_day: Some("2026-05-01".to_string()),
+                session_type: Some("RTH".to_string()),
+                include_coaching_memory: Some(false),
+                ..TraderContextFitQuery::default()
+            },
+        )
+        .expect("fit");
+        assert_eq!(
+            no_execution
+                .opportunity_fit
+                .get("executionConflict")
+                .and_then(|value| value.get("reason"))
+                .and_then(|value| value.as_str()),
+            Some("insufficientExecutionSample")
+        );
+    }
+
+    #[test]
+    fn execution_conflict_ignores_non_material_sign_difference() {
+        let db = test_db();
+        seed_setup(&db, "or5");
+        db.upsert_behavioral_pattern(&pattern(
+            "win_rate_by_setup:or5",
+            "win_rate_by_setup",
+            40,
+            -0.05,
+            json!({ "setupId": "or5" }),
+        ))
+        .expect("pattern");
+        let base_ms = 1_777_644_000_000.0;
+        for idx in 0..20 {
+            let (outcome, r_result) = if idx < 11 {
+                ("target_hit", 1.0)
+            } else {
+                ("stop_hit", -1.0)
+            };
+            db.insert_signal_outcome(&signal_outcome(
+                &format!("small-gap-signal-{idx}"),
+                "or5",
+                base_ms + (idx as f64 * 60_000.0),
+                outcome,
+                r_result,
+            ))
+            .expect("signal");
+        }
+
+        let fit = build_trader_context_fit(
+            &db,
+            TraderContextFitQuery {
+                setup_id: Some("or5".to_string()),
+                trading_day: Some("2026-05-01".to_string()),
+                session_type: Some("RTH".to_string()),
+                include_coaching_memory: Some(false),
+                ..TraderContextFitQuery::default()
+            },
+        )
+        .expect("fit");
+
+        let conflict = fit
+            .opportunity_fit
+            .get("executionConflict")
+            .expect("conflict");
+        assert_eq!(
+            conflict.get("detected").and_then(|value| value.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            conflict.get("reason").and_then(|value| value.as_str()),
+            Some("nonMaterialGap")
+        );
+    }
+
+    #[test]
+    fn execution_conflict_slice_is_not_limited_by_display_budget() {
+        let db = test_db();
+        seed_setup(&db, "or5");
+        seed_positive_or5_signal_outcomes(&db);
+        db.upsert_behavioral_pattern(&pattern(
+            "post_loss_after_one:setup:or5",
+            "post_loss_after_one",
+            40,
+            -0.6,
+            json!({ "setupId": "or5", "postLossState": "afterOneLoss" }),
+        ))
+        .expect("post loss one");
+        db.upsert_behavioral_pattern(&pattern(
+            "post_loss_after_two_plus:setup:or5",
+            "post_loss_after_two_plus",
+            40,
+            -0.7,
+            json!({ "setupId": "or5", "postLossState": "afterTwoPlusLosses" }),
+        ))
+        .expect("post loss two");
+        db.upsert_behavioral_pattern(&pattern(
+            "win_rate_by_setup:or5",
+            "win_rate_by_setup",
+            40,
+            -0.25,
+            json!({ "setupId": "or5" }),
+        ))
+        .expect("setup pattern");
+
+        let fit = build_trader_context_fit(
+            &db,
+            TraderContextFitQuery {
+                intent: TraderContextIntent::TradeTaken,
+                setup_id: Some("or5".to_string()),
+                trading_day: Some("2026-05-01".to_string()),
+                session_type: Some("RTH".to_string()),
+                include_coaching_memory: Some(false),
+                ..TraderContextFitQuery::default()
+            },
+        )
+        .expect("fit");
+
+        let matching_len = fit
+            .execution_fit
+            .get("matchingSlices")
+            .and_then(|value| value.as_array())
+            .map(Vec::len);
+        assert_eq!(matching_len, Some(2));
+        assert_eq!(
+            fit.opportunity_fit
+                .get("executionConflict")
+                .and_then(|value| value.get("comparedExecutionSlice"))
+                .and_then(|value| value.get("id"))
+                .and_then(|value| value.as_str()),
+            Some("win_rate_by_setup:or5")
+        );
     }
 }

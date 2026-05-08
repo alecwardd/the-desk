@@ -8850,7 +8850,7 @@ impl TheDeskMcp {
     }
 
     #[tool(
-        description = "Day type classification (Dalton): Normal, NormalVariation, Neutral, Trend, or DoubleDistribution. Profile shape: Gaussian, PShape, BShape, DShape. Balance state: Balanced vs Imbalanced. Single prints direction relative to POC."
+        description = "Day type classification (Dalton): NonTrend, Normal, NormalVariation, Neutral/NeutralCenter/NeutralExtreme, Trend, or DoubleDistributionTrend. Profile shape: Gaussian, PShape, BShape, DShape, or Elongated. Balance state: Balanced vs Imbalanced. Single prints direction relative to POC."
     )]
     async fn get_day_type(&self) -> Result<CallToolResult, McpError> {
         let db = self.db.lock().map_err(|_| lock_error())?;
@@ -10754,12 +10754,13 @@ fn finalize_rth_close(
     }
 
     let close_data = {
-        let p = pipelines
+        let mut p = pipelines
             .lock()
             .map_err(|_| RthCloseFinalizeError::PipelineLockUnavailable("snapshot"))?;
         if !p.levels.rth_started() {
             return Ok(None);
         }
+        p.refresh_day_type_classification();
         let close_ts = p
             .tape_pace
             .last_trade_timestamp_ms()

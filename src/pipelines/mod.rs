@@ -16,7 +16,10 @@ mod trade_size;
 mod vwap;
 
 pub use absorption::{AbsorptionEvent, AbsorptionPipeline, RecentSignalSnapshot};
-pub use day_type::{BalanceState, DayType, DayTypeClassifier, ProfileShape, SinglePrintsDirection};
+pub use day_type::{
+    day_type_label_aliases, normalize_day_type_label, normalize_profile_shape_label, BalanceState,
+    DayType, DayTypeClassifier, ProfileShape, SinglePrintsDirection,
+};
 pub use delta::DeltaPipeline;
 pub use event_detector::{EventDetector, MarketEvent, IB_EXTENSION_RATIO};
 pub use flow_event_emitter::FlowEventEmitter;
@@ -574,21 +577,30 @@ impl PipelineEngine {
 
         // Periodically update day type classifier (every ~30 trades to avoid overhead)
         if self.vwap.trade_count().is_multiple_of(30) {
-            let tpo_counts = self.tpo.tpo_count_by_price();
-            let single_prints = self.tpo.single_print_prices();
-            self.day_type.update(
-                &tpo_counts,
-                self.tpo.va_high(),
-                self.tpo.va_low(),
-                self.tpo.poc(),
-                self.tpo.ib_high(),
-                self.tpo.ib_low(),
-                self.levels.session_high,
-                self.levels.session_low,
-                &single_prints,
-            );
+            self.refresh_day_type_classification();
         }
         self.last_trade_price = Some(price);
+    }
+
+    /// Recompute day-type classification from the latest TPO state.
+    ///
+    /// The live path updates this periodically for low overhead, but final RTH
+    /// close/backfill snapshots should force a fresh read before persistence.
+    pub fn refresh_day_type_classification(&mut self) {
+        let tpo_counts = self.tpo.tpo_count_by_price();
+        let single_prints = self.tpo.single_print_prices();
+        self.day_type.update(
+            &tpo_counts,
+            self.tpo.va_high(),
+            self.tpo.va_low(),
+            self.tpo.poc(),
+            self.tpo.ib_high(),
+            self.tpo.ib_low(),
+            self.levels.session_high,
+            self.levels.session_low,
+            self.levels.last_price,
+            &single_prints,
+        );
     }
 
     /// Build current market state snapshot.

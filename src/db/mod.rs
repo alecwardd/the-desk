@@ -6,6 +6,7 @@ use crate::memory::{
 };
 use crate::observability::{RuntimeEvent, RuntimeEventFilter, RuntimeEventLevel};
 use crate::outcomes::{self, OutcomeDirection};
+use crate::pipelines::day_type_label_aliases;
 use crate::pipelines::event_detector::MarketEvent;
 use crate::risk::RiskState;
 use crate::rules::{
@@ -8131,8 +8132,19 @@ impl Database {
             bind_values.push(Box::new(ed.to_string()));
         }
         if let Some(dt) = day_type_filter {
-            conditions.push(format!("day_type = ?{}", bind_values.len() + 1));
-            bind_values.push(Box::new(dt.to_string()));
+            let aliases = day_type_label_aliases(dt);
+            if aliases.is_empty() {
+                conditions.push(format!("day_type = ?{}", bind_values.len() + 1));
+                bind_values.push(Box::new(dt.to_string()));
+            } else {
+                let mut placeholders = Vec::new();
+                for alias in aliases {
+                    let idx = bind_values.len() + 1;
+                    bind_values.push(Box::new(alias.to_string()));
+                    placeholders.push(format!("?{idx}"));
+                }
+                conditions.push(format!("day_type IN ({})", placeholders.join(", ")));
+            }
         }
         if let Some(st) = session_type_filter {
             conditions.push(format!("session_type = ?{}", bind_values.len() + 1));

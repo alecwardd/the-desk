@@ -1029,6 +1029,7 @@ where
     state.progress.current_session_date = Some(session_date.to_string());
     on_progress(&state.progress);
 
+    state.pipeline.refresh_day_type_classification();
     let snapshot = state
         .pipeline
         .snapshot_for_detection(bid, ask, exit_time_ms);
@@ -1193,6 +1194,7 @@ where
                 r_value_points,
             );
         }
+        state.pipeline.refresh_day_type_classification();
         let snapshot = if params.run_rules {
             state.pipeline.snapshot_at(bid, ask, exit_time_ms)
         } else {

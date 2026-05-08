@@ -4,6 +4,7 @@ pub mod hypothesis;
 use crate::db::{Database, SessionScopeFilter};
 use crate::depth::DomSummary;
 use crate::outcomes;
+use crate::pipelines::{normalize_day_type_label, normalize_profile_shape_label};
 use serde::{Deserialize, Serialize};
 
 /// Named percentile convention used by all research distribution queries.
@@ -719,7 +720,18 @@ pub fn conditional_probability(
                     }
                     _ => continue,
                 };
-                if field_val == outcome_value {
+                let matches_outcome = match outcome_field {
+                    "day_type" => {
+                        normalize_day_type_label(field_val)
+                            == normalize_day_type_label(outcome_value)
+                    }
+                    "profile_shape" => {
+                        normalize_profile_shape_label(field_val)
+                            == normalize_profile_shape_label(outcome_value)
+                    }
+                    _ => field_val == outcome_value,
+                };
+                if matches_outcome {
                     outcome_met += 1;
                 }
             } else {
@@ -888,7 +900,17 @@ pub fn signal_outcome_conditional(
                     .unwrap_or(""),
                 _ => continue,
             };
-            if field_val != field_value {
+            let matches_field = match session_field {
+                "day_type" => {
+                    normalize_day_type_label(field_val) == normalize_day_type_label(field_value)
+                }
+                "profile_shape" => {
+                    normalize_profile_shape_label(field_val)
+                        == normalize_profile_shape_label(field_value)
+                }
+                _ => field_val == field_value,
+            };
+            if !matches_field {
                 continue;
             }
             condition_met += 1;
@@ -1243,7 +1265,9 @@ pub fn compare_sessions_multi_with_meta(
 
     let current_ib = query.ib_range.unwrap_or(0.0);
     let current_day = query.day_type.as_deref().unwrap_or("");
+    let current_day_norm = normalize_day_type_label(current_day);
     let current_profile = query.profile_shape.as_deref().unwrap_or("");
+    let current_profile_norm = normalize_profile_shape_label(current_profile);
     let current_balance = query.balance_state.as_deref().unwrap_or("");
     let current_rvol = query.rvol_ratio.unwrap_or(1.0);
     let current_delta_sign = query.session_delta_sign.as_deref().unwrap_or("");
@@ -1261,17 +1285,20 @@ pub fn compare_sessions_multi_with_meta(
             };
 
             let ib_norm = ((s.ib_range - current_ib).abs() / ib_range_span) * w.ib_range;
-            let day_penalty = if current_day.is_empty() || s.day_type == current_day {
+            let day_penalty = if current_day.is_empty()
+                || normalize_day_type_label(&s.day_type) == current_day_norm
+            {
                 0.0
             } else {
                 w.day_type
             };
-            let profile_penalty =
-                if current_profile.is_empty() || s.profile_shape == current_profile {
-                    0.0
-                } else {
-                    w.profile_shape
-                };
+            let profile_penalty = if current_profile.is_empty()
+                || normalize_profile_shape_label(&s.profile_shape) == current_profile_norm
+            {
+                0.0
+            } else {
+                w.profile_shape
+            };
             let balance_penalty =
                 if current_balance.is_empty() || s.balance_state == current_balance {
                     0.0

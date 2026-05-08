@@ -1,6 +1,6 @@
 pub mod setup_templates;
 
-use crate::pipelines::MarketState;
+use crate::pipelines::{normalize_day_type_label, normalize_profile_shape_label, MarketState};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -730,14 +730,15 @@ fn evaluate_typed_condition(
         ConditionField::DayType => {
             if let ConditionValue::Text(expected) = &cond.value {
                 let actual = format!("{:?}", market.day_type);
-                return actual.to_lowercase() == expected.to_lowercase();
+                return normalize_day_type_label(&actual) == normalize_day_type_label(expected);
             }
             return false;
         }
         ConditionField::ProfileShape => {
             if let ConditionValue::Text(expected) = &cond.value {
                 let actual = format!("{:?}", market.profile_shape);
-                return actual.to_lowercase() == expected.to_lowercase();
+                return normalize_profile_shape_label(&actual)
+                    == normalize_profile_shape_label(expected);
             }
             return false;
         }

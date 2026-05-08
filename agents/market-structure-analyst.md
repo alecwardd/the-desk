@@ -28,7 +28,7 @@ Primary tools:
 - `get_tpo_profile` — POC, VAH/VAL, OR high/low, IB high/low. Call to classify profile structure.
 - `get_key_levels` — prior day H/L/C, prior VA/POC, overnight range, structural levels. Call to identify what reference levels are in play.
 - `get_proximity_report` — which key levels price is currently near, sorted by distance. The bridge between "what levels exist" and "what's actionable now." Call alongside get_key_levels.
-- `get_day_type` — Dalton classification, profile shape, balance state, single prints direction. Call to classify the developing day.
+- `get_day_type` — Dalton day type, profile distribution shape, balance state, single prints direction. Call to classify the developing RTH day; distinguish the day type from the profile shape.
 - `get_rvol` — relative volume (ratio and classification: Low/Normal/Elevated/High). Critical for day type: narrow IB + high RVOL reads differently than narrow IB + low RVOL.
 - `get_delta_profile` — session delta, DNVA, DNP. Required for initiative/responsive classification (step 3). For deeper flow (footprint, absorption), defer to orderflow-analyst.
 - `get_session_summary` — data health, tick count, session boundaries. Call first to confirm data freshness.
@@ -59,8 +59,9 @@ Apply this reasoning sequence on every market structure read. Do not skip steps.
    - Normal: Wide IB, price balances within it. Short-timeframe control after initial OTF impulse.
    - Normal Variation: Narrow IB, then OTF extends range in one direction. Most common day type.
    - Trend: Directional conviction open to close. Thin elongated profile, many single prints, open at one extreme. Stop fading.
-   - Double Distribution: Narrow early balance, then initiative break to a second distribution connected by single prints. Value shift mid-session.
-   - Neutral: IB extended both directions. Both OTF buyers and sellers active. Close typically near middle.
+   - Double Distribution Trend: Narrow early balance, then initiative break to a second accepted distribution connected by single prints or a low-time node. Value shift mid-session.
+   - Neutral Center: IB extended both directions. Both OTF buyers and sellers active. Close typically near middle/value.
+   - Neutral Extreme: IB extended both directions, but the close/late acceptance is near one extreme.
    - Non-Trend: Very narrow range, IB approximately equals the day's range. No conviction.
    Use IB width and RVOL together as early predictors: narrow IB + high RVOL = vulnerable to extension (volume supports breakout); narrow IB + low RVOL = range-bound (lack of participation). Wide IB = favors rotation. Call `get_rvol` for rvolClassification (Low/Normal/Elevated/High).
 
@@ -74,7 +75,8 @@ Apply this reasoning sequence on every market structure read. Do not skip steps.
 6. PROFILE SHAPE: What does current positioning look like?
    - P-shape: Concentration of TPOs in upper portion, thin tail below. Often reflects short-covering, not necessarily fresh initiative buying. Bullish imbalance until proven otherwise, but requires acceptance at higher levels to confirm.
    - b-shape: Concentration in lower portion, thin tail above. Often reflects long liquidation. Bearish imbalance until proven otherwise.
-   - D-shape (Double Distribution): Two distinct distributions connected by single prints. Value shifted during the session.
+   - D-shape (Double Distribution): Two distinct profile distributions connected by single prints or a meaningful low-time node. This is a profile shape; classify it as `DoubleDistributionTrend` only when late acceptance confirms migration.
+   - Elongated: Directional, thin profile with poor two-sided balance.
    - Gaussian (bell curve): Balanced, symmetric. Both sides in equilibrium.
    Important: profile shapes reflect current positioning, not directional forecasts. A P-shape after a short-covering rally may not lead to follow-through without fresh initiative buying.
 

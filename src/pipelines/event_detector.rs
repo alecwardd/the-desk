@@ -369,7 +369,7 @@ impl EventDetector {
         }
 
         // --- IB extension events ---
-        if state.ib_high > 0.0 && state.ib_low > 0.0 {
+        if self.ib_formed && state.ib_high > 0.0 && state.ib_low > 0.0 {
             let ib_range = state.ib_high - state.ib_low;
             if ib_range > 0.0 {
                 let extensions = [
@@ -1260,6 +1260,44 @@ mod tests {
         assert!(
             !events2.iter().any(|e| e.event_type == "ib_formed"),
             "should only fire once"
+        );
+    }
+
+    #[test]
+    fn does_not_detect_ib_extension_before_ib_is_formed() {
+        let mut detector = EventDetector::new();
+        let date = "2026-02-26";
+
+        let mut inside = base_state();
+        inside.last_price = 21000.0;
+        detector.detect(&inside, 1000.0, date, 10);
+
+        let mut extended = base_state();
+        extended.last_price = 21045.0; // above 0.5x high extension for 20980..21020
+        let events = detector.detect(&extended, 2000.0, date, 11);
+
+        assert!(
+            !events.iter().any(|e| e.event_type == "ib_extension_hit"),
+            "IB extension events should wait for the completed 60-minute IB"
+        );
+    }
+
+    #[test]
+    fn detects_ib_extension_after_ib_is_formed() {
+        let mut detector = EventDetector::new();
+        let date = "2026-02-26";
+
+        let mut inside = base_state();
+        inside.last_price = 21000.0;
+        detector.detect(&inside, 1000.0, date, 60);
+
+        let mut extended = base_state();
+        extended.last_price = 21045.0; // above 0.5x high extension for 20980..21020
+        let events = detector.detect(&extended, 2000.0, date, 61);
+
+        assert!(
+            events.iter().any(|e| e.event_type == "ib_extension_hit"),
+            "IB extension should fire after IB formation"
         );
     }
 

@@ -1,10 +1,19 @@
 use schemars::JsonSchema;
 use serde::Deserialize;
 
+fn json_object_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "object",
+        "additionalProperties": true
+    })
+}
+
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RegisterHypothesisParams {
+    #[schemars(schema_with = "json_object_schema")]
     pub metadata: serde_json::Value,
+    #[schemars(schema_with = "json_object_schema")]
     #[serde(alias = "setup_definition")]
     pub setup_definition: serde_json::Value,
     #[serde(default, alias = "dry_run")]

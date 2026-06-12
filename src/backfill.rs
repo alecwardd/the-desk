@@ -1081,7 +1081,16 @@ fn prepare_backfill_setups(
     let filtered = if let Some(ref ids) = params.setup_ids {
         setups
             .into_iter()
-            .filter(|setup| ids.contains(&setup.id))
+            .filter_map(|mut setup| {
+                if ids.contains(&setup.id) {
+                    // Explicit historical jobs may evaluate inactive hypothesis
+                    // setups without activating them for live playbook alerts.
+                    setup.active = true;
+                    Some(setup)
+                } else {
+                    None
+                }
+            })
             .collect()
     } else {
         setups.into_iter().filter(|setup| setup.active).collect()
@@ -1594,6 +1603,38 @@ mod tests {
         assert!(start.is_some());
         assert!(end.is_some());
         assert!(end.unwrap() > start.unwrap());
+    }
+
+    #[test]
+    fn explicit_setup_ids_are_activated_for_replay_only() {
+        let db = Database::open(":memory:").expect("db");
+        db.upsert_setup(&SetupDefinition {
+            id: "hypothesis_setup".to_string(),
+            name: "Hypothesis Setup".to_string(),
+            active: false,
+            ..Default::default()
+        })
+        .expect("setup");
+
+        let params = BackfillJobParams {
+            job_id: "job-1".to_string(),
+            job_type: HistoricalJobType::Backtest,
+            start_date: None,
+            end_date: None,
+            force: true,
+            run_rules: true,
+            setup_ids: Some(vec!["hypothesis_setup".to_string()]),
+        };
+
+        let replay_setups = prepare_backfill_setups(&db, &params).expect("setups");
+        assert_eq!(replay_setups.len(), 1);
+        assert!(replay_setups[0].active);
+
+        let persisted = db
+            .get_setup("hypothesis_setup")
+            .expect("query")
+            .expect("persisted setup");
+        assert!(!persisted.active);
     }
 
     #[test]

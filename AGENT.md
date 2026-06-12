@@ -108,7 +108,7 @@ When implementing a feature:
 3. **Write tests** alongside the code — every pipeline must have unit tests
 4. **Integrate with `PipelineEngine`** if adding a new pipeline (update `mod.rs`, `MarketState`, `snapshot()`)
 5. **Add `ConditionField` variants** if the rules engine needs to evaluate the new data
-6. **Add MCP tool** in `src/bin/the-desk-mcp.rs` if agents need access
+6. **Add MCP tool** in the matching domain module under `src/bin/the-desk-mcp/tools/` if agents need access (checklist: `docs/mcp/README.md`), then regenerate `docs/mcp/tool-reference.md`
 7. **Run `cargo test`** before declaring done
 
 ---
@@ -196,7 +196,13 @@ Rules:
 
 ## MCP Tools Reference
 
-The MCP server (`src/bin/the-desk-mcp.rs`) exposes 120 MCP tools across 13 categories.
+The MCP server (`src/bin/the-desk-mcp/`, domain modules under `tools/`) exposes 120 MCP tools across 9 domains.
+
+**Canonical references (read these, in order):**
+
+1. **`skills/mcp-tools/SKILL.md`** — scenario → tool routing ("which tool do I call when…"). Start here.
+2. **`docs/mcp/tool-reference.md`** — exhaustive generated catalog of every tool with its full description. Never stale: generated from the compiled server (`cargo run --bin the-desk-mcp -- --write-tool-docs`) and guarded by the `tool_reference_doc_is_current` test.
+3. **`docs/mcp/README.md`** — server architecture and the add-a-tool checklist.
 
 ### Live vs Historical — Quick Reference
 
@@ -211,99 +217,21 @@ The MCP server (`src/bin/the-desk-mcp.rs`) exposes 120 MCP tools across 13 categ
 
 **Data dependency:** Historical tools return empty or minimal data until `backfill_history` has populated the database. Call `get_research_summary` first to check session count; if low, run backfill before deep analysis.
 
-### Full Tool List by Category
+### Full Tool List
 
-| Category | Tools | Description |
-|----------|-------|-------------|
-| **Snapshot** | `get_market_snapshot` | Current price, VWAP, session state |
-| | `get_session_context` | Session type (RTH/Globex), segment (Asia/London), trading day, data freshness |
-| | `get_session_summary` | Total tick count, latest tick timestamp, latest pipeline snapshot (health check) |
-| | `get_feed_health` | SCID path status, file metadata, ingest lag, freshness diagnostics |
-| | `get_runtime_events` | Recent structured MCP runtime diagnostics for post-mortems |
-| | `get_contract_rollover_status` | Pre-session contract roll validation: active contract, prior reference contract, and whether carry-forward levels are authoritative |
-| | `validate_contract_rollover` | Validation alias for `get_contract_rollover_status` for pre-session safety gates |
-| | `get_snapshot_at` | Historical pipeline snapshot nearest to a given timestamp |
-| | `get_context_frame` | Session-relative framing with stable buckets, historical analogs, reliability caveats, and optional setup outcomes |
-| **Structure** | `get_tpo_profile` | POC, value area, opening range, initial balance |
-| | `get_tpo_detail` | Per-price TPO letter detail (which brackets printed where, single prints) |
-| | `get_delta_profile` | Session delta, DNVA, DNP |
-| | `get_delta_at_price` | Delta at a specific price level + top N prices by absolute delta |
-| | `get_key_levels` | Prior day H/L/C, prior VA/POC, overnight H/L, Globex OR30, London OR60, IB |
-| **Microstructure** | `get_tape_pace` | Rolling ticks/sec, volume/sec, acceleration, pace percentile, dwell time |
-| | `get_footprint` | Volume-at-price for current session (bid/ask/delta per level) |
-| | `get_footprint_window` | Time-windowed footprint for a specific time range |
-| | `get_imbalances` | Stacked and diagonal imbalance detection from footprint |
-| | `get_absorption_events` | Absorption/exhaustion events with severity scores |
-| | `get_trade_size_profile` | Trade size distribution (1-lot, 2-5, 6-20, 21+), institutional clustering |
-| **PTT Indicators** | `get_or5_status` | 5-min Opening Range: levels, break direction, mid retest, extension targets |
-| | `get_rvol` | Relative volume vs N-day average at same time-of-day |
-| | `get_day_type` | Day type (Normal/Trend/etc.), profile shape, balance state, single prints |
-| | `get_rebid_reoffer_zones` | Active acceleration zones with status (Fresh/Retested/Held/Failed) |
-| | `get_pinch_events` | Delta momentum reversals across 1m/5m/15m/30m timeframes |
-| | `get_session_inventory` | Cross-session delta inventory (Building/Clearing/Neutral), trend count |
-| **Rules** | `evaluate_playbook` | All active setups vs current market state (met/approaching/notActive) |
-| | `get_setup_context` | Full context for a named setup (OR5, delta, RVOL, day type, zones, risk) |
-| | `check_delta_confirmation` | Session + price-level delta confirmation for a trade direction |
-| | `get_setup_state_history` | Durable setup state/progress transitions for restart and lifecycle review |
-| | `acknowledge_setup_prompt` | Mark discretionary confirmation as acknowledged for a setup lifecycle |
-| | `mark_setup_in_trade` | Mark a setup lifecycle as in-trade |
-| | `close_setup_state` | Close a setup lifecycle state |
-| **Attention** | `get_attention_inbox` | Ranked proactive inbox. First call for "what deserves attention now?" |
-| | `get_signal_detail` | Full evidence, priority breakdown, linked setup/risk context, and suggested next tools for one signal |
-| | `acknowledge_attention_signal` | Mark an attention signal reviewed by trader or agent |
-| | `what_changed_since` | Cursor-based catch-up feed for structure/setup/risk changes since a prior cursor |
-| | `get_attention_changelog` | Replay signal lifecycle deltas: created, priority changed, acknowledged, expired, invalidated, notified |
-| | `get_active_trade_ideas` | Current idea-card overlays derived from playbook setup lifecycle and attention signals |
-| | `mark_trade_idea_confirmed` | Mark a trade idea confirmed with evidence |
-| | `mark_trade_idea_invalidated` | Mark a trade idea invalidated with a reason |
-| | `mark_trade_idea_in_trade` | Mark a trade idea as in-trade, optionally linked to a signal outcome |
-| | `mark_trade_idea_resolved` | Mark a trade idea resolved with an outcome note |
-| **Risk** | `get_risk_state` | Daily P&L in R, trade count, streaks, drawdown, at-limit status |
-| | `get_risk_config` | R-value, max daily loss, circuit breaker, trade limits |
-| | `save_risk_config` | Persist risk configuration (partial updates supported) |
-| | `init_risk_state` | Initialize/reset risk state for new session |
-| | `get_account_state` | Last balance, open positions, Lucid params, profit goals |
-| | `save_account_state` | Persist account state (partial updates supported) |
-| | `get_kelly_position_size` | 1/4 Kelly sizing with confidence scaling |
-| | `get_signal_performance` | Win rate, avg R, resolved/pending, target/stop/time-exit counts |
-| | `record_trade_result` | Record closed trade, update risk state |
-| **Data** | `query_ticks` | Raw tick data queries |
-| | `get_proximity_report` | Which key levels is price near (sorted by distance) |
-| **Integrity** | `validate_data_integrity` | Tick count, freshness, pipeline consistency invariants |
-| **Research** | `query_event_frequency` | How often does event X occur across sessions? |
-| | `query_conditional` | When X happens N+ times, how often does Y occur? |
-| | `query_distribution` | Distribution stats for a numeric metric (mean, median, percentiles) |
-| | `get_setup_performance_matrix` | Per-setup performance table (win rate, avg R, counts) |
-| | `query_signal_outcome_distribution` | R-result distribution for a setup's signal outcomes |
-| | `query_signal_outcome_conditional` | Conditional win rate for signals filtered by session attributes |
-| | `query_signal_outcome_excursions` | MFE/MAE/time-to-outcome diagnostics for signal outcomes |
-| | `compare_sessions` | Multi-dimensional similarity matching against historical sessions |
-| | `get_session_history` | Query past session summaries with optional filters |
-| | `get_research_summary` | Pre-session statistical briefing (session count, IB dist, day types) |
-| **Hypotheses** | `register_hypothesis` | Validate or register an inactive per-version hypothesis setup from a typed `SetupDefinition` plus metadata |
-| | `list_hypotheses` | Query registered hypotheses by lifecycle so agents do not repeat failed/rejected ideas |
-| | `summarize_hypothesis_run` | Summarize one completed hypothesis backtest by explicit `setupId` and `jobId` |
-| | `propose_draft_setup` | Apply the strict promotion gate and transition passing hypotheses to inactive drafts |
-| | `activate_draft_setup` | Activate a draft setup after human confirmation and engine-version freshness check |
-| | `set_hypothesis_lifecycle` | Mark a hypothesis/draft as `rejectedByHuman` or `retired` with a reason |
-| **Backfill** | `backfill_history` | Queue historical backfill job (all 14 pipelines + event detection) |
-| | `run_backtest` | Queue backtest replay job (rules engine over historical data) |
-| | `get_backfill_status` | Poll progress for backfill/backtest jobs |
-| | `cancel_backfill` | Cancel in-flight backfill/backtest job |
-| | `get_backtest_results` | Retrieve stored backtest runs with metrics |
-| | `compare_backtests` | Compare two or more backtest runs side-by-side |
-| **Memory** | `get_memory_brief` | Ranked carry-forward memory by intent (session_start, setup_check, trade_review, weekly_review). Read-only — call `refresh_memory_state` first when `memoryMaintenance.refreshSuggested` is true or after memory-affecting writes (trades, reviews, imports) in the same flow. |
-| | `get_pre_session_briefing` | Memory brief + account + risk state for session start. When maintenance is dirty, performs one bounded `refresh_memory_state` (patterns + insight lifecycle) before building the brief unless `skipMemoryRefreshIfDirty` is true. Response includes `memoryAutoRefreshed`. |
-| | `get_trader_context_fit` | Typed trader memory envelope by intent. Separates executed-trade memory, setup opportunity, coaching reminders, live post-loss/ordinal state, reliability, and provenance. Memory reports context only and must not adjust sizing by itself. |
-| | `refresh_memory_state` | Explicit refresh of behavioral patterns and/or insight lifecycle; clears dirty flags. Use before `get_memory_brief` when ranked memory must reflect recent journal or trade changes. |
-| | `save_agent_insight` | Persist LLM-authored insight (candidate/validated lifecycle) |
-| | `recall_agent_insights` | Query insights by category, setup, status |
-| | `acknowledge_agent_insight` | Mark insight surfaced/helpful/irrelevant/wrong/pin |
-| | `create_memory_followup` | Open follow-up for next session |
-| | `resolve_memory_followup` | Close follow-up with optional note |
-| | `detect_behavioral_patterns` | Run deterministic pattern detection |
-| | `get_behavioral_patterns` | Query detected patterns |
-| **Storage** | `archive_status` | Hot/warm/cold tier sizes, session count, last archive date |
+The complete per-tool catalog lives in **`docs/mcp/tool-reference.md`** (generated — do not edit by hand). Domains and counts:
+
+| Domain | Tools | Module |
+|--------|-------|--------|
+| Market | 24 | `src/bin/the-desk-mcp/tools/market.rs` |
+| DOM | 10 | `src/bin/the-desk-mcp/tools/dom.rs` |
+| Options | 3 | `src/bin/the-desk-mcp/tools/options.rs` |
+| Playbook | 16 | `src/bin/the-desk-mcp/tools/playbook.rs` |
+| Risk | 9 | `src/bin/the-desk-mcp/tools/risk.rs` |
+| Journal | 12 | `src/bin/the-desk-mcp/tools/journal.rs` |
+| Memory | 12 | `src/bin/the-desk-mcp/tools/memory.rs` |
+| Research | 23 | `src/bin/the-desk-mcp/tools/research.rs` |
+| Admin | 11 | `src/bin/the-desk-mcp/tools/admin.rs` |
 
 ### Agent-to-Capability Mapping
 

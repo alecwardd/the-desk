@@ -90,7 +90,7 @@ Use `get_feed_health` and `validate_data_integrity` to confirm feed freshness an
 the-desk/
 ├── Cargo.toml                  # Rust package (default-run: the-desk-mcp)
 ├── src/
-│   ├── bin/the-desk-mcp.rs     # MCP server binary
+│   ├── bin/the-desk-mcp/       # MCP server binary (9 tool domain modules)
 │   ├── lib.rs                  # Module exports
 │   ├── backfill.rs             # Historical .scid backfill engine
 │   ├── research/mod.rs         # Query engine (frequency, conditional, distribution)

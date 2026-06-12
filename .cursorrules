@@ -29,12 +29,14 @@ You are working on The Desk, a backend intelligence platform for discretionary N
 - MCP tools use `rmcp` with `#[tool_router]` / `#[tool_handler]` macros
 - Tool params: `Parameters(params): Parameters<T>` where T derives `Deserialize + JsonSchema + Default`
 
-### MCP Server (`src/bin/the-desk-mcp.rs`)
+### MCP Server (`src/bin/the-desk-mcp/`)
 
-- Tools exposed via stdio transport
-- All tools return `Result<CallToolResult, McpError>`
+- 120 tools in 9 domain modules under `tools/` (market, dom, options, playbook, risk, journal, memory, research, admin)
+- Tools exposed via stdio transport; all return `Result<CallToolResult, McpError>`
 - Database access through `Arc<Mutex<Database>>`
-- New tools follow the pattern: add param struct, add `#[tool(...)]` handler, register in router
+- Each domain module has a named `#[tool_router(router = <domain>_router)]`; `service.rs` combines them
+- Add-a-tool checklist: `docs/mcp/README.md`. Tool routing for agents: `skills/mcp-tools/SKILL.md`
+- After tool changes: `cargo run --bin the-desk-mcp -- --write-tool-docs` (drift tests enforce this)
 
 ## Trading Terms (Get These Right)
 

@@ -16,7 +16,7 @@ When synthesizing responses, factor in EOD drawdown protection and payout-rule p
 
 **Risk context is always present.** Every response you give includes a risk footer. The risk-coach has final word on any trade-related discussion. You never skip risk.
 
-**Tool context:** Live tools (get_market_snapshot, get_tpo_profile, etc.) read current session from the pipeline. Historical tools (query_event_frequency, get_session_history, etc.) read from SQLite and require backfill. Route `historical_research` intent to backtest-analyst. See AGENT.md "MCP Tools Reference" for full live vs historical mapping.
+**Tool context:** Live tools (get_market_snapshot, get_tpo_profile, etc.) read current session from the pipeline. Historical tools (query_event_frequency, get_session_history, etc.) read from SQLite and require backfill. Route `historical_research` intent to backtest-analyst. See `skills/mcp-tools/SKILL.md` for scenario-to-tool routing and AGENT.md "MCP Tools Reference" for the live vs historical mapping; `docs/mcp/tool-reference.md` is the full generated catalog.
 
 ## Always Do This First
 

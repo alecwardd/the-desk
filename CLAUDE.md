@@ -139,6 +139,7 @@ Read these before working on related components:
 | Trading Domain | Before implementing any pipeline or playbook logic | `skills/trading-domain/SKILL.md` |
 | Sierra SCID / feed | Before working on `.scid` tailing, symbol resolution, or `.depth` | `skills/trading-domain/SKILL.md` + `src/feed/` |
 | Compliance | Before writing prompts or marketing text | `skills/compliance-research/SKILL.md` |
+| MCP Tools | Before calling or adding MCP tools — scenario routing for agents | `skills/mcp-tools/SKILL.md` |
 
 ---
 
@@ -149,7 +150,14 @@ the-desk/
 ├── Cargo.toml                        # Rust package manifest (default-run: the-desk-mcp)
 ├── src/                              # Library + binaries
 │   ├── lib.rs                        # Crate root (`the_desk_backend`)
-│   ├── bin/the-desk-mcp.rs           # MCP server binary (120 tools)
+│   ├── bin/the-desk-mcp/             # MCP server binary (120 tools)
+│   │   ├── main.rs                   # Entry point + module wiring
+│   │   ├── state.rs / service.rs     # Service state, combined tool router
+│   │   ├── helpers.rs / params.rs    # Shared helpers, tool param structs
+│   │   ├── lifecycle.rs              # Tick processing, session transitions
+│   │   ├── docs.rs                   # Tool-reference generator (--write-tool-docs)
+│   │   └── tools/                    # 9 domain modules (market, dom, options,
+│   │                                 #   playbook, risk, journal, memory, research, admin)
 │   ├── backfill.rs                   # Historical .scid backfill engine
 │   ├── research/mod.rs               # Query engine (frequency, conditional, distribution)
 │   ├── pipelines/                    # 14 pipeline modules + event detector
@@ -179,6 +187,7 @@ the-desk/
 │   ├── risk/mod.rs                   # Risk state tracking
 │   └── recording/mod.rs             # Session recording + replay
 ├── docs/
+│   ├── mcp/                          # MCP server architecture + generated tool reference
 │   ├── decision-log.md               # ADR-style decisions (living)
 │   └── archive/v0-tauri-gui/         # Pre-pivot planning docs (reference)
 ├── agents/                           # Cursor agent definitions

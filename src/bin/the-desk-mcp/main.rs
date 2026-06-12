@@ -22,6 +22,7 @@ use the_desk_backend::{
 };
 use tokio::time::{sleep, Duration};
 
+mod docs;
 mod handler;
 mod helpers;
 mod lifecycle;
@@ -38,6 +39,9 @@ use crate::{helpers::*, lifecycle::*, params::*, state::*};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::args().any(|a| a == "--write-tool-docs") {
+        return docs::write_tool_reference();
+    }
     let logging_config = load_logging_config();
     let mut effective_logging_config = logging_config.clone();
     let logging_runtime = match init_logging(&logging_config) {

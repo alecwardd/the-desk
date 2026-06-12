@@ -566,6 +566,43 @@ fn documented_mcp_tool_count_matches_router() {
 }
 
 #[test]
+fn domain_routers_cover_combined_router_exactly() {
+    let combined: std::collections::BTreeSet<String> = TheDeskMcp::tool_router()
+        .list_all()
+        .into_iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    let mut from_domains = std::collections::BTreeSet::new();
+    for domain in crate::docs::tool_domains() {
+        for tool in (domain.router)().list_all() {
+            assert!(
+                from_domains.insert(tool.name.to_string()),
+                "tool `{}` appears in more than one domain router",
+                tool.name
+            );
+        }
+    }
+    assert_eq!(
+        combined, from_domains,
+        "docs::tool_domains() must list the same routers service.rs combines"
+    );
+}
+
+#[test]
+fn tool_reference_doc_is_current() {
+    let expected = crate::docs::render_tool_reference();
+    let path = crate::docs::tool_reference_path();
+    let on_disk = std::fs::read_to_string(&path)
+        .unwrap_or_default()
+        .replace("\r\n", "\n");
+    assert!(
+        on_disk == expected.replace("\r\n", "\n"),
+        "docs/mcp/tool-reference.md is stale; regenerate with \
+         `cargo run --bin the-desk-mcp -- --write-tool-docs`"
+    );
+}
+
+#[test]
 fn pipeline_lock_recently_contended_uses_a_latched_window() {
     let runtime = McpFeedRuntimeState::default();
     runtime.record_pipeline_lock_sample(true, 10_000);

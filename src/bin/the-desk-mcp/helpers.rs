@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use the_desk_backend::attention::AttentionPulseKind;
 use the_desk_backend::backfill;
+use the_desk_backend::backup::{self, SkipReason, StartupBackupReport};
 use the_desk_backend::db::{
     Database, HistoricalJobRun, SessionScopeFilter, SetupPerformanceSortBy, TradeRecord,
     RESEARCH_DISTRIBUTION_METRICS,
@@ -248,6 +249,98 @@ pub(crate) fn spawn_runtime_event_pruner(
             sleep(interval).await;
             if let Ok(db) = db.lock() {
                 prune_runtime_events_if_enabled(runtime_events.as_ref(), &db);
+            }
+        }
+    });
+}
+
+/// Take a verified database snapshot on startup, off the serving path.
+///
+/// Runs once in a background task: the `VACUUM INTO` happens inside
+/// `spawn_blocking` (it briefly holds the writer mutex), and the resulting
+/// runtime event is emitted only after the lock is released — `record_runtime_event`
+/// re-locks the same mutex to persist, and `std::sync::Mutex` is not reentrant.
+/// Gated by `[backup].enabled` and `min_interval_hours` so frequent restarts
+/// don't accumulate snapshots.
+pub(crate) fn spawn_startup_backup(
+    runtime_events: Arc<RuntimeEventStore>,
+    db: Arc<Mutex<Database>>,
+) {
+    let config = backup::load_backup_config();
+    if !config.enabled {
+        return;
+    }
+    tokio::spawn(async move {
+        let db_for_blocking = Arc::clone(&db);
+        let outcome = tokio::task::spawn_blocking(move || {
+            let now = Utc::now();
+            let guard = db_for_blocking
+                .lock()
+                .map_err(|_| "database mutex poisoned".to_string())?;
+            backup::run_startup_backup(&guard, &config, now).map_err(|e| e.to_string())
+        })
+        .await;
+
+        match outcome {
+            Ok(Ok(StartupBackupReport::Created(o))) => {
+                record_runtime_event(
+                    &runtime_events,
+                    Some(&db),
+                    RuntimeEventLevel::Info,
+                    "backup.created",
+                    "backup",
+                    "Database snapshot written on startup.",
+                    serde_json::json!({
+                        "path": o.path.to_string_lossy(),
+                        "sizeBytes": o.size_bytes,
+                        "verified": o.verified,
+                        "prunedCount": o.pruned.len(),
+                    }),
+                );
+            }
+            Ok(Ok(StartupBackupReport::Skipped(reason))) => {
+                let fields = match &reason {
+                    SkipReason::Disabled => serde_json::json!({ "reason": "disabled" }),
+                    SkipReason::WithinInterval {
+                        hours_since_last,
+                        min_interval_hours,
+                    } => serde_json::json!({
+                        "reason": "withinInterval",
+                        "hoursSinceLast": hours_since_last,
+                        "minIntervalHours": min_interval_hours,
+                    }),
+                };
+                record_runtime_event(
+                    &runtime_events,
+                    Some(&db),
+                    RuntimeEventLevel::Info,
+                    "backup.skipped",
+                    "backup",
+                    "Startup database backup skipped.",
+                    fields,
+                );
+            }
+            Ok(Err(detail)) => {
+                record_runtime_event(
+                    &runtime_events,
+                    Some(&db),
+                    RuntimeEventLevel::Warn,
+                    "backup.failed",
+                    "backup",
+                    "Startup database backup failed.",
+                    serde_json::json!({ "error": detail }),
+                );
+            }
+            Err(join_err) => {
+                record_runtime_event(
+                    &runtime_events,
+                    Some(&db),
+                    RuntimeEventLevel::Warn,
+                    "backup.failed",
+                    "backup",
+                    "Startup database backup task did not complete.",
+                    serde_json::json!({ "error": join_err.to_string() }),
+                );
             }
         }
     });

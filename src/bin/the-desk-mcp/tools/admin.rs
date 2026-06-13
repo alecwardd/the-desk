@@ -730,4 +730,61 @@ impl TheDeskMcp {
 
         Ok(text_result(result))
     }
+
+    #[tool(
+        description = "Create a verified on-demand snapshot of the SQLite database (trades, journal, signal outcomes, memory, all session data) using VACUUM INTO, then prune old snapshots per the [backup] config. Unlike the automatic startup backup, this ignores the minimum-interval gate and always writes a fresh snapshot — call it before risky operations (large imports, schema changes) or when the trader wants a known-good restore point. Returns the new snapshot's path/size, how many old backups were pruned, and the full list of retained backups. Backups live in ~/.the-desk/backups by default."
+    )]
+    pub(crate) async fn create_database_backup(&self) -> Result<CallToolResult, McpError> {
+        let config = the_desk_backend::backup::load_backup_config();
+        let dir = config.directory_path();
+        let retention_days = config.retention_days;
+        let max_backups = config.max_backups;
+
+        let db = Arc::clone(&self.db);
+        let dir_for_blocking = dir.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            let guard = db
+                .lock()
+                .map_err(|_| "database mutex poisoned".to_string())?;
+            the_desk_backend::backup::perform_backup(
+                &guard,
+                &dir_for_blocking,
+                chrono::Utc::now(),
+                retention_days,
+                max_backups,
+            )
+            .map_err(|e| e.to_string())
+        })
+        .await
+        .map_err(|e| db_error(format!("backup task join: {e}")))?
+        .map_err(db_error)?;
+
+        let retained = the_desk_backend::backup::list_backups(&dir);
+        let retained_total_bytes: u64 = retained.iter().map(|b| b.size_bytes).sum();
+        let retained_json: Vec<serde_json::Value> = retained
+            .iter()
+            .map(|b| {
+                serde_json::json!({
+                    "fileName": b.file_name,
+                    "sizeBytes": b.size_bytes,
+                    "createdAt": b.created_at.map(|t| t.to_rfc3339()),
+                })
+            })
+            .collect();
+
+        Ok(text_result(serde_json::json!({
+            "status": "created",
+            "directory": dir.to_string_lossy(),
+            "backup": {
+                "path": outcome.path.to_string_lossy(),
+                "fileName": outcome.path.file_name().map(|n| n.to_string_lossy().into_owned()),
+                "sizeBytes": outcome.size_bytes,
+                "verified": outcome.verified,
+            },
+            "prunedCount": outcome.pruned.len(),
+            "retainedCount": retained.len(),
+            "retainedTotalBytes": retained_total_bytes,
+            "retained": retained_json,
+        })))
+    }
 }

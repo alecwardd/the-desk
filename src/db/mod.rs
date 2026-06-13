@@ -1164,6 +1164,20 @@ impl Database {
         Ok(Self { conn })
     }
 
+    /// Write a consistent, defragmented snapshot of the database to `dest`
+    /// using `VACUUM INTO`.
+    ///
+    /// Unlike copying the `.db`/`.db-wal`/`.db-shm` files (which can capture an
+    /// inconsistent moment mid-checkpoint), `VACUUM INTO` produces a single
+    /// self-contained file that already incorporates committed WAL state and is
+    /// guaranteed internally consistent. It runs as an ordinary read
+    /// transaction, so concurrent readers are not blocked and the writer is only
+    /// held for the snapshot's duration. `dest` must not already exist.
+    pub fn backup_to(&self, dest: &str) -> Result<(), DbError> {
+        self.conn.execute("VACUUM INTO ?1", params![dest])?;
+        Ok(())
+    }
+
     // ------------------------------------------------------------------
     // Schema migration
     // ------------------------------------------------------------------
@@ -10250,6 +10264,34 @@ mod tests {
     fn test_db() -> Database {
         let file = NamedTempFile::new().expect("temp");
         Database::open(file.path().to_string_lossy().as_ref()).expect("open")
+    }
+
+    #[test]
+    fn backup_to_produces_a_consistent_readable_snapshot() {
+        let db = test_db();
+        db.save_risk_config(&RiskConfigRecord {
+            r_value_points: 42.0,
+            ..RiskConfigRecord::default()
+        })
+        .expect("seed risk config");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dest = dir.path().join("snapshot.db");
+        let dest_str = dest.to_string_lossy().into_owned();
+        db.backup_to(&dest_str).expect("backup_to");
+
+        assert!(dest.exists(), "backup file should be created");
+
+        // The snapshot opens as a normal database and carries committed data.
+        let restored = Database::open(&dest_str).expect("open snapshot");
+        let config = restored.load_risk_config().expect("load risk config");
+        assert_eq!(config.r_value_points, 42.0);
+
+        // VACUUM INTO refuses to overwrite an existing file.
+        assert!(
+            db.backup_to(&dest_str).is_err(),
+            "backup_to must not clobber an existing destination"
+        );
     }
 
     #[test]

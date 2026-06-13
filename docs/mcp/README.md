@@ -8,7 +8,7 @@ connecting to it.
 - **Binary:** `the-desk-mcp` (default run target)
 - **Transport:** stdio (`rmcp` crate). stdout is protocol-only; logs go to
   stderr/file (enforced by the `mcp_stdio` integration test).
-- **Tool surface:** 120 tools in 9 domains. The exhaustive, generated catalog is
+- **Tool surface:** 121 tools in 9 domains. The exhaustive, generated catalog is
   [tool-reference.md](tool-reference.md). Scenario routing for agents is
   [skills/mcp-tools/SKILL.md](../../skills/mcp-tools/SKILL.md).
 
@@ -36,7 +36,7 @@ src/bin/the-desk-mcp/
     ├── journal.rs   # Trade entries, fills, journal, reviews (12)
     ├── memory.rs    # Insights, patterns, follow-ups, briefings (12)
     ├── research.rs  # Hypotheses, backtests, statistical queries (23)
-    └── admin.rs     # Feed health, ingestion, rollover, integrity (11)
+    └── admin.rs     # Feed health, ingestion, rollover, integrity, backups (12)
 ```
 
 ### The named-router pattern

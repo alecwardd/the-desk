@@ -196,7 +196,7 @@ Rules:
 
 ## MCP Tools Reference
 
-The MCP server (`src/bin/the-desk-mcp/`, domain modules under `tools/`) exposes 120 MCP tools across 9 domains.
+The MCP server (`src/bin/the-desk-mcp/`, domain modules under `tools/`) exposes 121 MCP tools across 9 domains.
 
 **Canonical references (read these, in order):**
 
@@ -231,7 +231,7 @@ The complete per-tool catalog lives in **`docs/mcp/tool-reference.md`** (generat
 | Journal | 12 | `src/bin/the-desk-mcp/tools/journal.rs` |
 | Memory | 12 | `src/bin/the-desk-mcp/tools/memory.rs` |
 | Research | 23 | `src/bin/the-desk-mcp/tools/research.rs` |
-| Admin | 11 | `src/bin/the-desk-mcp/tools/admin.rs` |
+| Admin | 12 | `src/bin/the-desk-mcp/tools/admin.rs` |
 
 ### Agent-to-Capability Mapping
 

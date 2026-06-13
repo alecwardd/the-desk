@@ -16,7 +16,7 @@ Sierra Chart (.scid files) → Rust Pipeline Engine → SQLite → MCP Server �
 4. **EventDetector** logs ~30 structured market events (level tests, IB extensions, day type changes, etc.)
 5. **SQLite** stores raw ticks, computed state, session summaries, market events, signal outcomes, and playbook signals
 6. **Research query engine** answers frequency, conditional probability, and distribution questions over historical data
-7. **MCP server** exposes 120 MCP tools that any Cursor agent can call for market context, feed diagnostics, setup lifecycle state, and historical research
+7. **MCP server** exposes 121 MCP tools that any Cursor agent can call for market context, feed diagnostics, setup lifecycle state, and historical research
 8. **Specialized subagents** (market structure, order flow, levels, performance) access domain-specific tools and report to the orchestrator
 9. **You chat with agents** in Cursor who reference live (1-5s delayed) market data and historical statistics
 
@@ -154,6 +154,16 @@ flush_poll_ms = 1000
 warm_retention_days = 30
 cold_archive_dir = "T:\\TheDesk\\archive"
 auto_archive = true
+
+# Optional. All fields shown with their defaults — omit the section entirely
+# to use them. The MCP server takes a verified VACUUM INTO snapshot on startup
+# (and on demand via the create_database_backup tool), then prunes old snapshots.
+[backup]
+enabled = true              # automatic startup backups
+directory = "~/.the-desk/backups"
+retention_days = 14         # prune snapshots older than this (0 = keep by age)
+max_backups = 30            # hard cap, oldest pruned first (0 = no cap)
+min_interval_hours = 12     # skip the startup backup if one is newer than this
 ```
 
 ### MCP Server

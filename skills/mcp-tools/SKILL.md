@@ -5,7 +5,7 @@ description: MCP tool routing for The Desk. USE WHEN any agent needs to decide w
 
 # MCP Tool Routing
 
-The Desk MCP server exposes **120 tools in 9 domains**. This skill tells you *which* tool to call *when*. For the full catalog with every description, read [docs/mcp/tool-reference.md](../../docs/mcp/tool-reference.md) — it is generated from the compiled server and guarded by a test, so it is never stale.
+The Desk MCP server exposes **121 tools in 9 domains**. This skill tells you *which* tool to call *when*. For the full catalog with every description, read [docs/mcp/tool-reference.md](../../docs/mcp/tool-reference.md) — it is generated from the compiled server and guarded by a test, so it is never stale.
 
 **Source layout:** each domain is a module in `src/bin/the-desk-mcp/tools/` (market, dom, options, playbook, risk, journal, memory, research, admin).
 
@@ -119,6 +119,11 @@ This is the canonical "potential trade" flow — keep state in the system, not i
 - `get_contract_rollover_status` / `validate_contract_rollover` — before trusting carry-forward levels near roll dates.
 - `get_runtime_events` — structured diagnostics for post-mortems.
 - Gaps and repair: `get_raw_tick_ingest_gaps`, `ingest_raw_ticks_from_scid`, `scan_scid_timestamp_anomalies`, `backfill_history`, `archive_status`.
+
+### Protecting the data (backups)
+
+- `create_database_backup` — verified `VACUUM INTO` snapshot of the whole SQLite store (trades, journal, signal outcomes, memory). Call it before risky operations: large imports, schema migrations, or any bulk edit the trader wants a known-good restore point for.
+- The server also takes an automatic verified snapshot on startup (bounded by `[backup].min_interval_hours`) and prunes old snapshots by age and count — no tool call needed for routine protection. Snapshots live in `~/.the-desk/backups`.
 
 ---
 

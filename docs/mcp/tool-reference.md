@@ -4,7 +4,7 @@
 > Regenerate with `cargo run --bin the-desk-mcp -- --write-tool-docs`.
 > The test `tool_reference_doc_is_current` fails when this file is stale.
 
-The Desk MCP server exposes **120 MCP tools** across **9 domains**. Each domain maps to a module under `src/bin/the-desk-mcp/tools/`. For scenario-based routing ("which tool do I call when…"), read `skills/mcp-tools/SKILL.md` first; this file is the exhaustive catalog.
+The Desk MCP server exposes **121 MCP tools** across **9 domains**. Each domain maps to a module under `src/bin/the-desk-mcp/tools/`. For scenario-based routing ("which tool do I call when…"), read `skills/mcp-tools/SKILL.md` first; this file is the exhaustive catalog.
 
 | Domain | Tools | Reach for it when… |
 |---|---|---|
@@ -16,7 +16,7 @@ The Desk MCP server exposes **120 MCP tools** across **9 domains**. Each domain 
 | [Journal](#journal) | 12 | recording or reviewing actual trades and journaling the session |
 | [Memory](#memory) | 12 | you want durable context about the trader, or to persist an insight worth remembering |
 | [Research](#research) | 23 | answering "how often" / "what happens after" questions or running and comparing backtests |
-| [Admin](#admin) | 11 | diagnosing data problems, backfilling history, or verifying feed and database health |
+| [Admin](#admin) | 12 | diagnosing data problems, backfilling history, or verifying feed and database health |
 
 ## Market
 
@@ -515,6 +515,10 @@ Storage tier status: shows hot (current session), warm (SQLite ticks), and cold 
 ### `backfill_history`
 
 Queue a historical backfill job and return a job id. Processes past sessions through all 14 pipelines, detects market events, and persists session summaries without blocking the MCP server.
+
+### `create_database_backup`
+
+Create a verified on-demand snapshot of the SQLite database (trades, journal, signal outcomes, memory, all session data) using VACUUM INTO, then prune old snapshots per the [backup] config. Unlike the automatic startup backup, this ignores the minimum-interval gate and always writes a fresh snapshot — call it before risky operations (large imports, schema changes) or when the trader wants a known-good restore point. Returns the new snapshot's path/size, how many old backups were pruned, and the full list of retained backups. Backups live in ~/.the-desk/backups by default.
 
 ### `get_contract_rollover_status`
 

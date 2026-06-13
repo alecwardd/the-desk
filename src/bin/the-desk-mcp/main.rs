@@ -188,6 +188,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ))
     })?;
 
+    // Take a verified database snapshot in the background (off the serving path).
+    spawn_startup_backup(Arc::clone(&server.runtime_events), Arc::clone(&server.db));
+
     if scid_available {
         let (startup_cutover_tx, rx) = tokio::sync::oneshot::channel::<u64>();
         startup_cutover_rx = Some(rx);

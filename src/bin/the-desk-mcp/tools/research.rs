@@ -352,15 +352,14 @@ impl TheDeskMcp {
         &self,
         Parameters(params): Parameters<LimitParams>,
     ) -> Result<CallToolResult, McpError> {
-        let db = self.db.lock().map_err(|_| lock_error())?;
         let limit = params.limit.unwrap_or(10) as usize;
-        match db.list_backtest_runs(limit) {
-            Ok(runs) => Ok(text_result(serde_json::json!({
-                "runs": runs,
-                "count": runs.len(),
-            }))),
-            Err(e) => Err(db_error(e)),
-        }
+        let runs = self
+            .with_read_db(move |db| db.list_backtest_runs(limit).map_err(db_error))
+            .await?;
+        Ok(text_result(serde_json::json!({
+            "runs": runs,
+            "count": runs.len(),
+        })))
     }
 
     #[tool(
@@ -370,13 +369,17 @@ impl TheDeskMcp {
         &self,
         Parameters(params): Parameters<CompareBacktestsParams>,
     ) -> Result<CallToolResult, McpError> {
-        let db = self.db.lock().map_err(|_| lock_error())?;
-        let mut runs = Vec::new();
-        for id in &params.run_ids {
-            if let Ok(Some(run)) = db.get_backtest_run(id) {
-                runs.push(run);
-            }
-        }
+        let runs = self
+            .with_read_db(move |db| {
+                let mut runs = Vec::new();
+                for id in &params.run_ids {
+                    if let Ok(Some(run)) = db.get_backtest_run(id) {
+                        runs.push(run);
+                    }
+                }
+                Ok(runs)
+            })
+            .await?;
         Ok(text_result(serde_json::json!({
             "runs": runs,
             "count": runs.len(),
@@ -452,9 +455,15 @@ impl TheDeskMcp {
             single_prints_direction: single_prints,
             weights: research::SimilarityWeights::default(),
         };
-        let db = self.db.lock().map_err(|_| lock_error())?;
         let max = params.max_results.unwrap_or(5) as usize;
-        match research::compare_sessions_multi_with_meta(&db, &query, max) {
+        let query_for_read = query.clone();
+        let compare_result = self
+            .with_read_db(move |db| {
+                research::compare_sessions_multi_with_meta(db, &query_for_read, max)
+                    .map_err(db_error)
+            })
+            .await;
+        match compare_result {
             Ok(result) => {
                 let count = result.results.len();
                 Ok(text_result(serde_json::json!({
@@ -470,7 +479,7 @@ impl TheDeskMcp {
                     "meta": result.meta,
                 })))
             }
-            Err(e) => Err(db_error(e)),
+            Err(e) => Err(e),
         }
     }
 
@@ -489,19 +498,21 @@ impl TheDeskMcp {
         )?;
         let scope = build_session_scope_filter(&params.session_scope)?;
         let event_type = parse_research_event_type(&params.event_type)?;
-        let db = self.db.lock().map_err(|_| lock_error())?;
-        match research::event_frequency(
-            &db,
-            &event_type,
-            params.start_date.as_deref(),
-            params.end_date.as_deref(),
-            scope.as_ref(),
-        ) {
-            Ok(result) => Ok(text_result(
-                serde_json::to_value(&result).unwrap_or_default(),
-            )),
-            Err(e) => Err(db_error(e)),
-        }
+        let result = self
+            .with_read_db(move |db| {
+                research::event_frequency(
+                    db,
+                    &event_type,
+                    params.start_date.as_deref(),
+                    params.end_date.as_deref(),
+                    scope.as_ref(),
+                )
+                .map_err(db_error)
+            })
+            .await?;
+        Ok(text_result(
+            serde_json::to_value(&result).unwrap_or_default(),
+        ))
     }
 
     #[tool(
@@ -522,22 +533,24 @@ impl TheDeskMcp {
         let min_count = parse_research_min_count(params.min_count)?;
         let outcome_field = parse_research_outcome_field(&params.outcome_field)?;
         let outcome_value = parse_non_empty_string("outcomeValue", &params.outcome_value)?;
-        let db = self.db.lock().map_err(|_| lock_error())?;
-        match research::conditional_probability(
-            &db,
-            &event_type,
-            min_count,
-            &outcome_field,
-            &outcome_value,
-            params.start_date.as_deref(),
-            params.end_date.as_deref(),
-            scope.as_ref(),
-        ) {
-            Ok(result) => Ok(text_result(
-                serde_json::to_value(&result).unwrap_or_default(),
-            )),
-            Err(e) => Err(db_error(e)),
-        }
+        let result = self
+            .with_read_db(move |db| {
+                research::conditional_probability(
+                    db,
+                    &event_type,
+                    min_count,
+                    &outcome_field,
+                    &outcome_value,
+                    params.start_date.as_deref(),
+                    params.end_date.as_deref(),
+                    scope.as_ref(),
+                )
+                .map_err(db_error)
+            })
+            .await?;
+        Ok(text_result(
+            serde_json::to_value(&result).unwrap_or_default(),
+        ))
     }
 
     #[tool(
@@ -555,19 +568,21 @@ impl TheDeskMcp {
         )?;
         let scope = build_session_scope_filter(&params.session_scope)?;
         let metric = parse_distribution_metric(&params.metric)?;
-        let db = self.db.lock().map_err(|_| lock_error())?;
-        match research::metric_distribution(
-            &db,
-            &metric,
-            params.start_date.as_deref(),
-            params.end_date.as_deref(),
-            scope.as_ref(),
-        ) {
-            Ok(result) => Ok(text_result(
-                serde_json::to_value(&result).unwrap_or_default(),
-            )),
-            Err(e) => Err(db_error(e)),
-        }
+        let result = self
+            .with_read_db(move |db| {
+                research::metric_distribution(
+                    db,
+                    &metric,
+                    params.start_date.as_deref(),
+                    params.end_date.as_deref(),
+                    scope.as_ref(),
+                )
+                .map_err(db_error)
+            })
+            .await?;
+        Ok(text_result(
+            serde_json::to_value(&result).unwrap_or_default(),
+        ))
     }
 
     #[tool(
@@ -586,22 +601,24 @@ impl TheDeskMcp {
         let scope = build_session_scope_filter(&params.session_scope)?;
         let setup_id = parse_non_empty_string("setupId", &params.setup_id)?;
         let source = parse_optional_signal_source(params.source.as_deref())?;
-        let db = self.db.lock().map_err(|_| lock_error())?;
-        match research::signal_outcome_distribution(
-            &db,
-            &setup_id,
-            params.start_date.as_deref(),
-            params.end_date.as_deref(),
-            scope.as_ref(),
-            source,
-            params.job_id.as_deref(),
-            params.include_unverified.unwrap_or(true),
-        ) {
-            Ok(result) => Ok(text_result(
-                serde_json::to_value(&result).unwrap_or_default(),
-            )),
-            Err(e) => Err(db_error(e)),
-        }
+        let result = self
+            .with_read_db(move |db| {
+                research::signal_outcome_distribution(
+                    db,
+                    &setup_id,
+                    params.start_date.as_deref(),
+                    params.end_date.as_deref(),
+                    scope.as_ref(),
+                    source,
+                    params.job_id.as_deref(),
+                    params.include_unverified.unwrap_or(true),
+                )
+                .map_err(db_error)
+            })
+            .await?;
+        Ok(text_result(
+            serde_json::to_value(&result).unwrap_or_default(),
+        ))
     }
 
     #[tool(
@@ -622,24 +639,26 @@ impl TheDeskMcp {
         let session_field = parse_signal_outcome_session_field(&params.session_field)?;
         let field_value = parse_non_empty_string("fieldValue", &params.field_value)?;
         let source = parse_optional_signal_source(params.source.as_deref())?;
-        let db = self.db.lock().map_err(|_| lock_error())?;
-        match research::signal_outcome_conditional(
-            &db,
-            &setup_id,
-            &session_field,
-            &field_value,
-            params.start_date.as_deref(),
-            params.end_date.as_deref(),
-            scope.as_ref(),
-            source,
-            params.job_id.as_deref(),
-            params.include_unverified.unwrap_or(true),
-        ) {
-            Ok(result) => Ok(text_result(
-                serde_json::to_value(&result).unwrap_or_default(),
-            )),
-            Err(e) => Err(db_error(e)),
-        }
+        let result = self
+            .with_read_db(move |db| {
+                research::signal_outcome_conditional(
+                    db,
+                    &setup_id,
+                    &session_field,
+                    &field_value,
+                    params.start_date.as_deref(),
+                    params.end_date.as_deref(),
+                    scope.as_ref(),
+                    source,
+                    params.job_id.as_deref(),
+                    params.include_unverified.unwrap_or(true),
+                )
+                .map_err(db_error)
+            })
+            .await?;
+        Ok(text_result(
+            serde_json::to_value(&result).unwrap_or_default(),
+        ))
     }
 
     #[tool(
@@ -658,22 +677,24 @@ impl TheDeskMcp {
         let scope = build_session_scope_filter(&params.session_scope)?;
         let setup_id = parse_optional_non_empty_string("setupId", params.setup_id.as_deref())?;
         let source = parse_optional_signal_source(params.source.as_deref())?;
-        let db = self.db.lock().map_err(|_| lock_error())?;
-        match research::signal_outcome_excursions(
-            &db,
-            setup_id.as_deref(),
-            params.start_date.as_deref(),
-            params.end_date.as_deref(),
-            scope.as_ref(),
-            source,
-            params.job_id.as_deref(),
-            params.include_unverified.unwrap_or(true),
-        ) {
-            Ok(result) => Ok(text_result(
-                serde_json::to_value(&result).unwrap_or_default(),
-            )),
-            Err(e) => Err(db_error(e)),
-        }
+        let result = self
+            .with_read_db(move |db| {
+                research::signal_outcome_excursions(
+                    db,
+                    setup_id.as_deref(),
+                    params.start_date.as_deref(),
+                    params.end_date.as_deref(),
+                    scope.as_ref(),
+                    source,
+                    params.job_id.as_deref(),
+                    params.include_unverified.unwrap_or(true),
+                )
+                .map_err(db_error)
+            })
+            .await?;
+        Ok(text_result(
+            serde_json::to_value(&result).unwrap_or_default(),
+        ))
     }
 
     #[tool(
@@ -690,25 +711,30 @@ impl TheDeskMcp {
             params.end_date.as_deref(),
         )?;
         let scope = build_session_scope_filter(&params.session_scope)?;
-        let start_date = scope
-            .as_ref()
-            .and_then(|s| s.trading_day_start.as_deref())
-            .or(params.start_date.as_deref());
-        let end_date = scope
-            .as_ref()
-            .and_then(|s| s.trading_day_end.as_deref())
-            .or(params.end_date.as_deref());
         let day_type = parse_optional_non_empty_string("dayType", params.day_type.as_deref())?;
-        let db = self.db.lock().map_err(|_| lock_error())?;
         let limit = parse_bounded_limit("limit", params.limit, 20, MAX_RESEARCH_RESULT_LIMIT)?;
-        match db.list_session_summaries_scoped(
-            start_date,
-            end_date,
-            day_type.as_deref(),
-            scope.as_ref().and_then(|s| s.session_type.as_deref()),
-            limit,
-            scope.as_ref(),
-        ) {
+        let sessions_result = self
+            .with_read_db(move |db| {
+                let start_date = scope
+                    .as_ref()
+                    .and_then(|s| s.trading_day_start.as_deref())
+                    .or(params.start_date.as_deref());
+                let end_date = scope
+                    .as_ref()
+                    .and_then(|s| s.trading_day_end.as_deref())
+                    .or(params.end_date.as_deref());
+                db.list_session_summaries_scoped(
+                    start_date,
+                    end_date,
+                    day_type.as_deref(),
+                    scope.as_ref().and_then(|s| s.session_type.as_deref()),
+                    limit,
+                    scope.as_ref(),
+                )
+                .map_err(db_error)
+            })
+            .await;
+        match sessions_result {
             Ok(sessions) => {
                 let count = sessions.len();
                 let mut previous_contract: Option<String> = None;
@@ -757,7 +783,7 @@ impl TheDeskMcp {
                     "count": count,
                 })))
             }
-            Err(e) => Err(db_error(e)),
+            Err(e) => Err(e),
         }
     }
 
@@ -778,18 +804,20 @@ impl TheDeskMcp {
                 })
             })
             .transpose()?;
-        let db = self.db.lock().map_err(|_| lock_error())?;
-        match db.signal_performance_filtered(
-            params.setup_id.as_deref(),
-            params.start_date.as_deref(),
-            params.end_date.as_deref(),
-            source,
-            params.job_id.as_deref(),
-            scope.as_ref(),
-        ) {
-            Ok(result) => Ok(text_result(result)),
-            Err(e) => Err(db_error(e)),
-        }
+        let result = self
+            .with_read_db(move |db| {
+                db.signal_performance_filtered(
+                    params.setup_id.as_deref(),
+                    params.start_date.as_deref(),
+                    params.end_date.as_deref(),
+                    source,
+                    params.job_id.as_deref(),
+                    scope.as_ref(),
+                )
+                .map_err(db_error)
+            })
+            .await?;
+        Ok(text_result(result))
     }
 
     #[tool(
@@ -812,15 +840,17 @@ impl TheDeskMcp {
                 }
             })
             .transpose()?;
-        let db = self.db.lock().map_err(|_| lock_error())?;
-        match db.signal_outcome_integrity_report(
-            source.as_deref(),
-            params.job_id.as_deref(),
-            params.setup_id.as_deref(),
-        ) {
-            Ok(report) => Ok(text_result(report)),
-            Err(e) => Err(db_error(e)),
-        }
+        let report = self
+            .with_read_db(move |db| {
+                db.signal_outcome_integrity_report(
+                    source.as_deref(),
+                    params.job_id.as_deref(),
+                    params.setup_id.as_deref(),
+                )
+                .map_err(db_error)
+            })
+            .await?;
+        Ok(text_result(report))
     }
 
     #[tool(
@@ -841,39 +871,50 @@ impl TheDeskMcp {
         let min_resolved =
             parse_nonnegative_i64("minResolved", params.min_resolved, 0, MAX_MIN_RESOLVED)?;
         let limit = parse_bounded_limit("limit", params.limit, 50, MAX_RESEARCH_RESULT_LIMIT)?;
-        let db = self.db.lock().map_err(|_| lock_error())?;
-        match db.setup_performance_matrix_filtered(
-            params.start_date.as_deref(),
-            params.end_date.as_deref(),
-            None,
-            None,
-            scope.as_ref(),
-            min_resolved,
-            sort_by,
-            limit,
-        ) {
-            Ok(rows) => Ok(text_result(serde_json::json!({
-                "rows": rows,
-                "count": rows.len(),
-                "sortBy": params.sort_by.unwrap_or_else(|| "resolved".to_string()),
-                "minResolved": min_resolved,
-            }))),
-            Err(e) => Err(db_error(e)),
-        }
+        let sort_by_label = params
+            .sort_by
+            .clone()
+            .unwrap_or_else(|| "resolved".to_string());
+        let rows = self
+            .with_read_db(move |db| {
+                db.setup_performance_matrix_filtered(
+                    params.start_date.as_deref(),
+                    params.end_date.as_deref(),
+                    None,
+                    None,
+                    scope.as_ref(),
+                    min_resolved,
+                    sort_by,
+                    limit,
+                )
+                .map_err(db_error)
+            })
+            .await?;
+        Ok(text_result(serde_json::json!({
+            "rows": rows,
+            "count": rows.len(),
+            "sortBy": sort_by_label,
+            "minResolved": min_resolved,
+        })))
     }
 
     #[tool(
         description = "Research summary: pre-session statistical briefing. Returns session count in database, IB range distribution, recent day types, and key frequencies. One call = baseline context for the trading day."
     )]
     pub(crate) async fn get_research_summary(&self) -> Result<CallToolResult, McpError> {
-        let db = self.db.lock().map_err(|_| lock_error())?;
-        let session_count = db.session_summary_count().unwrap_or(0);
-        let ib_dist = research::metric_distribution(&db, "ib_range", None, None, None)
-            .ok()
-            .map(|d| serde_json::to_value(&d).unwrap_or_default());
-        let delta_dist = research::metric_distribution(&db, "session_delta", None, None, None)
-            .ok()
-            .map(|d| serde_json::to_value(&d).unwrap_or_default());
+        let (session_count, ib_dist, delta_dist) = self
+            .with_read_db(move |db| {
+                let session_count = db.session_summary_count().unwrap_or(0);
+                let ib_dist = research::metric_distribution(db, "ib_range", None, None, None)
+                    .ok()
+                    .map(|d| serde_json::to_value(&d).unwrap_or_default());
+                let delta_dist =
+                    research::metric_distribution(db, "session_delta", None, None, None)
+                        .ok()
+                        .map(|d| serde_json::to_value(&d).unwrap_or_default());
+                Ok((session_count, ib_dist, delta_dist))
+            })
+            .await?;
 
         Ok(text_result(serde_json::json!({
             "sessionsInDatabase": session_count,

@@ -61,9 +61,14 @@ impl TheDeskMcp {
         db_path: String,
         runtime_events: Arc<RuntimeEventStore>,
     ) -> Self {
+        let read_pool = crate::read_pool::ReadPool::new(
+            db_path.clone(),
+            crate::read_pool::DEFAULT_READ_POOL_SIZE,
+        );
         Self {
             db: Arc::new(Mutex::new(db)),
             db_path: Arc::new(db_path),
+            read_pool,
             pipelines: Arc::new(Mutex::new(pipelines)),
             detector: Arc::new(Mutex::new(EventDetector::new())),
             flow_emitter: Arc::new(Mutex::new(FlowEventEmitter::new())),
@@ -79,6 +84,29 @@ impl TheDeskMcp {
             context_frame_cache: Arc::new(Mutex::new(HashMap::new())),
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// Run a read-only query on a pooled `SQLITE_OPEN_READ_ONLY` connection.
+    ///
+    /// The closure executes inside `spawn_blocking`, so a heavy query neither
+    /// contends on the single writer mutex (`self.db`) nor blocks the async
+    /// runtime worker thread. Use this for read-only `query_*` / `get_*` tools;
+    /// keep writes on the mutex-guarded writer connection.
+    pub(crate) async fn with_read_db<T, F>(&self, f: F) -> Result<T, McpError>
+    where
+        F: FnOnce(&Database) -> Result<T, McpError> + Send + 'static,
+        T: Send + 'static,
+    {
+        let mut guard = self.read_pool.acquire().await.map_err(db_error)?;
+        let db = guard.take();
+        let (db, result) = tokio::task::spawn_blocking(move || {
+            let result = f(&db);
+            (db, result)
+        })
+        .await
+        .map_err(|e| db_error(format!("read query task failed: {e}")))?;
+        guard.restore(db);
+        result
     }
 
     pub(crate) fn resolve_contract_cached(&self) -> (FeedConfig, ContractMetadata) {

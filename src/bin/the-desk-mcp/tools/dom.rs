@@ -713,15 +713,18 @@ impl TheDeskMcp {
         )?;
         let behavior = parse_dom_behavior_name(&params.behavior)?;
         let min_duration_ms = parse_dom_behavior_min_duration(params.min_duration_ms)?;
-        let db = self.db.lock().map_err(|_| lock_error())?;
-        let result = research::dom_behavior_frequency(
-            &db,
-            &behavior,
-            min_duration_ms,
-            params.start_date.as_deref(),
-            params.end_date.as_deref(),
-        )
-        .map_err(db_error)?;
+        let result = self
+            .with_read_db(move |db| {
+                research::dom_behavior_frequency(
+                    db,
+                    &behavior,
+                    min_duration_ms,
+                    params.start_date.as_deref(),
+                    params.end_date.as_deref(),
+                )
+                .map_err(db_error)
+            })
+            .await?;
         Ok(text_result(
             serde_json::to_value(result).unwrap_or_default(),
         ))
@@ -745,20 +748,23 @@ impl TheDeskMcp {
         let setup_id = parse_optional_non_empty_string("setupId", params.setup_id.as_deref())?;
         let min_duration_ms = parse_dom_behavior_min_duration(params.min_duration_ms)?;
         let source = parse_optional_signal_source(params.source.as_deref())?;
-        let db = self.db.lock().map_err(|_| lock_error())?;
-        let result = research::dom_behavior_conditional(
-            &db,
-            &behavior,
-            setup_id.as_deref(),
-            min_duration_ms,
-            params.start_date.as_deref(),
-            params.end_date.as_deref(),
-            scope.as_ref(),
-            source,
-            params.job_id.as_deref(),
-            params.include_unverified.unwrap_or(true),
-        )
-        .map_err(db_error)?;
+        let result = self
+            .with_read_db(move |db| {
+                research::dom_behavior_conditional(
+                    db,
+                    &behavior,
+                    setup_id.as_deref(),
+                    min_duration_ms,
+                    params.start_date.as_deref(),
+                    params.end_date.as_deref(),
+                    scope.as_ref(),
+                    source,
+                    params.job_id.as_deref(),
+                    params.include_unverified.unwrap_or(true),
+                )
+                .map_err(db_error)
+            })
+            .await?;
         Ok(text_result(
             serde_json::to_value(result).unwrap_or_default(),
         ))
@@ -781,17 +787,20 @@ impl TheDeskMcp {
         let event_type = parse_research_event_type(&params.event_type)?;
         let behavior = parse_dom_behavior_name(&params.behavior)?;
         let min_duration_ms = parse_dom_behavior_min_duration(params.min_duration_ms)?;
-        let db = self.db.lock().map_err(|_| lock_error())?;
-        let result = research::dom_reaction_at_levels(
-            &db,
-            &event_type,
-            &behavior,
-            min_duration_ms,
-            params.start_date.as_deref(),
-            params.end_date.as_deref(),
-            scope.as_ref(),
-        )
-        .map_err(db_error)?;
+        let result = self
+            .with_read_db(move |db| {
+                research::dom_reaction_at_levels(
+                    db,
+                    &event_type,
+                    &behavior,
+                    min_duration_ms,
+                    params.start_date.as_deref(),
+                    params.end_date.as_deref(),
+                    scope.as_ref(),
+                )
+                .map_err(db_error)
+            })
+            .await?;
         Ok(text_result(
             serde_json::to_value(result).unwrap_or_default(),
         ))

@@ -27,6 +27,7 @@ mod handler;
 mod helpers;
 mod lifecycle;
 mod params;
+mod read_pool;
 mod service;
 mod state;
 mod tools;

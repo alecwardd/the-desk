@@ -14,7 +14,7 @@ use crate::rules::{
 };
 use crate::tick_time_context_from_timestamp_ms;
 use crate::trading_day_from_timestamp_ms;
-use rusqlite::{params, Connection, Row};
+use rusqlite::{params, Connection, OpenFlags, Row};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
@@ -1143,6 +1143,25 @@ impl Database {
         let db = Self { conn };
         db.run_migrations()?;
         Ok(db)
+    }
+
+    /// Open a read-only connection to an existing database.
+    ///
+    /// Intended for the read-connection pool that serves read-only MCP tools
+    /// (`query_*` / `get_*`). The underlying database already runs in WAL mode,
+    /// so these connections read concurrently with the single mutex-guarded
+    /// writer without blocking it. The connection is opened with
+    /// `SQLITE_OPEN_READ_ONLY`, sets the same 5s `busy_timeout` as the writer,
+    /// and runs no migrations (the writer owns schema). `PRAGMA query_only`
+    /// is a defense-in-depth guard against accidental writes.
+    pub fn open_read_only(path: &str) -> Result<Self, DbError> {
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_URI;
+        let conn = Connection::open_with_flags(path, flags)?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        conn.execute_batch("PRAGMA query_only=ON; PRAGMA foreign_keys=ON;")?;
+        Ok(Self { conn })
     }
 
     // ------------------------------------------------------------------

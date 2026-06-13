@@ -610,20 +610,29 @@ impl TheDeskMcp {
         &self,
         Parameters(params): Parameters<SnapshotAtParams>,
     ) -> Result<CallToolResult, McpError> {
-        let db = self.db.lock().map_err(|_| lock_error())?;
-        let target_ms = params
-            .timestamp_ms
-            .unwrap_or_else(|| db.latest_tick_timestamp_ms().ok().flatten().unwrap_or(0.0));
-        match db.get_snapshot_near(target_ms) {
-            Ok(Some((snapshot_ts, payload))) => Ok(text_result(serde_json::json!({
-                "snapshot": payload,
-                "snapshotTimestampMs": snapshot_ts,
-                "requestedTimestampMs": target_ms,
-                "offsetMs": snapshot_ts - target_ms,
-                "dataAgeMs": compute_data_age(&db)
-            }))),
-            Ok(None) => Ok(no_data("No pipeline snapshots found. Snapshots are stored every ~30s once data is flowing.")),
-            Err(e) => Err(db_error(e)),
+        let result = self
+            .with_read_db(move |db| {
+                let target_ms = params
+                    .timestamp_ms
+                    .unwrap_or_else(|| db.latest_tick_timestamp_ms().ok().flatten().unwrap_or(0.0));
+                match db.get_snapshot_near(target_ms) {
+                    Ok(Some((snapshot_ts, payload))) => Ok(Some(serde_json::json!({
+                        "snapshot": payload,
+                        "snapshotTimestampMs": snapshot_ts,
+                        "requestedTimestampMs": target_ms,
+                        "offsetMs": snapshot_ts - target_ms,
+                        "dataAgeMs": compute_data_age(db)
+                    }))),
+                    Ok(None) => Ok(None),
+                    Err(e) => Err(db_error(e)),
+                }
+            })
+            .await?;
+        match result {
+            Some(payload) => Ok(text_result(payload)),
+            None => Ok(no_data(
+                "No pipeline snapshots found. Snapshots are stored every ~30s once data is flowing.",
+            )),
         }
     }
 

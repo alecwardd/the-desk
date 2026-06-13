@@ -365,6 +365,9 @@ pub(crate) fn render_market_snapshot_payload(r: &LiveMarketResolution) -> serde_
 pub struct TheDeskMcp {
     pub(crate) db: Arc<Mutex<Database>>,
     pub(crate) db_path: Arc<String>,
+    /// Pool of read-only connections for `query_*` / `get_*` tools, so long
+    /// research queries do not contend on the single writer mutex (`db`).
+    pub(crate) read_pool: crate::read_pool::ReadPool,
     pub(crate) pipelines: Arc<Mutex<PipelineEngine>>,
     pub(crate) detector: Arc<Mutex<EventDetector>>,
     pub(crate) flow_emitter: Arc<Mutex<FlowEventEmitter>>,

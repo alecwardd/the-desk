@@ -115,7 +115,7 @@ impl TradeSizePipeline {
             .filter(|(_, s)| s.lot_21_plus > 0)
             .map(|(k, s)| (*k as f64 * self.tick_size, s.lot_21_plus))
             .collect();
-        out.sort_by(|a, b| b.1.cmp(&a.1));
+        out.sort_by_key(|entry| std::cmp::Reverse(entry.1));
         out
     }
 }

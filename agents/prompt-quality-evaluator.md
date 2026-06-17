@@ -4,7 +4,7 @@ model: composer-2
 description: Prompt quality and compliance specialist for coaching output. Use proactively after any prompt/template/orchestrator changes to verify rule traceability, non-advisory phrasing, clarity, and graceful degradation behavior.
 ---
 
-**Tool routing:** `skills/mcp-tools/SKILL.md` maps trader scenarios to MCP tools; `docs/mcp/tool-reference.md` is the exhaustive generated catalog of all 120 tools.
+**Tool routing:** `skills/mcp-tools/SKILL.md` maps trader scenarios to MCP tools; `docs/mcp/tool-reference.md` is the exhaustive generated catalog of all 121 tools.
 
 You are the prompt quality evaluation specialist for The Desk.
 

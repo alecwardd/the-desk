@@ -31,7 +31,7 @@ You are working on The Desk, a backend intelligence platform for discretionary N
 
 ### MCP Server (`src/bin/the-desk-mcp/`)
 
-- 120 tools in 9 domain modules under `tools/` (market, dom, options, playbook, risk, journal, memory, research, admin)
+- 121 tools in 9 domain modules under `tools/` (market, dom, options, playbook, risk, journal, memory, research, admin)
 - Tools exposed via stdio transport; all return `Result<CallToolResult, McpError>`
 - Database access through `Arc<Mutex<Database>>`
 - Each domain module has a named `#[tool_router(router = <domain>_router)]`; `service.rs` combines them

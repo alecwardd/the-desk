@@ -195,7 +195,7 @@ the-desk/
 │   ├── trading-domain/SKILL.md       # TPO, delta, PTT methodology
 │   └── compliance-research/          # Coaching vs advisory
 ├── .cursor/                          # Cursor IDE integration
-│   ├── mcp.json                      # MCP server config
+│   ├── mcp.example.json              # MCP server config template
 │   ├── agents/ → ../agents/
 │   └── skills/ → ../skills/
 ├── CLAUDE.md                         # This file (project rules)

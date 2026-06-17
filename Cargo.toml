@@ -3,6 +3,9 @@ name = "the-desk-backend"
 version = "0.1.0"
 edition = "2021"
 default-run = "the-desk-mcp"
+description = "Backend market-intelligence platform for discretionary NQ futures traders"
+repository = "https://github.com/alecwardd/the-desk"
+publish = false
 
 [dependencies]
 chrono = { version = "0.4", features = ["serde"] }

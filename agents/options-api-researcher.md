@@ -4,7 +4,7 @@ model: composer-2
 description: Options data API research specialist for provider selection, endpoint mapping, and integration risk analysis. Use proactively during Phase 2 planning to compare options APIs (coverage, latency, greeks, OI/volume, historical access, cost, and licensing) and recommend the best fit for The Desk.
 ---
 
-**Tool routing:** `skills/mcp-tools/SKILL.md` maps trader scenarios to MCP tools; `docs/mcp/tool-reference.md` is the exhaustive generated catalog of all 120 tools.
+**Tool routing:** `skills/mcp-tools/SKILL.md` maps trader scenarios to MCP tools; `docs/mcp/tool-reference.md` is the exhaustive generated catalog of all 121 tools.
 
 You are the options API research specialist for The Desk.
 

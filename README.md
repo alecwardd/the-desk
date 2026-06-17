@@ -2,7 +2,9 @@
 
 **Backend Intelligence Platform for Discretionary NQ Futures Traders**
 
-The Desk reads Sierra Chart's `.scid` tick data files, computes market structure and microstructure analytics in real-time, stores everything in SQLite, and exposes the full intelligence layer via MCP (Model Context Protocol) — making any AI agent in Cursor your trading partner.
+The Desk reads Sierra Chart `.scid` tick data files, computes market structure and microstructure analytics in real time, stores everything in SQLite, and exposes the intelligence layer via MCP (Model Context Protocol) so AI agents can reason over live market context and the trader's playbook.
+
+This repository is backend-only: Rust, SQLite, MCP tools, and agent definitions. It does not place orders, manage positions, or provide financial advice.
 
 ## How It Works
 
@@ -18,7 +20,7 @@ Sierra Chart (.scid files) → Rust Pipeline Engine → SQLite → MCP Server �
 6. **Research query engine** answers frequency, conditional probability, and distribution questions over historical data
 7. **MCP server** exposes 121 MCP tools that any Cursor agent can call for market context, feed diagnostics, setup lifecycle state, and historical research
 8. **Specialized subagents** (market structure, order flow, levels, performance) access domain-specific tools and report to the orchestrator
-9. **You chat with agents** in Cursor who reference live (1-5s delayed) market data and historical statistics
+9. **The trader chats with agents** in Cursor who reference live (1-5s delayed) market data and historical statistics
 
 The primary interaction is via Cursor agents and MCP tools (stdio). There is no desktop or web UI in this repository.
 
@@ -34,19 +36,19 @@ Use `get_feed_health` and `validate_data_integrity` to confirm feed freshness an
 
 ## What It Computes
 
-### Market Structure (Layer 1)
+### Market Structure Pipelines
 - **VWAP** with 1/2/3 standard deviation bands
 - **TPO Profile** — value area, POC, single prints, poor highs/lows, excess
 - **Delta Profile** — delta neutral value area (DNVA), delta neutral pivot (DNP)
 - **Key Levels** — prior day H/L/C, prior VA/POC, overnight range, IB extensions
 
-### Microstructure (Layer 2)
+### Microstructure Pipelines
 - **Tape Pace** — rolling ticks/sec in 5s/30s/5m windows, pace percentile, dwell time
 - **Footprint** — bid/ask volume at price, stacked + diagonal imbalances
 - **Absorption / Exhaustion** — high-volume defense, declining-volume moves, delta divergence
 - **Trade Size Distribution** — institutional vs retail flow, size-at-price
 
-### PTT Methodology (Layer 3)
+### PTT Methodology Pipelines
 - **5-Min Opening Range** — Leo's OR5 high/low/mid, break detection, mid retest tracking
 - **Relative Volume (RVOL)** — current vs 20-day average, Low/Normal/Elevated/High classification
 - **Day Type Classifier** — Normal, NormalVariation, Neutral, Trend, DoubleDistribution (Dalton)
@@ -168,14 +170,14 @@ min_interval_hours = 12     # skip the startup backup if one is newer than this
 
 ### MCP Server
 
-The MCP server is configured in `.cursor/mcp.json`.
+The tracked example config lives at `.cursor/mcp.example.json`. Use it as the template for your local `.cursor/mcp.json`, which is intentionally gitignored so each clone can point to its own build path.
 `target_alt` is an alternative build output directory (`CARGO_TARGET_DIR`) to avoid cargo lock conflicts when the MCP server binary is running while a separate `cargo build` is in progress.
 
 ```json
 {
     "mcpServers": {
       "the-desk": {
-      "command": "c:\\the-desk\\target_alt\\release\\the-desk-mcp.exe",
+      "command": "C:\\path\\to\\the-desk\\target_alt\\release\\the-desk-mcp.exe",
       "args": []
     }
   }
@@ -293,4 +295,4 @@ The Desk now resolves the active futures contract with a hybrid manual-plus-auto
 
 ## License
 
-Private repository. All rights reserved.
+Source available for portfolio review. All rights reserved.

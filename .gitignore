@@ -26,6 +26,9 @@ config.toml
 !.vscode/settings.json
 !.vscode/extensions.json
 .idea/
+.cursor/mcp.json
+.cursor/plans/
+.cursor/worktrees.json
 
 # OS
 .DS_Store

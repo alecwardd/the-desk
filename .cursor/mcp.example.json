@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "the-desk": {
+      "command": "C:\\path\\to\\the-desk\\target_alt\\release\\the-desk-mcp.exe",
+      "args": []
+    }
+  }
+}

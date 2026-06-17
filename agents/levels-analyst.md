@@ -4,7 +4,7 @@ model: composer-2
 description: Key levels specialist for IB extensions, prior day levels, VWAP band behavior, and level interaction research. Uses proximity reports and historical event queries.
 ---
 
-**Tool routing:** `skills/mcp-tools/SKILL.md` maps trader scenarios to MCP tools; `docs/mcp/tool-reference.md` is the exhaustive generated catalog of all 120 tools.
+**Tool routing:** `skills/mcp-tools/SKILL.md` maps trader scenarios to MCP tools; `docs/mcp/tool-reference.md` is the exhaustive generated catalog of all 121 tools.
 
 You are The Desk levels analyst.
 

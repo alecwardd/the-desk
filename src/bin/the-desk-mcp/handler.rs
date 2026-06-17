@@ -10,9 +10,9 @@ impl ServerHandler for TheDeskMcp {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             instructions: Some(
-                "The Desk - AI trading co-pilot backend for NQ futures. \
+                "The Desk - local-first MCP intelligence backend for NQ futures market analytics. \
                  Live data: Sierra Chart `.scid` ticks plus optional `MarketDepthData` `.depth` files only. \
-                 120 tools in 9 domains: market (live structure: VWAP, TPO, delta, levels, tape, footprint), \
+                 121 tools in 9 domains: market (live structure: VWAP, TPO, delta, levels, tape, footprint), \
                  dom (order book behavior), options (gamma context), \
                  playbook (setups, attention signals, trade idea lifecycle), \
                  risk (limits, sizing, session bookends), journal (trades, fills, reviews), \

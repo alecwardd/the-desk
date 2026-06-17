@@ -1,28 +1,58 @@
 # The Desk
 
-**Backend Intelligence Platform for Discretionary NQ Futures Traders**
+**Local-First MCP Intelligence Backend for AI Agents**
 
-The Desk reads Sierra Chart `.scid` tick data files, computes market structure and microstructure analytics in real time, stores everything in SQLite, and exposes the intelligence layer via MCP (Model Context Protocol) so AI agents can reason over live market context and the trader's playbook.
+The Desk is a backend intelligence platform that gives AI agents structured, trusted data through an MCP server. Deterministic Rust pipelines, a rules engine, and local SQLite persistence keep computed state and guardrails as the source of truth before any model synthesizes context.
 
-This repository is backend-only: Rust, SQLite, MCP tools, and agent definitions. It does not place orders, manage positions, or provide financial advice.
+The concrete use case is trading analytics for discretionary NQ futures: The Desk reads Sierra Chart `.scid` tick data files, computes market structure and microstructure analytics in real time, and exposes the results to Cursor agents. This repository is backend-only: Rust, SQLite, MCP tools, and agent definitions. It does not place orders, manage positions, or provide financial advice.
 
 ## How It Works
 
 ```
-Sierra Chart (.scid files) → Rust Pipeline Engine → SQLite → MCP Server → Cursor Agents
+Sierra Chart .scid/.depth files
+        |
+        v
+Rust incremental pipelines
+        |
+        v
+Rules engine + guardrails
+        |
+        v
+SQLite state and research store
+        |
+        v
+MCP server (121 structured tools)
+        |
+        v
+AI agents in Cursor
 ```
 
 1. **Sierra Chart** writes tick data to `.scid` files as part of normal operation
 2. **The Desk** tail-reads those files, parsing 40-byte binary records (price, bid, ask, volume, aggressor side)
 3. **14 pipeline modules** compute market structure incrementally on every tick
 4. **EventDetector** logs ~30 structured market events (level tests, IB extensions, day type changes, etc.)
-5. **SQLite** stores raw ticks, computed state, session summaries, market events, signal outcomes, and playbook signals
-6. **Research query engine** answers frequency, conditional probability, and distribution questions over historical data
-7. **MCP server** exposes 121 MCP tools that any Cursor agent can call for market context, feed diagnostics, setup lifecycle state, and historical research
-8. **Specialized subagents** (market structure, order flow, levels, performance) access domain-specific tools and report to the orchestrator
-9. **The trader chats with agents** in Cursor who reference live (1-5s delayed) market data and historical statistics
+5. **Rules engine** evaluates typed playbook conditions and risk gates before any agent synthesis
+6. **SQLite** stores raw ticks, computed state, session summaries, market events, signal outcomes, and playbook signals
+7. **Research query engine** answers frequency, conditional probability, and distribution questions over historical data
+8. **MCP server** exposes 121 MCP tools that any Cursor agent can call for market context, feed diagnostics, setup lifecycle state, and historical research
+9. **Specialized subagents** (market structure, order flow, levels, performance) access domain-specific tools and report to the orchestrator
+10. **The trader chats with agents** in Cursor who reference live (1-5s delayed) market data and historical statistics
 
 The primary interaction is via Cursor agents and MCP tools (stdio). There is no desktop or web UI in this repository.
+
+## Design Decisions
+
+### Deterministic Before LLM Synthesis
+Market state is computed in Rust pipelines and checked by the rules engine before agents synthesize a response. The model receives typed tool outputs and rule status, not an invitation to infer structure from scratch, which keeps the data layer auditable and reduces hallucination risk.
+
+### Structured Data Only
+MCP tools return computed snapshots, profiles, events, outcomes, and diagnostics. They do not stream raw ticks into prompts, which keeps context bounded and makes each agent-facing answer traceable to a specific pipeline or database query.
+
+### Local-First Operation
+The core system reads local Sierra Chart files and persists to local SQLite. Pipelines, rules, backfill, and research queries work without network connectivity, which keeps the trading-data path reliable and under local control.
+
+### No Autonomous Execution
+The Desk informs, coaches, logs, and researches. It never places orders, manages positions through a broker, or takes actions on the trader's behalf.
 
 ## Ingestion Modes
 
@@ -148,8 +178,8 @@ Create `~/.the-desk/config.toml`:
 sierra_data_dir = "D:\\SierraChart\\Data"
 base_symbol = "NQ"
 symbol_mode = "hybrid"
-symbol = "NQH26.CME"
-active_symbol_override = "NQH26.CME"
+symbol = "NQU26.CME"                 # replace with the active Sierra Chart contract
+active_symbol_override = "NQU26.CME" # optional manual override
 flush_poll_ms = 1000
 
 [storage]
@@ -171,7 +201,12 @@ min_interval_hours = 12     # skip the startup backup if one is newer than this
 ### MCP Server
 
 The tracked example config lives at `.cursor/mcp.example.json`. Use it as the template for your local `.cursor/mcp.json`, which is intentionally gitignored so each clone can point to its own build path.
-`target_alt` is an alternative build output directory (`CARGO_TARGET_DIR`) to avoid cargo lock conflicts when the MCP server binary is running while a separate `cargo build` is in progress.
+`target_alt` is an alternative build output directory (`CARGO_TARGET_DIR`) to avoid cargo lock conflicts when the MCP server binary is running while a separate `cargo build` is in progress. Build the release binary there before pointing Cursor at it:
+
+```powershell
+$env:CARGO_TARGET_DIR = "target_alt"
+cargo build --release --bin the-desk-mcp
+```
 
 ```json
 {
@@ -189,7 +224,11 @@ Once running, any Cursor agent can call tools like `get_market_snapshot`, `get_d
 ### Development
 
 ```bash
-# From repository root — run all tests (pipelines, rules, db, research, MCP helpers, etc.)
+# From repository root - check formatting and linting
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+
+# Run all tests (pipelines, rules, db, research, MCP helpers, etc.)
 cargo test
 
 # Check compilation

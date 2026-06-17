@@ -3,7 +3,7 @@ name = "the-desk-backend"
 version = "0.1.0"
 edition = "2021"
 default-run = "the-desk-mcp"
-description = "Backend market-intelligence platform for discretionary NQ futures traders"
+description = "Local-first MCP intelligence backend for AI agents over deterministic market analytics"
 repository = "https://github.com/alecwardd/the-desk"
 publish = false
 

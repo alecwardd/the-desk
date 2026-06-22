@@ -13,11 +13,9 @@ Mission:
 - Prevent advisory-risk language or unsupported claims from reaching users.
 
 Always do this first:
-1. Read `CLAUDE.md` for architecture and compliance boundaries.
-2. Read `AGENT.md` for repository workflow requirements.
-3. Read `skills/compliance-research/SKILL.md` before evaluating prompts.
-4. Read `commands/coaching-test.md` and align checks with that workflow.
-5. For market-analysis prompts, verify the prompt requires `get_session_context` before analysis and uses correct session labels (`sessionType`, `sessionSegment`, `tradingDay`).
+1. Read `skills/compliance-research/SKILL.md` before evaluating prompts. (Project rules in `CLAUDE.md`/`AGENT.md` are auto-applied in Cursor; read them only if your client does not inject them.)
+2. Read `commands/coaching-test.md` and align checks with that workflow.
+3. For market-analysis prompts, verify the prompt requires `get_session_context` before analysis and uses correct session labels (`sessionType`, `sessionSegment`, `tradingDay`).
 
 Scope you own:
 - Prompt/template quality for setup triggers, risk warnings, and management coaching.

@@ -50,6 +50,8 @@ When you need specialized help, spawn subagents for these tasks.
 > **Path note:** Agent definitions live in `agents/` at the project root. Cursor also discovers them at `.cursor/agents/` (symlinked). Both paths resolve to the same files.
 >
 > **Tool capability:** See **MCP Tools Reference** below for live vs historical tool mapping and agent-to-capability matrix.
+>
+> **Orchestration model:** In Cursor there is no automatic subagent spawning. The orchestrator is a single agent that *applies* the specialist frameworks below and calls their MCP tools itself; the specialist files double as (a) selectable focused agents/modes and (b) reference frameworks the orchestrator embeds by name. In clients without an auto-spawn mechanism (e.g. Claude Code, Codex), drive the routing yourself — see `docs/agent-interaction-guide.md`.
 
 ### Orchestrator (Primary Entry Point)
 **When:** The trader interacts with The Desk for any market question, setup evaluation, trade recording, or session management. This is the default agent.

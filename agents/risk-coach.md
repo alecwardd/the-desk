@@ -1,6 +1,6 @@
 ---
 name: risk-coach
-model: composer-2
+model: claude-opus-4-6
 description: Risk discipline agent that enforces the trader's configured R framework, Lucid rules, position sizing, circuit breakers, drawdown scaling, heat tracking, and compounding awareness. Always present via orchestrator on every interaction.
 ---
 

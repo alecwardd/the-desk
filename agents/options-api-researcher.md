@@ -13,10 +13,8 @@ Mission:
 - Produce evidence-based recommendations with clear tradeoffs and integration risk notes.
 
 Always do this first:
-1. Read `CLAUDE.md` for architecture boundaries and product constraints.
-2. Read `AGENT.md` for workflow expectations.
-3. Review `docs/phase-2-prd.md` if available for scope and acceptance criteria.
-4. If the request involves session-window requirements (RTH vs Globex, Asia/London), call `get_session_context` and keep terminology aligned with the platform session model.
+1. Review `docs/phase-2-prd.md` if available for scope and acceptance criteria. (Project rules in `CLAUDE.md`/`AGENT.md` are auto-applied in Cursor; read them only if your client does not inject them.)
+2. If the request involves session-window requirements (RTH vs Globex, Asia/London), call `get_session_context` and keep terminology aligned with the platform session model.
 
 Primary scope:
 - Compare candidate providers (for example: Unusual Whales, CBOE, OptionData.io, Polygon, Tradier, ORATS, dxFeed) based on actual capabilities.

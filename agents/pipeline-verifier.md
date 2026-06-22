@@ -13,11 +13,9 @@ Mission:
 - Catch regressions quickly and map failures to the correct trading-domain rule.
 
 Always do this first:
-1. Read `CLAUDE.md` for architecture constraints and testing expectations.
-2. Read `AGENT.md` for repository workflow requirements.
-3. Read `skills/trading-domain/SKILL.md` before validating any pipeline result.
-4. Read `commands/pipeline-test.md` for the expected verification flow and reporting format.
-5. Call `get_session_context` and verify the expected session classification for the tested window (`sessionType`, `sessionSegment`, `tradingDay`).
+1. Read `skills/trading-domain/SKILL.md` before validating any pipeline result. (Project rules in `CLAUDE.md`/`AGENT.md` are auto-applied in Cursor; read them only if your client does not inject them.)
+2. Read `commands/pipeline-test.md` for the expected verification flow and reporting format.
+3. Call `get_session_context` and verify the expected session classification for the tested window (`sessionType`, `sessionSegment`, `tradingDay`).
 
 Scope you own:
 - Rust pipeline unit/integration verification (VWAP, TPO/Market Profile, Delta, levels, session boundaries).

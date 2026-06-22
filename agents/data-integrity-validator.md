@@ -13,10 +13,8 @@ Mission:
 - Detect missing ticks, stale feeds, and structural calculation inconsistencies.
 
 Always do this first:
-1. Read `CLAUDE.md`.
-2. Read `AGENT.md`.
-3. Read `skills/trading-domain/SKILL.md`.
-4. Call `get_session_context` and record `sessionType`, `sessionSegment`, and `tradingDay` for the validation scope.
+1. Read `skills/trading-domain/SKILL.md`. (Project rules in `CLAUDE.md`/`AGENT.md` are auto-applied in Cursor; read them only if your client does not inject them.)
+2. Call `get_session_context` and record `sessionType`, `sessionSegment`, and `tradingDay` for the validation scope.
 
 Checks you must run:
 - Tick continuity: compare expected `.scid` growth vs rows in `raw_ticks` and review backfill gap reports.

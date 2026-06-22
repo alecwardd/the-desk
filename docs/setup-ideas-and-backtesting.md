@@ -69,6 +69,24 @@ Current local evidence suggests:
 - Use **inventory-clear / mean-reversion / repair logic** when the session is behaving like a double-distribution migration or London-to-RTH unwind
 - Treat **pinch**, **OR5**, and **raw absorption** as context-dependent, not standalone edge
 
+**Implementation note (2026-06-22):** Template-library coverage was expanded from 9 to 13 in
+`src/rules/setup_templates.rs`. Added short-side mirrors (OR5 Mid Retest, Single Print
+Continuation, IB Extension, VWAP Band Zone) so continuation/responsive families are no longer
+long-only, and tagged every template with a `regime` field (`continuation` | `responsive` |
+`transition`) in `marketContext`. A non-destructive seeder (`seed_templates`, exposed via
+`the-desk-mcp --seed-templates [--activate]`) idempotently loads these doctrine templates into the
+playbook DB — closing the gap where `all_templates()` was never seeded. What is **not** yet done,
+and still requires new `ConditionField` variants plus pipeline detection before it can fire live:
+
+- **Regime gate (IDEA-000):** the `regime` tag is metadata only; the rules engine does not yet gate
+  which families may fire. Needs a computed regime field on `MarketState` and an eligibility check
+  before condition evaluation.
+- **Reversal / trap family (IDEA-002, IDEA-012, IDEA-003):** failed-breakout-state,
+  absorption-invalidation, and naked-VPOC-proximity have no condition fields today
+  (`delta_confirmation_at_level` / `rebid_zone_held` currently always evaluate false). These must go
+  through the `register_hypothesis` → `run_backtest` → `propose_draft_setup` → `activate_draft_setup`
+  loop once the detection fields exist.
+
 ---
 
 ## Codebase Audit & Opinion

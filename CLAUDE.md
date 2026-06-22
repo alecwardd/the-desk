@@ -34,7 +34,7 @@ LAYER 2: Rules Engine (Rust)
   - Evaluates playbook conditions against Layer 1 signals
   - 40+ typed condition fields. Deterministic boolean logic. No LLM calls.
   - Fires typed alerts when conditions are met.
-  - 9 pre-built setup templates from PTT methodology.
+  - 13 pre-built setup templates from PTT methodology.
 
 LAYER 2.5: Research Infrastructure (Rust)
   - EventDetector: detects structured market events (level tests, extensions, day type changes)
@@ -179,7 +179,7 @@ the-desk/
 │   │   └── session_inventory.rs     # Cross-session positioning
 │   ├── rules/                        # Playbook rules engine
 │   │   ├── mod.rs                    # Condition evaluator (40+ fields)
-│   │   └── setup_templates.rs        # 9 pre-built PTT setup templates
+│   │   └── setup_templates.rs        # 13 pre-built PTT setup templates
 │   ├── feed/                         # Data ingestion
 │   │   ├── mod.rs                    # FeedEvent, FeedConfig
 │   │   └── scid_reader.rs           # .scid binary file parser

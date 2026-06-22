@@ -46,6 +46,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::args().any(|a| a == "--write-tool-docs") {
         return docs::write_tool_reference();
     }
+    if std::env::args().any(|a| a == "--seed-templates") {
+        let activate = std::env::args().any(|a| a == "--activate");
+        return seed_templates_cli(activate);
+    }
     let logging_config = load_logging_config();
     let mut effective_logging_config = logging_config.clone();
     let logging_runtime = match init_logging(&logging_config) {
@@ -1208,5 +1212,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let service = server.serve(stdio()).await?;
     service.waiting().await?;
+    Ok(())
+}
+
+/// Seed the canonical PTT setup templates into the playbook DB and exit.
+///
+/// Invoked via `--seed-templates [--activate]`. Without `--activate`, templates
+/// load inactive (review-then-arm). With `--activate`, missing templates are
+/// inserted already armed. Idempotent: existing setups are never modified.
+fn seed_templates_cli(activate: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let db_path = data_dir().join("data.db");
+    let db = Database::open(&db_path.to_string_lossy())?;
+    let report = the_desk_backend::rules::setup_templates::seed_templates(&db, activate)?;
+    println!(
+        "Seeded playbook templates into {} (activate={activate})",
+        db_path.display()
+    );
+    println!(
+        "  inserted ({}): {}",
+        report.inserted.len(),
+        report.inserted.join(", ")
+    );
+    println!(
+        "  skipped existing ({}): {}",
+        report.skipped_existing.len(),
+        report.skipped_existing.join(", ")
+    );
+    if activate {
+        println!("  inserted templates are ACTIVE and will evaluate live this session.");
+    } else {
+        println!(
+            "  inserted templates are INACTIVE. Re-run with --activate to arm them directly, \
+             or run them through the backtest loop before activating."
+        );
+    }
     Ok(())
 }

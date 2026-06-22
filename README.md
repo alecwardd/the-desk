@@ -90,7 +90,7 @@ Use `get_feed_health` and `validate_data_integrity` to confirm feed freshness an
 - Typed conditions evaluated against `MarketState` on every tick
 - 40+ condition field variants covering all pipeline outputs
 - Setup state machine: NotActive → Approaching → ConditionsMet → Confirmed → InTrade → Closed
-- 9 pre-built setup templates (OR5 Mid Retest, Rebid at Support, Delta Pinch Reversal, etc.)
+- 13 pre-built setup templates (OR5 Mid Retest, Rebid at Support, Delta Pinch Reversal, plus short-side mirrors, etc.)
 
 ### Research Infrastructure
 - **EventDetector** — logs ~30 structured event types (level tests, IB extensions, day type changes, new session highs/lows, poor highs/lows, excess, RVOL spikes, DNP crosses)
@@ -145,7 +145,7 @@ the-desk/
 │   │   └── session_inventory.rs   # Cross-session positioning
 │   ├── rules/
 │   │   ├── mod.rs              # Rules engine + condition evaluator
-│   │   └── setup_templates.rs  # 9 pre-built playbook templates
+│   │   └── setup_templates.rs  # 13 pre-built playbook templates
 │   ├── feed/
 │   │   ├── mod.rs              # FeedEvent, FeedConfig, StorageConfig
 │   │   └── scid_reader.rs      # .scid binary file parser

@@ -1,6 +1,6 @@
 //! Read-only SQLite connection pool.
 //!
-//! All 120 MCP tools share a single writer connection behind `Arc<Mutex<Database>>`.
+//! All MCP tools share a single writer connection behind `Arc<Mutex<Database>>`.
 //! A long-running research query holding that mutex blocks live market reads.
 //! The database runs in WAL mode, which supports any number of concurrent
 //! readers alongside a single writer, so read-only tools can each borrow a

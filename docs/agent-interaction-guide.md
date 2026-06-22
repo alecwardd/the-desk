@@ -23,7 +23,7 @@ YOU (prompt)
 ORCHESTRATOR AGENT          ← classifies intent, runs baseline + risk calls
    │  routes to a specialist framework (≤2 routes/turn)
    ▼
-MCP SERVER (121 tools)      ← deterministic Rust pipelines + SQLite, never an LLM
+MCP SERVER (all tools)      ← deterministic Rust pipelines + SQLite, never an LLM
    │  returns structured JSON (snapshots, profiles, events, stats, freshness)
    ▼
 SPECIALIST SYNTHESIS        ← Dalton / orderflow / levels / risk framework applied
@@ -328,12 +328,27 @@ test workflows) were kept. All 12 agents are now consistent.
 frameworks the orchestrator *applies* (not auto-spawned services), and that in
 clients without an auto-spawn mechanism you drive routing yourself (this guide).
 
+### 7.6 ✅ Fixed — count drift + stale docs (repo-wide)
+- **Tool-count drift guard widened.** `121 MCP tools` was hardcoded in ~20 spots
+  but `documented_mcp_tool_count_matches_router` only checked three —
+  `read_pool.rs` had already drifted to "120". Now the test also guards
+  `.cursorrules`, `docs/mcp/README.md`, `skills/mcp-tools/SKILL.md`, and the
+  `handler.rs` server-instructions string (all normalized to the `N MCP tools`
+  phrasing). Decorative mentions in the agent headers and this guide were
+  de-numbered so they can't drift, and `read_pool.rs` no longer hardcodes a count.
+- **Stale concurrency doc fixed.** `docs/mcp/README.md` called the read-only
+  connection pool "the planned improvement" — it has shipped (`read_pool.rs`,
+  `with_read_db`). Rewritten to describe the actual model.
+- **`commands/` documented.** The nine Cursor slash-commands are now listed in
+  `CLAUDE.md`'s File Structure.
+- **Stale paths repointed.** `skills/tauri-bridge/SKILL.md` → `src/bin/the-desk-mcp/`
+  (now a directory); `options-api-researcher` → `docs/phase-2-options-databento-memo.md`.
+
 ### Optional / not done (your call)
 - **Newer model string** — see the 7.2 verify note.
-- **`docs/phase-2-prd.md`** referenced by `options-api-researcher` does not exist
-  at that path (only `docs/archive/v0-tauri-gui/phase-2-prd.md` and
-  `docs/phase-2-options-databento-memo.md`). The reference is guarded with "if
-  available", so it's harmless — repoint it if you want it live.
+- **`docs/setup-ideas-and-backtesting.md`** still references the pre-split
+  `src/bin/the-desk-mcp.rs` single file and recommends splitting it (since done).
+  Left as-is: it's a point-in-time analysis doc, not a live spec.
 
 ### What's already strong (left untouched)
 - Uniform agent skeleton: `Always Do This First` → primary tool tables → decision

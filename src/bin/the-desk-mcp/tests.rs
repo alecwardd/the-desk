@@ -553,10 +553,26 @@ fn documented_mcp_tool_count_matches_router() {
     let tool_count = TheDeskMcp::tool_router().list_all().len();
     let expected = format!("{tool_count} MCP tools");
 
+    // Every authoritative surface that states the count must agree with the live
+    // router (the generated tool-reference.md is the catalog; these are the prose,
+    // config, and runtime-instruction surfaces a reader or agent might trust).
     for (path, contents) in [
         ("AGENT.md", include_str!("../../../AGENT.md")),
         ("README.md", include_str!("../../../README.md")),
         ("CLAUDE.md", include_str!("../../../CLAUDE.md")),
+        (".cursorrules", include_str!("../../../.cursorrules")),
+        (
+            "docs/mcp/README.md",
+            include_str!("../../../docs/mcp/README.md"),
+        ),
+        (
+            "skills/mcp-tools/SKILL.md",
+            include_str!("../../../skills/mcp-tools/SKILL.md"),
+        ),
+        (
+            "handler.rs (server instructions)",
+            include_str!("handler.rs"),
+        ),
     ] {
         assert!(
             contents.contains(&expected),

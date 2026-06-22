@@ -8,7 +8,7 @@ connecting to it.
 - **Binary:** `the-desk-mcp` (default run target)
 - **Transport:** stdio (`rmcp` crate). stdout is protocol-only; logs go to
   stderr/file (enforced by the `mcp_stdio` integration test).
-- **Tool surface:** 121 tools in 9 domains. The exhaustive, generated catalog is
+- **Tool surface:** 121 MCP tools in 9 domains. The exhaustive, generated catalog is
   [tool-reference.md](tool-reference.md). Scenario routing for agents is
   [skills/mcp-tools/SKILL.md](../../skills/mcp-tools/SKILL.md).
 
@@ -95,16 +95,20 @@ guarantees the two lists can never diverge.
 ## Runtime Model
 
 - **State:** `TheDeskMcp` (in `state.rs`) holds `Arc`-shared handles: the SQLite
-  `Database` behind a mutex, the `PipelineEngine`, rules engine, event detector,
+  `Database` writer behind a mutex, a bounded read-only WAL connection pool
+  (`ReadPool`), the `PipelineEngine`, rules engine, event detector,
   attention/runtime-event stores, and caches (contract resolution, context
   frames, options snapshots, playbook runtime).
 - **Feed loop:** `main.rs` spawns the `.scid` poll loop; `lifecycle.rs` owns
   tick processing, depth polling, RTH close finalization, new-session
   preparation, and startup warm replay.
-- **Concurrency caveat:** all tools currently share one SQLite connection
-  behind a mutex. Long research queries can block live reads. Heavy paths use
-  `spawn_blocking`; a read-only connection pool (WAL supports concurrent
-  readers) is the planned improvement.
+- **Concurrency model:** writes go through the single `Database` writer behind
+  `Arc<Mutex<Database>>`; read-only tools borrow a dedicated
+  `SQLITE_OPEN_READ_ONLY` connection from a bounded WAL pool (`read_pool.rs`,
+  `DEFAULT_READ_POOL_SIZE = 4`) via `with_read_db`, so long research queries no
+  longer block live market reads or the writer. The pool opens connections
+  lazily, returns them to an idle stack on drop, and self-heals if one is lost.
+  Heavy synchronous paths still run under `spawn_blocking`.
 
 ## Hard Rules (from CLAUDE.md)
 

@@ -5,7 +5,7 @@ description: MCP tool routing for The Desk. USE WHEN any agent needs to decide w
 
 # MCP Tool Routing
 
-The Desk MCP server exposes **121 tools in 9 domains**. This skill tells you *which* tool to call *when*. For the full catalog with every description, read [docs/mcp/tool-reference.md](../../docs/mcp/tool-reference.md) — it is generated from the compiled server and guarded by a test, so it is never stale.
+The Desk MCP server exposes **121 MCP tools in 9 domains**. This skill tells you *which* tool to call *when*. For the full catalog with every description, read [docs/mcp/tool-reference.md](../../docs/mcp/tool-reference.md) — it is generated from the compiled server and guarded by a test, so it is never stale.
 
 **Source layout:** each domain is a module in `src/bin/the-desk-mcp/tools/` (market, dom, options, playbook, risk, journal, memory, research, admin).
 

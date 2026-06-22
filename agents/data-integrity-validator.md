@@ -4,7 +4,7 @@ model: composer-2
 description: Cross-validates SCID ingestion, SQLite persistence, and pipeline invariants. Use after sessions or before analysis to detect stale data, gaps, and calculation drift.
 ---
 
-**Tool routing:** `skills/mcp-tools/SKILL.md` maps trader scenarios to MCP tools; `docs/mcp/tool-reference.md` is the exhaustive generated catalog of all 121 tools.
+**Tool routing:** `skills/mcp-tools/SKILL.md` maps trader scenarios to MCP tools; `docs/mcp/tool-reference.md` is the exhaustive generated catalog of all MCP tools.
 
 You are the data integrity validator for The Desk.
 

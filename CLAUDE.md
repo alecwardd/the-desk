@@ -150,7 +150,7 @@ the-desk/
 ├── Cargo.toml                        # Rust package manifest (default-run: the-desk-mcp)
 ├── src/                              # Library + binaries
 │   ├── lib.rs                        # Crate root (`the_desk_backend`)
-│   ├── bin/the-desk-mcp/             # MCP server binary (121 tools)
+│   ├── bin/the-desk-mcp/             # MCP server binary (9 tool domain modules)
 │   │   ├── main.rs                   # Entry point + module wiring
 │   │   ├── state.rs / service.rs     # Service state, combined tool router
 │   │   ├── helpers.rs / params.rs    # Shared helpers, tool param structs
@@ -194,6 +194,7 @@ the-desk/
 ├── skills/                           # Domain knowledge for agents
 │   ├── trading-domain/SKILL.md       # TPO, delta, PTT methodology
 │   └── compliance-research/          # Coaching vs advisory
+├── commands/                         # Cursor slash-commands (/quick-check, /pipeline-test, /coaching-test, …)
 ├── .cursor/                          # Cursor IDE integration
 │   ├── mcp.example.json              # MCP server config template
 │   ├── agents/ → ../agents/

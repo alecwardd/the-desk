@@ -12,7 +12,7 @@ impl ServerHandler for TheDeskMcp {
             instructions: Some(
                 "The Desk - local-first MCP intelligence backend for NQ futures market analytics. \
                  Live data: Sierra Chart `.scid` ticks plus optional `MarketDepthData` `.depth` files only. \
-                 121 tools in 9 domains: market (live structure: VWAP, TPO, delta, levels, tape, footprint), \
+                 121 MCP tools in 9 domains: market (live structure: VWAP, TPO, delta, levels, tape, footprint), \
                  dom (order book behavior), options (gamma context), \
                  playbook (setups, attention signals, trade idea lifecycle), \
                  risk (limits, sizing, session bookends), journal (trades, fills, reviews), \

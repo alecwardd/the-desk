@@ -1679,6 +1679,7 @@ mod tests {
             active_symbol_override: None,
             flush_poll_ms: 1_000,
             price_scale: 1.0,
+            ..Default::default()
         }
     }
 

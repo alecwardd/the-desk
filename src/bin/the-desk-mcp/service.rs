@@ -81,6 +81,7 @@ impl TheDeskMcp {
             backfill_manager: Arc::new(AsyncMutex::new(BackfillManager::default())),
             options_cache: Arc::new(AsyncMutex::new(OptionsSnapshotCache::default())),
             contract_cache: Arc::new(Mutex::new(ContractResolutionCache::default())),
+            boundary_cache: Arc::new(Mutex::new(BoundarySessionCache::default())),
             context_frame_cache: Arc::new(Mutex::new(HashMap::new())),
             tool_router: Self::tool_router(),
         }

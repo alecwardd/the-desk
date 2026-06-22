@@ -60,10 +60,31 @@ pub struct FeedConfig {
     /// multiplied by 100 (e.g., 24966.75 → 2496675), so set this to 100.
     #[serde(default = "default_price_scale")]
     pub price_scale: f64,
+    /// Maximum live SCID records to drain in one poll iteration.
+    #[serde(default = "default_max_ticks_per_poll")]
+    pub max_ticks_per_poll: usize,
+    /// Minimum market-time interval between coalesced analysis passes.
+    #[serde(default = "default_analysis_min_interval_ms")]
+    pub analysis_min_interval_ms: f64,
+    /// Force a coalesced analysis pass after this many ingested ticks.
+    #[serde(default = "default_analysis_max_ticks")]
+    pub analysis_max_ticks: usize,
 }
 
 fn default_price_scale() -> f64 {
     100.0
+}
+
+fn default_max_ticks_per_poll() -> usize {
+    5_000
+}
+
+fn default_analysis_min_interval_ms() -> f64 {
+    250.0
+}
+
+fn default_analysis_max_ticks() -> usize {
+    500
 }
 
 fn default_base_symbol() -> String {
@@ -80,6 +101,9 @@ impl Default for FeedConfig {
             active_symbol_override: None,
             flush_poll_ms: 1_000,
             price_scale: 100.0,
+            max_ticks_per_poll: default_max_ticks_per_poll(),
+            analysis_min_interval_ms: default_analysis_min_interval_ms(),
+            analysis_max_ticks: default_analysis_max_ticks(),
         }
     }
 }

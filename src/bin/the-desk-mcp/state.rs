@@ -6,13 +6,16 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
-use the_desk_backend::db::{Database, HistoricalJobRun};
+use the_desk_backend::db::{Database, HistoricalJobRun, PriorDayReference};
 use the_desk_backend::feed::monotonic::MonotonicTimestampViolationKind;
 use the_desk_backend::feed::{ContractMetadata, FeedConfig};
 use the_desk_backend::observability::RuntimeEventStore;
 use the_desk_backend::options::OptionsSnapshot;
-use the_desk_backend::pipelines::{EventDetector, FlowEventEmitter, PipelineEngine};
+use the_desk_backend::pipelines::{
+    EventDetector, FlowEventEmitter, PipelineEngine, PriorSessionData,
+};
 use the_desk_backend::research;
+use the_desk_backend::rollover::ContractRolloverStatus;
 use the_desk_backend::rules::{RulesEngine, SetupDefinition};
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -31,6 +34,11 @@ pub(crate) const MAX_MIN_RESOLVED: i64 = 10_000;
 pub(crate) const MAX_DOM_BEHAVIOR_MIN_DURATION_MS: f64 = 86_400_000.0;
 pub(crate) const CONTRACT_RESOLUTION_CACHE_TTL_MS: u128 = 2_000;
 pub(crate) const CONTEXT_FRAME_CACHE_LIMIT: usize = 128;
+pub(crate) const SCID_WORKER_IDLE: u64 = 0;
+pub(crate) const SCID_WORKER_READING: u64 = 1;
+pub(crate) const SCID_WORKER_PROCESSING: u64 = 2;
+pub(crate) const SCID_WORKER_DB: u64 = 3;
+pub(crate) const SCID_WORKER_ANALYSIS: u64 = 4;
 pub(crate) const LIVE_CONTEXT_FRAME_SNAPSHOT_INTERVAL_MS: f64 = 60_000.0;
 pub(crate) static LAST_LIVE_CONTEXT_SNAPSHOT_MS_BITS: AtomicU64 = AtomicU64::new(0);
 pub(crate) const RESEARCH_EVENT_TYPES: &[&str] = &[
@@ -137,6 +145,8 @@ pub struct McpFeedRuntimeState {
     pub last_scid_tick_ms_bits: Arc<AtomicU64>,
     pub last_depth_timestamp_ms_bits: Arc<AtomicU64>,
     pub scid_tail_offset: Arc<AtomicU64>,
+    pub scid_read_offset: Arc<AtomicU64>,
+    pub scid_processed_offset: Arc<AtomicU64>,
     pub scid_file_len: Arc<AtomicU64>,
     pub scid_tail_reset_count: Arc<AtomicU64>,
     pub scid_last_shrink_len: Arc<AtomicU64>,
@@ -145,6 +155,12 @@ pub struct McpFeedRuntimeState {
     pub backward_timestamp_ticks: Arc<AtomicU64>,
     pub last_non_monotonic_tick_ms_bits: Arc<AtomicU64>,
     pub last_scid_poll_wall_ms: Arc<AtomicU64>,
+    pub last_scid_poll_started_wall_ms: Arc<AtomicU64>,
+    pub last_scid_poll_completed_wall_ms: Arc<AtomicU64>,
+    pub last_scid_batch_tick_count: Arc<AtomicU64>,
+    pub last_scid_batch_process_wall_ms: Arc<AtomicU64>,
+    pub scid_worker_phase: Arc<AtomicU64>,
+    pub last_analysis_pass_wall_ms: Arc<AtomicU64>,
     pub pipeline_lock_contended_now: Arc<AtomicBool>,
     pub pipeline_last_contended_wall_ms: Arc<AtomicU64>,
     pub setup_runtime_rehydrated: Arc<AtomicBool>,
@@ -157,6 +173,8 @@ impl Default for McpFeedRuntimeState {
             last_scid_tick_ms_bits: Arc::new(AtomicU64::new(0)),
             last_depth_timestamp_ms_bits: Arc::new(AtomicU64::new(0)),
             scid_tail_offset: Arc::new(AtomicU64::new(0)),
+            scid_read_offset: Arc::new(AtomicU64::new(0)),
+            scid_processed_offset: Arc::new(AtomicU64::new(0)),
             scid_file_len: Arc::new(AtomicU64::new(0)),
             scid_tail_reset_count: Arc::new(AtomicU64::new(0)),
             scid_last_shrink_len: Arc::new(AtomicU64::new(0)),
@@ -165,6 +183,12 @@ impl Default for McpFeedRuntimeState {
             backward_timestamp_ticks: Arc::new(AtomicU64::new(0)),
             last_non_monotonic_tick_ms_bits: Arc::new(AtomicU64::new(0)),
             last_scid_poll_wall_ms: Arc::new(AtomicU64::new(0)),
+            last_scid_poll_started_wall_ms: Arc::new(AtomicU64::new(0)),
+            last_scid_poll_completed_wall_ms: Arc::new(AtomicU64::new(0)),
+            last_scid_batch_tick_count: Arc::new(AtomicU64::new(0)),
+            last_scid_batch_process_wall_ms: Arc::new(AtomicU64::new(0)),
+            scid_worker_phase: Arc::new(AtomicU64::new(SCID_WORKER_IDLE)),
+            last_analysis_pass_wall_ms: Arc::new(AtomicU64::new(0)),
             pipeline_lock_contended_now: Arc::new(AtomicBool::new(false)),
             pipeline_last_contended_wall_ms: Arc::new(AtomicU64::new(0)),
             setup_runtime_rehydrated: Arc::new(AtomicBool::new(false)),
@@ -194,6 +218,16 @@ impl MonotonicRuntimeSnapshot {
 }
 
 impl McpFeedRuntimeState {
+    pub(crate) fn scid_worker_phase_label(&self) -> &'static str {
+        match self.scid_worker_phase.load(Ordering::Acquire) {
+            SCID_WORKER_READING => "reading",
+            SCID_WORKER_PROCESSING => "processing",
+            SCID_WORKER_DB => "blocked_on_db_or_persisting",
+            SCID_WORKER_ANALYSIS => "analysis",
+            _ => "idle",
+        }
+    }
+
     pub(crate) fn record_pipeline_lock_sample(&self, contended: bool, observed_at_ms: u64) {
         self.pipeline_lock_contended_now
             .store(contended, Ordering::Release);
@@ -380,6 +414,7 @@ pub struct TheDeskMcp {
     pub(crate) backfill_manager: Arc<AsyncMutex<BackfillManager>>,
     pub(crate) options_cache: Arc<AsyncMutex<OptionsSnapshotCache>>,
     pub(crate) contract_cache: Arc<Mutex<ContractResolutionCache>>,
+    pub(crate) boundary_cache: Arc<Mutex<BoundarySessionCache>>,
     pub(crate) context_frame_cache:
         Arc<Mutex<HashMap<String, research::context_frame::ContextFrame>>>,
     pub(crate) tool_router: ToolRouter<Self>,
@@ -402,6 +437,39 @@ pub(crate) struct BackfillManager {
 #[derive(Debug, Default)]
 pub(crate) struct OptionsSnapshotCache {
     pub(crate) snapshot: Option<OptionsSnapshot>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct BoundarySessionCacheEntry {
+    pub(crate) lookup_date: String,
+    pub(crate) new_session: the_desk_backend::SessionType,
+    pub(crate) new_segment: the_desk_backend::DeltaSegment,
+    pub(crate) contract_symbol: String,
+    pub(crate) prior_reference: Option<PriorDayReference>,
+    pub(crate) rollover_status: Option<ContractRolloverStatus>,
+    pub(crate) prior_inventory: Vec<PriorSessionData>,
+    #[allow(dead_code)]
+    pub(crate) refreshed_at: Instant,
+}
+
+impl BoundarySessionCacheEntry {
+    pub(crate) fn matches(
+        &self,
+        lookup_date: &str,
+        new_session: the_desk_backend::SessionType,
+        new_segment: the_desk_backend::DeltaSegment,
+        contract_symbol: &str,
+    ) -> bool {
+        self.lookup_date == lookup_date
+            && self.new_session == new_session
+            && self.new_segment == new_segment
+            && self.contract_symbol == contract_symbol
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct BoundarySessionCache {
+    pub(crate) cached: Option<BoundarySessionCacheEntry>,
 }
 
 #[derive(Debug, Clone)]

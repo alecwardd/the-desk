@@ -11,12 +11,12 @@ use std::path::Path;
 #[allow(unused_imports)]
 use std::sync::atomic::Ordering;
 use tempfile::{tempdir, NamedTempFile};
-use the_desk_backend::db::SessionSummary;
 #[allow(unused_imports)]
 use the_desk_backend::db::{
     Database, HistoricalJobRun, RiskConfigRecord, SessionScopeFilter, SetupPerformanceSortBy,
     SetupRuntimeStateRecord, RESEARCH_DISTRIBUTION_METRICS,
 };
+use the_desk_backend::db::{PriorDayReference, SessionSummary, SignalOutcome};
 #[allow(unused_imports)]
 use the_desk_backend::depth::{DepthBook, DepthReader};
 #[allow(unused_imports)]
@@ -31,8 +31,9 @@ use the_desk_backend::feed::{load_feed_config, TradeSide};
 use the_desk_backend::observability::RuntimeEventLevel;
 #[allow(unused_imports)]
 use the_desk_backend::pipelines::event_detector::MarketEvent;
+use the_desk_backend::pipelines::PriorSessionData;
 #[allow(unused_imports)]
-use the_desk_backend::pipelines::PipelineEngine;
+use the_desk_backend::pipelines::{EventDetector, FlowEventEmitter, PipelineEngine};
 #[allow(unused_imports)]
 use the_desk_backend::research;
 #[allow(unused_imports)]
@@ -125,6 +126,207 @@ fn test_contract_metadata() -> the_desk_backend::feed::ContractMetadata {
         depth_file_count: 1,
         ..Default::default()
     }
+}
+
+fn pending_outcome(signal_id: &str, fired_at_ms: f64) -> SignalOutcome {
+    SignalOutcome {
+        signal_id: signal_id.to_string(),
+        setup_id: "or5-mid-retest".to_string(),
+        setup_name: Some("OR5 Mid Retest".to_string()),
+        session_date: session_date_from_timestamp_ms(fired_at_ms),
+        root_symbol: Some("NQ".to_string()),
+        contract_symbol: Some("NQH26.CME".to_string()),
+        source: "live".to_string(),
+        job_id: None,
+        fired_at_ms,
+        fired_price: 100.0,
+        target_price: Some(101.0),
+        stop_price: Some(99.0),
+        outcome: "pending".to_string(),
+        outcome_at_ms: None,
+        max_favorable_excursion: None,
+        max_adverse_excursion: None,
+        r_result: None,
+        time_to_outcome_ms: None,
+        rvol_at_fire: None,
+        rvol_bucket_at_fire: None,
+        direction: Some("long".to_string()),
+        entry_price: Some(100.0),
+        risk_points: Some(1.0),
+        exit_price: None,
+        outcome_quality: "verified".to_string(),
+        quality_flags: Vec::new(),
+        outcome_engine_version: None,
+        rules_schema_version: None,
+        setup_template_hash: None,
+        last_observed_price: None,
+        last_observed_at_ms: None,
+    }
+}
+
+#[test]
+fn in_memory_pending_outcomes_match_db_tracker_chronological_resolution() {
+    let old_db = Database::open(":memory:").expect("old db");
+    let new_db = Database::open(":memory:").expect("new db");
+    let fired_at_ms = 1_766_162_400_000.0;
+    let row = pending_outcome("sig-chronological", fired_at_ms);
+    old_db.insert_signal_outcome(&row).expect("insert old");
+    new_db.insert_signal_outcome(&row).expect("insert new");
+
+    let mut pending = PendingOutcomeSet::default();
+    pending
+        .reconcile_from_db(&new_db)
+        .expect("seed pending outcomes");
+
+    for (price, ts) in [
+        (101.0, fired_at_ms + 1_000.0),
+        (99.0, fired_at_ms + 2_000.0),
+    ] {
+        the_desk_backend::outcome_tracker::on_tick(&old_db, price, ts).expect("db tick");
+        pending.observe_tick(price, ts);
+    }
+    pending.flush_to_db(&new_db).expect("flush pending");
+
+    let old_row = old_db
+        .list_signal_outcomes_for_replay(Some("live"), None)
+        .expect("old replay")
+        .pop()
+        .expect("old row");
+    let new_row = new_db
+        .list_signal_outcomes_for_replay(Some("live"), None)
+        .expect("new replay")
+        .pop()
+        .expect("new row");
+
+    assert_eq!(old_row.outcome, new_row.outcome);
+    assert_eq!(old_row.outcome, "target_hit");
+    assert_eq!(old_row.outcome_at_ms, new_row.outcome_at_ms);
+    assert_eq!(old_row.exit_price, new_row.exit_price);
+    assert_eq!(old_row.r_result, new_row.r_result);
+    assert_eq!(
+        old_row.max_favorable_excursion,
+        new_row.max_favorable_excursion
+    );
+    assert_eq!(old_row.max_adverse_excursion, new_row.max_adverse_excursion);
+}
+
+#[test]
+fn cached_boundary_data_installs_before_first_rth_tick_without_db_lookup() {
+    let pipelines = std::sync::Arc::new(std::sync::Mutex::new(PipelineEngine::new()));
+    let db = std::sync::Arc::new(std::sync::Mutex::new(
+        Database::open(":memory:").expect("db"),
+    ));
+    let boundary_cache = std::sync::Arc::new(std::sync::Mutex::new(BoundarySessionCache {
+        cached: Some(BoundarySessionCacheEntry {
+            lookup_date: "2026-03-09".to_string(),
+            new_session: SessionType::Rth,
+            new_segment: DeltaSegment::Rth,
+            contract_symbol: "NQH26".to_string(),
+            prior_reference: Some(PriorDayReference {
+                date: "2026-03-08".to_string(),
+                high: 21100.0,
+                low: 20900.0,
+                close: 21025.0,
+                va_high: Some(21080.0),
+                va_low: Some(20940.0),
+                poc: Some(21010.0),
+                dnva_high: Some(21090.0),
+                dnva_low: Some(20935.0),
+                dnp: Some(21000.0),
+                root_symbol: Some("NQ".to_string()),
+                contract_symbol: Some("NQH26".to_string()),
+            }),
+            rollover_status: None,
+            prior_inventory: vec![PriorSessionData {
+                final_delta: 1_250.0,
+                dnva_high: 21090.0,
+                dnva_low: 20935.0,
+                dnp: 21000.0,
+            }],
+            refreshed_at: std::time::Instant::now(),
+        }),
+    }));
+    let boundary_ts = Utc
+        .with_ymd_and_hms(2026, 3, 9, 13, 30, 0)
+        .single()
+        .expect("boundary")
+        .timestamp_millis() as f64;
+
+    prepare_for_new_session_with_cache(
+        &pipelines,
+        &db,
+        None,
+        &boundary_cache,
+        SessionType::Rth,
+        DeltaSegment::Rth,
+        boundary_ts,
+        &test_contract_metadata(),
+    );
+
+    let p = pipelines.lock().expect("pipelines");
+    assert_eq!(p.levels.prior_day_high, 21100.0);
+    assert_eq!(p.levels.prior_day_low, 20900.0);
+    assert_eq!(p.levels.prior_day_close, 21025.0);
+    assert_eq!(p.levels.prior_va_high, 21080.0);
+    assert_eq!(p.levels.prior_dnva_high, 21090.0);
+    assert_eq!(p.session_inventory.prior_sessions().len(), 1);
+}
+
+#[test]
+fn open_burst_capped_chunks_match_uncapped_pipeline_state() {
+    fn replay(prices: &[f64], chunk_size: usize) -> the_desk_backend::pipelines::MarketState {
+        let pipelines = std::sync::Arc::new(std::sync::Mutex::new(PipelineEngine::new()));
+        let detector = std::sync::Arc::new(std::sync::Mutex::new(EventDetector::new()));
+        let flow_emitter = std::sync::Arc::new(std::sync::Mutex::new(FlowEventEmitter::new()));
+        let last_bid = std::sync::Arc::new(std::sync::Mutex::new(0.0));
+        let last_ask = std::sync::Arc::new(std::sync::Mutex::new(0.0));
+        let mut events = Vec::new();
+        let start_ts = Utc
+            .with_ymd_and_hms(2026, 3, 9, 13, 30, 0)
+            .single()
+            .expect("start")
+            .timestamp_millis() as f64;
+        let mut latest = None;
+        let mut tick_index = 0usize;
+
+        for chunk in prices.chunks(chunk_size) {
+            for price in chunk {
+                latest = ingest_tick(
+                    &pipelines,
+                    &detector,
+                    &flow_emitter,
+                    None,
+                    &last_bid,
+                    &last_ask,
+                    *price,
+                    1.0 + (tick_index % 3) as f64,
+                    tick_index.is_multiple_of(2),
+                    start_ts + (tick_index as f64 * 250.0),
+                    *price - 0.25,
+                    *price + 0.25,
+                    &mut events,
+                )
+                .map(|outcome| outcome.snapshot);
+                tick_index += 1;
+            }
+        }
+
+        latest.expect("snapshot")
+    }
+
+    let prices = [
+        21000.0, 21000.25, 21000.5, 21001.0, 21000.75, 21001.25, 21001.5, 21001.0, 21000.5,
+        21000.25,
+    ];
+    let uncapped = replay(&prices, prices.len());
+    let capped = replay(&prices, 3);
+
+    assert_eq!(uncapped.last_price, capped.last_price);
+    assert_eq!(uncapped.session_delta, capped.session_delta);
+    assert_eq!(uncapped.cumulative_delta, capped.cumulative_delta);
+    assert_eq!(uncapped.session_high, capped.session_high);
+    assert_eq!(uncapped.session_low, capped.session_low);
+    assert_eq!(uncapped.vwap, capped.vwap);
 }
 
 #[tokio::test]

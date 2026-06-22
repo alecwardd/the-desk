@@ -2,7 +2,7 @@
 
 use chrono::TimeZone;
 use rmcp::{model::*, ErrorData as McpError};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use the_desk_backend::attention::{
@@ -25,7 +25,7 @@ use the_desk_backend::feed::scid_reader::{
 use the_desk_backend::feed::{load_feed_config, TradeSide};
 use the_desk_backend::observability::{RuntimeEvent, RuntimeEventLevel, RuntimeEventStore};
 use the_desk_backend::pipelines::{
-    EventDetector, FlowEventEmitter, MarketEvent, PipelineEngine, PriorSessionData,
+    EventDetector, FlowEventEmitter, MarketEvent, MarketState, PipelineEngine, PriorSessionData,
 };
 use the_desk_backend::research;
 use the_desk_backend::rollover::{
@@ -603,16 +603,115 @@ pub(crate) fn compose_and_persist_attention(
     }
 }
 
-/// Process a single tick through the pipeline engine, event detector, rules engine, and outcome tracker.
+#[derive(Debug, Clone)]
+pub(crate) struct IngestTickOutcome {
+    pub(crate) snapshot: MarketState,
+    pub(crate) new_events: Vec<MarketEvent>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct PendingOutcomeSet {
+    pending: HashMap<String, SignalOutcome>,
+    dirty: HashSet<String>,
+    resolved: HashSet<String>,
+}
+
+impl PendingOutcomeSet {
+    pub(crate) fn reconcile_from_db(&mut self, db: &Database) -> Result<(), String> {
+        let pending = db
+            .pending_signal_outcomes_filtered(None, None)
+            .map_err(|e| e.to_string())?;
+        let mut live_ids = HashSet::new();
+        for outcome in pending {
+            live_ids.insert(outcome.signal_id.clone());
+            self.pending
+                .entry(outcome.signal_id.clone())
+                .or_insert(outcome);
+        }
+        self.pending.retain(|id, _| {
+            live_ids.contains(id) || self.dirty.contains(id) || self.resolved.contains(id)
+        });
+        Ok(())
+    }
+
+    pub(crate) fn observe_tick(
+        &mut self,
+        price: f64,
+        timestamp_ms: f64,
+    ) -> Vec<outcome_tracker::Resolution> {
+        if self.pending.is_empty() {
+            return Vec::new();
+        }
+        let current_session = session_date_from_timestamp_ms(timestamp_ms);
+        let mut resolutions = Vec::new();
+        for outcome in self.pending.values_mut() {
+            if self.resolved.contains(&outcome.signal_id) {
+                continue;
+            }
+            let mut tick_result = None;
+            let fired_session = session_date_from_timestamp_ms(outcome.fired_at_ms);
+            if fired_session != current_session {
+                let exit_price = outcome.last_observed_price.unwrap_or(price);
+                let exit_ts = outcome.last_observed_at_ms.unwrap_or(timestamp_ms);
+                tick_result = Some(outcomes::finalize_time_exit(outcome, exit_price, exit_ts));
+            }
+            let tick_result =
+                tick_result.unwrap_or_else(|| outcomes::apply_tick(outcome, price, timestamp_ms));
+            match tick_result {
+                outcomes::OutcomeTickResult::Resolved => {
+                    self.dirty.insert(outcome.signal_id.clone());
+                    self.resolved.insert(outcome.signal_id.clone());
+                    resolutions.push(outcome_tracker::Resolution {
+                        signal_id: outcome.signal_id.clone(),
+                        outcome: outcome.outcome.clone(),
+                        r_result: outcome.r_result,
+                    });
+                }
+                outcomes::OutcomeTickResult::StillPending => {
+                    self.dirty.insert(outcome.signal_id.clone());
+                }
+                outcomes::OutcomeTickResult::Ignored => {}
+            }
+        }
+        resolutions
+    }
+
+    pub(crate) fn flush_to_db(&mut self, db: &Database) -> Result<(), String> {
+        let resolved_ids: Vec<String> = self.resolved.iter().cloned().collect();
+        for signal_id in resolved_ids {
+            if let Some(outcome) = self.pending.remove(&signal_id) {
+                db.update_signal_outcome_state(&outcome)
+                    .map_err(|e| e.to_string())?;
+            }
+            self.dirty.remove(&signal_id);
+            self.resolved.remove(&signal_id);
+        }
+
+        let dirty_ids: Vec<String> = self.dirty.iter().cloned().collect();
+        for signal_id in dirty_ids {
+            if let Some(outcome) = self.pending.get(&signal_id) {
+                db.update_signal_outcome_progress(
+                    &outcome.signal_id,
+                    outcome.max_favorable_excursion,
+                    outcome.max_adverse_excursion,
+                    outcome.last_observed_price,
+                    outcome.last_observed_at_ms,
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            self.dirty.remove(&signal_id);
+        }
+        Ok(())
+    }
+}
+
+/// Ingest a single tick through deterministic state only. No SQLite work happens here.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn process_tick(
+pub(crate) fn ingest_tick(
     pipelines: &Arc<Mutex<PipelineEngine>>,
     detector: &Arc<Mutex<EventDetector>>,
     flow_emitter: &Arc<Mutex<FlowEventEmitter>>,
-    rules: &Arc<Mutex<RulesEngine>>,
-    playbook_cache: &Arc<PlaybookRuntimeCache>,
-    db: &Arc<Mutex<Database>>,
-    runtime_events: &Arc<RuntimeEventStore>,
+    pending_outcomes: Option<&Arc<Mutex<PendingOutcomeSet>>>,
     last_bid: &Arc<Mutex<f64>>,
     last_ask: &Arc<Mutex<f64>>,
     price: f64,
@@ -622,7 +721,7 @@ pub(crate) fn process_tick(
     bid: f64,
     ask: f64,
     event_buffer: &mut Vec<the_desk_backend::pipelines::MarketEvent>,
-) {
+) -> Option<IngestTickOutcome> {
     let session_type = et_minutes_from_timestamp(timestamp_ms)
         .map(classify_session)
         .unwrap_or(if minute_of_session_from_timestamp(timestamp_ms) < 0 {
@@ -631,7 +730,7 @@ pub(crate) fn process_tick(
             SessionType::Rth
         });
     if session_type == SessionType::Unknown {
-        return;
+        return None;
     }
     let minute = minute_of_session_from_timestamp(timestamp_ms);
     let event_buffer_start = event_buffer.len();
@@ -656,48 +755,17 @@ pub(crate) fn process_tick(
 
             snapshot
         } else {
-            return;
+            return None;
         }
     };
     let new_attention_events: Vec<MarketEvent> = event_buffer[event_buffer_start..].to_vec();
-    let setup_trading_day = trading_day_from_timestamp_ms(timestamp_ms);
 
-    // Rules engine: evaluate setups and persist progress outside the pipeline lock.
-    evaluate_setups_for_snapshot(
-        rules,
-        playbook_cache,
-        db,
-        Some(runtime_events),
-        &snapshot,
-        &setup_trading_day,
-        timestamp_ms,
-        SetupPersistencePolicy::Live,
-    );
-
-    // Outcome tracker: update MFE/MAE and resolve signals
-    if let Ok(d) = db.lock() {
-        let _ = outcome_tracker::on_tick(&d, price, timestamp_ms);
-        if !new_attention_events.is_empty() {
-            compose_and_persist_attention(
-                &d,
-                runtime_events,
-                &snapshot,
-                &new_attention_events,
-                AttentionPulseKind::EventDriven,
-                timestamp_ms,
-                "live",
-                None,
-            );
+    if let Some(pending_outcomes) = pending_outcomes {
+        if let Ok(mut pending) = pending_outcomes.lock() {
+            let _ = pending.observe_tick(price, timestamp_ms);
         }
     }
 
-    // Flush event buffer periodically
-    if event_buffer.len() >= 50 {
-        if let Ok(d) = db.lock() {
-            let _ = d.insert_market_events_batch(event_buffer);
-        }
-        event_buffer.clear();
-    }
     if bid > 0.0 {
         if let Ok(mut b) = last_bid.lock() {
             *b = bid;
@@ -707,6 +775,122 @@ pub(crate) fn process_tick(
         if let Ok(mut a) = last_ask.lock() {
             *a = ask;
         }
+    }
+
+    Some(IngestTickOutcome {
+        snapshot,
+        new_events: new_attention_events,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_analysis_pass(
+    rules: &Arc<Mutex<RulesEngine>>,
+    playbook_cache: &Arc<PlaybookRuntimeCache>,
+    db: &Arc<Mutex<Database>>,
+    runtime_events: &Arc<RuntimeEventStore>,
+    pending_outcomes: Option<&Arc<Mutex<PendingOutcomeSet>>>,
+    snapshot: &MarketState,
+    new_attention_events: &[MarketEvent],
+    timestamp_ms: f64,
+    pulse_kind: AttentionPulseKind,
+) {
+    let setup_trading_day = trading_day_from_timestamp_ms(timestamp_ms);
+    evaluate_setups_for_snapshot(
+        rules,
+        playbook_cache,
+        db,
+        Some(runtime_events),
+        snapshot,
+        &setup_trading_day,
+        timestamp_ms,
+        SetupPersistencePolicy::Live,
+    );
+
+    if let Ok(d) = db.lock() {
+        if let Some(pending_outcomes) = pending_outcomes {
+            if let Ok(mut pending) = pending_outcomes.lock() {
+                let _ = pending.flush_to_db(&d);
+                let _ = pending.reconcile_from_db(&d);
+            }
+        }
+        if !new_attention_events.is_empty() {
+            compose_and_persist_attention(
+                &d,
+                runtime_events,
+                snapshot,
+                new_attention_events,
+                pulse_kind,
+                timestamp_ms,
+                "live",
+                None,
+            );
+        }
+    }
+}
+
+/// Process a single tick through the old all-in-one path. Kept for tests and replay utilities.
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn process_tick(
+    pipelines: &Arc<Mutex<PipelineEngine>>,
+    detector: &Arc<Mutex<EventDetector>>,
+    flow_emitter: &Arc<Mutex<FlowEventEmitter>>,
+    rules: &Arc<Mutex<RulesEngine>>,
+    playbook_cache: &Arc<PlaybookRuntimeCache>,
+    db: &Arc<Mutex<Database>>,
+    runtime_events: &Arc<RuntimeEventStore>,
+    last_bid: &Arc<Mutex<f64>>,
+    last_ask: &Arc<Mutex<f64>>,
+    price: f64,
+    volume: f64,
+    is_buy: bool,
+    timestamp_ms: f64,
+    bid: f64,
+    ask: f64,
+    event_buffer: &mut Vec<the_desk_backend::pipelines::MarketEvent>,
+) {
+    let pending_outcomes = Arc::new(Mutex::new(PendingOutcomeSet::default()));
+    if let Ok(d) = db.lock() {
+        let _ = pending_outcomes.lock().map(|mut pending| {
+            let _ = pending.reconcile_from_db(&d);
+        });
+    }
+    let Some(outcome) = ingest_tick(
+        pipelines,
+        detector,
+        flow_emitter,
+        Some(&pending_outcomes),
+        last_bid,
+        last_ask,
+        price,
+        volume,
+        is_buy,
+        timestamp_ms,
+        bid,
+        ask,
+        event_buffer,
+    ) else {
+        return;
+    };
+    run_analysis_pass(
+        rules,
+        playbook_cache,
+        db,
+        runtime_events,
+        Some(&pending_outcomes),
+        &outcome.snapshot,
+        &outcome.new_events,
+        timestamp_ms,
+        AttentionPulseKind::EventDriven,
+    );
+
+    // Flush event buffer periodically
+    if event_buffer.len() >= 50 {
+        if let Ok(d) = db.lock() {
+            let _ = d.insert_market_events_batch(event_buffer);
+        }
+        event_buffer.clear();
     }
 }
 
@@ -1173,9 +1357,26 @@ impl ScidPollReadStep {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn read_scid_poll_step(
     reader: &ScidReader,
     requested_offset: u64,
+) -> Result<ScidPollReadStep, String> {
+    read_scid_poll_step_inner(reader, requested_offset, None)
+}
+
+pub(crate) fn read_scid_poll_step_capped(
+    reader: &ScidReader,
+    requested_offset: u64,
+    max_records: usize,
+) -> Result<ScidPollReadStep, String> {
+    read_scid_poll_step_inner(reader, requested_offset, Some(max_records))
+}
+
+fn read_scid_poll_step_inner(
+    reader: &ScidReader,
+    requested_offset: u64,
+    max_records: Option<usize>,
 ) -> Result<ScidPollReadStep, String> {
     let header_size =
         ScidReader::header_size_bytes_for_path(reader.path()).map_err(|e| e.to_string())?;
@@ -1198,9 +1399,14 @@ pub(crate) fn read_scid_poll_step(
         start_offset = header_size;
     }
 
-    let batch = reader
-        .read_bulk_from_offset(start_offset)
-        .map_err(|e| e.to_string())?;
+    let batch = match max_records {
+        Some(max_records) => reader
+            .read_bulk_from_offset_capped(start_offset, max_records)
+            .map_err(|e| e.to_string())?,
+        None => reader
+            .read_bulk_from_offset(start_offset)
+            .map_err(|e| e.to_string())?,
+    };
 
     Ok(ScidPollReadStep {
         requested_offset,
@@ -1575,41 +1781,76 @@ pub(crate) fn finalize_rth_close(
     }))
 }
 
-/// Reset pipelines for a new session and load the most recent prior-day /
-/// prior-session inventory references from SQLite. Used at session boundaries
-/// other than the RTH close (which goes through `finalize_rth_close`).
-///
-/// Idempotent: safe to invoke even when in-memory state was already prepared
-/// by a prior `finalize_rth_close` (the DB read returns the same atomically
-/// persisted values).
-pub(crate) fn prepare_for_new_session(
-    pipelines: &Arc<Mutex<PipelineEngine>>,
-    db: &Arc<Mutex<Database>>,
-    runtime_events: Option<&Arc<RuntimeEventStore>>,
+fn boundary_inventory_session_type(
+    new_session: SessionType,
+    new_segment: DeltaSegment,
+) -> &'static str {
+    if new_session == SessionType::Rth {
+        "RTH"
+    } else if new_segment == DeltaSegment::Asia {
+        "Asia"
+    } else {
+        "London"
+    }
+}
+
+pub(crate) fn load_boundary_session_cache_entry(
+    db: &Database,
     new_session: SessionType,
     new_segment: DeltaSegment,
     boundary_tick_ts: f64,
     contract_metadata: &the_desk_backend::feed::ContractMetadata,
-) {
+) -> BoundarySessionCacheEntry {
     let lookup_date = session_date_from_timestamp_ms(boundary_tick_ts);
-    let (root_symbol, contract_symbol) = contract_scope(contract_metadata);
-    let (prior, rollover_status) = if let Ok(d) = db.lock() {
-        authoritative_prior_reference_from_db(
-            &d,
-            contract_metadata,
-            Some(contract_metadata),
-            &lookup_date,
-        )
-        .map(|(prior, status)| (prior, Some(status)))
-        .unwrap_or((None, None))
-    } else {
-        (None, None)
-    };
+    let (prior_reference, rollover_status) = authoritative_prior_reference_from_db(
+        db,
+        contract_metadata,
+        Some(contract_metadata),
+        &lookup_date,
+    )
+    .map(|(prior, status)| (prior, Some(status)))
+    .unwrap_or((None, None));
 
+    let inv_session_type = boundary_inventory_session_type(new_session, new_segment);
+    let scope = contract_session_scope(contract_metadata);
+    let mut prior_inventory: Vec<PriorSessionData> = db
+        .list_session_summaries_scoped(None, None, None, Some(inv_session_type), 5, scope.as_ref())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|s| s.dnva_high > 0.0 && s.dnva_low > 0.0 && s.dnp > 0.0)
+        .map(|s| PriorSessionData {
+            final_delta: s.session_delta,
+            dnva_high: s.dnva_high,
+            dnva_low: s.dnva_low,
+            dnp: s.dnp,
+        })
+        .collect();
+    prior_inventory.reverse();
+
+    BoundarySessionCacheEntry {
+        lookup_date,
+        new_session,
+        new_segment,
+        contract_symbol: contract_metadata.contract_symbol.clone(),
+        prior_reference,
+        rollover_status,
+        prior_inventory,
+        refreshed_at: std::time::Instant::now(),
+    }
+}
+
+fn apply_prepared_session_data(
+    pipelines: &Arc<Mutex<PipelineEngine>>,
+    runtime_events: Option<&Arc<RuntimeEventStore>>,
+    prepared: BoundarySessionCacheEntry,
+    contract_metadata: &the_desk_backend::feed::ContractMetadata,
+) {
+    let lookup_date = prepared.lookup_date.clone();
+    let (root_symbol, contract_symbol) = contract_scope(contract_metadata);
     if let Ok(mut p) = pipelines.lock() {
-        p.reset_session_with_type(new_session == SessionType::Globex);
-        if matches!(new_session, SessionType::Rth | SessionType::Globex) {
-            if let Some(prior_ref) = prior {
+        p.reset_session_with_type(prepared.new_session == SessionType::Globex);
+        if matches!(prepared.new_session, SessionType::Rth | SessionType::Globex) {
+            if let Some(prior_ref) = prepared.prior_reference {
                 p.levels
                     .set_prior_day(prior_ref.high, prior_ref.low, prior_ref.close);
                 p.levels.set_prior_day_contract_context(
@@ -1631,7 +1872,7 @@ pub(crate) fn prepare_for_new_session(
                 p.levels.clear_prior_references();
                 p.levels
                     .set_prior_day_contract_context(root_symbol, None, contract_symbol);
-                if let Some(status) = rollover_status {
+                if let Some(status) = prepared.rollover_status {
                     if let Some(runtime_events) = runtime_events {
                         let event = RuntimeEvent::new(
                             RuntimeEventLevel::Warn,
@@ -1659,37 +1900,97 @@ pub(crate) fn prepare_for_new_session(
                 }
             }
         }
+        p.session_inventory
+            .load_prior_sessions(prepared.prior_inventory);
     }
+}
 
-    let inv_session_type = if new_session == SessionType::Rth {
-        "RTH"
-    } else if new_segment == DeltaSegment::Asia {
-        "Asia"
+/// Reset pipelines for a new session and load the most recent prior-day /
+/// prior-session inventory references from SQLite. Used at session boundaries
+/// other than the RTH close (which goes through `finalize_rth_close`).
+///
+/// Idempotent: safe to invoke even when in-memory state was already prepared
+/// by a prior `finalize_rth_close` (the DB read returns the same atomically
+/// persisted values).
+pub(crate) fn prepare_for_new_session(
+    pipelines: &Arc<Mutex<PipelineEngine>>,
+    db: &Arc<Mutex<Database>>,
+    runtime_events: Option<&Arc<RuntimeEventStore>>,
+    new_session: SessionType,
+    new_segment: DeltaSegment,
+    boundary_tick_ts: f64,
+    contract_metadata: &the_desk_backend::feed::ContractMetadata,
+) {
+    let prepared = db.lock().ok().map(|d| {
+        load_boundary_session_cache_entry(
+            &d,
+            new_session,
+            new_segment,
+            boundary_tick_ts,
+            contract_metadata,
+        )
+    });
+    if let Some(prepared) = prepared {
+        apply_prepared_session_data(pipelines, runtime_events, prepared, contract_metadata);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_for_new_session_with_cache(
+    pipelines: &Arc<Mutex<PipelineEngine>>,
+    db: &Arc<Mutex<Database>>,
+    runtime_events: Option<&Arc<RuntimeEventStore>>,
+    boundary_cache: &Arc<Mutex<BoundarySessionCache>>,
+    new_session: SessionType,
+    new_segment: DeltaSegment,
+    boundary_tick_ts: f64,
+    contract_metadata: &the_desk_backend::feed::ContractMetadata,
+) {
+    let lookup_date = session_date_from_timestamp_ms(boundary_tick_ts);
+    let cached = boundary_cache.lock().ok().and_then(|cache| {
+        cache.cached.as_ref().and_then(|entry| {
+            entry
+                .matches(
+                    &lookup_date,
+                    new_session,
+                    new_segment,
+                    &contract_metadata.contract_symbol,
+                )
+                .then(|| entry.clone())
+        })
+    });
+
+    let prepared = if let Some(entry) = cached {
+        entry
     } else {
-        "London"
+        if let Some(runtime_events) = runtime_events {
+            let event = RuntimeEvent::new(
+                RuntimeEventLevel::Warn,
+                "session.boundary_cache_cold",
+                "session",
+                "Session boundary cache was cold; falling back to inline SQLite reads.",
+                serde_json::json!({
+                    "lookupDate": lookup_date,
+                    "newSession": format!("{:?}", new_session),
+                    "newSegment": format!("{:?}", new_segment),
+                    "contractSymbol": contract_metadata.contract_symbol,
+                }),
+            );
+            let _ = runtime_events.record(event);
+        }
+        match db.lock() {
+            Ok(d) => load_boundary_session_cache_entry(
+                &d,
+                new_session,
+                new_segment,
+                boundary_tick_ts,
+                contract_metadata,
+            ),
+            Err(_) => return,
+        }
     };
 
-    let scope = contract_session_scope(contract_metadata);
-    let mut prior_inv: Vec<PriorSessionData> = if let Ok(d) = db.lock() {
-        d.list_session_summaries_scoped(None, None, None, Some(inv_session_type), 5, scope.as_ref())
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|s| s.dnva_high > 0.0 && s.dnva_low > 0.0 && s.dnp > 0.0)
-            .map(|s| PriorSessionData {
-                final_delta: s.session_delta,
-                dnva_high: s.dnva_high,
-                dnva_low: s.dnva_low,
-                dnp: s.dnp,
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
-    prior_inv.reverse();
-
-    if let Ok(mut p) = pipelines.lock() {
-        p.session_inventory.load_prior_sessions(prior_inv);
-    }
+    apply_prepared_session_data(pipelines, runtime_events, prepared, contract_metadata);
 }
 
 /// Warm-replay SCID ticks into the live pipeline up to a pre-captured cutover offset.

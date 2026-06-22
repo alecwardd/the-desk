@@ -311,6 +311,55 @@ impl ScidReader {
         })
     }
 
+    /// Read at most `max_records` aligned SCID records from an existing byte offset.
+    ///
+    /// Returns the next aligned offset to resume from, even if some records are
+    /// skipped by parsing. Use the uncapped reader for warm replay; live tailing
+    /// uses this to bound one poll iteration during bursty opens.
+    pub fn read_bulk_from_offset_capped(
+        &self,
+        start_offset: u64,
+        max_records: usize,
+    ) -> Result<ReplayBatch, ScidError> {
+        let mut file = File::open(&self.path)?;
+        let header = Self::read_header(&mut file)?;
+        let data_start = header.header_size as u64;
+        let file_len = file.metadata()?.len();
+        let file_end = scid_tail_offset_after_shrink(file_len, data_start);
+        let clamped_start = scid_tail_offset_after_shrink(start_offset, data_start).min(file_end);
+
+        if clamped_start >= file_end || max_records == 0 {
+            return Ok(ReplayBatch {
+                ticks: Vec::new(),
+                next_offset: clamped_start,
+            });
+        }
+
+        file.seek(SeekFrom::Start(clamped_start))?;
+        let mut out = Vec::new();
+        let mut offset = clamped_start;
+        let mut records_read = 0usize;
+        let mut record = [0_u8; SCID_RECORD_SIZE];
+        while offset < file_end && records_read < max_records {
+            match file.read_exact(&mut record) {
+                Ok(()) => {
+                    offset = offset.saturating_add(SCID_RECORD_SIZE as u64);
+                    records_read += 1;
+                    if let Some(tick) = self.parse_record(&record) {
+                        out.push(tick);
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(err) => return Err(err.into()),
+            }
+        }
+
+        Ok(ReplayBatch {
+            ticks: out,
+            next_offset: offset,
+        })
+    }
+
     fn bounded_aligned_end_offset(
         file_len: u64,
         data_start: u64,
@@ -884,6 +933,39 @@ mod tests {
             .expect("eof");
         assert!(eof.ticks.is_empty());
         assert_eq!(eof.next_offset, full.next_offset);
+    }
+
+    #[test]
+    fn capped_bulk_reads_chain_to_same_result_as_uncapped() {
+        let mut file = NamedTempFile::new().expect("temp");
+        let prices = [
+            21000.0, 21000.25, 21000.5, 21000.75, 21001.0, 21001.25, 21001.5,
+        ];
+        write_scid(&mut file, &prices);
+        let reader = ScidReader::new(file.path());
+        let header_size = reader.current_aligned_end_offset().expect("end offset")
+            - (SCID_RECORD_SIZE as u64 * prices.len() as u64);
+
+        let full = reader
+            .read_bulk_from_offset(header_size)
+            .expect("full from header");
+        let mut offset = header_size;
+        let mut chained = Vec::new();
+        loop {
+            let batch = reader
+                .read_bulk_from_offset_capped(offset, 3)
+                .expect("capped batch");
+            if batch.ticks.is_empty() {
+                assert_eq!(batch.next_offset, full.next_offset);
+                break;
+            }
+            offset = batch.next_offset;
+            chained.extend(batch.ticks.into_iter().map(|tick| tick.price));
+        }
+
+        let expected: Vec<f64> = prices.into_iter().map(f64::from).collect();
+        assert_eq!(chained, expected);
+        assert_eq!(offset, full.next_offset);
     }
 
     #[test]

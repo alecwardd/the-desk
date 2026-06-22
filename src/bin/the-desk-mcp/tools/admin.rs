@@ -116,15 +116,27 @@ impl TheDeskMcp {
         let last_depth_ts =
             tick_ms_from_bits(fr.last_depth_timestamp_ms_bits.load(Ordering::Acquire));
         let scid_offset = fr.scid_tail_offset.load(Ordering::Acquire);
+        let scid_read_offset = fr.scid_read_offset.load(Ordering::Acquire);
+        let scid_processed_offset = fr.scid_processed_offset.load(Ordering::Acquire);
         let scid_len = fr.scid_file_len.load(Ordering::Acquire);
+        let scid_backlog_bytes = file_size_bytes.saturating_sub(scid_processed_offset);
+        let scid_read_backlog_bytes = file_size_bytes.saturating_sub(scid_read_offset);
         let scid_resets = fr.scid_tail_reset_count.load(Ordering::Acquire);
         let shrink_len = fr.scid_last_shrink_len.load(Ordering::Acquire);
         let now_wall_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
         let pipeline_contended = fr.pipeline_lock_recently_contended(now_wall_ms);
+        let last_poll_started = fr.last_scid_poll_started_wall_ms.load(Ordering::Acquire);
+        let last_poll_completed = fr.last_scid_poll_completed_wall_ms.load(Ordering::Acquire);
+        let last_analysis_pass = fr.last_analysis_pass_wall_ms.load(Ordering::Acquire);
+        let analysis_lag_ms = if last_analysis_pass > 0 {
+            Some(now_wall_ms.saturating_sub(last_analysis_pass))
+        } else {
+            None
+        };
         let monotonicity = fr.monotonicity_snapshot();
         let runtime_event_stats = self.runtime_events.stats();
 
-        Ok(text_result(serde_json::json!({
+        let mut payload = serde_json::json!({
             "liveDataSource": "scid",
             "rootSymbol": contract.root_symbol,
             "contractSymbol": contract.contract_symbol,
@@ -146,23 +158,117 @@ impl TheDeskMcp {
             "sourceState": source_state,
             "dataAgeMs": data_age_ms,
             "lastScidTickTimestampMs": last_scid_tick,
-            "lastDepthTimestampMs": last_depth_ts,
-            "scidTailOffsetBytes": scid_offset,
-            "scidFileLenBytes": scid_len,
-            "scidTailResetCount": scid_resets,
-            "scidLastShrinkFileLenBytes": shrink_len,
-            "skippedNonMonotonicTicks": monotonicity.skipped_non_monotonic_ticks,
-            "duplicateTimestampTicks": monotonicity.duplicate_timestamp_ticks,
-            "backwardTimestampTicks": monotonicity.backward_timestamp_ticks,
-            "lastNonMonotonicTimestampMs": monotonicity.last_non_monotonic_timestamp_ms,
-            "pipelineLockRecentlyContended": pipeline_contended,
-            "recentRuntimeEventCount": runtime_event_stats.recent_event_count,
-            "lastRuntimeWarningAtMs": runtime_event_stats.last_warning_at_ms,
-            "lastRuntimeErrorAtMs": runtime_event_stats.last_error_at_ms,
-            "lastRuntimeWarning": &runtime_event_stats.last_warning,
-            "lastRuntimeError": &runtime_event_stats.last_error,
-            "recentRuntimeEventNameCounts": &runtime_event_stats.recent_event_name_counts
-        })))
+            "lastDepthTimestampMs": last_depth_ts
+        });
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert(
+                "scidTailOffsetBytes".to_string(),
+                serde_json::json!(scid_offset),
+            );
+            obj.insert(
+                "scidReadOffsetBytes".to_string(),
+                serde_json::json!(scid_read_offset),
+            );
+            obj.insert(
+                "scidProcessedOffsetBytes".to_string(),
+                serde_json::json!(scid_processed_offset),
+            );
+            obj.insert("scidFileLenBytes".to_string(), serde_json::json!(scid_len));
+            obj.insert(
+                "scidFreshFileLenBytes".to_string(),
+                serde_json::json!(file_size_bytes),
+            );
+            obj.insert(
+                "scidBacklogBytes".to_string(),
+                serde_json::json!(scid_backlog_bytes),
+            );
+            obj.insert(
+                "scidReadBacklogBytes".to_string(),
+                serde_json::json!(scid_read_backlog_bytes),
+            );
+            obj.insert(
+                "scidTailResetCount".to_string(),
+                serde_json::json!(scid_resets),
+            );
+            obj.insert(
+                "scidLastShrinkFileLenBytes".to_string(),
+                serde_json::json!(shrink_len),
+            );
+            obj.insert(
+                "scidWorkerPhase".to_string(),
+                serde_json::json!(fr.scid_worker_phase_label()),
+            );
+            obj.insert(
+                "lastScidPollStartedWallMs".to_string(),
+                serde_json::json!(last_poll_started),
+            );
+            obj.insert(
+                "lastScidPollCompletedWallMs".to_string(),
+                serde_json::json!(last_poll_completed),
+            );
+            obj.insert(
+                "lastScidBatchTickCount".to_string(),
+                serde_json::json!(fr.last_scid_batch_tick_count.load(Ordering::Acquire)),
+            );
+            obj.insert(
+                "lastScidBatchProcessWallMs".to_string(),
+                serde_json::json!(fr.last_scid_batch_process_wall_ms.load(Ordering::Acquire)),
+            );
+            obj.insert(
+                "lastAnalysisPassWallMs".to_string(),
+                serde_json::json!(last_analysis_pass),
+            );
+            obj.insert(
+                "analysisLagMs".to_string(),
+                serde_json::json!(analysis_lag_ms),
+            );
+            obj.insert(
+                "skippedNonMonotonicTicks".to_string(),
+                serde_json::json!(monotonicity.skipped_non_monotonic_ticks),
+            );
+            obj.insert(
+                "duplicateTimestampTicks".to_string(),
+                serde_json::json!(monotonicity.duplicate_timestamp_ticks),
+            );
+            obj.insert(
+                "backwardTimestampTicks".to_string(),
+                serde_json::json!(monotonicity.backward_timestamp_ticks),
+            );
+            obj.insert(
+                "lastNonMonotonicTimestampMs".to_string(),
+                serde_json::json!(monotonicity.last_non_monotonic_timestamp_ms),
+            );
+            obj.insert(
+                "pipelineLockRecentlyContended".to_string(),
+                serde_json::json!(pipeline_contended),
+            );
+            obj.insert(
+                "recentRuntimeEventCount".to_string(),
+                serde_json::json!(runtime_event_stats.recent_event_count),
+            );
+            obj.insert(
+                "lastRuntimeWarningAtMs".to_string(),
+                serde_json::json!(runtime_event_stats.last_warning_at_ms),
+            );
+            obj.insert(
+                "lastRuntimeErrorAtMs".to_string(),
+                serde_json::json!(runtime_event_stats.last_error_at_ms),
+            );
+            obj.insert(
+                "lastRuntimeWarning".to_string(),
+                serde_json::json!(&runtime_event_stats.last_warning),
+            );
+            obj.insert(
+                "lastRuntimeError".to_string(),
+                serde_json::json!(&runtime_event_stats.last_error),
+            );
+            obj.insert(
+                "recentRuntimeEventNameCounts".to_string(),
+                serde_json::json!(&runtime_event_stats.recent_event_name_counts),
+            );
+        }
+
+        Ok(text_result(payload))
     }
 
     #[tool(

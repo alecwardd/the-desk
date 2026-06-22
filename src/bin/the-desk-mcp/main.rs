@@ -4,9 +4,11 @@
 //! modules. Tools are grouped by domain under `tools/` and combined into a
 //! single router in `service.rs`. See docs/mcp/README.md for the architecture.
 
+use chrono::{Datelike, Days, TimeZone, Timelike};
 use rmcp::{transport::stdio, ServiceExt};
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use the_desk_backend::attention::AttentionPulseKind;
 use the_desk_backend::db::{Database, RawTickBatchRow};
 use the_desk_backend::feed::monotonic::{MonotonicTickGuard, MonotonicTimestampDecision};
 use the_desk_backend::feed::scid_reader::ScidReader;
@@ -14,11 +16,12 @@ use the_desk_backend::feed::{load_feed_config, resolve_contract_metadata, TradeS
 use the_desk_backend::observability::{
     init_logging, load_logging_config, RuntimeEventLevel, RuntimeEventStore,
 };
-use the_desk_backend::pipelines::{PipelineEngine, RvolPipeline};
+use the_desk_backend::pipelines::{MarketEvent, PipelineEngine, RvolPipeline};
 use the_desk_backend::research;
 use the_desk_backend::{
     classify_delta_segment, classify_session, et_minutes_from_timestamp, globex_open_ms,
-    session_date_from_timestamp_ms, DeltaSegment, SessionType,
+    session_date_from_timestamp_ms, DeltaSegment, SessionType, GLOBEX_OPEN_ET, RTH_CLOSE_ET,
+    RTH_OPEN_ET,
 };
 use tokio::time::{sleep, Duration};
 
@@ -313,18 +316,184 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let context_frame_cache_bg = Arc::clone(&server.context_frame_cache);
         let poll_ms = config.flush_poll_ms;
         let price_scale = config.price_scale;
+        let max_ticks_per_poll = config.max_ticks_per_poll.max(1);
+        let analysis_min_interval_ms = config.analysis_min_interval_ms.max(1.0);
+        let analysis_max_ticks = config.analysis_max_ticks.max(1);
         let reader_path = reader.path().to_path_buf();
         let contract_metadata = contract_metadata.clone();
         let feed_rt_bg = Arc::clone(&server.feed_runtime);
+        let boundary_cache_bg = Arc::clone(&server.boundary_cache);
+        {
+            let feed_rt_watchdog = Arc::clone(&server.feed_runtime);
+            let runtime_events_watchdog = Arc::clone(&server.runtime_events);
+            let db_watchdog = Arc::clone(&server.db);
+            let reader_path_watchdog = reader.path().to_path_buf();
+            tokio::spawn(async move {
+                use tokio::time::{sleep, Duration};
+
+                const WATCHDOG_INTERVAL_MS: u64 = 5_000;
+                const STALL_THRESHOLD_MS: u64 = 10_000;
+
+                let mut last_reported_wall_ms = 0u64;
+                loop {
+                    sleep(Duration::from_millis(WATCHDOG_INTERVAL_MS)).await;
+                    let now_wall_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+                    let fresh_len = std::fs::metadata(&reader_path_watchdog)
+                        .map(|m| m.len())
+                        .unwrap_or(0);
+                    let processed = feed_rt_watchdog
+                        .scid_processed_offset
+                        .load(Ordering::Acquire);
+                    let last_completed = feed_rt_watchdog
+                        .last_scid_poll_completed_wall_ms
+                        .load(Ordering::Acquire);
+                    let started = feed_rt_watchdog
+                        .last_scid_poll_started_wall_ms
+                        .load(Ordering::Acquire);
+                    let last_progress = last_completed.max(started);
+                    let backlog = fresh_len.saturating_sub(processed);
+                    let stalled = backlog > 0
+                        && last_progress > 0
+                        && now_wall_ms.saturating_sub(last_progress) >= STALL_THRESHOLD_MS;
+                    if stalled && now_wall_ms.saturating_sub(last_reported_wall_ms) >= 30_000 {
+                        record_runtime_event(
+                            &runtime_events_watchdog,
+                            Some(&db_watchdog),
+                            RuntimeEventLevel::Warn,
+                            "scid.ingest_stalled",
+                            "scid",
+                            "SCID file is growing while processed offset is not advancing.",
+                            serde_json::json!({
+                                "freshFileLenBytes": fresh_len,
+                                "scidProcessedOffsetBytes": processed,
+                                "scidReadOffsetBytes": feed_rt_watchdog.scid_read_offset.load(Ordering::Acquire),
+                                "scidBacklogBytes": backlog,
+                                "workerPhase": feed_rt_watchdog.scid_worker_phase_label(),
+                                "lastPollStartedWallMs": started,
+                                "lastPollCompletedWallMs": last_completed,
+                            }),
+                        );
+                        last_reported_wall_ms = now_wall_ms;
+                    }
+                }
+            });
+        }
+        {
+            let db_prewarm = Arc::clone(&server.db);
+            let boundary_cache_prewarm = Arc::clone(&server.boundary_cache);
+            let runtime_events_prewarm = Arc::clone(&server.runtime_events);
+            let contract_metadata_prewarm = contract_metadata.clone();
+            tokio::spawn(async move {
+                use chrono_tz::US::Eastern;
+                use tokio::time::{sleep, Duration};
+
+                const PREWARM_INTERVAL_MS: u64 = 60_000;
+
+                loop {
+                    let now_et = chrono::Utc::now().with_timezone(&Eastern);
+                    let et_minutes = (now_et.hour() as i32 * 60) + now_et.minute() as i32;
+                    let today = now_et.date_naive();
+                    let (target_date, hour, minute, new_session, new_segment) =
+                        if et_minutes < RTH_OPEN_ET {
+                            (today, 9, 30, SessionType::Rth, DeltaSegment::Rth)
+                        } else if (RTH_CLOSE_ET..GLOBEX_OPEN_ET).contains(&et_minutes) {
+                            (today, 18, 0, SessionType::Globex, DeltaSegment::Asia)
+                        } else if et_minutes >= GLOBEX_OPEN_ET {
+                            let next_day = today.checked_add_days(Days::new(1)).unwrap_or(today);
+                            (next_day, 9, 30, SessionType::Rth, DeltaSegment::Rth)
+                        } else {
+                            (today, 18, 0, SessionType::Globex, DeltaSegment::Asia)
+                        };
+
+                    if let Some(target_dt) = Eastern
+                        .with_ymd_and_hms(
+                            target_date.year(),
+                            target_date.month(),
+                            target_date.day(),
+                            hour,
+                            minute,
+                            0,
+                        )
+                        .single()
+                    {
+                        let boundary_ts = target_dt.timestamp_millis() as f64;
+                        let lookup_date = session_date_from_timestamp_ms(boundary_ts);
+                        let cache_warm = boundary_cache_prewarm
+                            .lock()
+                            .ok()
+                            .and_then(|cache| cache.cached.clone())
+                            .map(|entry| {
+                                entry.matches(
+                                    &lookup_date,
+                                    new_session,
+                                    new_segment,
+                                    &contract_metadata_prewarm.contract_symbol,
+                                )
+                            })
+                            .unwrap_or(false);
+                        if !cache_warm {
+                            let db_for_load = Arc::clone(&db_prewarm);
+                            let contract_for_load = contract_metadata_prewarm.clone();
+                            let loaded = tokio::task::spawn_blocking(move || {
+                                db_for_load.lock().ok().map(|db| {
+                                    load_boundary_session_cache_entry(
+                                        &db,
+                                        new_session,
+                                        new_segment,
+                                        boundary_ts,
+                                        &contract_for_load,
+                                    )
+                                })
+                            })
+                            .await
+                            .ok()
+                            .flatten();
+                            if let Some(entry) = loaded {
+                                if let Ok(mut cache) = boundary_cache_prewarm.lock() {
+                                    cache.cached = Some(entry);
+                                }
+                                record_runtime_event(
+                                    &runtime_events_prewarm,
+                                    Some(&db_prewarm),
+                                    RuntimeEventLevel::Info,
+                                    "session.boundary_cache_prewarmed",
+                                    "session",
+                                    "Pre-warmed session boundary references.",
+                                    serde_json::json!({
+                                        "lookupDate": lookup_date,
+                                        "newSession": format!("{:?}", new_session),
+                                        "newSegment": format!("{:?}", new_segment),
+                                        "contractSymbol": contract_metadata_prewarm.contract_symbol,
+                                    }),
+                                );
+                            }
+                        }
+                    }
+
+                    sleep(Duration::from_millis(PREWARM_INTERVAL_MS)).await;
+                }
+            });
+        }
 
         tokio::spawn(async move {
             use tokio::time::{sleep, Duration};
 
             let poll = Duration::from_millis(poll_ms.max(250));
+            let mut caught_up = true;
             let mut offset: u64;
             let mut last_market_tick_ts: f64 = 0.0;
             let mut persist_counter: u64 = 0;
             let mut event_buffer = Vec::new();
+            let mut analysis_event_buffer: Vec<MarketEvent> = Vec::new();
+            let mut latest_analysis_snapshot = None;
+            let mut last_analysis_market_ts = 0.0_f64;
+            let mut ticks_since_analysis = 0usize;
+            let pending_outcomes = Arc::new(Mutex::new(PendingOutcomeSet::default()));
+            if let Ok(db) = db_bg.lock() {
+                if let Ok(mut pending) = pending_outcomes.lock() {
+                    let _ = pending.reconcile_from_db(&db);
+                }
+            }
             let mut tick_buffer: Vec<RawTickBatchRow> = Vec::new();
             let mut last_integrity_check =
                 std::time::Instant::now() - std::time::Duration::from_secs(30);
@@ -355,9 +524,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or_else(|_| safe_scid_data_offset(&ScidReader::new(reader_path.clone())))
             };
             feed_rt_bg.scid_tail_offset.store(offset, Ordering::Release);
+            feed_rt_bg.scid_read_offset.store(offset, Ordering::Release);
+            feed_rt_bg
+                .scid_processed_offset
+                .store(offset, Ordering::Release);
 
             loop {
-                sleep(poll).await;
+                if caught_up {
+                    sleep(poll).await;
+                } else {
+                    tokio::task::yield_now().await;
+                }
                 if last_integrity_check.elapsed() >= std::time::Duration::from_secs(15) {
                     let pipeline_invariants = pipelines_bg
                         .lock()
@@ -372,13 +549,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 let reader_for_step =
                     ScidReader::with_price_scale(reader_path.clone(), price_scale);
+                let poll_started_wall_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+                feed_rt_bg
+                    .last_scid_poll_started_wall_ms
+                    .store(poll_started_wall_ms, Ordering::Release);
+                feed_rt_bg
+                    .scid_worker_phase
+                    .store(SCID_WORKER_READING, Ordering::Release);
                 let step = match tokio::task::spawn_blocking(move || {
-                    read_scid_poll_step(&reader_for_step, offset)
+                    read_scid_poll_step_capped(&reader_for_step, offset, max_ticks_per_poll)
                 })
                 .await
                 {
                     Ok(Ok(step)) => step,
                     Ok(Err(err)) => {
+                        feed_rt_bg
+                            .scid_worker_phase
+                            .store(SCID_WORKER_IDLE, Ordering::Release);
+                        feed_rt_bg.last_scid_poll_completed_wall_ms.store(
+                            chrono::Utc::now().timestamp_millis().max(0) as u64,
+                            Ordering::Release,
+                        );
                         record_runtime_event(
                             &runtime_events_bg,
                             Some(&db_bg),
@@ -391,6 +582,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         continue;
                     }
                     Err(err) => {
+                        feed_rt_bg
+                            .scid_worker_phase
+                            .store(SCID_WORKER_IDLE, Ordering::Release);
+                        feed_rt_bg.last_scid_poll_completed_wall_ms.store(
+                            chrono::Utc::now().timestamp_millis().max(0) as u64,
+                            Ordering::Release,
+                        );
                         record_runtime_event(
                             &runtime_events_bg,
                             Some(&db_bg),
@@ -406,10 +604,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 feed_rt_bg
                     .scid_file_len
                     .store(step.file_len, Ordering::Release);
+                feed_rt_bg
+                    .scid_read_offset
+                    .store(step.next_offset, Ordering::Release);
                 feed_rt_bg.last_scid_poll_wall_ms.store(
                     chrono::Utc::now().timestamp_millis() as u64,
                     Ordering::Release,
                 );
+                feed_rt_bg
+                    .scid_worker_phase
+                    .store(SCID_WORKER_PROCESSING, Ordering::Release);
 
                 if step.was_realigned() {
                     feed_rt_bg
@@ -447,10 +651,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         );
                     }
                 }
-                offset = step.next_offset;
-                feed_rt_bg.scid_tail_offset.store(offset, Ordering::Release);
-
                 let mut ticks_this_poll = 0u64;
+                let batch_process_started = std::time::Instant::now();
                 for tick in &step.ticks {
                     match monotonic_guard.observe(tick.timestamp_ms) {
                         MonotonicTimestampDecision::Accept => {}
@@ -531,10 +733,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         {
                             // Other known→known transitions, e.g. Globex→RTH at
                             // 09:30 ET. Reuses the shared boundary helper.
-                            prepare_for_new_session(
+                            prepare_for_new_session_with_cache(
                                 &pipelines_bg,
                                 &db_bg,
                                 Some(&runtime_events_bg),
+                                &boundary_cache_bg,
                                 new_session,
                                 new_segment,
                                 tick.timestamp_ms,
@@ -568,10 +771,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             // start landing inside RTH/Globex). Idempotent with
                             // any in-memory state finalize_rth_close already
                             // installed.
-                            prepare_for_new_session(
+                            prepare_for_new_session_with_cache(
                                 &pipelines_bg,
                                 &db_bg,
                                 Some(&runtime_events_bg),
+                                &boundary_cache_bg,
                                 new_session,
                                 new_segment,
                                 tick.timestamp_ms,
@@ -628,15 +832,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
 
                     let is_buy = matches!(tick.side, TradeSide::Buy);
-                    let event_start = event_buffer.len();
-                    process_tick(
+                    let ingest_outcome = ingest_tick(
                         &pipelines_bg,
                         &detector_bg,
                         &flow_emitter_bg,
-                        &rules_bg,
-                        &playbook_cache_bg,
-                        &db_bg,
-                        &runtime_events_bg,
+                        Some(&pending_outcomes),
                         &last_bid_bg,
                         &last_ask_bg,
                         tick.price,
@@ -647,8 +847,79 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         tick.ask,
                         &mut event_buffer,
                     );
+                    let new_events = if let Some(ingest_outcome) = ingest_outcome {
+                        latest_analysis_snapshot = Some(ingest_outcome.snapshot);
+                        let new_events = ingest_outcome.new_events;
+                        analysis_event_buffer.extend(new_events.iter().cloned());
+                        ticks_since_analysis = ticks_since_analysis.saturating_add(1);
+                        new_events
+                    } else {
+                        Vec::new()
+                    };
+                    let should_run_analysis = latest_analysis_snapshot.is_some()
+                        && (ticks_since_analysis >= analysis_max_ticks
+                            || last_analysis_market_ts <= 0.0
+                            || tick.timestamp_ms - last_analysis_market_ts
+                                >= analysis_min_interval_ms);
+                    if should_run_analysis {
+                        let snapshot = latest_analysis_snapshot
+                            .clone()
+                            .expect("analysis snapshot checked above");
+                        let events = std::mem::take(&mut analysis_event_buffer);
+                        let rules_analysis = Arc::clone(&rules_bg);
+                        let playbook_cache_analysis = Arc::clone(&playbook_cache_bg);
+                        let db_analysis = Arc::clone(&db_bg);
+                        let runtime_events_analysis = Arc::clone(&runtime_events_bg);
+                        let pending_analysis = Arc::clone(&pending_outcomes);
+                        let feed_rt_analysis = Arc::clone(&feed_rt_bg);
+                        let analysis_timestamp_ms = tick.timestamp_ms;
+                        feed_rt_bg
+                            .scid_worker_phase
+                            .store(SCID_WORKER_ANALYSIS, Ordering::Release);
+                        match tokio::task::spawn_blocking(move || {
+                            run_analysis_pass(
+                                &rules_analysis,
+                                &playbook_cache_analysis,
+                                &db_analysis,
+                                &runtime_events_analysis,
+                                Some(&pending_analysis),
+                                &snapshot,
+                                &events,
+                                analysis_timestamp_ms,
+                                AttentionPulseKind::EventDriven,
+                            );
+                            feed_rt_analysis.last_analysis_pass_wall_ms.store(
+                                chrono::Utc::now().timestamp_millis().max(0) as u64,
+                                Ordering::Release,
+                            );
+                        })
+                        .await
+                        {
+                            Ok(()) => {
+                                last_analysis_market_ts = tick.timestamp_ms;
+                                ticks_since_analysis = 0;
+                            }
+                            Err(err) => {
+                                record_runtime_event(
+                                    &runtime_events_bg,
+                                    Some(&db_bg),
+                                    RuntimeEventLevel::Error,
+                                    "scid.analysis_failed",
+                                    "scid",
+                                    "Coalesced SCID analysis pass failed to join.",
+                                    serde_json::json!({
+                                        "timestampMs": tick.timestamp_ms,
+                                        "error": err.to_string(),
+                                    }),
+                                );
+                            }
+                        }
+                        feed_rt_bg
+                            .scid_worker_phase
+                            .store(SCID_WORKER_PROCESSING, Ordering::Release);
+                    }
                     if session_changed_for_context_warm
-                        || event_buffer[event_start..]
+                        || new_events
                             .iter()
                             .any(|event| context_frame_warm_event(&event.event_type))
                     {
@@ -660,18 +931,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 tick.timestamp_ms,
                             )
                         {
-                            warm_context_frame_cache(
-                                &db_bg,
-                                &context_frame_cache_bg,
-                                &runtime_events_bg,
-                                &payload,
-                                research::context_frame::ContextFrameOptions {
-                                    mode: research::context_frame::ContextFrameMode::Live,
-                                    snapshot_timestamp_ms: Some(timestamp_ms),
-                                    include_historical: true,
-                                    ..Default::default()
-                                },
-                            );
+                            let db_warm = Arc::clone(&db_bg);
+                            let context_frame_cache_warm = Arc::clone(&context_frame_cache_bg);
+                            let runtime_events_warm = Arc::clone(&runtime_events_bg);
+                            tokio::task::spawn_blocking(move || {
+                                warm_context_frame_cache(
+                                    &db_warm,
+                                    &context_frame_cache_warm,
+                                    &runtime_events_warm,
+                                    &payload,
+                                    research::context_frame::ContextFrameOptions {
+                                        mode: research::context_frame::ContextFrameMode::Live,
+                                        snapshot_timestamp_ms: Some(timestamp_ms),
+                                        include_historical: true,
+                                        ..Default::default()
+                                    },
+                                );
+                            });
                         }
                     }
 
@@ -699,14 +975,84 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ));
 
                     if tick_buffer.len() >= 100 {
+                        feed_rt_bg
+                            .scid_worker_phase
+                            .store(SCID_WORKER_DB, Ordering::Release);
                         if let Ok(db) = db_bg.lock() {
                             let _ = db.insert_raw_ticks_batch(&tick_buffer);
                         }
+                        feed_rt_bg
+                            .scid_worker_phase
+                            .store(SCID_WORKER_PROCESSING, Ordering::Release);
                         tick_buffer.clear();
                     }
 
                     ticks_this_poll += 1;
                 }
+                if ticks_since_analysis > 0 {
+                    if let Some(snapshot) = latest_analysis_snapshot.clone() {
+                        let events = std::mem::take(&mut analysis_event_buffer);
+                        let rules_analysis = Arc::clone(&rules_bg);
+                        let playbook_cache_analysis = Arc::clone(&playbook_cache_bg);
+                        let db_analysis = Arc::clone(&db_bg);
+                        let runtime_events_analysis = Arc::clone(&runtime_events_bg);
+                        let pending_analysis = Arc::clone(&pending_outcomes);
+                        let feed_rt_analysis = Arc::clone(&feed_rt_bg);
+                        let analysis_timestamp_ms = last_market_tick_ts;
+                        feed_rt_bg
+                            .scid_worker_phase
+                            .store(SCID_WORKER_ANALYSIS, Ordering::Release);
+                        match tokio::task::spawn_blocking(move || {
+                            run_analysis_pass(
+                                &rules_analysis,
+                                &playbook_cache_analysis,
+                                &db_analysis,
+                                &runtime_events_analysis,
+                                Some(&pending_analysis),
+                                &snapshot,
+                                &events,
+                                analysis_timestamp_ms,
+                                AttentionPulseKind::EventDriven,
+                            );
+                            feed_rt_analysis.last_analysis_pass_wall_ms.store(
+                                chrono::Utc::now().timestamp_millis().max(0) as u64,
+                                Ordering::Release,
+                            );
+                        })
+                        .await
+                        {
+                            Ok(()) => {
+                                last_analysis_market_ts = last_market_tick_ts;
+                                ticks_since_analysis = 0;
+                            }
+                            Err(err) => {
+                                record_runtime_event(
+                                    &runtime_events_bg,
+                                    Some(&db_bg),
+                                    RuntimeEventLevel::Error,
+                                    "scid.analysis_failed",
+                                    "scid",
+                                    "Forced SCID analysis pass failed to join.",
+                                    serde_json::json!({
+                                        "timestampMs": last_market_tick_ts,
+                                        "error": err.to_string(),
+                                    }),
+                                );
+                            }
+                        }
+                        feed_rt_bg
+                            .scid_worker_phase
+                            .store(SCID_WORKER_PROCESSING, Ordering::Release);
+                    }
+                }
+                offset = step.next_offset;
+                feed_rt_bg.scid_tail_offset.store(offset, Ordering::Release);
+                feed_rt_bg
+                    .scid_processed_offset
+                    .store(offset, Ordering::Release);
+                feed_rt_bg
+                    .last_scid_batch_tick_count
+                    .store(ticks_this_poll, Ordering::Release);
 
                 let monotonicity = feed_rt_bg.monotonicity_snapshot();
                 let new_non_monotonic_skips = monotonicity
@@ -738,6 +1084,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 // Flush remaining events
                 if !event_buffer.is_empty() {
+                    feed_rt_bg
+                        .scid_worker_phase
+                        .store(SCID_WORKER_DB, Ordering::Release);
                     if let Ok(db) = db_bg.lock() {
                         let _ = db.insert_market_events_batch(&event_buffer);
                     }
@@ -746,6 +1095,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 // Flush remaining raw ticks
                 if !tick_buffer.is_empty() {
+                    feed_rt_bg
+                        .scid_worker_phase
+                        .store(SCID_WORKER_DB, Ordering::Release);
                     if let Ok(db) = db_bg.lock() {
                         let _ = db.insert_raw_ticks_batch(&tick_buffer);
                     }
@@ -768,6 +1120,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
+                let process_wall_ms = batch_process_started.elapsed().as_millis() as u64;
+                feed_rt_bg
+                    .last_scid_batch_process_wall_ms
+                    .store(process_wall_ms, Ordering::Release);
+                feed_rt_bg.last_scid_poll_completed_wall_ms.store(
+                    chrono::Utc::now().timestamp_millis().max(0) as u64,
+                    Ordering::Release,
+                );
+                feed_rt_bg
+                    .scid_worker_phase
+                    .store(SCID_WORKER_IDLE, Ordering::Release);
+                caught_up = offset >= step.file_len;
             }
         });
     }

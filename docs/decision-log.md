@@ -449,3 +449,26 @@ Initial similarity weights are day type 0.30, profile shape 0.20, VWAP-sigma buc
 - Infer one-sided extension only from event counts — rejected because live/legacy summaries benefit from a range-derived fallback when event rows are missing.
 
 **Consequences:** IDEA-011 can filter sessions directly by queryable regime fields without depending on sparse poor-high/poor-low flags. Poor-high/poor-low remain explicitly deferred until a dedicated TPO semantics pass defines and validates their exact rule.
+
+### ADR-019: Live SCID ingest splits into a deterministic hot path and a coalesced analysis pass
+
+**Date:** 2026-06-22
+**Status:** Decided
+
+**Context:** At the 09:30 ET Globex→RTH open, SCID-derived pipeline state (VWAP, OR5, delta, structure) froze while DOM stayed live and the `.scid` file kept growing — a silent hot-path backlog, not a Sierra outage. Root cause: the live poll loop did all per-tick work on one thread via `process_tick` — pipeline update, event detection, rules/setup evaluation, an `outcome_tracker::on_tick` SQLite query *every tick*, attention persistence, and occasional historical `warm_context_frame_cache` reads. During the open burst the processing rate fell below the arrival rate. Two amplifiers: `read_bulk_from_offset` drained tail→EOF uncapped, and the loop slept unconditionally at the top of every iteration even when behind, so lag could not self-correct. DOM stayed live only because depth polling is a separate task. `prepare_for_new_session` added two more hot-path SQLite reads at the boundary tick.
+
+**Decision:** Split the live tick path into an ingest-only hot path (`ingest_tick`) and a throttled analysis pass (`run_analysis_pass`):
+- `ingest_tick` performs deterministic state only (pipeline, event detection, per-tick outcome excursion apply) with no SQLite work.
+- `run_analysis_pass` runs the rules engine, outcome DB flush, and attention persistence on `spawn_blocking`, coalesced to at most once per `analysis_min_interval_ms` (250 ms) or `analysis_max_ticks` (500), and always forced at batch end and on session boundaries.
+- Outcome MFE/MAE and chronological target/stop resolution are preserved exactly via an in-memory `PendingOutcomeSet` (per-tick CPU apply, DB writes once per pass) rather than carrying only high/low.
+- The live reader is capped (`read_bulk_from_offset_capped`, `max_ticks_per_poll`=5000) to bound one poll iteration; the loop yields instead of sleeping while behind so lag self-corrects.
+- Boundary SQLite reads move off the hot path: an in-memory reset runs inline, prior-day/inventory references are served from a pre-warmed `BoundarySessionCache` (refreshed by a 60 s background task), with a cold-cache fallback that logs `session.boundary_cache_cold` and reads inline.
+- New observability: distinct read-vs-processed offsets, worker-phase labels, batch tick count/process time, analysis lag, and a stall watchdog that warns when the file grows but the processed offset does not advance.
+
+New `FeedConfig` fields (all serde-default): `max_ticks_per_poll` (5000), `analysis_min_interval_ms` (250), `analysis_max_ticks` (500).
+
+**Alternatives considered:**
+- Keep the single-threaded `process_tick` and only cap the reader — rejected because the per-tick SQLite query remained on the hot path and would still backlog at the open.
+- Carry only running high/low for outcome resolution instead of a pending set — rejected because it cannot reproduce the exact first-crossing target/stop semantics the DB tracker guarantees.
+
+**Consequences:** Rule and setup *firing* is now sampled (≤250 ms / 500 ticks) rather than evaluated on every tick — an accepted 100–250 ms alert-coalescing tradeoff for discretionary coaching. Outcome excursion accuracy stays per-tick exact. Parity tests assert capped == uncapped final pipeline state and coalesced == per-tick outcome extremes. `process_tick` is retained for tests and replay utilities but is no longer on the live path.

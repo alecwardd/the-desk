@@ -2,6 +2,13 @@
 
 Living document for trade setup ideas, backtesting hypotheses, research findings, and cross-cutting infrastructure work (pipelines, MCP server surface, multi-instrument support). Each idea is tracked from concept through validation.
 
+### Companion specs
+
+Standalone deep-dive specs referenced by ideas in this document:
+
+- **Multi-instrument flow architecture (NQ / MNQ / ES / MES)** — [`docs/multi-instrument-flow-architecture.md`](multi-instrument-flow-architecture.md) (tracked as IDEA-021): share structure / separate flow, mini-vs-micro flow-agreement → conviction & sizing, cross-asset NQ↔ES.
+- **IDEA-000 / IDEA-012 backtest runbook** — [`docs/idea000-idea012-backtest-runbook.md`](idea000-idea012-backtest-runbook.md): copy-pasteable register → backtest → gate → activate sequence.
+
 ---
 
 ## How to Use This Document

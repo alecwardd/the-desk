@@ -118,9 +118,12 @@ Window `2025-11-28 → 2026-03-06`, job `091f54ef-3f3d-453b-a38e-0859e157c6ab`, 
   the entry trigger and the classifier thresholds (`REGIME_ELEVATED_RVOL` / `REGIME_ELEVATED_PACE`)
   before re-testing the gate.
 - **IDEA-012 fires ~20×/RTH session** because `absorption_invalidated` is a 45s *state flag* that the
-  rules engine re-evaluates every analysis pass. The +0.06R on N=1,720 is over-trading noise. Needs a
-  one-shot-per-event cooldown and an `absorption_invalidation_direction` field before it is a discrete,
-  testable setup. Re-open as a refinement, not as currently specified.
+  rules engine re-evaluates every analysis pass, and the v1 spec used the 2s default suppression and
+  omitted the doc's required pace-expansion filter. The +0.06R on N=1,720 is over-trading noise.
+  *Refined (2026-06-23):* added the `absorption_invalidation_direction` condition field
+  (`RULES_ENGINE_SCHEMA_VERSION` 3→4) and a v2 spec in the runbook — direction scoping +
+  `tape_pace_percentile > 0.7` + `duplicateSuppressionMs = 300000` so one failure is one signal.
+  Awaiting re-backtest under v4.
 
 **Infrastructure findings from this run (must fix before the next pass):**
 1. **Stale MCP server rejected the new condition fields** until `target/release/the-desk-mcp.exe` was

@@ -13,7 +13,7 @@ use std::collections::HashMap;
 /// semantics change in a way that invalidates cached backtest statistics.
 /// Examples: adding/removing condition variants, changing comparison semantics
 /// in `evaluate_typed_condition`, or changing `resolve_price_expression` modes.
-pub const RULES_ENGINE_SCHEMA_VERSION: u32 = 3;
+pub const RULES_ENGINE_SCHEMA_VERSION: u32 = 4;
 
 // ---------------------------------------------------------------------------
 // Setup state machine
@@ -159,6 +159,10 @@ pub enum ConditionField {
     // --- Absorption failure (IDEA-012) ---
     /// Whether a recently invalidated (failed) absorption is live.
     AbsorptionInvalidated,
+    /// Original (pre-failure) rejection direction of the invalidated absorption:
+    /// "up" or "down". Note the trade is typically *opposite* this — a failed
+    /// down-defense resolves into an upside vacuum.
+    AbsorptionInvalidationDirection,
 }
 
 /// Comparison operator for a condition.
@@ -888,6 +892,16 @@ fn evaluate_typed_condition(
         // --- Absorption failure (IDEA-012) ---
         ConditionField::AbsorptionInvalidated => {
             return market.has_recent_invalidated_absorption;
+        }
+        ConditionField::AbsorptionInvalidationDirection => {
+            if let ConditionValue::Text(expected) = &cond.value {
+                return market
+                    .recent_invalidated_absorption_direction
+                    .as_deref()
+                    .map(|dir| dir.eq_ignore_ascii_case(expected))
+                    .unwrap_or(false);
+            }
+            return false;
         }
     };
 
@@ -1861,6 +1875,25 @@ mod tests {
         assert!(evaluate_typed_condition(&cond, &failed, None));
         let calm = MarketState::default();
         assert!(!evaluate_typed_condition(&cond, &calm, None));
+    }
+
+    #[test]
+    fn absorption_invalidation_direction_matches_state() {
+        let market = MarketState {
+            has_recent_invalidated_absorption: true,
+            recent_invalidated_absorption_direction: Some("down".to_string()),
+            ..Default::default()
+        };
+        let hit: SetupCondition = serde_json::from_str(
+            r#"{"id":"c1","field":"absorption_invalidation_direction","operator":"equals","value":"down"}"#,
+        )
+        .unwrap();
+        assert!(evaluate_typed_condition(&hit, &market, None));
+        let miss: SetupCondition = serde_json::from_str(
+            r#"{"id":"c1","field":"absorption_invalidation_direction","operator":"equals","value":"up"}"#,
+        )
+        .unwrap();
+        assert!(!evaluate_typed_condition(&miss, &market, None));
     }
 
     #[test]

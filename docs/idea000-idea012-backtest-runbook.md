@@ -76,47 +76,65 @@ control: if the gated variant does not beat it, the regime gate is not earning i
 
 ---
 
-## IDEA-012 — Absorption Failure / Liquidity Vacuum (Short)
+## IDEA-012 — Absorption Failure / Liquidity Vacuum (Short) — v2 (refined 2026-06-23)
+
+The v1 run rejected because it fired ~20×/RTH session: it omitted the doc's required **pace-expansion**
+filter and used the 2s default suppression against a 45s state flag, so one failure counted ~20 times.
+v2 tightens with three changes: scope direction via the new `absorption_invalidation_direction` field
+(a failed **up**-defense → downside vacuum → short), require **pace expansion** (`tape_pace_percentile`),
+and raise `duplicateSuppressionMs` so a single failure is one signal.
 
 ```json
 {
   "metadata": {
     "hypothesisId": "IDEA-012-vacuum-short",
-    "version": 1,
+    "version": 2,
     "docReference": "IDEA-012",
-    "proseSummary": "Failed absorption below VWAP resolves into a downside liquidity vacuum.",
+    "proseSummary": "Failed up-defense + pace expansion resolves into a downside liquidity vacuum.",
     "owner": "user",
     "sessionScope": ["rth"]
   },
   "setupDefinition": {
-    "id": "hyp_IDEA-012_vacuum_short_v1",
-    "name": "IDEA-012 Absorption Failure / Vacuum (Short)",
-    "description": "Fires when a recent absorption invalidates while price is below VWAP — trade through the failed zone, not at it.",
+    "id": "hyp_IDEA-012_vacuum_short_v2",
+    "name": "IDEA-012 Absorption Failure / Vacuum (Short) v2",
+    "description": "A recent up-rejection absorption fails while pace expands — trade the downside vacuum through the failed zone, not at it.",
     "active": false,
+    "duplicateSuppressionMs": 300000,
     "conditions": [
       "{\"id\":\"c1\",\"field\":\"absorption_invalidated\",\"operator\":\"equals\",\"value\":true}",
-      "{\"id\":\"c2\",\"field\":\"price_vs_vwap\",\"operator\":\"below\"}"
+      "{\"id\":\"c2\",\"field\":\"absorption_invalidation_direction\",\"operator\":\"equals\",\"value\":\"up\"}",
+      "{\"id\":\"c3\",\"field\":\"tape_pace_percentile\",\"operator\":\"above\",\"value\":0.7}"
     ],
     "stopLogic": { "mode": "fixed_points", "direction": "short", "points": 10 },
     "targets": [ { "mode": "fixed_points", "direction": "short", "points": 20, "label": "2R fixed target" } ],
     "positionSizing": { "r_points": 10 },
-    "templateSource": "hypothesis:IDEA-012:v1"
+    "templateSource": "hypothesis:IDEA-012:v2"
   },
   "dryRun": true
 }
 ```
 
-> Long mirror: swap `price_vs_vwap below`→`above` and `direction short`→`long`. The local sample hint
-> (failed down-absorption flipped to opposite-direction closes 58.8% of the time) suggests the
-> long-from-failed-low side is worth testing too — let the verified distribution decide.
+> **Direction semantics:** `absorption_invalidation_direction` is the *original* (pre-failure)
+> rejection direction, and the trade is the **opposite** — a failed `up`-defense (buyers couldn't hold)
+> resolves *down* → short; a failed `down`-defense resolves *up* → long.
+>
+> Long mirror (`hyp_IDEA-012_vacuum_long_v2`): set `absorption_invalidation_direction = "down"` and
+> `direction long`. The local sample hint (failed down-absorption flipped to opposite-direction closes
+> 58.8% of the time) makes the long-from-failed-low side the one to watch.
+
+If v2 still fires too often or shows no edge, the next lever is requiring key-level proximity at the
+failed zone (per the IDEA-012 "Critical Rule": failed defense **+** pace expansion **+** liquidity pull).
 
 ---
 
 ## Caveats
 
-- `absorption_invalidated` direction is not yet a condition field, so these scope direction via
-  `price_vs_vwap`. If the backtest shows edge but is direction-noisy, the next refinement is a
-  dedicated `absorption_invalidation_direction` field.
+- **Direction is now a field** (`absorption_invalidation_direction`, added 2026-06-23); v2 uses it
+  instead of the looser `price_vs_vwap` scoping.
+- After this field addition the rules engine is at `RULES_ENGINE_SCHEMA_VERSION = 4` — rebuild
+  `target/release/the-desk-mcp.exe` and restart the Cursor MCP server before registering, or it will
+  reject the new field (see `docs/setup-ideas-and-backtesting.md` infra findings).
+- Pass the contract that was front during the window (`NQH6.CME` + `force: true` for 2025-11-28…
+  2026-03-06). A mismatch now surfaces a `scid_window_mismatch_warning` and `integrity_status:"warning"`
+  instead of a silent zero, but you still get no usable data.
 - Keep every setup `active: false` at registration; activation is gated and explicit.
-- `run_backtest` needs SCID / raw-tick coverage for the window; if results are empty, confirm ingest
-  with the raw-tick gap tools first.

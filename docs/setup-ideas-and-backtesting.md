@@ -86,11 +86,16 @@ and still requires new `ConditionField` variants plus pipeline detection before 
   automatic *eligibility gate* that disables continuation families on `Migration`/`Transition` days
   before condition evaluation, plus a backtest of gated-vs-ungated expectancy. Classifier thresholds
   (`REGIME_ELEVATED_RVOL`, `REGIME_ELEVATED_PACE`) are deliberately provisional pending that backtest.
-- **Reversal / trap family (IDEA-002, IDEA-012, IDEA-003):** failed-breakout-state,
-  absorption-invalidation, and naked-VPOC-proximity have no condition fields today
-  (`delta_confirmation_at_level` / `rebid_zone_held` currently always evaluate false). These must go
-  through the `register_hypothesis` → `run_backtest` → `propose_draft_setup` → `activate_draft_setup`
-  loop once the detection fields exist.
+- **Reversal / trap family (IDEA-002, IDEA-003):** failed-breakout-state and naked-VPOC-proximity
+  still have no condition fields today (`delta_confirmation_at_level` / `rebid_zone_held` currently
+  always evaluate false). These must go through the `register_hypothesis` → `run_backtest` →
+  `propose_draft_setup` → `activate_draft_setup` loop once the detection fields exist.
+- **Absorption failure (IDEA-012):** *Landed (2026-06-22).* The absorption pipeline already ran a
+  full detected→confirmed→invalidated state machine; PR2 surfaced the invalidation as
+  `has_recent_invalidated_absorption` (+ price/direction/age/distance) on `MarketState` and as the
+  `absorption_invalidated` condition field, mapped to the existing `absorption_invalidated` market
+  event for sample-size projection. `RULES_ENGINE_SCHEMA_VERSION` bumped 2→3. Ready to register and
+  backtest a failed-absorption / liquidity-vacuum setup; not yet wired into a template or activated.
 
 ---
 

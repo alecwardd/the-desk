@@ -852,6 +852,41 @@ impl AbsorptionPipeline {
             ACTIVE_EXHAUSTION_FRESHNESS_MS,
         )
     }
+
+    /// Snapshot of the most recent *invalidated* absorption considered live for
+    /// evaluation (IDEA-012 absorption-failure / liquidity vacuum). Unlike the
+    /// confirmed-absorption snapshot, no distance gate is applied: the failure
+    /// move travels away from the defended price, so the trade is taken through
+    /// the failed zone rather than at it.
+    pub fn recent_invalidated_absorption_state(
+        &self,
+        timestamp_ms: f64,
+        current_price: f64,
+    ) -> RecentSignalSnapshot {
+        for event in self.recent_events.iter().rev() {
+            if event.event_type != "absorption"
+                || event.status != SignalStatus::Invalidated.as_str()
+            {
+                continue;
+            }
+            // Age the failure from when it invalidated, not when first detected.
+            let event_time = event.invalidated_at_ms.unwrap_or(event.timestamp_ms);
+            let age_ms = timestamp_ms - event_time;
+            if !(0.0..=ACTIVE_SIGNAL_FRESHNESS_MS).contains(&age_ms) {
+                continue;
+            }
+            let distance_ticks = ((event.price - current_price) / self.tick_size).abs();
+            return RecentSignalSnapshot {
+                is_active: true,
+                price: Some(event.price),
+                direction: event.direction.clone(),
+                age_ms: Some(age_ms),
+                distance_ticks: Some(distance_ticks),
+                status: Some(event.status.clone()),
+            };
+        }
+        RecentSignalSnapshot::default()
+    }
 }
 
 #[cfg(test)]
@@ -916,6 +951,51 @@ mod tests {
             .recent_events()
             .iter()
             .any(|e| e.event_type == "absorption" && e.status == "confirmed"));
+    }
+
+    #[test]
+    fn invalidated_absorption_surfaces_via_state() {
+        let mut p = AbsorptionPipeline::new(0.25);
+        // Build buy absorption at ~21000 (expected down rejection).
+        for i in 0..30 {
+            p.on_trade(
+                10_000.0 + i as f64 * 200.0,
+                21_000.0 + (i % 2) as f64 * 0.25,
+                12.0,
+                0.0,
+                true,
+                10,
+                0.75,
+                1.1,
+                &[],
+            );
+        }
+        // Price pushes UP through the zone instead of rejecting down -> failure.
+        let mut last_ts = 0.0;
+        for i in 0..14 {
+            last_ts = 20_000.0 + i as f64 * 400.0;
+            p.on_trade(
+                last_ts,
+                21_001.5 + i as f64 * 0.5,
+                8.0,
+                1.0,
+                true,
+                12,
+                0.6,
+                1.0,
+                &[],
+            );
+        }
+
+        assert!(
+            p.recent_events()
+                .iter()
+                .any(|e| e.event_type == "absorption" && e.status == "invalidated"),
+            "expected an invalidated absorption event"
+        );
+        let snap = p.recent_invalidated_absorption_state(last_ts + 100.0, 21_010.0);
+        assert!(snap.is_active, "invalidated absorption should be live");
+        assert_eq!(snap.status.as_deref(), Some("invalidated"));
     }
 
     #[test]

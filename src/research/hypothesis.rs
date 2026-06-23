@@ -485,6 +485,7 @@ fn projected_sample_size(
 fn dominant_event_type(condition: &SetupCondition) -> Option<&'static str> {
     match condition.field {
         ConditionField::AbsorptionAtPrice => Some("absorption_detected"),
+        ConditionField::AbsorptionInvalidated => Some("absorption_invalidated"),
         ConditionField::PinchDetected => Some("pinch_detected"),
         ConditionField::RvolClassification
         | ConditionField::RvolPercentile

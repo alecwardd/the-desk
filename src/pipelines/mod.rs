@@ -236,6 +236,16 @@ pub struct MarketState {
     pub recent_confirmed_absorption_age_ms: Option<f64>,
     /// Distance from current price to the most recent confirmed absorption, in ticks.
     pub recent_confirmed_absorption_distance_ticks: Option<f64>,
+    /// Whether a recently *invalidated* absorption is live (IDEA-012 failure / vacuum).
+    pub has_recent_invalidated_absorption: bool,
+    /// Price of the most recent invalidated absorption.
+    pub recent_invalidated_absorption_price: Option<f64>,
+    /// Direction implied by the most recent invalidated absorption.
+    pub recent_invalidated_absorption_direction: Option<String>,
+    /// Age of the most recent invalidated absorption (since it failed), in milliseconds.
+    pub recent_invalidated_absorption_age_ms: Option<f64>,
+    /// Distance from current price to the most recent invalidated absorption, in ticks.
+    pub recent_invalidated_absorption_distance_ticks: Option<f64>,
     /// Whether there is a still-live confirmed exhaustion signal.
     pub has_recent_confirmed_exhaustion: bool,
     /// Price of the most recent confirmed exhaustion considered live for evaluation.
@@ -709,6 +719,12 @@ impl PipelineEngine {
         } else {
             RecentSignalSnapshot::default()
         };
+        let recent_invalidated_absorption = if include_extended_metrics {
+            self.absorption
+                .recent_invalidated_absorption_state(timestamp_ms, self.levels.last_price)
+        } else {
+            RecentSignalSnapshot::default()
+        };
         let ib_extension_state = ib_extension_state_from_range(
             self.tpo.ib_high(),
             self.tpo.ib_low(),
@@ -810,6 +826,14 @@ impl PipelineEngine {
             recent_confirmed_absorption_direction: recent_absorption.direction,
             recent_confirmed_absorption_age_ms: recent_absorption.age_ms,
             recent_confirmed_absorption_distance_ticks: recent_absorption.distance_ticks,
+            has_recent_invalidated_absorption: recent_invalidated_absorption.is_active,
+            recent_invalidated_absorption_price: recent_invalidated_absorption.price,
+            recent_invalidated_absorption_direction: recent_invalidated_absorption
+                .direction
+                .clone(),
+            recent_invalidated_absorption_age_ms: recent_invalidated_absorption.age_ms,
+            recent_invalidated_absorption_distance_ticks: recent_invalidated_absorption
+                .distance_ticks,
             has_recent_confirmed_exhaustion: recent_exhaustion.is_active,
             recent_confirmed_exhaustion_price: recent_exhaustion.price,
             recent_confirmed_exhaustion_direction: recent_exhaustion.direction,

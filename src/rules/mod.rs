@@ -13,7 +13,7 @@ use std::collections::HashMap;
 /// semantics change in a way that invalidates cached backtest statistics.
 /// Examples: adding/removing condition variants, changing comparison semantics
 /// in `evaluate_typed_condition`, or changing `resolve_price_expression` modes.
-pub const RULES_ENGINE_SCHEMA_VERSION: u32 = 2;
+pub const RULES_ENGINE_SCHEMA_VERSION: u32 = 3;
 
 // ---------------------------------------------------------------------------
 // Setup state machine
@@ -155,6 +155,10 @@ pub enum ConditionField {
     Regime,
     /// Live 0.5x IB extension state: None | UpOnly | DownOnly | BothSides.
     IbExtensionState,
+
+    // --- Absorption failure (IDEA-012) ---
+    /// Whether a recently invalidated (failed) absorption is live.
+    AbsorptionInvalidated,
 }
 
 /// Comparison operator for a condition.
@@ -879,6 +883,11 @@ fn evaluate_typed_condition(
                 return market.ib_extension_state.to_lowercase() == expected.to_lowercase();
             }
             return false;
+        }
+
+        // --- Absorption failure (IDEA-012) ---
+        ConditionField::AbsorptionInvalidated => {
+            return market.has_recent_invalidated_absorption;
         }
     };
 
@@ -1837,6 +1846,21 @@ mod tests {
         )
         .unwrap();
         assert!(!evaluate_typed_condition(&miss, &market, None));
+    }
+
+    #[test]
+    fn absorption_invalidated_condition_matches_state() {
+        let cond: SetupCondition = serde_json::from_str(
+            r#"{"id":"c1","field":"absorption_invalidated","operator":"equals","value":true}"#,
+        )
+        .unwrap();
+        let failed = MarketState {
+            has_recent_invalidated_absorption: true,
+            ..Default::default()
+        };
+        assert!(evaluate_typed_condition(&cond, &failed, None));
+        let calm = MarketState::default();
+        assert!(!evaluate_typed_condition(&cond, &calm, None));
     }
 
     #[test]

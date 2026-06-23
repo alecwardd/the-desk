@@ -114,6 +114,14 @@ pub struct BackfillResult {
     pub integrity_status: String,
     pub scid_timestamp_monotonicity: MonotonicTimestampStats,
     pub warnings: Vec<String>,
+    /// Number of coalesced analysis (full snapshot + rules) passes run.
+    pub analysis_passes: usize,
+    /// Average RTH ticks per analysis pass (1.0 would mean no coalescing).
+    pub ticks_per_analysis_avg: f64,
+    /// Analysis cadence used: minimum wall-interval between passes (ms).
+    pub analysis_min_interval_ms: f64,
+    /// Analysis cadence used: maximum ticks between passes.
+    pub analysis_max_ticks: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -214,6 +222,14 @@ struct BackfillRunState {
     buffers: SessionBuffers,
     segment_buffers: SegmentBuffers,
     last_context_snapshot_ms: Option<f64>,
+    /// Coalesced-analysis cursor: ticks observed since the last analysis pass.
+    ticks_since_analysis: usize,
+    /// Market timestamp (ms) of the last analysis pass; <=0 means none yet.
+    last_analysis_ms: f64,
+    /// Total coalesced analysis passes run (audit metric).
+    analysis_passes: usize,
+    /// Total RTH ticks seen by the analysis gate (audit metric).
+    analyzed_rth_ticks: usize,
 }
 
 /// Classify whether the session reached no, one-sided, or both-sided 0.5x IB
@@ -515,6 +531,15 @@ where
     let (start_ms, end_ms_exclusive) =
         parse_backfill_date_range(params.start_date.as_deref(), params.end_date.as_deref())?;
     let source = params.job_type.replay_source();
+    // Replay analysis cadence — mirror the live server so the backtest coalesces
+    // the expensive snapshot+rules pass instead of running it on every RTH tick.
+    let (analysis_min_interval_ms, analysis_max_ticks) = {
+        let cfg = load_feed_config();
+        (
+            cfg.analysis_min_interval_ms.max(1.0),
+            cfg.analysis_max_ticks.max(1),
+        )
+    };
     let setups = prepare_backfill_setups(db, params)?;
     let r_value_points = db
         .load_risk_config()
@@ -570,6 +595,10 @@ where
         buffers: SessionBuffers::default(),
         segment_buffers: SegmentBuffers::default(),
         last_context_snapshot_ms: None,
+        ticks_since_analysis: 0,
+        last_analysis_ms: 0.0,
+        analysis_passes: 0,
+        analyzed_rth_ticks: 0,
     };
     state
         .pipeline
@@ -624,250 +653,261 @@ where
     let mut cancelled = false;
     let mut monotonic_guard = MonotonicTickGuard::default();
 
-    let scan_stats =
-        reader
-            .scan_range_in_file_order(start_ms, end_ms_exclusive, |tick| {
-                if cancel_flag.load(Ordering::Relaxed) {
-                    cancelled = true;
-                    return Ok(ScanControl::Stop);
-                }
+    let scan_stats = reader
+        .scan_range_in_file_order(start_ms, end_ms_exclusive, |tick| {
+            if cancel_flag.load(Ordering::Relaxed) {
+                cancelled = true;
+                return Ok(ScanControl::Stop);
+            }
 
-                state.progress.records_scanned += 1;
-                if state.progress.records_scanned == 1 {
-                    state.progress.current_phase = "processing_session".to_string();
-                }
+            state.progress.records_scanned += 1;
+            if state.progress.records_scanned == 1 {
+                state.progress.current_phase = "processing_session".to_string();
+            }
 
-                if !matches!(
-                    monotonic_guard.observe(tick.timestamp_ms),
-                    crate::feed::monotonic::MonotonicTimestampDecision::Accept
-                ) {
-                    return Ok(ScanControl::Continue);
-                }
+            if !matches!(
+                monotonic_guard.observe(tick.timestamp_ms),
+                crate::feed::monotonic::MonotonicTimestampDecision::Accept
+            ) {
+                return Ok(ScanControl::Continue);
+            }
 
-                let tick_ctx = match tick_time_context_from_timestamp_ms(tick.timestamp_ms) {
-                    Some(ctx) => ctx,
-                    None => return Ok(ScanControl::Continue),
-                };
-                let tick_class = tick_ctx.session_type;
-                if let Some(prev) = prev_ts {
-                    let gap_ms = tick.timestamp_ms - prev;
-                    if gap_ms > 0.0 && tick_class == prev_class {
-                        let threshold_ms = match tick_class {
-                            SessionType::Rth => 5.0 * 60_000.0,
-                            SessionType::Globex => 30.0 * 60_000.0,
-                            SessionType::Unknown => f64::INFINITY,
-                        };
-                        if gap_ms > threshold_ms {
-                            gaps.push(TickGap {
-                                from_ms: prev,
-                                to_ms: tick.timestamp_ms,
-                                duration_minutes: gap_ms / 60_000.0,
-                                session_date: session_date_from_timestamp_ms(tick.timestamp_ms),
-                                session_type: format!("{tick_class:?}"),
-                            });
-                        }
+            let tick_ctx = match tick_time_context_from_timestamp_ms(tick.timestamp_ms) {
+                Some(ctx) => ctx,
+                None => return Ok(ScanControl::Continue),
+            };
+            let tick_class = tick_ctx.session_type;
+            if let Some(prev) = prev_ts {
+                let gap_ms = tick.timestamp_ms - prev;
+                if gap_ms > 0.0 && tick_class == prev_class {
+                    let threshold_ms = match tick_class {
+                        SessionType::Rth => 5.0 * 60_000.0,
+                        SessionType::Globex => 30.0 * 60_000.0,
+                        SessionType::Unknown => f64::INFINITY,
+                    };
+                    if gap_ms > threshold_ms {
+                        gaps.push(TickGap {
+                            from_ms: prev,
+                            to_ms: tick.timestamp_ms,
+                            duration_minutes: gap_ms / 60_000.0,
+                            session_date: session_date_from_timestamp_ms(tick.timestamp_ms),
+                            session_type: format!("{tick_class:?}"),
+                        });
                     }
                 }
-                prev_ts = Some(tick.timestamp_ms);
-                prev_class = tick_class;
+            }
+            prev_ts = Some(tick.timestamp_ms);
+            prev_class = tick_class;
 
-                if current_date_key != Some(tick_ctx.session_date_key) {
-                    current_date = tick_ctx.session_date.clone();
-                    current_date_key = Some(tick_ctx.session_date_key);
+            if current_date_key != Some(tick_ctx.session_date_key) {
+                current_date = tick_ctx.session_date.clone();
+                current_date_key = Some(tick_ctx.session_date_key);
+            }
+            state.progress.current_session_date = Some(current_date.clone());
+
+            let new_session = tick_ctx.session_type;
+            let new_segment = classify_delta_segment(tick_ctx.et_minutes);
+
+            if new_session != current_session
+                && current_session != SessionType::Unknown
+                && new_session != SessionType::Unknown
+            {
+                finalize_session_period(
+                    db,
+                    params,
+                    &mut state,
+                    current_session,
+                    current_delta_segment,
+                    &current_date,
+                    last_tick_meta,
+                    source,
+                    r_value_points,
+                    cancel_flag,
+                    &mut on_progress,
+                )
+                .map_err(|e| e.to_string())?;
+
+                state
+                    .pipeline
+                    .reset_session_with_type(new_session == SessionType::Globex);
+                detector.reset();
+                flow_emitter.reset();
+                if let Some(ref mut rules) = rules {
+                    rules.reset();
                 }
-                state.progress.current_session_date = Some(current_date.clone());
+                state.buffers = SessionBuffers::default();
+                state.segment_buffers = SegmentBuffers::default();
+                state.last_context_snapshot_ms = None;
 
-                let new_session = tick_ctx.session_type;
-                let new_segment = classify_delta_segment(tick_ctx.et_minutes);
-
-                if new_session != current_session
-                    && current_session != SessionType::Unknown
-                    && new_session != SessionType::Unknown
-                {
-                    finalize_session_period(
+                if new_session == SessionType::Rth || new_session == SessionType::Globex {
+                    let current_contract_reference = db
+                        .load_prior_day_reference_for_contract(
+                            &current_date,
+                            contract_metadata.root_symbol.as_str(),
+                            contract_metadata.contract_symbol.as_str(),
+                        )
+                        .map_err(runtime_err)
+                        .map_err(|e| e.to_string())?;
+                    let same_root_reference = db
+                        .load_prior_day_reference_for_root(
+                            &current_date,
+                            contract_metadata.root_symbol.as_str(),
+                        )
+                        .map_err(runtime_err)
+                        .map_err(|e| e.to_string())?;
+                    let rollover_status = build_contract_rollover_status(
+                        &contract_metadata,
+                        Some(&contract_metadata),
+                        current_contract_reference.clone(),
+                        same_root_reference,
+                        None,
+                        15_000.0,
+                    );
+                    if rollover_status.prior_reference_trust == PriorReferenceTrust::Authoritative {
+                        if let Some(prior_ref) = current_contract_reference {
+                            state.pipeline.levels.set_prior_day(
+                                prior_ref.high,
+                                prior_ref.low,
+                                prior_ref.close,
+                            );
+                            state.pipeline.levels.set_prior_day_contract_context(
+                                prior_ref.root_symbol.as_deref(),
+                                prior_ref.contract_symbol.as_deref(),
+                                Some(contract_metadata.contract_symbol.as_str()),
+                            );
+                            if let (Some(vh), Some(vl), Some(pc)) =
+                                (prior_ref.va_high, prior_ref.va_low, prior_ref.poc)
+                            {
+                                state.pipeline.levels.set_prior_profile(vh, vl, pc);
+                            }
+                            if let (Some(dh), Some(dl), Some(dp)) =
+                                (prior_ref.dnva_high, prior_ref.dnva_low, prior_ref.dnp)
+                            {
+                                state.pipeline.levels.set_prior_dnva(dh, dl, dp);
+                            }
+                        }
+                    } else {
+                        state.pipeline.levels.clear_prior_references();
+                        state.pipeline.levels.set_prior_day_contract_context(
+                            Some(contract_metadata.root_symbol.as_str()),
+                            None,
+                            Some(contract_metadata.contract_symbol.as_str()),
+                        );
+                    }
+                }
+            } else if new_segment != current_delta_segment
+                && current_delta_segment != DeltaSegment::Unknown
+                && new_segment != DeltaSegment::Unknown
+            {
+                // Persist the segment we're leaving (Asia or London) before reset.
+                if current_delta_segment == DeltaSegment::Asia {
+                    persist_segment_summary(
                         db,
                         params,
                         &mut state,
-                        current_session,
-                        current_delta_segment,
                         &current_date,
+                        "Asia",
                         last_tick_meta,
                         source,
-                        r_value_points,
-                        cancel_flag,
                         &mut on_progress,
                     )
                     .map_err(|e| e.to_string())?;
+                }
+                state.pipeline.reset_segment(new_segment);
+                state.segment_buffers = SegmentBuffers::default();
+            }
 
-                    state
-                        .pipeline
-                        .reset_session_with_type(new_session == SessionType::Globex);
-                    detector.reset();
-                    flow_emitter.reset();
-                    if let Some(ref mut rules) = rules {
-                        rules.reset();
-                    }
-                    state.buffers = SessionBuffers::default();
-                    state.segment_buffers = SegmentBuffers::default();
-                    state.last_context_snapshot_ms = None;
+            if new_session != SessionType::Unknown {
+                current_session = new_session;
+            }
+            if new_segment != DeltaSegment::Unknown {
+                current_delta_segment = new_segment;
+            }
+            if tick_class == SessionType::Unknown {
+                return Ok(ScanControl::Continue);
+            }
 
-                    if new_session == SessionType::Rth || new_session == SessionType::Globex {
-                        let current_contract_reference = db
-                            .load_prior_day_reference_for_contract(
-                                &current_date,
-                                contract_metadata.root_symbol.as_str(),
-                                contract_metadata.contract_symbol.as_str(),
-                            )
-                            .map_err(runtime_err)
-                            .map_err(|e| e.to_string())?;
-                        let same_root_reference = db
-                            .load_prior_day_reference_for_root(
-                                &current_date,
-                                contract_metadata.root_symbol.as_str(),
-                            )
-                            .map_err(runtime_err)
-                            .map_err(|e| e.to_string())?;
-                        let rollover_status = build_contract_rollover_status(
-                            &contract_metadata,
-                            Some(&contract_metadata),
-                            current_contract_reference.clone(),
-                            same_root_reference,
-                            None,
-                            15_000.0,
+            let is_buy = matches!(tick.side, TradeSide::Buy);
+            let minute = tick_ctx.minute_of_session;
+            if state.buffers.session_open_price <= 0.0 {
+                state.buffers.session_open_price = tick.price;
+            }
+            state.buffers.session_tick_count += 1;
+            state.buffers.session_volume += tick.volume;
+            state.segment_buffers.observe_trade(tick.price, tick.volume);
+
+            state.pipeline.on_trade_with_session_flag(
+                tick.price,
+                tick.volume,
+                is_buy,
+                minute,
+                tick.timestamp_ms,
+                current_session != SessionType::Rth,
+                tick_ctx.et_minutes,
+            );
+
+            let bid = if tick.bid > 0.0 {
+                tick.bid
+            } else {
+                tick.price - 0.25
+            };
+            let ask = if tick.ask > 0.0 {
+                tick.ask
+            } else {
+                tick.price + 0.25
+            };
+            last_tick_meta = Some((bid, ask, tick.price, tick.timestamp_ms));
+
+            // Per-tick: event detection uses the cheap detection snapshot (its
+            // intended input), so market_events keep full fidelity. The expensive
+            // full snapshot + rules generation runs only on the coalesced pass below.
+            let detection_snapshot =
+                state
+                    .pipeline
+                    .snapshot_for_detection(bid, ask, tick.timestamp_ms);
+            state.progress.current_phase = "processing_session".to_string();
+
+            tick_events.clear();
+            detector.detect_into(
+                &detection_snapshot,
+                tick.timestamp_ms,
+                &current_date,
+                minute,
+                &mut tick_events,
+            );
+            flow_emitter.detect_into(
+                &state.pipeline,
+                tick.timestamp_ms,
+                &current_date,
+                tick.price,
+                &mut tick_events,
+            );
+            state.buffers.event_buffer.append(&mut tick_events);
+
+            if current_session == SessionType::Rth {
+                // Coalesced: build the full snapshot and evaluate rules on the
+                // live analysis cadence (min interval / max ticks), not every
+                // tick. Pipelines already updated above; outcome tracking below
+                // stays per-tick for accurate MFE/MAE.
+                state.analyzed_rth_ticks += 1;
+                state.ticks_since_analysis += 1;
+                let analysis_due = state.last_analysis_ms <= 0.0
+                    || tick.timestamp_ms - state.last_analysis_ms >= analysis_min_interval_ms
+                    || state.ticks_since_analysis >= analysis_max_ticks;
+                if analysis_due {
+                    state.last_analysis_ms = tick.timestamp_ms;
+                    state.ticks_since_analysis = 0;
+                    state.analysis_passes += 1;
+                    let snapshot = state.pipeline.snapshot_at(bid, ask, tick.timestamp_ms);
+                    if should_persist_context_snapshot(&mut state, tick.timestamp_ms) {
+                        let payload = serde_json::to_value(&snapshot).unwrap_or_default();
+                        let context = snapshot_context_buckets(&payload, tick.timestamp_ms);
+                        let _ = db.insert_pipeline_snapshot_with_context(
+                            tick.timestamp_ms,
+                            &payload,
+                            &context,
                         );
-                        if rollover_status.prior_reference_trust
-                            == PriorReferenceTrust::Authoritative
-                        {
-                            if let Some(prior_ref) = current_contract_reference {
-                                state.pipeline.levels.set_prior_day(
-                                    prior_ref.high,
-                                    prior_ref.low,
-                                    prior_ref.close,
-                                );
-                                state.pipeline.levels.set_prior_day_contract_context(
-                                    prior_ref.root_symbol.as_deref(),
-                                    prior_ref.contract_symbol.as_deref(),
-                                    Some(contract_metadata.contract_symbol.as_str()),
-                                );
-                                if let (Some(vh), Some(vl), Some(pc)) =
-                                    (prior_ref.va_high, prior_ref.va_low, prior_ref.poc)
-                                {
-                                    state.pipeline.levels.set_prior_profile(vh, vl, pc);
-                                }
-                                if let (Some(dh), Some(dl), Some(dp)) =
-                                    (prior_ref.dnva_high, prior_ref.dnva_low, prior_ref.dnp)
-                                {
-                                    state.pipeline.levels.set_prior_dnva(dh, dl, dp);
-                                }
-                            }
-                        } else {
-                            state.pipeline.levels.clear_prior_references();
-                            state.pipeline.levels.set_prior_day_contract_context(
-                                Some(contract_metadata.root_symbol.as_str()),
-                                None,
-                                Some(contract_metadata.contract_symbol.as_str()),
-                            );
-                        }
                     }
-                } else if new_segment != current_delta_segment
-                    && current_delta_segment != DeltaSegment::Unknown
-                    && new_segment != DeltaSegment::Unknown
-                {
-                    // Persist the segment we're leaving (Asia or London) before reset.
-                    if current_delta_segment == DeltaSegment::Asia {
-                        persist_segment_summary(
-                            db,
-                            params,
-                            &mut state,
-                            &current_date,
-                            "Asia",
-                            last_tick_meta,
-                            source,
-                            &mut on_progress,
-                        )
-                        .map_err(|e| e.to_string())?;
-                    }
-                    state.pipeline.reset_segment(new_segment);
-                    state.segment_buffers = SegmentBuffers::default();
-                }
-
-                if new_session != SessionType::Unknown {
-                    current_session = new_session;
-                }
-                if new_segment != DeltaSegment::Unknown {
-                    current_delta_segment = new_segment;
-                }
-                if tick_class == SessionType::Unknown {
-                    return Ok(ScanControl::Continue);
-                }
-
-                let is_buy = matches!(tick.side, TradeSide::Buy);
-                let minute = tick_ctx.minute_of_session;
-                if state.buffers.session_open_price <= 0.0 {
-                    state.buffers.session_open_price = tick.price;
-                }
-                state.buffers.session_tick_count += 1;
-                state.buffers.session_volume += tick.volume;
-                state.segment_buffers.observe_trade(tick.price, tick.volume);
-
-                state.pipeline.on_trade_with_session_flag(
-                    tick.price,
-                    tick.volume,
-                    is_buy,
-                    minute,
-                    tick.timestamp_ms,
-                    current_session != SessionType::Rth,
-                    tick_ctx.et_minutes,
-                );
-
-                let bid = if tick.bid > 0.0 {
-                    tick.bid
-                } else {
-                    tick.price - 0.25
-                };
-                let ask = if tick.ask > 0.0 {
-                    tick.ask
-                } else {
-                    tick.price + 0.25
-                };
-                last_tick_meta = Some((bid, ask, tick.price, tick.timestamp_ms));
-
-                let snapshot = if params.run_rules && current_session == SessionType::Rth {
-                    state.pipeline.snapshot_at(bid, ask, tick.timestamp_ms)
-                } else {
-                    state
-                        .pipeline
-                        .snapshot_for_detection(bid, ask, tick.timestamp_ms)
-                };
-                if should_persist_context_snapshot(&mut state, tick.timestamp_ms) {
-                    let payload = serde_json::to_value(&snapshot).unwrap_or_default();
-                    let context = snapshot_context_buckets(&payload, tick.timestamp_ms);
-                    let _ = db.insert_pipeline_snapshot_with_context(
-                        tick.timestamp_ms,
-                        &payload,
-                        &context,
-                    );
-                }
-                state.progress.current_phase = "processing_session".to_string();
-
-                tick_events.clear();
-                detector.detect_into(
-                    &snapshot,
-                    tick.timestamp_ms,
-                    &current_date,
-                    minute,
-                    &mut tick_events,
-                );
-                flow_emitter.detect_into(
-                    &state.pipeline,
-                    tick.timestamp_ms,
-                    &current_date,
-                    tick.price,
-                    &mut tick_events,
-                );
-                state.buffers.event_buffer.append(&mut tick_events);
-
-                if current_session == SessionType::Rth {
                     if let Some(ref mut rules) = rules {
                         for setup in &setups {
                             let alert = rules.evaluate(setup, &snapshot, false);
@@ -946,23 +986,24 @@ where
                         }
                         rules.update_prev_market(&snapshot);
                     }
-
-                    if params.run_rules {
-                        update_signal_outcomes(
-                            &mut state.buffers.signal_outcomes,
-                            tick.price,
-                            tick.timestamp_ms,
-                            r_value_points,
-                        );
-                    }
                 }
 
-                if state.progress.records_scanned.is_multiple_of(5_000) {
-                    on_progress(&state.progress);
+                if params.run_rules {
+                    update_signal_outcomes(
+                        &mut state.buffers.signal_outcomes,
+                        tick.price,
+                        tick.timestamp_ms,
+                        r_value_points,
+                    );
                 }
-                Ok(ScanControl::Continue)
-            })
-            .map_err(runtime_err)?;
+            }
+
+            if state.progress.records_scanned.is_multiple_of(5_000) {
+                on_progress(&state.progress);
+            }
+            Ok(ScanControl::Continue)
+        })
+        .map_err(runtime_err)?;
 
     if state.progress.estimated_records == 0 {
         state.progress.estimated_records = scan_stats.estimated_records;
@@ -1046,6 +1087,14 @@ where
         },
         scid_timestamp_monotonicity: monotonicity,
         warnings: state.warnings,
+        analysis_passes: state.analysis_passes,
+        ticks_per_analysis_avg: if state.analysis_passes > 0 {
+            state.analyzed_rth_ticks as f64 / state.analysis_passes as f64
+        } else {
+            0.0
+        },
+        analysis_min_interval_ms,
+        analysis_max_ticks,
     })
 }
 
@@ -1825,5 +1874,63 @@ mod tests {
             .warnings
             .iter()
             .any(|warning| warning.contains("non-monotonic SCID ticks")));
+    }
+
+    #[test]
+    fn backtest_coalesces_analysis_passes() {
+        let mut file = NamedTempFile::new().expect("temp");
+        write_scid_header(&mut file);
+        // 10:00 ET on 2026-03-05 (EST) -> RTH.
+        let base = chrono::Utc
+            .with_ymd_and_hms(2026, 3, 5, 15, 0, 0)
+            .single()
+            .expect("base timestamp")
+            .timestamp_millis() as f64;
+        // 1200 RTH ticks spaced 10ms apart (~12s). With a 250ms / 500-tick cadence
+        // the analysis pass should run far fewer than 1200 times.
+        let n = 1200_usize;
+        for i in 0..n {
+            write_record(
+                &mut file,
+                base + i as f64 * 10.0,
+                21000.0_f32 + (i % 5) as f32 * 0.25,
+            );
+        }
+        file.flush().expect("flush");
+
+        let db = Database::open(":memory:").expect("db");
+        let cancel_flag = AtomicBool::new(false);
+        let result = run_backfill_job(
+            &ScidReader::new(file.path()),
+            &db,
+            &BackfillJobParams {
+                job_id: "coalesce-1".to_string(),
+                job_type: HistoricalJobType::Backtest,
+                start_date: Some("2026-03-05".to_string()),
+                end_date: Some("2026-03-05".to_string()),
+                force: true,
+                run_rules: true,
+                setup_ids: None,
+            },
+            |_| {},
+            &cancel_flag,
+        )
+        .expect("backtest");
+
+        assert!(
+            result.analysis_passes > 0,
+            "should run some analysis passes"
+        );
+        assert!(
+            result.analysis_passes < n,
+            "coalescing should run far fewer passes ({}) than ticks ({n})",
+            result.analysis_passes
+        );
+        assert!(
+            result.ticks_per_analysis_avg > 1.0,
+            "avg ticks/pass should exceed 1 when coalescing"
+        );
+        assert!(result.analysis_min_interval_ms >= 1.0);
+        assert!(result.analysis_max_ticks >= 1);
     }
 }

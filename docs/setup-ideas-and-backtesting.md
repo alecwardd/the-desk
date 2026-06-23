@@ -154,6 +154,15 @@ Window `2025-11-28 → 2026-03-06`, job `091f54ef-3f3d-453b-a38e-0859e157c6ab`, 
    so a backtest can pin the window's front contract **without** mutating global `active_symbol_override`.
    This removes the live/backtest config conflict — live trading can stay on the current front month
    while a backtest replays a prior contract concurrently. Deploy requires rebuild + MCP restart.
+3. **Backtest ran the full snapshot + rules on *every* RTH tick** — far slower than live *and* less
+   faithful (live coalesces via `analysis_min_interval_ms` / `analysis_max_ticks`, so the per-tick
+   backtest found fire-points live would never check). *Fixed (2026-06-23):* the replay now coalesces
+   the expensive full snapshot + rules generation onto the live cadence, while event detection and
+   per-tick MFE/MAE outcome tracking stay per-tick. The job result now reports `analysisPasses`,
+   `ticksPerAnalysisAvg`, `analysisMinIntervalMs`, and `analysisMaxTicks` so each run is auditable.
+   This is faster *and* higher-fidelity; post-coalescing numbers are the valid ones (not comparable
+   to pre-fix runs). Remaining speed levers (isolated DB copy, two-phase cache, parallel sessions)
+   are tracked separately.
 
 ---
 

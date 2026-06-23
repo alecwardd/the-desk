@@ -1110,6 +1110,8 @@ mod tests {
             or_low: 20985.0,
             ib_high: 21020.0,
             ib_low: 20980.0,
+            ib_extension_state: "None".to_string(),
+            regime: crate::pipelines::Regime::Unclear,
             tape_pace_5s: Some(5.0),
             tape_pace_30s: Some(4.0),
             tape_pace_5m: Some(3.0),

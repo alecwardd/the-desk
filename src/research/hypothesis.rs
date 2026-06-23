@@ -495,14 +495,16 @@ fn dominant_event_type(condition: &SetupCondition) -> Option<&'static str> {
         }
         ConditionField::PriceVsIbExtension
         | ConditionField::PriceVsIbHigh
-        | ConditionField::PriceVsIbLow => Some("ib_extension_hit"),
+        | ConditionField::PriceVsIbLow
+        | ConditionField::IbExtensionState => Some("ib_extension_hit"),
         ConditionField::ActiveRebidZone | ConditionField::ActiveReofferZone => {
             Some("acceleration_zone_created")
         }
         ConditionField::RebidZoneHeld => Some("acceleration_zone_held"),
-        ConditionField::DayType | ConditionField::ProfileShape | ConditionField::BalanceState => {
-            Some("day_type_change")
-        }
+        ConditionField::DayType
+        | ConditionField::ProfileShape
+        | ConditionField::BalanceState
+        | ConditionField::Regime => Some("day_type_change"),
         _ => None,
     }
 }

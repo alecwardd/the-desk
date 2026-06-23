@@ -216,22 +216,10 @@ struct BackfillRunState {
     last_context_snapshot_ms: Option<f64>,
 }
 
-/// Classify whether the session reached no, one-sided, or both-sided 0.5x IB extension.
-pub fn ib_extension_state_from_range(ib_high: f64, ib_low: f64, high: f64, low: f64) -> String {
-    if ib_high <= 0.0 || ib_low <= 0.0 || ib_high <= ib_low {
-        return "None".to_string();
-    }
-    let ib_range = ib_high - ib_low;
-    let up_extension = high >= ib_high + ib_range * crate::pipelines::IB_EXTENSION_RATIO;
-    let down_extension = low <= ib_low - ib_range * crate::pipelines::IB_EXTENSION_RATIO;
-    match (up_extension, down_extension) {
-        (true, true) => "BothSides",
-        (true, false) => "UpOnly",
-        (false, true) => "DownOnly",
-        (false, false) => "None",
-    }
-    .to_string()
-}
+/// Classify whether the session reached no, one-sided, or both-sided 0.5x IB
+/// extension. Re-exported from the Layer-1 pipeline so live snapshots and
+/// stored session summaries share one implementation.
+pub use crate::pipelines::ib_extension_state_from_range;
 
 pub fn apply_ib_extension_observation(
     summary: &mut SessionSummary,

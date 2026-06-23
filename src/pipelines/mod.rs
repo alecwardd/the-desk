@@ -8,6 +8,7 @@ mod levels;
 mod opening_range_5min;
 mod pinch;
 mod rebid_reoffer;
+mod regime;
 mod rvol;
 mod session_inventory;
 mod tape_pace;
@@ -28,6 +29,7 @@ pub use levels::{KeyLevel, KeyLevelType, LevelsPipeline, ProximityLevel};
 pub use opening_range_5min::{OpeningRange5MinPipeline, Or5BreakDirection};
 pub use pinch::{PinchEvent, PinchPipeline};
 pub use rebid_reoffer::{AccelerationZone, RebidReofferPipeline, ZoneStatus, ZoneType};
+pub use regime::{classify_regime, ib_extension_state_from_range, Regime, RegimeInputs};
 pub use rvol::{RvolClassification, RvolPipeline};
 pub use session_inventory::{
     InventoryDirection, InventoryState, PriorSessionData, SessionInventoryPipeline,
@@ -282,6 +284,12 @@ pub struct MarketState {
     pub balance_state: BalanceState,
     /// Single prints direction relative to POC.
     pub single_prints_direction: SinglePrintsDirection,
+
+    // --- Regime (IDEA-000) ---
+    /// Live 0.5x IB extension state: "None" | "UpOnly" | "DownOnly" | "BothSides".
+    pub ib_extension_state: String,
+    /// Computed session regime used to gate setup-family eligibility.
+    pub regime: Regime,
 
     // --- Pinch Events ---
     /// Number of recent pinch events.
@@ -701,6 +709,22 @@ impl PipelineEngine {
         } else {
             RecentSignalSnapshot::default()
         };
+        let ib_extension_state = ib_extension_state_from_range(
+            self.tpo.ib_high(),
+            self.tpo.ib_low(),
+            self.levels.session_high,
+            self.levels.session_low,
+        );
+        let regime = classify_regime(&RegimeInputs {
+            ib_extension_state: &ib_extension_state,
+            day_type: self.day_type.day_type(),
+            balance_state: self.day_type.balance_state(),
+            last_price: self.levels.last_price,
+            vwap,
+            dnp: self.delta.dnp(),
+            rvol_ratio: self.rvol.rvol_ratio(),
+            pace_percentile: tape.pace_percentile,
+        });
         MarketState {
             last_price: self.levels.last_price,
             bid,
@@ -810,6 +834,9 @@ impl PipelineEngine {
             profile_shape: self.day_type.profile_shape(),
             balance_state: self.day_type.balance_state(),
             single_prints_direction: self.day_type.single_prints_direction(),
+
+            ib_extension_state,
+            regime,
 
             pinch_event_count,
 

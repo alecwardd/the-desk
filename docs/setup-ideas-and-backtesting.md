@@ -78,9 +78,14 @@ long-only, and tagged every template with a `regime` field (`continuation` | `re
 playbook DB — closing the gap where `all_templates()` was never seeded. What is **not** yet done,
 and still requires new `ConditionField` variants plus pipeline detection before it can fire live:
 
-- **Regime gate (IDEA-000):** the `regime` tag is metadata only; the rules engine does not yet gate
-  which families may fire. Needs a computed regime field on `MarketState` and an eligibility check
-  before condition evaluation.
+- **Regime gate (IDEA-000):** *Partially landed (2026-06-22).* `MarketState` now carries a computed
+  `regime` (`OneSidedAcceptance`/`Migration`/`Transition`/`Unclear`) plus a live `ib_extension_state`,
+  derived in `pipelines/regime.rs` from IB extension + day type + VWAP/DNP acceptance + participation.
+  Both are addressable as rules-engine condition fields (`regime`, `ib_extension_state`), and
+  `RULES_ENGINE_SCHEMA_VERSION` was bumped 1→2 (re-backtest hypotheses under v2). Still pending: the
+  automatic *eligibility gate* that disables continuation families on `Migration`/`Transition` days
+  before condition evaluation, plus a backtest of gated-vs-ungated expectancy. Classifier thresholds
+  (`REGIME_ELEVATED_RVOL`, `REGIME_ELEVATED_PACE`) are deliberately provisional pending that backtest.
 - **Reversal / trap family (IDEA-002, IDEA-012, IDEA-003):** failed-breakout-state,
   absorption-invalidation, and naked-VPOC-proximity have no condition fields today
   (`delta_confirmation_at_level` / `rebid_zone_held` currently always evaluate false). These must go

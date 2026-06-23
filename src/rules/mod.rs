@@ -13,7 +13,7 @@ use std::collections::HashMap;
 /// semantics change in a way that invalidates cached backtest statistics.
 /// Examples: adding/removing condition variants, changing comparison semantics
 /// in `evaluate_typed_condition`, or changing `resolve_price_expression` modes.
-pub const RULES_ENGINE_SCHEMA_VERSION: u32 = 1;
+pub const RULES_ENGINE_SCHEMA_VERSION: u32 = 2;
 
 // ---------------------------------------------------------------------------
 // Setup state machine
@@ -149,6 +149,12 @@ pub enum ConditionField {
 
     // --- IB Extensions ---
     PriceVsIbExtension,
+
+    // --- Regime (IDEA-000) ---
+    /// Session regime: OneSidedAcceptance | Migration | Transition | Unclear.
+    Regime,
+    /// Live 0.5x IB extension state: None | UpOnly | DownOnly | BothSides.
+    IbExtensionState,
 }
 
 /// Comparison operator for a condition.
@@ -856,6 +862,21 @@ fn evaluate_typed_condition(
                     ConditionOperator::Below => price < ext_low,
                     _ => false,
                 };
+            }
+            return false;
+        }
+
+        // --- Regime (IDEA-000) ---
+        ConditionField::Regime => {
+            if let ConditionValue::Text(expected) = &cond.value {
+                let actual = format!("{:?}", market.regime);
+                return actual.to_lowercase() == expected.to_lowercase();
+            }
+            return false;
+        }
+        ConditionField::IbExtensionState => {
+            if let ConditionValue::Text(expected) = &cond.value {
+                return market.ib_extension_state.to_lowercase() == expected.to_lowercase();
             }
             return false;
         }
@@ -1780,6 +1801,42 @@ mod tests {
             ..Default::default()
         };
         assert!(evaluate_typed_condition(&tc, &market, None));
+    }
+
+    #[test]
+    fn regime_condition_matches_state() {
+        let market = MarketState {
+            regime: crate::pipelines::Regime::OneSidedAcceptance,
+            ..Default::default()
+        };
+        let hit: SetupCondition = serde_json::from_str(
+            r#"{"id":"c1","field":"regime","operator":"equals","value":"OneSidedAcceptance"}"#,
+        )
+        .unwrap();
+        assert!(evaluate_typed_condition(&hit, &market, None));
+        let miss: SetupCondition = serde_json::from_str(
+            r#"{"id":"c1","field":"regime","operator":"equals","value":"Migration"}"#,
+        )
+        .unwrap();
+        assert!(!evaluate_typed_condition(&miss, &market, None));
+    }
+
+    #[test]
+    fn ib_extension_state_condition_matches_state() {
+        let market = MarketState {
+            ib_extension_state: "UpOnly".to_string(),
+            ..Default::default()
+        };
+        let hit: SetupCondition = serde_json::from_str(
+            r#"{"id":"c1","field":"ib_extension_state","operator":"equals","value":"UpOnly"}"#,
+        )
+        .unwrap();
+        assert!(evaluate_typed_condition(&hit, &market, None));
+        let miss: SetupCondition = serde_json::from_str(
+            r#"{"id":"c1","field":"ib_extension_state","operator":"equals","value":"BothSides"}"#,
+        )
+        .unwrap();
+        assert!(!evaluate_typed_condition(&miss, &market, None));
     }
 
     #[test]

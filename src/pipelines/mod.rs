@@ -24,11 +24,13 @@ pub use day_type::{
 pub use delta::DeltaPipeline;
 pub use event_detector::{EventDetector, MarketEvent, IB_EXTENSION_RATIO};
 pub use flow_event_emitter::FlowEventEmitter;
-pub use footprint::{FootprintLevel, FootprintPipeline};
+pub use footprint::{FootprintLevel, FootprintPipeline, StackedZone};
 pub use levels::{KeyLevel, KeyLevelType, LevelsPipeline, ProximityLevel};
 pub use opening_range_5min::{OpeningRange5MinPipeline, Or5BreakDirection};
 pub use pinch::{PinchEvent, PinchPipeline};
-pub use rebid_reoffer::{AccelerationZone, RebidReofferPipeline, ZoneStatus, ZoneType};
+pub use rebid_reoffer::{
+    AccelerationZone, RebidReofferPipeline, ZoneAcceptance, ZoneSignal, ZoneStatus, ZoneType,
+};
 pub use regime::{classify_regime, ib_extension_state_from_range, Regime, RegimeInputs};
 pub use rvol::{RvolClassification, RvolPipeline};
 pub use session_inventory::{
@@ -316,6 +318,27 @@ pub struct MarketState {
     // --- Rebid/Reoffer ---
     /// Number of active acceleration zones.
     pub active_zone_count: usize,
+    /// A non-failed rebid (buy/support) zone is within proximity of price.
+    pub rebid_zone_near: bool,
+    /// A non-failed reoffer (sell/resistance) zone is within proximity of price.
+    pub reoffer_zone_near: bool,
+    /// A rebid zone near price is at Retested status — the entry trigger.
+    pub rebid_zone_retested: bool,
+    /// A reoffer zone near price is at Retested status — the entry trigger.
+    pub reoffer_zone_retested: bool,
+    /// A rebid zone near price is at Held status.
+    pub rebid_zone_held: bool,
+    /// A reoffer zone near price is at Held status.
+    pub reoffer_zone_held: bool,
+    /// Direction of the nearest non-failed zone ("buy"/"sell"), if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nearest_zone_direction: Option<String>,
+    /// Lifecycle status of the nearest non-failed zone, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nearest_zone_status: Option<String>,
+    /// Distance in ticks to the nearest non-failed zone, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nearest_zone_distance_ticks: Option<f64>,
 
     // --- TPO Enhancements ---
     /// Whether the session high is a "poor high" (multiple prints at extreme).
@@ -587,8 +610,16 @@ impl PipelineEngine {
         self.trade_size.on_trade(volume, price);
         self.or5.on_trade(price, minute_of_session);
         self.rvol.on_trade(volume, minute_of_session);
-        self.rebid_reoffer
-            .on_trade(price, volume, is_buy, timestamp_ms);
+        self.rebid_reoffer.on_trade(
+            price,
+            timestamp_ms,
+            &self.footprint,
+            ZoneAcceptance {
+                pace_percentile: tape.pace_percentile,
+                rvol_velocity: self.rvol.rvol_velocity(),
+                tape_acceleration: tape.acceleration.unwrap_or(0.0),
+            },
+        );
         self.pinch.on_trade(timestamp_ms, price, volume, is_buy);
         self.session_inventory
             .update(self.delta.session_delta(), self.delta.dnp());
@@ -706,6 +737,11 @@ impl PipelineEngine {
             self.rebid_reoffer.active_zones().len()
         } else {
             0
+        };
+        let zone_signal = if include_extended_metrics {
+            self.rebid_reoffer.zone_signal(self.levels.last_price)
+        } else {
+            ZoneSignal::default()
         };
         let recent_absorption = if include_extended_metrics {
             self.absorption
@@ -869,6 +905,15 @@ impl PipelineEngine {
             sessions_in_trend: self.session_inventory.sessions_in_trend(),
 
             active_zone_count,
+            rebid_zone_near: zone_signal.rebid_near,
+            reoffer_zone_near: zone_signal.reoffer_near,
+            rebid_zone_retested: zone_signal.rebid_retested,
+            reoffer_zone_retested: zone_signal.reoffer_retested,
+            rebid_zone_held: zone_signal.rebid_held,
+            reoffer_zone_held: zone_signal.reoffer_held,
+            nearest_zone_direction: zone_signal.nearest_direction,
+            nearest_zone_status: zone_signal.nearest_status,
+            nearest_zone_distance_ticks: zone_signal.nearest_distance_ticks,
 
             poor_high: self.tpo.poor_high(),
             poor_low: self.tpo.poor_low(),

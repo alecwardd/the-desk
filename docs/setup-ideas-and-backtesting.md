@@ -678,6 +678,47 @@ This is not enough to call it validated, but it is enough to promote failure-of-
 
 ---
 
+### IDEA-020: Footprint Rebid/Reoffer Zone Lifecycle
+
+**Status:** Stage 1 landed (2026-06-23); Stage 2 deferred
+**Source:** Trader doctrine session 2026-06-23 (see memory `rebid-reoffer-zone-doctrine`)
+**Complements:** Rebid/Reoffer templates, Absorption, IDEA-000 regime selector
+
+**Concept:** Redefine acceleration zones around the trader's actual model — **footprint stacked
+one-sided delta** (≥5 consecutive levels at ~3:1, loose bands) with an initiative move away — instead
+of the original 5-min-bar range proxy. Track a lifecycle whose *outcomes* are themselves signals:
+
+- **Forming** → watchlist. **Retested** (price re-enters the band, ≤5-tick poke tolerated) → **entry**
+  with a tight stop (high R:R). **Held** (fires back in zone direction) → continuation. **Failed**
+  (extends ≥5 ticks beyond the poke *with acceptance* = dwell + building volume / accelerating tape)
+  → trend change / not real initiative. **Abandoned** (never returns to the band) → strong-trend tell.
+
+**Stage 1 (landed 2026-06-23):** directional, proximity- and status-aware zones from footprint stacked
+delta (`footprint.stacked_imbalance_zones` + rewritten `rebid_reoffer.rs` lifecycle). Fixed
+`active_rebid_zone`/`active_reoffer_zone` (were both `active_zone_count > 0`), implemented the dead
+`rebid_zone_held`, and added `reoffer_zone_held` + `rebid_zone_retested`/`reoffer_zone_retested` (the
+entry trigger). `RULES_ENGINE_SCHEMA_VERSION` 4→5. Acceptance =
+`tape_dwell_at_current_price_ms` + (`pace_percentile` elevated OR `rvol_velocity > 0` OR
+`tape_acceleration > 0`). Starting tunables: 5 levels, 3:1 ratio, 5-tick move-away / poke / failure
+extension, ~20–30s dwell.
+
+**Stage 2 (deferred — revisit in a future build):**
+- **Per-session zone aggregates** (formed / retested / held / failed / abandoned) rolled into an
+  order-flow-sourced **regime input for IDEA-000**: many forming+held, few failing → trend; many
+  failing → transition; many abandoned → strong trend. This is the highest-value follow-up — it gives
+  the regime classifier a second, independent signal (the v1 regime gate was too loose).
+- **DOM corroboration** (`dom_summary` bid/ask pull-rates): confirm the "original aggressor reloads +
+  trapped passive side covers" mechanic on the retest. `dom_summary` is delayed context, not live book.
+- **Tick-adjacency** for "consecutive levels" (Stage 1 uses consecutive entries in the sorted footprint,
+  matching existing `stacked_imbalances`); revisit if gappy bands cause false zones.
+
+**Backtesting Hypotheses (after Stage 1 deploys):**
+> What is the R-distribution of entering on a retest of a held footprint zone with a tight (≤5-tick) stop?
+
+> Do sessions with a high abandoned-zone ratio close as trend days more often than the base rate?
+
+---
+
 ## Priority 2 — Infrastructure Upgrades
 
 ### IDEA-006: Volume Imbalance Bars (Lopez de Prado)

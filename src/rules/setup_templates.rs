@@ -560,10 +560,7 @@ mod tests {
     fn is_dead_field(field: &str) -> bool {
         matches!(
             field,
-            "time_of_day"
-                | "tpo_single_prints_present"
-                | "rebid_zone_held"
-                | "delta_confirmation_at_level"
+            "time_of_day" | "tpo_single_prints_present" | "delta_confirmation_at_level"
         )
     }
 

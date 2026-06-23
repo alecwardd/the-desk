@@ -13,7 +13,7 @@ use std::collections::HashMap;
 /// semantics change in a way that invalidates cached backtest statistics.
 /// Examples: adding/removing condition variants, changing comparison semantics
 /// in `evaluate_typed_condition`, or changing `resolve_price_expression` modes.
-pub const RULES_ENGINE_SCHEMA_VERSION: u32 = 4;
+pub const RULES_ENGINE_SCHEMA_VERSION: u32 = 5;
 
 // ---------------------------------------------------------------------------
 // Setup state machine
@@ -142,6 +142,11 @@ pub enum ConditionField {
     ActiveRebidZone,
     ActiveReofferZone,
     RebidZoneHeld,
+    ReofferZoneHeld,
+    /// Rebid (buy/support) zone near price re-entered — entry trigger.
+    RebidZoneRetested,
+    /// Reoffer (sell/resistance) zone near price re-entered — entry trigger.
+    ReofferZoneRetested,
 
     // --- Inventory ---
     SessionInventoryState,
@@ -838,13 +843,22 @@ fn evaluate_typed_condition(
 
         // --- Zones ---
         ConditionField::ActiveRebidZone => {
-            return market.active_zone_count > 0;
+            return market.rebid_zone_near;
         }
         ConditionField::ActiveReofferZone => {
-            return market.active_zone_count > 0;
+            return market.reoffer_zone_near;
         }
         ConditionField::RebidZoneHeld => {
-            return false; // requires zone-level detail not in MarketState
+            return market.rebid_zone_held;
+        }
+        ConditionField::ReofferZoneHeld => {
+            return market.reoffer_zone_held;
+        }
+        ConditionField::RebidZoneRetested => {
+            return market.rebid_zone_retested;
+        }
+        ConditionField::ReofferZoneRetested => {
+            return market.reoffer_zone_retested;
         }
 
         // --- Inventory ---
@@ -1923,6 +1937,47 @@ mod tests {
         };
         assert!(evaluate_typed_condition(&above, &extended, None));
         assert!(!evaluate_typed_condition(&within, &extended, None));
+    }
+
+    #[test]
+    fn zone_conditions_are_directional() {
+        // A buy/support zone near price, retested: rebid conditions fire, reoffer don't.
+        let market = MarketState {
+            rebid_zone_near: true,
+            rebid_zone_retested: true,
+            ..Default::default()
+        };
+        let rebid_near: SetupCondition = serde_json::from_str(
+            r#"{"id":"c1","field":"active_rebid_zone","operator":"equals","value":true}"#,
+        )
+        .unwrap();
+        let reoffer_near: SetupCondition = serde_json::from_str(
+            r#"{"id":"c1","field":"active_reoffer_zone","operator":"equals","value":true}"#,
+        )
+        .unwrap();
+        let rebid_retested: SetupCondition = serde_json::from_str(
+            r#"{"id":"c1","field":"rebid_zone_retested","operator":"equals","value":true}"#,
+        )
+        .unwrap();
+        assert!(evaluate_typed_condition(&rebid_near, &market, None));
+        assert!(!evaluate_typed_condition(&reoffer_near, &market, None));
+        assert!(evaluate_typed_condition(&rebid_retested, &market, None));
+
+        // rebid_zone_held is now live (was always-false).
+        let held_market = MarketState {
+            rebid_zone_held: true,
+            ..Default::default()
+        };
+        let rebid_held: SetupCondition = serde_json::from_str(
+            r#"{"id":"c1","field":"rebid_zone_held","operator":"equals","value":true}"#,
+        )
+        .unwrap();
+        assert!(evaluate_typed_condition(&rebid_held, &held_market, None));
+        assert!(!evaluate_typed_condition(
+            &rebid_held,
+            &MarketState::default(),
+            None
+        ));
     }
 
     #[test]

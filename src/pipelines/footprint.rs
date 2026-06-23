@@ -29,6 +29,23 @@ impl FootprintLevel {
     }
 }
 
+/// A contiguous band of same-side stacked imbalance (a candidate acceleration zone).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StackedZone {
+    /// Lowest price level in the run.
+    pub low: f64,
+    /// Highest price level in the run.
+    pub high: f64,
+    /// True = ask/buy-stacked (rebid/support); false = bid/sell-stacked (reoffer/resistance).
+    pub is_buy: bool,
+    /// Summed signed delta (ask - bid) across the run.
+    pub delta: f64,
+    /// Summed total volume across the run.
+    pub total: f64,
+    /// Number of consecutive levels in the run.
+    pub levels: usize,
+}
+
 /// Individual trade record for time-windowed queries.
 #[derive(Debug, Clone)]
 struct TimedTrade {
@@ -133,6 +150,110 @@ impl FootprintPipeline {
         out
     }
 
+    /// Directional stacked imbalances: maximal runs of `>= consecutive` adjacent
+    /// levels (in the price-sorted footprint) that are all imbalanced to the
+    /// SAME side at `>= min_ratio`. Buy-stacked (ask-dominant) marks a
+    /// rebid/support band; sell-stacked (bid-dominant) marks a reoffer/resistance
+    /// band. Returns one [`StackedZone`] per qualifying run.
+    pub fn stacked_imbalance_zones(&self, min_ratio: f64, consecutive: usize) -> Vec<StackedZone> {
+        #[allow(clippy::too_many_arguments)]
+        fn flush(
+            dir: Option<bool>,
+            low: f64,
+            high: f64,
+            delta: f64,
+            total: f64,
+            len: usize,
+            consecutive: usize,
+            out: &mut Vec<StackedZone>,
+        ) {
+            if let Some(is_buy) = dir {
+                if len >= consecutive {
+                    out.push(StackedZone {
+                        low,
+                        high,
+                        is_buy,
+                        delta,
+                        total,
+                        levels: len,
+                    });
+                }
+            }
+        }
+
+        let sorted = self.levels();
+        let mut out = Vec::new();
+        let mut run_dir: Option<bool> = None;
+        let mut run_low = 0.0;
+        let mut run_high = 0.0;
+        let mut run_delta = 0.0;
+        let mut run_total = 0.0;
+        let mut run_len = 0_usize;
+
+        for (price, lvl) in &sorted {
+            let dir = if lvl.total() <= 0.0 {
+                None
+            } else if lvl.ask_volume >= lvl.bid_volume * min_ratio {
+                Some(true) // buy-stacked
+            } else if lvl.bid_volume >= lvl.ask_volume * min_ratio {
+                Some(false) // sell-stacked
+            } else {
+                None
+            };
+            match (dir, run_dir) {
+                (Some(d), Some(rd)) if d == rd => {
+                    run_high = *price;
+                    run_delta += lvl.delta();
+                    run_total += lvl.total();
+                    run_len += 1;
+                }
+                (Some(d), _) => {
+                    flush(
+                        run_dir,
+                        run_low,
+                        run_high,
+                        run_delta,
+                        run_total,
+                        run_len,
+                        consecutive,
+                        &mut out,
+                    );
+                    run_dir = Some(d);
+                    run_low = *price;
+                    run_high = *price;
+                    run_delta = lvl.delta();
+                    run_total = lvl.total();
+                    run_len = 1;
+                }
+                (None, _) => {
+                    flush(
+                        run_dir,
+                        run_low,
+                        run_high,
+                        run_delta,
+                        run_total,
+                        run_len,
+                        consecutive,
+                        &mut out,
+                    );
+                    run_dir = None;
+                    run_len = 0;
+                }
+            }
+        }
+        flush(
+            run_dir,
+            run_low,
+            run_high,
+            run_delta,
+            run_total,
+            run_len,
+            consecutive,
+            &mut out,
+        );
+        out
+    }
+
     /// Diagonal imbalances: bid volume at price N compared to ask volume at price N+1.
     /// If bid_vol[N] / ask_vol[N+1] >= `min_ratio` (or vice versa), it's a diagonal imbalance.
     /// Returns (price_low, price_high, ratio, is_buy_imbalance).
@@ -193,6 +314,30 @@ mod tests {
         let window = p.levels_in_window(4000.0, 6000.0);
         assert_eq!(window.len(), 1);
         assert_eq!(window[0].1.ask_volume, 5.0);
+    }
+
+    #[test]
+    fn stacked_imbalance_zones_directional() {
+        let mut p = FootprintPipeline::new(0.25);
+        // Five consecutive ask-dominant levels (buy-stacked) at 21000.00..21001.00.
+        for i in 0..5 {
+            let price = 21_000.0 + i as f64 * 0.25;
+            p.on_trade(price, 30.0, true, 1_000.0 + i as f64); // ask volume
+            p.on_trade(price, 5.0, false, 1_000.0 + i as f64); // small bid
+        }
+        let zones = p.stacked_imbalance_zones(3.0, 5);
+        assert_eq!(zones.len(), 1, "expected one buy-stacked zone");
+        let z = zones[0];
+        assert!(z.is_buy, "ask-dominant run should be a buy zone");
+        assert_eq!(z.levels, 5);
+        assert!((z.low - 21_000.0).abs() < 1e-9);
+        assert!((z.high - 21_001.0).abs() < 1e-9);
+
+        // A non-stacked book yields nothing.
+        let mut q = FootprintPipeline::new(0.25);
+        q.on_trade(21_000.0, 10.0, true, 1.0);
+        q.on_trade(21_000.0, 10.0, false, 2.0);
+        assert!(q.stacked_imbalance_zones(3.0, 5).is_empty());
     }
 
     #[test]

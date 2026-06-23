@@ -513,10 +513,13 @@ fn dominant_event_type(condition: &SetupCondition) -> Option<&'static str> {
         | ConditionField::PriceVsIbHigh
         | ConditionField::PriceVsIbLow
         | ConditionField::IbExtensionState => Some("ib_extension_hit"),
-        ConditionField::ActiveRebidZone | ConditionField::ActiveReofferZone => {
-            Some("acceleration_zone_created")
+        ConditionField::ActiveRebidZone
+        | ConditionField::ActiveReofferZone
+        | ConditionField::RebidZoneRetested
+        | ConditionField::ReofferZoneRetested => Some("acceleration_zone_created"),
+        ConditionField::RebidZoneHeld | ConditionField::ReofferZoneHeld => {
+            Some("acceleration_zone_held")
         }
-        ConditionField::RebidZoneHeld => Some("acceleration_zone_held"),
         ConditionField::DayType
         | ConditionField::ProfileShape
         | ConditionField::BalanceState

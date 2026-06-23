@@ -139,8 +139,12 @@ Window `2025-11-28 → 2026-03-06`, job `091f54ef-3f3d-453b-a38e-0859e157c6ab`, 
    *Fixed (2026-06-23):* `run_backfill_job_with_options` now reads the SCID file's timestamp bounds
    and, when they do not overlap the requested window, pushes a `scid_window_mismatch_warning` into
    the job result (which flips `integrity_status` to `"warning"`), naming the configured contract,
-   the file's actual coverage, and the requested window. Partial-coverage runs are unaffected. A
-   future enhancement could auto-route the replay to the contract that was front during the window.
+   the file's actual coverage, and the requested window. Partial-coverage runs are unaffected.
+   *Follow-up (2026-06-23):* `run_backtest` / `run_backfill` now accept an optional `contract`
+   parameter (`resolve_contract_metadata_for_symbol` → per-job `ScidReader` + `contract_metadata`),
+   so a backtest can pin the window's front contract **without** mutating global `active_symbol_override`.
+   This removes the live/backtest config conflict — live trading can stay on the current front month
+   while a backtest replays a prior contract concurrently. Deploy requires rebuild + MCP restart.
 
 ---
 

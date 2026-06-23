@@ -5,7 +5,9 @@ pub mod monotonic;
 pub mod scid_reader;
 pub mod symbol_resolution;
 
-pub use symbol_resolution::{resolve_contract_metadata, ContractMetadata, SymbolMode};
+pub use symbol_resolution::{
+    resolve_contract_metadata, resolve_contract_metadata_for_symbol, ContractMetadata, SymbolMode,
+};
 
 /// Side of a trade execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]

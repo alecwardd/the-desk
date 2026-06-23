@@ -212,6 +212,41 @@ fn scid_path_for_symbol(sierra_data_dir: &str, symbol: &str) -> PathBuf {
     PathBuf::from(sierra_data_dir).join(symbol_to_scid_file(symbol))
 }
 
+/// Build [`ContractMetadata`] for an explicit contract symbol, independent of
+/// the live `active_symbol_override`.
+///
+/// Used by backtest routing: a historical replay can pin the contract that was
+/// front during its window (e.g. `NQH6.CME`) without mutating global feed
+/// config, so concurrent live trading stays on the current front month.
+pub fn resolve_contract_metadata_for_symbol(config: &FeedConfig, symbol: &str) -> ContractMetadata {
+    let contract_symbol = symbol.trim().to_string();
+    let root_symbol = infer_root_symbol(&contract_symbol);
+    let scid_path = scid_path_for_symbol(&config.sierra_data_dir, &contract_symbol);
+    let scid_file_exists = scid_path.exists();
+    let depth_count = discover_depth_file_count(&config.sierra_data_dir, &contract_symbol);
+    let mut warnings = Vec::new();
+    if !scid_file_exists {
+        warnings.push(format!(
+            "Resolved SCID file is missing for backtest contract symbol {contract_symbol}."
+        ));
+    }
+    ContractMetadata {
+        root_symbol,
+        contract_symbol: contract_symbol.clone(),
+        contract_month: infer_contract_month(&contract_symbol),
+        expiry_year_month: infer_contract_month(&contract_symbol),
+        symbol_resolution_mode: "manual".to_string(),
+        symbol_resolution_source: "backtest_contract_override".to_string(),
+        configured_symbol: contract_symbol.clone(),
+        active_symbol_override: Some(contract_symbol.clone()),
+        scid_path: scid_path.to_string_lossy().to_string(),
+        scid_file_exists,
+        depth_prefix: contract_symbol,
+        depth_file_count: depth_count,
+        warnings,
+    }
+}
+
 fn discover_scid_candidates(sierra_data_dir: &str, root_symbol: &str) -> Vec<SymbolCandidate> {
     let dir = PathBuf::from(sierra_data_dir);
     let Ok(entries) = fs::read_dir(&dir) else {
@@ -313,5 +348,23 @@ mod tests {
         );
         assert_eq!(infer_contract_month("ESH6").as_deref(), Some("2026-03"));
         assert_eq!(infer_contract_month("NQ").as_deref(), None);
+    }
+
+    #[test]
+    fn builds_metadata_for_explicit_backtest_symbol() {
+        let mut config = FeedConfig::default();
+        config.sierra_data_dir = "C:/nonexistent-test-dir".to_string();
+        let meta = resolve_contract_metadata_for_symbol(&config, "  NQH6.CME  ");
+        // Trims input and derives root/month from the symbol.
+        assert_eq!(meta.contract_symbol, "NQH6.CME");
+        assert_eq!(meta.root_symbol, "NQ");
+        assert_eq!(meta.contract_month.as_deref(), Some("2026-03"));
+        // Pins the explicit contract without claiming live-config provenance.
+        assert_eq!(meta.symbol_resolution_source, "backtest_contract_override");
+        assert_eq!(meta.active_symbol_override.as_deref(), Some("NQH6.CME"));
+        assert!(meta.scid_path.ends_with("NQH6.CME.scid"));
+        // Missing file is reported, not silently accepted.
+        assert!(!meta.scid_file_exists);
+        assert!(meta.warnings.iter().any(|w| w.contains("NQH6.CME")));
     }
 }

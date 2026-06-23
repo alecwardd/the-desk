@@ -760,9 +760,22 @@ impl TheDeskMcp {
             params.end_date.as_deref(),
         )
         .map_err(|e| invalid_params_error(e.to_string()))?;
+        // Optional per-job contract routing: replay an explicit contract's .scid
+        // without mutating global feed config, keeping live trading isolated.
+        let job_contract_metadata = params.contract_symbol.as_deref().map(|symbol| {
+            the_desk_backend::feed::resolve_contract_metadata_for_symbol(
+                &load_feed_config(),
+                symbol,
+            )
+        });
         let initial_estimated_records = {
             let config = load_feed_config();
-            let reader = ScidReader::from_feed_config(&config);
+            let reader = match &job_contract_metadata {
+                Some(meta) => {
+                    ScidReader::with_price_scale(meta.scid_path.clone(), config.price_scale)
+                }
+                None => ScidReader::from_feed_config(&config),
+            };
             reader
                 .estimate_range_records(start_ms, end_ms_exclusive)
                 .unwrap_or(0)
@@ -777,6 +790,7 @@ impl TheDeskMcp {
             "force": params.force.unwrap_or(false),
             "runRules": run_rules,
             "setupIds": params.setup_ids,
+            "contractSymbol": params.contract_symbol,
         });
 
         let mut manager = self.backfill_manager.lock().await;
@@ -850,7 +864,12 @@ impl TheDeskMcp {
         };
         tokio::task::spawn_blocking(move || {
             let config = load_feed_config();
-            let reader = ScidReader::from_feed_config(&config);
+            let reader = match &job_contract_metadata {
+                Some(meta) => {
+                    ScidReader::with_price_scale(meta.scid_path.clone(), config.price_scale)
+                }
+                None => ScidReader::from_feed_config(&config),
+            };
             let db = match Database::open(db_path.as_str()) {
                 Ok(db) => db,
                 Err(err) => {
@@ -922,7 +941,14 @@ impl TheDeskMcp {
             let mut last_persisted_phase = String::from("scanning");
             let mut last_persisted_session_date: Option<String> = None;
             let mut smoothed_records_per_second = 0.0_f64;
-            let result = backfill::run_backfill_job(
+            let replay_options = match job_contract_metadata {
+                Some(meta) => backfill::BackfillReplayOptions {
+                    contract_metadata: Some(meta),
+                    ..Default::default()
+                },
+                None => backfill::BackfillReplayOptions::default(),
+            };
+            let result = backfill::run_backfill_job_with_options(
                 &reader,
                 &db,
                 &worker_params,
@@ -999,6 +1025,7 @@ impl TheDeskMcp {
                     }
                 },
                 cancel_flag.as_ref(),
+                replay_options,
             );
 
             let finished_at_ms = chrono::Utc::now().timestamp_millis() as f64;

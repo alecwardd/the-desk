@@ -359,6 +359,13 @@ pub(crate) struct BackfillParams {
     /// Wait for the background job to complete before responding.
     #[serde(alias = "wait_for_completion")]
     pub(crate) wait_for_completion: Option<bool>,
+    /// Optional contract to replay (e.g. "NQH6.CME"). When set, the job reads
+    /// that contract's `.scid` and pins its metadata WITHOUT mutating global
+    /// feed config — so a historical window can use the contract that was front
+    /// then while live trading stays on the current front month. Mainly for
+    /// backtests; pass the contract instead of flipping `active_symbol_override`.
+    #[serde(alias = "contract_symbol", alias = "contract")]
+    pub(crate) contract_symbol: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]

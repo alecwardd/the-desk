@@ -148,7 +148,11 @@ failed zone (per the IDEA-012 "Critical Rule": failed defense **+** pace expansi
 - After this field addition the rules engine is at `RULES_ENGINE_SCHEMA_VERSION = 4` — rebuild
   `target/release/the-desk-mcp.exe` and restart the Cursor MCP server before registering, or it will
   reject the new field (see `docs/setup-ideas-and-backtesting.md` infra findings).
-- Pass the contract that was front during the window (`NQH6.CME` + `force: true` for 2025-11-28…
-  2026-03-06). A mismatch now surfaces a `scid_window_mismatch_warning` and `integrity_status:"warning"`
-  instead of a silent zero, but you still get no usable data.
+- Pass the contract that was front during the window (`NQH6.CME` for 2025-11-28…2026-03-06) with
+  `force: true`. **Once the contract-routing change is deployed** (rebuild + restart), pass it directly
+  to `run_backtest` as `{ "contract": "NQH6.CME" }` — this replays that contract's `.scid` without
+  touching `active_symbol_override`, so you no longer flip global config and live trading stays
+  isolated on the current front month. Until then, use the temporary `active_symbol_override` flip.
+  Either way, a coverage mismatch now surfaces a `scid_window_mismatch_warning` and
+  `integrity_status:"warning"` instead of a silent zero.
 - Keep every setup `active: false` at registration; activation is gated and explicit.

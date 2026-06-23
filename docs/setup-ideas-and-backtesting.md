@@ -97,6 +97,41 @@ and still requires new `ConditionField` variants plus pipeline detection before 
   event for sample-size projection. `RULES_ENGINE_SCHEMA_VERSION` bumped 2→3. Ready to register and
   backtest a failed-absorption / liquidity-vacuum setup; not yet wired into a template or activated.
 
+### Backtest Results (2026-06-23) — all four hypotheses REJECTED
+
+Window `2025-11-28 → 2026-03-06`, job `091f54ef-3f3d-453b-a38e-0859e157c6ab`, contract `NQH6.CME`
+(`force: true`), all integrity `ok`, all left inactive (no activation). **No setup earned a template.**
+
+| Hypothesis | N | Win | Expectancy (R) | Verdict |
+|---|---|---|---|---|
+| IDEA-000 gated long (`hyp_idea-000-gate-long_v1`) | 90 | 30.0% | **−0.23** | Reject — loses to baseline |
+| IDEA-000 baseline long (`hyp_idea-000-baseline-long_v1`) | 19 | 36.8% | −0.04 | Reject — N<30, still negative |
+| IDEA-012 vacuum short (`hyp_idea-012-vacuum-short_v1`) | 1,720 | 35.2% | +0.06 | Reject — over-trading noise |
+| IDEA-012 vacuum long (`hyp_idea-012-vacuum-long_v1`) | 1,646 | 32.6% | −0.02 | Reject — flat-negative |
+
+**Interpretation:**
+- **IDEA-000 gate adds samples but hurts** (gated −0.23R vs ungated −0.04R; 30% vs 37% win). The
+  `regime=OneSidedAcceptance` filter is currently *admitting* worse trades, not selecting better ones.
+  Both variants are negative because the underlying entry is a fixed-point continuation long fired on
+  a static condition (no pullback trigger), tested in a quarter that was ~52/81 double-distribution
+  and only 7/81 trend. The entry mechanics — not just the gate — lack edge. Do not activate; revisit
+  the entry trigger and the classifier thresholds (`REGIME_ELEVATED_RVOL` / `REGIME_ELEVATED_PACE`)
+  before re-testing the gate.
+- **IDEA-012 fires ~20×/RTH session** because `absorption_invalidated` is a 45s *state flag* that the
+  rules engine re-evaluates every analysis pass. The +0.06R on N=1,720 is over-trading noise. Needs a
+  one-shot-per-event cooldown and an `absorption_invalidation_direction` field before it is a discrete,
+  testable setup. Re-open as a refinement, not as currently specified.
+
+**Infrastructure findings from this run (must fix before the next pass):**
+1. **Stale MCP server rejected the new condition fields** until `target/release/the-desk-mcp.exe` was
+   rebuilt. After any `ConditionField` change, rebuild the release binary and restart the Cursor MCP
+   server before registering hypotheses.
+2. **Silent zero-out on contract mismatch.** `config.toml` lived at `NQU6.CME` (Sept 2026+); this
+   window needed `NQH6.CME` with `force: true`. A mismatched live contract makes the backtest return
+   0 sessions / 0 signals **silently** — indistinguishable from "no setups fired." Needs a guard: the
+   backtest should warn/error when the configured contract does not cover the requested date range,
+   or route the historical replay to the contract that does.
+
 ---
 
 ## Codebase Audit & Opinion

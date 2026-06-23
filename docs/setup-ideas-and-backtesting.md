@@ -127,7 +127,9 @@ Window `2025-11-28 → 2026-03-06`, job `091f54ef-3f3d-453b-a38e-0859e157c6ab`, 
   *Refined (2026-06-23):* added the `absorption_invalidation_direction` condition field
   (`RULES_ENGINE_SCHEMA_VERSION` 3→4) and a v2 spec in the runbook — direction scoping +
   `tape_pace_percentile > 0.7` + `duplicateSuppressionMs = 300000` so one failure is one signal.
-  Awaiting re-backtest under v4.
+  Awaiting re-backtest under v4. *Tooling (2026-06-23):* `summarize_hypothesis_run` now reports
+  `signalsPerActiveSession` + a `chatty` flag and emits an `over_firing` warning above ~5 signals per
+  active session, so this class of over-trading auto-flags instead of needing manual N inspection.
 
 **Infrastructure findings from this run (must fix before the next pass):**
 1. **Stale MCP server rejected the new condition fields** until `target/release/the-desk-mcp.exe` was

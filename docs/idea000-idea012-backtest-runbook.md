@@ -138,6 +138,9 @@ and raise `duplicateSuppressionMs` so a single failure is one signal.
 
 If v2 still fires too often or shows no edge, the next lever is requiring key-level proximity at the
 failed zone (per the IDEA-012 "Critical Rule": failed defense **+** pace expansion **+** liquidity pull).
+The over-firing is now auto-flagged: `summarize_hypothesis_run` reports `signalsPerActiveSession` and a
+`chatty` boolean, and emits an `over_firing` warning above ~5 signals per active session — so you no
+longer have to eyeball N to catch a state-flag setup re-firing.
 
 ---
 

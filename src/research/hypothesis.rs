@@ -14,6 +14,12 @@ use std::collections::{BTreeMap, BTreeSet};
 const DEFAULT_EXPECTANCY_FLOOR_R: f64 = 0.25;
 const MIN_REPORTABLE_N: usize = 30;
 const MIN_REGIME_N: usize = 10;
+/// Heuristic over-firing threshold: a discrete intraday entry should fire only a
+/// handful of times on an active session. Above this many signals per active
+/// session, the setup is likely re-firing on a sticky state flag (e.g. a 45s
+/// `absorption_invalidated`) rather than triggering a distinct entry — a
+/// visibility warning, not a gate failure. Provisional; tune from real runs.
+const CHATTY_SIGNALS_PER_SESSION: f64 = 5.0;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -70,6 +76,13 @@ pub struct HypothesisRunSummary {
     pub setup_id: String,
     pub job_id: String,
     pub total_signals: usize,
+    /// Distinct sessions in which this setup fired at least one signal.
+    pub active_session_count: usize,
+    /// total_signals / active_session_count — over-firing detector.
+    pub signals_per_active_session: f64,
+    /// True when `signals_per_active_session` exceeds the chatty threshold,
+    /// i.e. the setup is likely over-trading a sticky state flag.
+    pub chatty: bool,
     pub resolved: usize,
     pub pending: usize,
     pub expectancy_r: f64,
@@ -707,6 +720,18 @@ fn summarize_rows(
         &day_type_breakdown,
         &rvol_breakdown,
     );
+    let active_session_count = rows
+        .iter()
+        .map(|r| r.session_date.as_str())
+        .collect::<std::collections::BTreeSet<&str>>()
+        .len();
+    let signals_per_active_session = if active_session_count > 0 {
+        total as f64 / active_session_count as f64
+    } else {
+        0.0
+    };
+    let chatty = signals_per_active_session > CHATTY_SIGNALS_PER_SESSION;
+
     let mut warnings = Vec::new();
     if !engine_version_is_current(&engine_version) {
         warnings.push(
@@ -714,11 +739,21 @@ fn summarize_rows(
                 .to_string(),
         );
     }
+    if chatty {
+        warnings.push(format!(
+            "over_firing: {signals_per_active_session:.1} signals per active session \
+             ({total} signals over {active_session_count} sessions, threshold {CHATTY_SIGNALS_PER_SESSION:.0}) \
+             — likely re-firing on a sticky state flag rather than a discrete entry; tighten conditions or raise duplicateSuppressionMs."
+        ));
+    }
 
     Ok(HypothesisRunSummary {
         setup_id: setup_id.to_string(),
         job_id: job_id.to_string(),
         total_signals: total,
+        active_session_count,
+        signals_per_active_session,
+        chatty,
         resolved,
         pending,
         expectancy_r: expectancy,
@@ -960,6 +995,81 @@ mod tests {
             "value": value,
         })
         .to_string()
+    }
+
+    fn outcome_row(session_date: &str, idx: usize) -> HypothesisSignalOutcomeRow {
+        HypothesisSignalOutcomeRow {
+            signal_id: format!("sig-{session_date}-{idx}"),
+            setup_id: "s1".into(),
+            setup_name: None,
+            session_date: session_date.to_string(),
+            session_type: Some("RTH".into()),
+            day_type: Some("Trend".into()),
+            rvol_bucket_at_fire: None,
+            fired_at_ms: 0.0,
+            fired_price: 21_000.0,
+            target_price: Some(21_018.0),
+            stop_price: Some(20_988.0),
+            outcome: "target_hit".into(),
+            max_favorable_excursion: Some(18.0),
+            max_adverse_excursion: Some(6.0),
+            r_result: Some(1.5),
+            time_to_outcome_ms: Some(60_000.0),
+            root_symbol: Some("NQ".into()),
+            contract_symbol: Some("NQH6.CME".into()),
+            direction: Some("long".into()),
+            entry_price: Some(21_000.0),
+            risk_points: Some(12.0),
+            exit_price: Some(21_018.0),
+            outcome_quality: "verified".into(),
+        }
+    }
+
+    fn rows_over_sessions(
+        sessions: &[&str],
+        per_session: usize,
+    ) -> Vec<HypothesisSignalOutcomeRow> {
+        let mut rows = Vec::new();
+        for d in sessions {
+            for i in 0..per_session {
+                rows.push(outcome_row(d, i));
+            }
+        }
+        rows
+    }
+
+    #[test]
+    fn over_firing_flags_chatty_setups() {
+        let setup = SetupDefinition {
+            id: "s1".into(),
+            position_sizing: serde_json::json!({ "r_points": 12.0 }),
+            ..Default::default()
+        };
+        // 6 signals/session across 2 sessions > 5.0 threshold -> chatty.
+        let chatty = summarize_rows(
+            "s1",
+            "job1",
+            &setup,
+            rows_over_sessions(&["2026-01-05", "2026-01-06"], 6),
+            current_engine_version(),
+        )
+        .unwrap();
+        assert_eq!(chatty.active_session_count, 2);
+        assert!((chatty.signals_per_active_session - 6.0).abs() < 1e-9);
+        assert!(chatty.chatty);
+        assert!(chatty.warnings.iter().any(|w| w.starts_with("over_firing")));
+
+        // 2 signals/session -> discrete, not chatty.
+        let calm = summarize_rows(
+            "s1",
+            "job1",
+            &setup,
+            rows_over_sessions(&["2026-01-05", "2026-01-06"], 2),
+            current_engine_version(),
+        )
+        .unwrap();
+        assert!(!calm.chatty);
+        assert!(!calm.warnings.iter().any(|w| w.starts_with("over_firing")));
     }
 
     fn hypothesis_setup() -> SetupDefinition {

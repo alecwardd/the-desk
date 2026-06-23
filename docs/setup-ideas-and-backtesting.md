@@ -128,9 +128,12 @@ Window `2025-11-28 → 2026-03-06`, job `091f54ef-3f3d-453b-a38e-0859e157c6ab`, 
    server before registering hypotheses.
 2. **Silent zero-out on contract mismatch.** `config.toml` lived at `NQU6.CME` (Sept 2026+); this
    window needed `NQH6.CME` with `force: true`. A mismatched live contract makes the backtest return
-   0 sessions / 0 signals **silently** — indistinguishable from "no setups fired." Needs a guard: the
-   backtest should warn/error when the configured contract does not cover the requested date range,
-   or route the historical replay to the contract that does.
+   0 sessions / 0 signals **silently** — indistinguishable from "no setups fired."
+   *Fixed (2026-06-23):* `run_backfill_job_with_options` now reads the SCID file's timestamp bounds
+   and, when they do not overlap the requested window, pushes a `scid_window_mismatch_warning` into
+   the job result (which flips `integrity_status` to `"warning"`), naming the configured contract,
+   the file's actual coverage, and the requested window. Partial-coverage runs are unaffected. A
+   future enhancement could auto-route the replay to the contract that was front during the window.
 
 ---
 

@@ -429,6 +429,58 @@ pub fn parse_backfill_date_range(
     Ok((start_ms, end_ms))
 }
 
+/// Detect the silent zero-out failure mode where the configured contract's SCID
+/// file does not cover the requested backtest window (e.g. live config points at
+/// the next front month while the window needs the prior one). Returns a warning
+/// to surface in the job result instead of letting the replay return 0 sessions
+/// indistinguishably from "no setups fired".
+///
+/// `bounds` is `(first_ts_ms, last_ts_ms)` from [`ScidReader::file_timestamp_bounds`].
+/// Window bounds are optional; an open side is treated as "covers everything".
+fn scid_window_mismatch_warning(
+    bounds: (Option<f64>, Option<f64>),
+    contract_symbol: &str,
+    start_ms: Option<f64>,
+    end_ms_exclusive: Option<f64>,
+) -> Option<String> {
+    let fmt = |ms: f64| crate::session_date_from_timestamp_ms(ms);
+    let (first, last) = match bounds {
+        (Some(first), Some(last)) => (first, last),
+        _ => {
+            // Empty / unreadable file is only a problem if a window was requested.
+            if start_ms.is_some() || end_ms_exclusive.is_some() {
+                return Some(format!(
+                    "SCID file for contract {contract_symbol} contains no readable records; the \
+                     requested backtest window cannot be replayed. Check the configured contract \
+                     and data path."
+                ));
+            }
+            return None;
+        }
+    };
+    let no_overlap = match (start_ms, end_ms_exclusive) {
+        (Some(s), Some(e)) => last < s || first >= e,
+        (Some(s), None) => last < s,
+        (None, Some(e)) => first >= e,
+        (None, None) => false,
+    };
+    if !no_overlap {
+        return None;
+    }
+    Some(format!(
+        "SCID file for contract {contract_symbol} covers {} .. {}, which does not overlap the \
+         requested backtest window {} .. {}. The configured contract is probably not the one that \
+         was front during this window — pass the correct contract explicitly (with force), or set \
+         active_symbol_override.",
+        fmt(first),
+        fmt(last),
+        start_ms.map(fmt).unwrap_or_else(|| "(open)".to_string()),
+        end_ms_exclusive
+            .map(fmt)
+            .unwrap_or_else(|| "(open)".to_string()),
+    ))
+}
+
 pub fn run_backfill_job<F>(
     reader: &ScidReader,
     db: &Database,
@@ -527,6 +579,19 @@ where
         .pipeline
         .rvol
         .load_globex_historical_curve(&state.globex_rvol_curves);
+
+    // Guard against the silent zero-out where the configured contract's SCID does
+    // not cover the requested window (surfaces as a result warning, not a crash).
+    if let Ok(bounds) = reader.file_timestamp_bounds() {
+        if let Some(warning) = scid_window_mismatch_warning(
+            bounds,
+            &contract_metadata.contract_symbol,
+            start_ms,
+            end_ms_exclusive,
+        ) {
+            state.warnings.push(warning);
+        }
+    }
 
     let mut detector = EventDetector::new();
     let mut flow_emitter = FlowEventEmitter::new();
@@ -1467,6 +1532,62 @@ mod tests {
     use std::io::Write;
     use std::sync::atomic::AtomicBool;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn scid_mismatch_warns_when_window_does_not_overlap() {
+        // File covers [1000, 2000]; window [5000, 6000) is entirely after it.
+        let w = scid_window_mismatch_warning(
+            (Some(1000.0), Some(2000.0)),
+            "NQU6.CME",
+            Some(5000.0),
+            Some(6000.0),
+        );
+        assert!(w.as_deref().unwrap().contains("NQU6.CME"));
+        // Window entirely before the file is also a mismatch.
+        assert!(scid_window_mismatch_warning(
+            (Some(5000.0), Some(6000.0)),
+            "NQU6.CME",
+            Some(1000.0),
+            Some(2000.0)
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn scid_mismatch_silent_when_window_overlaps() {
+        // File spans the window.
+        assert!(scid_window_mismatch_warning(
+            (Some(1000.0), Some(9000.0)),
+            "NQH6.CME",
+            Some(4000.0),
+            Some(5000.0)
+        )
+        .is_none());
+        // Open-ended window starting inside the file still overlaps.
+        assert!(scid_window_mismatch_warning(
+            (Some(1000.0), Some(2000.0)),
+            "NQH6.CME",
+            Some(1500.0),
+            None
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn scid_mismatch_handles_open_and_empty() {
+        // Open start, end before the file begins -> mismatch.
+        assert!(scid_window_mismatch_warning(
+            (Some(5000.0), Some(6000.0)),
+            "X",
+            None,
+            Some(1000.0)
+        )
+        .is_some());
+        // Empty file with a requested window -> warn.
+        assert!(scid_window_mismatch_warning((None, None), "X", Some(1.0), Some(2.0)).is_some());
+        // Empty file, no window requested -> stay quiet.
+        assert!(scid_window_mismatch_warning((None, None), "X", None, None).is_none());
+    }
 
     const SCID_HEADER_SIZE_TEST: usize = 56;
     const SCID_MAGIC_TEST: &[u8; 4] = b"SCID";

@@ -50,6 +50,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let activate = std::env::args().any(|a| a == "--activate");
         return seed_templates_cli(activate);
     }
+    if std::env::args().any(|a| a == "--seed-backtest-db") {
+        return seed_backtest_db_cli();
+    }
     let logging_config = load_logging_config();
     let mut effective_logging_config = logging_config.clone();
     let logging_runtime = match init_logging(&logging_config) {
@@ -1212,6 +1215,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let service = server.serve(stdio()).await?;
     service.waiting().await?;
+    Ok(())
+}
+
+/// Build an isolated backtest database seeded with only reference tables and exit.
+///
+/// Invoked via `--seed-backtest-db --to <dest.db> [--from <live.db>]`. The replay
+/// reads ticks from `.scid`, so the huge `raw_ticks` table is not copied — the
+/// artifact stays tiny and the run is isolated from the live DB's writer.
+fn seed_backtest_db_cli() -> Result<(), Box<dyn std::error::Error>> {
+    let args: Vec<String> = std::env::args().collect();
+    let arg_val = |flag: &str| -> Option<String> {
+        args.iter()
+            .position(|a| a == flag)
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+    };
+    let from = arg_val("--from")
+        .unwrap_or_else(|| data_dir().join("data.db").to_string_lossy().to_string());
+    let to = match arg_val("--to") {
+        Some(t) => t,
+        None => {
+            eprintln!("usage: the-desk-mcp --seed-backtest-db --to <dest.db> [--from <live.db>]");
+            std::process::exit(2);
+        }
+    };
+    println!("Seeding isolated backtest DB at {to} (reference tables from {from})...");
+    let report = the_desk_backend::db::export_backtest_reference_db(&from, &to)?;
+    for (table, rows) in &report {
+        println!("  {table}: {rows} rows");
+    }
+    println!(
+        "Done. raw_ticks was NOT copied — the replay reads ticks from .scid. \
+         Point your backtest at {to}."
+    );
     Ok(())
 }
 

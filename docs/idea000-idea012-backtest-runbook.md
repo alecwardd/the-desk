@@ -159,3 +159,10 @@ longer have to eyeball N to catch a state-flag setup re-firing.
   Either way, a coverage mismatch now surfaces a `scid_window_mismatch_warning` and
   `integrity_status:"warning"` instead of a silent zero.
 - Keep every setup `active: false` at registration; activation is gated and explicit.
+- **Run heavy backtests against an isolated DB** so they never contend with the live server's single
+  writer (and never bloat the ~600 GB live `data.db`). Build one with
+  `the-desk-mcp --seed-backtest-db --to <dest.db> [--from <live data.db>]`: it copies only the small
+  *reference* tables (`session_summaries` for RVOL curves, `prior_day_levels`, `risk_config`,
+  `setups`, `research_hypotheses`) — **not** `raw_ticks` (the replay reads ticks from `.scid`). This
+  gives the replay valid historical inputs *and* meaningful dry-run projections, unlike a blank
+  fresh DB. Point the runner / backtest at `<dest.db>`.

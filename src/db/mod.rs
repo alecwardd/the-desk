@@ -1131,6 +1131,33 @@ impl Default for RiskConfigRecord {
 // Database
 // ---------------------------------------------------------------------------
 
+/// Small reference tables a backtest needs as *inputs* — historical RVOL curves,
+/// prior-day levels, risk config, and comparable setups/hypotheses for
+/// projections. Everything else (especially the multi-hundred-GB `raw_ticks`) is
+/// excluded: a replay reads ticks from `.scid` and regenerates events/outcomes.
+const BACKTEST_REFERENCE_TABLES: &[&str] = &[
+    "session_summaries",
+    "session_volume_curves",
+    "prior_day_levels",
+    "prior_day_levels_v22",
+    "risk_config",
+    "setups",
+    "research_hypotheses",
+];
+
+/// Build a fresh isolated backtest database at `dest_path`, seeded with only the
+/// small reference tables from `src_path` (the live DB). This avoids copying the
+/// huge `raw_ticks` table, so the artifact stays tiny and the run is isolated
+/// from the live DB's single writer — while still giving the replay valid
+/// historical inputs (RVOL curves, prior-day levels). Returns rows copied per table.
+pub fn export_backtest_reference_db(
+    src_path: &str,
+    dest_path: &str,
+) -> Result<Vec<(String, usize)>, DbError> {
+    let dest = Database::open(dest_path)?;
+    dest.copy_reference_tables_from(src_path)
+}
+
 pub struct Database {
     conn: Connection,
 }
@@ -1176,6 +1203,74 @@ impl Database {
     pub fn backup_to(&self, dest: &str) -> Result<(), DbError> {
         self.conn.execute("VACUUM INTO ?1", params![dest])?;
         Ok(())
+    }
+
+    /// Column names of `schema.table` (e.g. schema = "main" or "src").
+    fn table_columns(&self, schema: &str, table: &str) -> Result<Vec<String>, DbError> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!("PRAGMA {schema}.table_info(\"{table}\")"))?;
+        let cols = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<String>, _>>()?;
+        Ok(cols)
+    }
+
+    /// Copy the small backtest *reference* tables from `src_path` into this
+    /// (freshly created) database. Bulk/regenerated tables — `raw_ticks`,
+    /// `market_events`, `pipeline_snapshots`, signals, attention, logs — are
+    /// intentionally skipped, since a replay reads ticks from `.scid` and
+    /// regenerates events/outcomes. Columns are matched by name (intersection of
+    /// dest and src) so the copy survives minor schema drift between databases.
+    ///
+    /// Returns `(table, rows_copied)` for each reference table found in `src`.
+    pub fn copy_reference_tables_from(
+        &self,
+        src_path: &str,
+    ) -> Result<Vec<(String, usize)>, DbError> {
+        self.conn
+            .execute("ATTACH DATABASE ?1 AS src", params![src_path])?;
+        let copy = || -> Result<Vec<(String, usize)>, DbError> {
+            let mut report = Vec::new();
+            for table in BACKTEST_REFERENCE_TABLES {
+                let exists: i64 = self.conn.query_row(
+                    "SELECT count(*) FROM src.sqlite_master WHERE type='table' AND name=?1",
+                    params![table],
+                    |row| row.get(0),
+                )?;
+                if exists == 0 {
+                    continue;
+                }
+                let dest_cols = self.table_columns("main", table)?;
+                let src_cols = self.table_columns("src", table)?;
+                let shared: Vec<String> = dest_cols
+                    .into_iter()
+                    .filter(|c| src_cols.iter().any(|s| s == c))
+                    .collect();
+                if shared.is_empty() {
+                    continue;
+                }
+                let col_list = shared
+                    .iter()
+                    .map(|c| format!("\"{c}\""))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                self.conn
+                    .execute(&format!("DELETE FROM main.\"{table}\""), [])?;
+                let n = self.conn.execute(
+                    &format!(
+                        "INSERT INTO main.\"{table}\" ({col_list}) SELECT {col_list} FROM src.\"{table}\""
+                    ),
+                    [],
+                )?;
+                report.push(((*table).to_string(), n));
+            }
+            Ok(report)
+        };
+        let result = copy();
+        // Always detach, even on error.
+        let _ = self.conn.execute("DETACH DATABASE src", []);
+        result
     }
 
     // ------------------------------------------------------------------
@@ -10264,6 +10359,54 @@ mod tests {
     fn test_db() -> Database {
         let file = NamedTempFile::new().expect("temp");
         Database::open(file.path().to_string_lossy().as_ref()).expect("open")
+    }
+
+    #[test]
+    fn export_backtest_reference_db_copies_reference_not_bulk() {
+        let src_file = NamedTempFile::new().expect("src");
+        let src_path = src_file.path().to_string_lossy().to_string();
+        {
+            let src = Database::open(&src_path).expect("open src");
+            // A reference row (setups) and a bulk row (raw_ticks).
+            src.upsert_setup(&SetupDefinition {
+                id: "tpl_x".into(),
+                name: "X".into(),
+                ..Default::default()
+            })
+            .expect("setup");
+            src.insert_raw_ticks_batch(&[(
+                1.0,
+                21_000.0,
+                1.0,
+                20_999.75,
+                21_000.25,
+                true,
+                "2026-03-05".to_string(),
+                "NQ".to_string(),
+                "NQH6.CME".to_string(),
+            )])
+            .expect("ticks");
+        }
+
+        let dest_file = NamedTempFile::new().expect("dest");
+        let dest_path = dest_file.path().to_string_lossy().to_string();
+        let report = export_backtest_reference_db(&src_path, &dest_path).expect("export");
+        assert!(
+            report.iter().any(|(t, n)| t == "setups" && *n >= 1),
+            "setups should be copied, got {report:?}"
+        );
+
+        let dest = Database::open(&dest_path).expect("open dest");
+        let setups: i64 = dest
+            .conn
+            .query_row("SELECT count(*) FROM setups", [], |r| r.get(0))
+            .expect("count setups");
+        assert_eq!(setups, 1, "reference table should be seeded");
+        let raw: i64 = dest
+            .conn
+            .query_row("SELECT count(*) FROM raw_ticks", [], |r| r.get(0))
+            .expect("count raw_ticks");
+        assert_eq!(raw, 0, "raw_ticks must NOT be copied to the isolated DB");
     }
 
     #[test]

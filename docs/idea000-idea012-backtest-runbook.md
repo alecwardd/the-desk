@@ -35,32 +35,42 @@ expectancy / win rate over the ungated baseline.
 
 ## IDEA-000 — Regime-Gated One-Sided Acceptance (Long)
 
+**v2 (refined 2026-06-23):** the v1 run had *no entry trigger* — it fired anywhere price was above
+VWAP, i.e. chasing extended price. Both gated and ungated were negative because the entry, not just
+the gate, lacked edge. v2 adds a **pullback-proximity trigger**: enter long only when price has pulled
+back to *within 8 pts above* VWAP (`price_vs_vwap within 8` AND `price_vs_vwap above`), and raises
+suppression so each pullback episode is one entry. This re-asks the real question — does the regime
+gate help once the entry is a disciplined pullback rather than a chase? No code change; uses the
+`within` operator already in the engine.
+
 ### Gated variant
 
 ```json
 {
   "metadata": {
     "hypothesisId": "IDEA-000-gate-long",
-    "version": 1,
+    "version": 2,
     "docReference": "IDEA-000",
-    "proseSummary": "Continuation long gated on computed regime=OneSidedAcceptance with up-only IB extension.",
+    "proseSummary": "Continuation long on a pullback to VWAP, gated on regime=OneSidedAcceptance with up-only IB extension.",
     "owner": "user",
     "sessionScope": ["rth"]
   },
   "setupDefinition": {
-    "id": "hyp_IDEA-000_gate_long_v1",
-    "name": "IDEA-000 One-Sided Acceptance Gate (Long)",
-    "description": "Fires when regime=OneSidedAcceptance, ib_extension_state=UpOnly, and price accepted above VWAP.",
+    "id": "hyp_IDEA-000_gate_long_v2",
+    "name": "IDEA-000 One-Sided Acceptance Gate (Long) v2",
+    "description": "Fires when regime=OneSidedAcceptance, ib_extension_state=UpOnly, and price has pulled back to within 8 pts above VWAP.",
     "active": false,
+    "duplicateSuppressionMs": 600000,
     "conditions": [
       "{\"id\":\"c1\",\"field\":\"regime\",\"operator\":\"equals\",\"value\":\"OneSidedAcceptance\"}",
       "{\"id\":\"c2\",\"field\":\"ib_extension_state\",\"operator\":\"equals\",\"value\":\"UpOnly\"}",
-      "{\"id\":\"c3\",\"field\":\"price_vs_vwap\",\"operator\":\"above\"}"
+      "{\"id\":\"c3\",\"field\":\"price_vs_vwap\",\"operator\":\"above\"}",
+      "{\"id\":\"c4\",\"field\":\"price_vs_vwap\",\"operator\":\"within\",\"value\":8.0}"
     ],
     "stopLogic": { "mode": "fixed_points", "direction": "long", "points": 12 },
     "targets": [ { "mode": "fixed_points", "direction": "long", "points": 18, "label": "1.5R fixed target" } ],
     "positionSizing": { "r_points": 12 },
-    "templateSource": "hypothesis:IDEA-000:v1"
+    "templateSource": "hypothesis:IDEA-000:v2"
   },
   "dryRun": true
 }
@@ -68,11 +78,15 @@ expectancy / win rate over the ungated baseline.
 
 ### Ungated baseline (drop the `regime` condition)
 
-Same as above with `id` = `hyp_IDEA-000_baseline_long_v1`, name "(Baseline, Ungated)", and
-`conditions` reduced to `c2` (ib_extension_state=UpOnly) + `c3` (price_vs_vwap above). This is the
-control: if the gated variant does not beat it, the regime gate is not earning its place.
+Same as above with `id` = `hyp_IDEA-000_baseline_long_v2`, name "(Baseline, Ungated) v2", and `c1`
+removed (keep `c2`/`c3`/`c4`). This is the control: if the gated variant does not beat it, the regime
+gate is not earning its place — even with the better entry.
 
-> Short mirrors: swap `UpOnly`→`DownOnly`, `price_vs_vwap above`→`below`, and `direction long`→`short`.
+> Short mirrors: swap `UpOnly`→`DownOnly` and `price_vs_vwap above`→`below` (the `within 8` pullback
+> condition stays; combined with `below` it means within 8 pts *under* VWAP), and `direction long`→`short`.
+>
+> The 8-pt pullback band and 12-pt stop are starting points — tune from the MFE/MAE distribution once
+> v2 produces verified outcomes.
 
 ---
 

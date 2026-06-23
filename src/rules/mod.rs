@@ -1897,6 +1897,35 @@ mod tests {
     }
 
     #[test]
+    fn vwap_pullback_band_combines_above_and_within() {
+        // IDEA-000 v2 entry: price must be above VWAP AND within 8 pts of it.
+        let above: SetupCondition =
+            serde_json::from_str(r#"{"id":"c3","field":"price_vs_vwap","operator":"above"}"#)
+                .unwrap();
+        let within: SetupCondition = serde_json::from_str(
+            r#"{"id":"c4","field":"price_vs_vwap","operator":"within","value":8.0}"#,
+        )
+        .unwrap();
+
+        let pulled_back = MarketState {
+            last_price: 21005.0,
+            vwap: 21000.0,
+            ..Default::default()
+        };
+        assert!(evaluate_typed_condition(&above, &pulled_back, None));
+        assert!(evaluate_typed_condition(&within, &pulled_back, None));
+
+        // Extended 15 pts above VWAP: still above, but the pullback gate rejects it.
+        let extended = MarketState {
+            last_price: 21015.0,
+            vwap: 21000.0,
+            ..Default::default()
+        };
+        assert!(evaluate_typed_condition(&above, &extended, None));
+        assert!(!evaluate_typed_condition(&within, &extended, None));
+    }
+
+    #[test]
     fn crosses_above_requires_prev() {
         let tc = SetupCondition {
             id: "c1".into(),

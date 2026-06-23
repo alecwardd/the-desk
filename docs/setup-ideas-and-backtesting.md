@@ -116,7 +116,11 @@ Window `2025-11-28 → 2026-03-06`, job `091f54ef-3f3d-453b-a38e-0859e157c6ab`, 
   a static condition (no pullback trigger), tested in a quarter that was ~52/81 double-distribution
   and only 7/81 trend. The entry mechanics — not just the gate — lack edge. Do not activate; revisit
   the entry trigger and the classifier thresholds (`REGIME_ELEVATED_RVOL` / `REGIME_ELEVATED_PACE`)
-  before re-testing the gate.
+  before re-testing the gate. *Refined (2026-06-23):* runbook v2 adds a pullback-proximity entry
+  (`price_vs_vwap within 8` AND `above`) plus a 10-min suppression so the entry is a disciplined
+  pullback, not a chase — no code change (uses the existing `within` operator). Awaiting re-backtest;
+  if v2 is still negative, the regime/continuation track is likely dead in this market and the next
+  move is a different idea, not more tuning.
 - **IDEA-012 fires ~20×/RTH session** because `absorption_invalidated` is a 45s *state flag* that the
   rules engine re-evaluates every analysis pass, and the v1 spec used the 2s default suppression and
   omitted the doc's required pace-expansion filter. The +0.06R on N=1,720 is over-trading noise.

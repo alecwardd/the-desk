@@ -235,8 +235,18 @@ Follow-up hardening added a rules-enabled golden (`expected_rules.json`), a non-
 ### IDEA-000: Regime-Gated Setup Selector
 <!-- hypothesis-anchor: IDEA-000 -->
 
-**Status:** Researched
+**Status:** REJECTED as a standalone setup (2026-06-23) — concept folded into IDEA-020.
 **Source:** Local 2025-11-28 through 2026-03-06 database study; 0DTE / dealer gamma literature; CME liquidity research
+
+> **Verdict (2026-06-23): rejected as a tradeable setup; retained as a context *gate*, reconstructed in IDEA-020.**
+> v2 backtest (regime gate + VWAP-pullback entry) on 2025-11-28…2026-03-06: gated N=2, baseline N=3, both
+> 0% win / −1.0R — untestable. Root cause is a *design contradiction*, not "no edge":
+> `regime=OneSidedAcceptance` means price is accepted **away** from VWAP, while `price_vs_vwap within 8`
+> requires price **at** VWAP — they almost never co-occur, so the entry never fired. The regime *gate*
+> idea is still good, but as a **context layer, not an entry**. Reconstruction: derive regime from **zone
+> outcomes** (IDEA-020 Stage 2 — many zones forming+held → trend; many failing → change), which is tighter
+> than the IB-extension/day-type classifier that proved too loose, and use it to gate which zone family
+> may fire. Do not re-test this as a standalone continuation entry.
 **Complements:** All existing setup templates
 
 **Concept:** Stop treating every setup as always-on. Add a top-level regime selector that determines which setup families are valid:
@@ -514,9 +524,19 @@ The regime layer should drive which existing templates are active, not just how 
 
 ### IDEA-012: Absorption Failure / Liquidity Vacuum
 
-**Status:** Researched
+**Status:** REJECTED as a standalone setup (2026-06-23) — concept folded into IDEA-020.
 **Source:** Local 2025-11-28 through 2026-03-06 database study; CME liquidity research
 **Complements:** IDEA-002 Trapped Trader Reversal, Rebid/Reoffer, Absorption pipeline
+
+> **Verdict (2026-06-23): rejected as specified; the *concept* is a "Failed zone" — reconstructed in IDEA-020.**
+> v2 backtest (`absorption_invalidated` + `absorption_invalidation_direction` + `tape_pace_percentile`):
+> short N=58 / −0.07R (reject); long N=58 / +0.09R coalesced (was +0.25R under every-tick over-sampling,
+> so the honest number is ~+0.09R — marginal at best). Root cause: a generic `absorption_invalidated` flag
+> fires on *any* failed absorption anywhere, with fixed-point stops/targets and **no level context**.
+> Reconstruction: a failed defense → vacuum **is** a `Failed` rebid/reoffer zone in IDEA-020 (price breaks
+> through the band with acceptance = the trader's "failed zone = trend change"). Express it there, anchored
+> to the zone: stop *inside* the failed zone, target the next zone/level. Do not re-test the free-floating
+> flag version.
 
 **Concept:** The better signal may be the *failure* of a defended level, not the original absorption itself. A failed defense plus liquidity pull creates a vacuum move that can travel faster than the original defense setup.
 
@@ -696,9 +716,13 @@ This is not enough to call it validated, but it is enough to promote failure-of-
 
 ### IDEA-020: Footprint Rebid/Reoffer Zone Lifecycle
 
-**Status:** Stage 1 landed (2026-06-23); Stage 2 deferred
+**Status:** Stage 1 landed (2026-06-23); Stage 2 deferred. **Now the primary track** — the framework
+into which the rejected IDEA-000 (regime) and IDEA-012 (absorption-failure) concepts were folded.
 **Source:** Trader doctrine session 2026-06-23 (see memory `rebid-reoffer-zone-doctrine`)
-**Complements:** Rebid/Reoffer templates, Absorption, IDEA-000 regime selector
+**Complements / absorbs:** Rebid/Reoffer templates, Absorption pipeline; **supersedes IDEA-000** (regime
+becomes a Stage-2 read derived from zone outcomes, not a standalone entry) and **IDEA-012** (a failed
+defense / vacuum is a `Failed` zone in this lifecycle, anchored to a real level — see those entries'
+2026-06-23 verdicts).
 
 **Concept:** Redefine acceleration zones around the trader's actual model — **footprint stacked
 one-sided delta** (≥5 consecutive levels at ~3:1, loose bands) with an initiative move away — instead

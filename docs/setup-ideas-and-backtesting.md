@@ -742,6 +742,24 @@ entry trigger). `RULES_ENGINE_SCHEMA_VERSION` 4→5. Acceptance =
 `tape_acceleration > 0`). Starting tunables: 5 levels, 3:1 ratio, 5-tick move-away / poke / failure
 extension, ~20–30s dwell.
 
+**Backtest finding (2026-06-24) — entry mechanics, not exits, are the limiter.** A full exit sweep on
+the retest/held entries (job `1d690dee`, NQH6, isolated DB) confirmed the trader's win-rate intuition:
+at a 1R target, win rates are **50–55%** (the original 3R target's 25% was an artifact). But expectancy
+stays thin (best = rebid-held-long @ 2R, **+0.22R**, N=64). The smoking gun: **MAE p50 = 1.0R for *every*
+variant** — half of all trades touch the full flat 3pt stop, which is *not* how the trader executes. So
+the flat-point stop and the zone *definition* — not the exit target — cap the result.
+
+**Stage 1.5 (in progress — make mechanics match execution):**
+- **Zone-anchored exits (landed 2026-06-24):** `MarketState` now exposes `rebid_zone_low/high` and
+  `reoffer_zone_low/high` (nearest zone band edges), wired as named levels in `resolve_price_expression`.
+  A stop can now sit *just past the zone* (`named_level_offset` on `rebid_zone_low`, e.g. `offsetTicks:-4`)
+  and a target at a structural level, instead of a flat point — directly attacking the MAE-p50=1R problem.
+  Backtest next with zone-anchored stops vs the flat-point baseline.
+- **Recent-window zone detection (next):** the Stage-1 detector reads the *session-cumulative* footprint
+  (`stacked_imbalance_zones` over all accumulated delta-by-price); the trader's zone is a *quick
+  one-sided burst* then a leave. Switch detection to a recent window (`footprint.levels_in_window`) so it
+  forms the trader's zones, not slow-accumulation bands.
+
 **Stage 2 (deferred — revisit in a future build):**
 - **Per-session zone aggregates** (formed / retested / held / failed / abandoned) rolled into an
   order-flow-sourced **regime input for IDEA-000**: many forming+held, few failing → trend; many

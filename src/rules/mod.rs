@@ -458,6 +458,12 @@ fn named_level_value(name: &str, market: &MarketState) -> Option<f64> {
         "or5_high" => market.or5_high,
         "or5_low" => market.or5_low,
         "or5_mid" => market.or5_mid,
+        // Footprint zone band edges (IDEA-020) — anchor stops/targets to the zone
+        // structure instead of a flat point. None when no such zone is near price.
+        "rebid_zone_low" => market.rebid_zone_low.unwrap_or(0.0),
+        "rebid_zone_high" => market.rebid_zone_high.unwrap_or(0.0),
+        "reoffer_zone_low" => market.reoffer_zone_low.unwrap_or(0.0),
+        "reoffer_zone_high" => market.reoffer_zone_high.unwrap_or(0.0),
         _ => return None,
     };
     (value > 0.0 && value.is_finite()).then_some(value)
@@ -1978,6 +1984,34 @@ mod tests {
             &MarketState::default(),
             None
         ));
+    }
+
+    #[test]
+    fn zone_anchored_stop_resolves_from_band_edge() {
+        // Rebid (buy) zone band 21000.00–21001.00; long stop 4 ticks below the low.
+        let market = MarketState {
+            last_price: 21_000.5,
+            rebid_zone_low: Some(21_000.0),
+            rebid_zone_high: Some(21_001.0),
+            ..Default::default()
+        };
+        let stop_expr = serde_json::json!({
+            "mode": "named_level_offset",
+            "level": "rebid_zone_low",
+            "offsetTicks": -4.0
+        });
+        let stop = resolve_price_expression(&stop_expr, &market, true).expect("stop resolves");
+        assert!(
+            (stop - (21_000.0 - 1.0)).abs() < 1e-9,
+            "stop should be zone low − 1.0 pt, got {stop}"
+        );
+
+        // No zone present → the named level is absent → no stop resolved (falls back).
+        let no_zone = MarketState {
+            last_price: 21_000.5,
+            ..Default::default()
+        };
+        assert!(resolve_price_expression(&stop_expr, &no_zone, true).is_none());
     }
 
     #[test]

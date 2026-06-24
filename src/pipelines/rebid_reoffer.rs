@@ -84,6 +84,12 @@ pub struct ZoneSignal {
     pub nearest_direction: Option<String>,
     pub nearest_status: Option<String>,
     pub nearest_distance_ticks: Option<f64>,
+    /// Band edges of the nearest non-failed rebid (buy/support) zone — exit anchors.
+    pub rebid_zone_low: Option<f64>,
+    pub rebid_zone_high: Option<f64>,
+    /// Band edges of the nearest non-failed reoffer (sell/resistance) zone.
+    pub reoffer_zone_low: Option<f64>,
+    pub reoffer_zone_high: Option<f64>,
 }
 
 /// Detects footprint rebid/reoffer acceleration zones and tracks their lifecycle.
@@ -290,6 +296,8 @@ impl RebidReofferPipeline {
     pub fn zone_signal(&self, price: f64) -> ZoneSignal {
         let mut sig = ZoneSignal::default();
         let mut nearest: Option<(f64, &AccelerationZone)> = None;
+        let mut nearest_rebid: Option<(f64, &AccelerationZone)> = None;
+        let mut nearest_reoffer: Option<(f64, &AccelerationZone)> = None;
         for zone in &self.zones {
             if matches!(zone.status, ZoneStatus::Failed | ZoneStatus::Abandoned) {
                 continue;
@@ -301,11 +309,17 @@ impl RebidReofferPipeline {
                     sig.rebid_near |= near;
                     sig.rebid_retested |= near && zone.status == ZoneStatus::Retested;
                     sig.rebid_held |= near && zone.status == ZoneStatus::Held;
+                    if nearest_rebid.map(|(d, _)| dist_ticks < d).unwrap_or(true) {
+                        nearest_rebid = Some((dist_ticks, zone));
+                    }
                 }
                 ZoneType::Sell => {
                     sig.reoffer_near |= near;
                     sig.reoffer_retested |= near && zone.status == ZoneStatus::Retested;
                     sig.reoffer_held |= near && zone.status == ZoneStatus::Held;
+                    if nearest_reoffer.map(|(d, _)| dist_ticks < d).unwrap_or(true) {
+                        nearest_reoffer = Some((dist_ticks, zone));
+                    }
                 }
             }
             if nearest.map(|(d, _)| dist_ticks < d).unwrap_or(true) {
@@ -316,6 +330,14 @@ impl RebidReofferPipeline {
             sig.nearest_direction = Some(format!("{:?}", zone.zone_type).to_lowercase());
             sig.nearest_status = Some(format!("{:?}", zone.status).to_lowercase());
             sig.nearest_distance_ticks = Some(dist);
+        }
+        if let Some((_, zone)) = nearest_rebid {
+            sig.rebid_zone_low = Some(zone.low);
+            sig.rebid_zone_high = Some(zone.high);
+        }
+        if let Some((_, zone)) = nearest_reoffer {
+            sig.reoffer_zone_low = Some(zone.low);
+            sig.reoffer_zone_high = Some(zone.high);
         }
         sig
     }

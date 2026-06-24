@@ -339,6 +339,16 @@ pub struct MarketState {
     /// Distance in ticks to the nearest non-failed zone, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nearest_zone_distance_ticks: Option<f64>,
+    /// Band edges of the nearest rebid (buy/support) zone — exit anchors for longs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rebid_zone_low: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rebid_zone_high: Option<f64>,
+    /// Band edges of the nearest reoffer (sell/resistance) zone — exit anchors for shorts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reoffer_zone_low: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reoffer_zone_high: Option<f64>,
 
     // --- TPO Enhancements ---
     /// Whether the session high is a "poor high" (multiple prints at extreme).
@@ -914,6 +924,10 @@ impl PipelineEngine {
             nearest_zone_direction: zone_signal.nearest_direction,
             nearest_zone_status: zone_signal.nearest_status,
             nearest_zone_distance_ticks: zone_signal.nearest_distance_ticks,
+            rebid_zone_low: zone_signal.rebid_zone_low,
+            rebid_zone_high: zone_signal.rebid_zone_high,
+            reoffer_zone_low: zone_signal.reoffer_zone_low,
+            reoffer_zone_high: zone_signal.reoffer_zone_high,
 
             poor_high: self.tpo.poor_high(),
             poor_low: self.tpo.poor_low(),

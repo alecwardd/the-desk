@@ -23,6 +23,7 @@ Settings for Sierra Chart integration with The Desk. These are the recommended/c
 | **Chart Update Interval (ms)** | 600 | UI/chart refresh cadence. Helpful for display responsiveness, but disk flush behavior for `.scid` is primarily governed by Intraday File Flush Time. |
 | **Number of Stored Time & Sales Records** | 4000 | SC display setting only — does not affect `.scid` file storage or The Desk. |
 | **Maximum Time & Sales Depth Levels** | 0 | DOM depth recording. Set to 0 (disabled) since The Desk pipelines use tick-level data, not order book depth. Increase to 10 if DOM imbalance analysis is added later. |
+| **Chartbook to open on startup** | `LightweightChartBook2026.Cht` | Belt-and-suspenders for the watchdog: Sierra should reopen the live recording chartbook even after an abnormal exit. |
 
 ## Logging
 
@@ -48,11 +49,18 @@ These Sierra Chart settings correspond to the following `~/.the-desk/config.toml
 sierra_data_dir = "T:\\SierraChart\\Data"
 base_symbol = "NQ"
 symbol_mode = "hybrid"       # manual | auto | hybrid
-symbol = "NQH6.CME"          # Legacy fallback; still honored
-active_symbol_override = "NQH6.CME" # Set only when you want to pin a contract
-flush_poll_ms = 1000          # How often The Desk checks for new .scid data
+symbol = "NQU6.CME"          # Legacy fallback; still honored
+active_symbol_override = "NQU6.CME" # Set only when you want to pin a contract
+flush_poll_ms = 100           # How often The Desk checks for new .scid data
 price_scale = 100.0           # Rithmic NQ prices are raw * 100
+
+[storage]
+warm_retention_days = 30
+cold_archive_dir = "X:\\TheDesk\\archive"
+auto_archive = true           # Vestigial; scheduled task performs archival
 ```
+
+The actual storage automation is handled by Windows Task Scheduler through `scripts\ops\Run-Weekly-Archive.ps1`; `auto_archive` is retained for config compatibility but is not acted on by the runtime. See `docs/ops/automation-and-storage.md`.
 
 ---
 
@@ -84,9 +92,10 @@ For runtime verification, use MCP tools `get_feed_health` and `validate_data_int
 
 1. **Confirm 1-Tick storage on all four charts (NQ, MNQ, ES, MES).** `Intraday Data Storage Time Unit = 1 Tick` is the single most important setting — anything coarser (1 second) permanently discards individual-trade granularity and breaks delta/footprint/tape-pace. This is the one to never get wrong.
 2. **Keep Sierra Chart running continuously** Globex open → weekend (you already do this).
-3. **Clean shutdown on the weekend** (File → Exit / Disconnect, not a hard kill / Task Manager / power loss). A clean exit lets the final buffer flush and avoids a torn last record. Data already flushed is safe regardless, but a clean exit is tidier.
-4. **Watch for feed disconnects** during the week. After any reconnect, optionally run `get_raw_tick_ingest_gaps` / `scan_scid_timestamp_anomalies` to see if a hole formed, and `get_feed_health` to confirm the feed is live.
-5. **Leave the OS/data drive (`T:`) with headroom.** `.scid` files grow continuously; a full disk stops recording. (Archival of The Desk's *own* SQLite copy is a separate concern — see `the-desk-storage --archive`; it does not touch your Sierra `.scid` files.)
+3. **Configure Sierra startup chartbook** to open `LightweightChartBook2026.Cht`. The watchdog launches Sierra, and Sierra should deterministically reopen the live recording chartbook.
+4. **Clean shutdown on the weekend** (File → Exit / Disconnect, not a hard kill / Task Manager / power loss). A clean exit lets the final buffer flush and avoids a torn last record. Data already flushed is safe regardless, but a clean exit is tidier.
+5. **Watch for feed disconnects** during the week. After any reconnect, optionally run `get_raw_tick_ingest_gaps` / `scan_scid_timestamp_anomalies` to see if a hole formed, and `get_feed_health` to confirm the feed is live.
+6. **Leave the OS/data drive (`T:`) with headroom.** `.scid` files grow continuously; a full disk stops recording. (Archival of The Desk's *own* SQLite copy is automated by the weekly archive task; it does not touch your Sierra `.scid` files.)
 
 **The Desk's role in all this: read-only over the `.scid`.** The MCP backend *tails* the `.scid` files (poll every `flush_poll_ms`) and keeps its own SQLite copy of the ticks (`raw_ticks`) for research/backtests. It never writes to or alters the Sierra `.scid` — so The Desk being up or down has **zero** effect on your recording fidelity. If The Desk is off for a stretch, the `.scid` still captures everything and a later `backfill_history` / `ingest_raw_ticks_from_scid` can replay it into the DB. Sierra is the recorder; The Desk is the reader.
 

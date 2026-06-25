@@ -106,7 +106,7 @@ function Assert-StorageExe {
 }
 
 function Invoke-StorageCommand {
-    param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Arguments)
+    param([Parameter(Mandatory)][string[]]$Arguments)
 
     $display = "$script:StorageExe $($Arguments -join ' ')"
     if ($DryRun -or $WhatIf) {
@@ -304,7 +304,7 @@ function Get-TDriveFreeBytes {
 }
 
 function Get-FreelistGb {
-    $output = Invoke-StorageCommand @("--status")
+    $output = Invoke-StorageCommand -Arguments @("--status")
     foreach ($line in $output) {
         $text = $line.ToString()
         if ($text -match 'freelist_size=([0-9.]+)\s+GB') {
@@ -325,8 +325,8 @@ function Remove-DbSidecars {
 
 function Invoke-ArchiveOldTicks {
     param([Parameter(Mandatory)][string]$Cutoff)
-    Invoke-StorageCommand @("--status", "--cutoff", $Cutoff) | Out-Null
-    Invoke-StorageCommand @("--maintain", "--cutoff", $Cutoff) | Out-Null
+    Invoke-StorageCommand -Arguments @("--status", "--cutoff", $Cutoff) | Out-Null
+    Invoke-StorageCommand -Arguments @("--maintain", "--cutoff", $Cutoff) | Out-Null
 }
 
 function Invoke-CompactIntoArchive {
@@ -335,7 +335,7 @@ function Invoke-CompactIntoArchive {
     if ((Test-Path -LiteralPath $compacted) -and -not ($DryRun -or $WhatIf)) {
         throw "Compacted destination already exists: $compacted"
     }
-    Invoke-StorageCommand @("--compact-into", $compacted, "--cutoff", $Cutoff) | Out-Null
+    Invoke-StorageCommand -Arguments @("--compact-into", $compacted, "--cutoff", $Cutoff) | Out-Null
     return $compacted
 }
 
@@ -345,7 +345,7 @@ function Verify-DatabaseCopy {
         [Parameter(Mandatory)][string]$ComparePath,
         [Parameter(Mandatory)][string]$Cutoff
     )
-    Invoke-StorageCommand @("--verify-db", $CopyPath, "--compare-db", $ComparePath, "--cutoff", $Cutoff) | Out-Null
+    Invoke-StorageCommand -Arguments @("--verify-db", $CopyPath, "--compare-db", $ComparePath, "--cutoff", $Cutoff) | Out-Null
 }
 
 function Swap-Database {
@@ -379,7 +379,7 @@ function Swap-Database {
             Remove-DbSidecars
             try {
                 Move-Item -LiteralPath $verifyCopy -Destination $script:DataDb
-                Invoke-StorageCommand @("--status", "--cutoff", $Cutoff) | Out-Null
+                Invoke-StorageCommand -Arguments @("--status", "--cutoff", $Cutoff) | Out-Null
                 Remove-Item -LiteralPath $backup -Force
                 Write-Log "Swap complete; removed old database backup $backup."
             } catch {
@@ -397,7 +397,7 @@ function Swap-Database {
             Remove-Item -LiteralPath $script:DataDb -Force
             Remove-DbSidecars
             Move-Item -LiteralPath $CompactedPath -Destination $script:DataDb
-            Invoke-StorageCommand @("--status", "--cutoff", $Cutoff) | Out-Null
+            Invoke-StorageCommand -Arguments @("--status", "--cutoff", $Cutoff) | Out-Null
         }
     } -Destructive
 }

@@ -40,7 +40,8 @@ function Write-Log {
         Initialize-Logging
     }
     $line = "[{0}] {1}" -f (Get-Date).ToString("s"), $Message
-    $line | Tee-Object -FilePath $script:LogPath -Append
+    Add-Content -LiteralPath $script:LogPath -Value $line
+    Write-Host $line
 }
 
 function Copy-TempLogToArchive {
@@ -172,6 +173,10 @@ function Assert-ArchiveDiskSafety {
 }
 
 function Assert-ArchiveVolume {
+    $driveRoot = "$($script:ArchiveDrive):\"
+    if (-not (Test-Path -LiteralPath $driveRoot)) {
+        throw "$driveRoot is not mounted."
+    }
     $volume = Get-Volume -DriveLetter $script:ArchiveDrive -ErrorAction Stop
     if ($volume.FileSystem -ne "NTFS") {
         throw "X: is not NTFS; found $($volume.FileSystem)."

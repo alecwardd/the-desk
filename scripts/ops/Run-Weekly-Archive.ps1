@@ -21,7 +21,8 @@ function Write-Log {
     param([Parameter(Mandatory)][string]$Message)
     if (-not $script:LogPath) { Initialize-Logging }
     $line = "[{0}] {1}" -f (Get-Date).ToString("s"), $Message
-    $line | Tee-Object -FilePath $script:LogPath -Append
+    Add-Content -LiteralPath $script:LogPath -Value $line
+    Write-Host $line
 }
 
 function Get-ArchiveCutoff {

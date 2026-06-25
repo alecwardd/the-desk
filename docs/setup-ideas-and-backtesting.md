@@ -767,6 +767,19 @@ the flat-point stop and the zone *definition* — not the exit target — cap th
   12 pt stop, ~9–12 pt target per the diagnostic) — ideally on the cleaner **live-recorded** data, since
   the gappy NQH6 backfill is a poor judge and we've largely exhausted what it can tell us.
 
+**Stage 1.5 conclusion (2026-06-25) — mechanical cycle exhausted on the NQH6 backfill.** The recent-window
+A/B (job `6e70e29e`) barely moved fire rate (N 64→69) and showed no clear MFE improvement; every entry/exit
+variation across the full cycle (targets → stops → zone-anchoring → detection window) lands negative-to-
+breakeven on this window (median favorable excursion ~6–12 pt with ~80% stop-hit at a 12 pt stop). **This is
+not proof the setup has no edge** — it is proof the *gappy, double-distribution NQH6 backfill cannot answer
+the question*, and that further mechanical tuning on it is motion without information. **Stop backtesting
+this data.** Two paths actually resolve the uncertainty: (1) **live-eye validation** — rebuild the live
+server to the recent-window detector (`70bec5c`), restart, and during an active RTH session compare the
+code's `get_rebid_reoffer_zones` output against the trader's chart: *does the code find the zones the trader
+actually trades?* That tests the one thing backtesting can't. (2) **Clean-data re-backtest** — let the
+live-recorded 4-contract `.scid` (started 2026-06-23) accrue a few weeks, then re-run. Until one of those,
+no further IDEA-020 backtest variations on NQH6.
+
 **Stage 2 (deferred — revisit in a future build):**
 - **Per-session zone aggregates** (formed / retested / held / failed / abandoned) rolled into an
   order-flow-sourced **regime input for IDEA-000**: many forming+held, few failing → trend; many

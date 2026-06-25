@@ -1,4 +1,4 @@
-//! IDEA-020 zone backtest runner — exit target/stop sweep. Pins NQH6.CME + force replay.
+//! IDEA-020 A/B backtest runner — recent-window zone detection vs prior session-cumulative baselines.
 
 use serde_json::json;
 use std::sync::atomic::AtomicBool;
@@ -17,6 +17,7 @@ use the_desk_backend::research::{
 
 const START: &str = "2025-11-28";
 const END: &str = "2026-03-06";
+const R_POINTS: f64 = 12.0;
 
 fn data_dir() -> std::path::PathBuf {
     let home = std::env::var("USERPROFILE")
@@ -131,77 +132,47 @@ fn hypotheses() -> Vec<serde_json::Value> {
         },
     ];
 
-    let targets: [(f64, f64, &str); 3] = [(1.0, 3.0, "1R"), (1.5, 4.5, "1_5R"), (2.0, 6.0, "2R")];
-    const STOP: f64 = 3.0;
-    const R_POINTS: f64 = 3.0;
+    const STOP: f64 = 12.0;
+    // v6/v7 = session-cumulative excursion diagnostic; v8/v9 = recent-window A/B (this run).
+    let targets: [(i64, f64, &str); 2] = [(8, 9.0, "9pt"), (9, 12.0, "12pt")];
 
     let mut out = Vec::new();
-    for e in entries {
-        for (idx, (r_mult, target_pts, suffix)) in targets.iter().enumerate() {
-            let version = (idx as i64) + 2; // v1 = original 3R run; sweep uses v2–v4
-            let dir = e.direction;
+    for e in &entries {
+        for (version, target_pts, label) in targets {
             out.push(json!({
                 "metadata": {
                     "hypothesisId": e.hyp_id,
                     "version": version,
                     "docReference": "IDEA-020",
-                    "proseSummary": format!("{} @ {} target ({} pt stop).", e.name, suffix.replace('_', "."), STOP),
+                    "proseSummary": format!(
+                        "{} — recent-window zones, 12pt stop / {} target (A/B vs session-cumulative).",
+                        e.name, label
+                    ),
                     "owner": "user",
                     "sessionScope": ["rth"]
                 },
                 "setupDefinition": {
-                    "id": format!("hyp_IDEA-020_{}_{}", e.id_base, suffix),
-                    "name": format!("IDEA-020 {} {}", e.name, suffix.replace('_', ".")),
+                    "id": format!("hyp_IDEA-020_{}_{}", e.id_base, label.replace('.', "_")),
+                    "name": format!("IDEA-020 {} {}", e.name, label),
                     "description": e.description,
                     "active": false,
                     "duplicateSuppressionMs": 300000,
                     "conditions": [
                         format!("{{\"id\":\"c1\",\"field\":\"{}\",\"operator\":\"equals\",\"value\":true}}", e.field)
                     ],
-                    "stopLogic": { "mode": "fixed_points", "direction": dir, "points": STOP },
+                    "stopLogic": { "mode": "fixed_points", "direction": e.direction, "points": STOP },
                     "targets": [{
                         "mode": "fixed_points",
-                        "direction": dir,
+                        "direction": e.direction,
                         "points": target_pts,
-                        "label": format!("{r_mult}R fixed target")
+                        "label": format!("{label} target")
                     }],
                     "positionSizing": { "r_points": R_POINTS },
-                    "templateSource": format!("hypothesis:{}:v{}", e.id_base, version)
+                    "templateSource": format!("hypothesis:IDEA-020:{}:recent-window:{}", e.id_base, label)
                 }
             }));
         }
     }
-
-    // Wider-stop probe on best long variant (rebid held) — version 5 under same hypothesisId.
-    out.push(json!({
-        "metadata": {
-            "hypothesisId": "IDEA-020-rebid-held-long",
-            "version": 5,
-            "docReference": "IDEA-020",
-            "proseSummary": "Rebid held long with wider 4.5 pt stop / 6.75 pt target (1.5R).",
-            "owner": "user",
-            "sessionScope": ["rth"]
-        },
-        "setupDefinition": {
-            "id": "hyp_IDEA-020_rebid_held_long_widestop",
-            "name": "IDEA-020 Rebid Zone Held (Long) widestop",
-            "description": "Rebid zone held long with 4.5 pt stop and 6.75 pt target.",
-            "active": false,
-            "duplicateSuppressionMs": 300000,
-            "conditions": [
-                "{\"id\":\"c1\",\"field\":\"rebid_zone_held\",\"operator\":\"equals\",\"value\":true}"
-            ],
-            "stopLogic": { "mode": "fixed_points", "direction": "long", "points": 4.5 },
-            "targets": [{
-                "mode": "fixed_points",
-                "direction": "long",
-                "points": 6.75,
-                "label": "1.5R fixed target (wide stop)"
-            }],
-            "positionSizing": { "r_points": 4.5 },
-            "templateSource": "hypothesis:IDEA-020:rebid-held-long:v5"
-        }
-    }));
 
     out
 }
@@ -234,7 +205,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .to_string();
         let dry = register_hypothesis(&db, request_from_json(hyp_json.clone(), true))?;
         eprintln!(
-            "\n=== {label} v2 dry-run: setupId={} feasibleForN30={} projected={} warnings={:?}",
+            "\n=== {label} recent-window A/B dry-run: setupId={} feasibleForN30={} projected={} warnings={:?}",
             dry.setup_id, dry.feasible_for_n30, dry.projected_sample_size, dry.warnings
         );
         if !dry.feasible_for_n30 {
@@ -407,11 +378,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "N": dist.meta.effective_sample_size,
             "verifiedSampleSize": dist.sample_count,
             "winRate": summary.win_rate,
+            "expectancyPoints": dist.mean * R_POINTS,
             "expectancyR": dist.mean,
-            "mfeMeanR": summary.mfe_distribution_r.mean,
-            "mfeP50R": summary.mfe_distribution_r.median,
-            "maeMeanR": summary.mae_distribution_r.mean,
-            "maeP50R": summary.mae_distribution_r.median,
+            "mfePoints": {
+                "mean": excursions.mfe_distribution.mean,
+                "p10": excursions.mfe_distribution.p10,
+                "p25": excursions.mfe_distribution.p25,
+                "p50": excursions.mfe_distribution.median,
+                "p75": excursions.mfe_distribution.p75,
+                "p90": excursions.mfe_distribution.p90,
+            },
+            "maePoints": {
+                "mean": excursions.mae_distribution.mean,
+                "p10": excursions.mae_distribution.p10,
+                "p25": excursions.mae_distribution.p25,
+                "p50": excursions.mae_distribution.median,
+                "p75": excursions.mae_distribution.p75,
+                "p90": excursions.mae_distribution.p90,
+            },
+            "outcomeBreakdown": excursions.outcome_breakdown,
             "signalsPerActiveSession": summary.signals_per_active_session,
             "activeSessionCount": summary.active_session_count,
             "chatty": summary.chatty,

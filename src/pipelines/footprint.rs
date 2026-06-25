@@ -156,6 +156,59 @@ impl FootprintPipeline {
     /// rebid/support band; sell-stacked (bid-dominant) marks a reoffer/resistance
     /// band. Returns one [`StackedZone`] per qualifying run.
     pub fn stacked_imbalance_zones(&self, min_ratio: f64, consecutive: usize) -> Vec<StackedZone> {
+        Self::stacked_zones_from_levels(&self.levels(), min_ratio, consecutive)
+    }
+
+    /// Like [`stacked_imbalance_zones`], but over only the trades in the recent
+    /// window `[now_ms - window_ms, now_ms]` — the *initiation burst*, not the
+    /// session-cumulative footprint (IDEA-020 Stage 1.5: trader zones form from a
+    /// quick one-sided burst, not slow all-session accumulation).
+    pub fn stacked_imbalance_zones_recent(
+        &self,
+        min_ratio: f64,
+        consecutive: usize,
+        now_ms: f64,
+        window_ms: f64,
+    ) -> Vec<StackedZone> {
+        Self::stacked_zones_from_levels(
+            &self.recent_levels(now_ms, window_ms),
+            min_ratio,
+            consecutive,
+        )
+    }
+
+    /// Footprint levels built from only the trades in `[now_ms - window_ms, now_ms]`,
+    /// scanning from the most recent trade backward (O(window) not O(session)).
+    fn recent_levels(&self, now_ms: f64, window_ms: f64) -> Vec<(f64, FootprintLevel)> {
+        let cutoff = now_ms - window_ms;
+        let mut windowed: HashMap<i64, FootprintLevel> = HashMap::new();
+        for t in self.trades.iter().rev() {
+            if t.timestamp_ms < cutoff {
+                break; // trades are appended in time order (monotonic guard upstream)
+            }
+            let level = windowed.entry(t.price_key).or_default();
+            if t.is_buy {
+                level.ask_volume += t.volume;
+            } else {
+                level.bid_volume += t.volume;
+            }
+        }
+        let mut out: Vec<(f64, FootprintLevel)> = windowed
+            .into_iter()
+            .map(|(k, v)| (k as f64 * self.tick_size, v))
+            .collect();
+        out.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        out
+    }
+
+    /// Find maximal runs of `>= consecutive` adjacent same-side imbalanced levels
+    /// (`>= min_ratio`) in a price-sorted level list. Shared by the cumulative and
+    /// recent-window zone finders.
+    fn stacked_zones_from_levels(
+        sorted: &[(f64, FootprintLevel)],
+        min_ratio: f64,
+        consecutive: usize,
+    ) -> Vec<StackedZone> {
         #[allow(clippy::too_many_arguments)]
         fn flush(
             dir: Option<bool>,
@@ -181,7 +234,6 @@ impl FootprintPipeline {
             }
         }
 
-        let sorted = self.levels();
         let mut out = Vec::new();
         let mut run_dir: Option<bool> = None;
         let mut run_low = 0.0;
@@ -190,7 +242,7 @@ impl FootprintPipeline {
         let mut run_total = 0.0;
         let mut run_len = 0_usize;
 
-        for (price, lvl) in &sorted {
+        for (price, lvl) in sorted {
             let dir = if lvl.total() <= 0.0 {
                 None
             } else if lvl.ask_volume >= lvl.bid_volume * min_ratio {
@@ -338,6 +390,30 @@ mod tests {
         q.on_trade(21_000.0, 10.0, true, 1.0);
         q.on_trade(21_000.0, 10.0, false, 2.0);
         assert!(q.stacked_imbalance_zones(3.0, 5).is_empty());
+    }
+
+    #[test]
+    fn stacked_imbalance_zones_recent_windows_out_old_bands() {
+        let mut p = FootprintPipeline::new(0.25);
+        // OLD buy-stacked band at t≈0, prices 21000.00–21001.00.
+        for i in 0..5 {
+            let price = 21_000.0 + i as f64 * 0.25;
+            p.on_trade(price, 30.0, true, i as f64);
+            p.on_trade(price, 5.0, false, i as f64);
+        }
+        // RECENT sell-stacked band at t≈1,000,000ms, prices 21010.00–21011.00.
+        let now = 1_000_000.0;
+        for i in 0..5 {
+            let price = 21_010.0 + i as f64 * 0.25;
+            p.on_trade(price, 5.0, true, now + i as f64);
+            p.on_trade(price, 30.0, false, now + i as f64);
+        }
+        // Session-cumulative finds both bands...
+        assert_eq!(p.stacked_imbalance_zones(3.0, 5).len(), 2);
+        // ...the recent 5-min window finds only the recent (sell-stacked) one.
+        let recent = p.stacked_imbalance_zones_recent(3.0, 5, now + 10.0, 300_000.0);
+        assert_eq!(recent.len(), 1, "old band should be windowed out");
+        assert!(!recent[0].is_buy, "the recent band is sell-stacked");
     }
 
     #[test]

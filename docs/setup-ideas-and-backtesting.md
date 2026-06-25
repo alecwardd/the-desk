@@ -755,10 +755,17 @@ the flat-point stop and the zone *definition* — not the exit target — cap th
   A stop can now sit *just past the zone* (`named_level_offset` on `rebid_zone_low`, e.g. `offsetTicks:-4`)
   and a target at a structural level, instead of a flat point — directly attacking the MAE-p50=1R problem.
   Backtest next with zone-anchored stops vs the flat-point baseline.
-- **Recent-window zone detection (next):** the Stage-1 detector reads the *session-cumulative* footprint
-  (`stacked_imbalance_zones` over all accumulated delta-by-price); the trader's zone is a *quick
-  one-sided burst* then a leave. Switch detection to a recent window (`footprint.levels_in_window`) so it
-  forms the trader's zones, not slow-accumulation bands.
+- **Excursion diagnostic (2026-06-25, job `e76710a7`):** uncapping the target (12pt stop / 40pt target)
+  showed trades run **~9–12 pt median MFE** (the earlier ~3 pt was a 9pt-target cap, not reality) — but
+  still short of the 24–36 pt a high-R:R style wants. **Zone-anchored stops underperformed the flat 12 pt**
+  on every rebid-long metric (so the Stage-1.5 anchored-exit idea was a miss; the named-level capability is
+  retained but unused by default). Verdict: the limiter is the **entries**, not the exits.
+- **Recent-window zone detection (landed 2026-06-25):** the Stage-1 detector read the *session-cumulative*
+  footprint; the trader's zone is a *quick one-sided burst* then a leave. Detection now uses a recent
+  window — `footprint.stacked_imbalance_zones_recent(...)` over `ZONE_FOOTPRINT_WINDOW_MS` (300 s, tunable),
+  built by an efficient back-scan of recent trades. Re-backtest the zone entries with this detector (flat
+  12 pt stop, ~9–12 pt target per the diagnostic) — ideally on the cleaner **live-recorded** data, since
+  the gappy NQH6 backfill is a poor judge and we've largely exhausted what it can tell us.
 
 **Stage 2 (deferred — revisit in a future build):**
 - **Per-session zone aggregates** (formed / retested / held / failed / abandoned) rolled into an

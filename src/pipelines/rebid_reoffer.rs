@@ -122,6 +122,9 @@ const FAILURE_DWELL_MS: f64 = 25_000.0;
 const ACCEPT_PACE_PERCENTILE: f64 = 0.6;
 /// How often to rescan the footprint for new bands.
 const RESCAN_INTERVAL_MS: f64 = 2_000.0;
+/// Footprint window used to detect a zone: the recent *initiation burst*, not the
+/// session-cumulative footprint (IDEA-020 Stage 1.5). Tunable.
+const ZONE_FOOTPRINT_WINDOW_MS: f64 = 300_000.0;
 const MAX_ZONES: usize = 50;
 
 impl RebidReofferPipeline {
@@ -162,8 +165,12 @@ impl RebidReofferPipeline {
     }
 
     fn detect_new_zones(&mut self, price: f64, timestamp_ms: f64, footprint: &FootprintPipeline) {
-        let bands: Vec<StackedZone> =
-            footprint.stacked_imbalance_zones(IMBALANCE_RATIO, MIN_STACKED_LEVELS);
+        let bands: Vec<StackedZone> = footprint.stacked_imbalance_zones_recent(
+            IMBALANCE_RATIO,
+            MIN_STACKED_LEVELS,
+            timestamp_ms,
+            ZONE_FOOTPRINT_WINDOW_MS,
+        );
         for band in bands {
             // Skip if a live zone already covers this band.
             let overlaps_existing = self.zones.iter().any(|z| {

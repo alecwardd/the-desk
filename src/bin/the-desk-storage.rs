@@ -3,9 +3,10 @@
 //! Use outside market hours:
 //!   cargo run --bin the-desk-storage -- --status
 //!   cargo run --bin the-desk-storage -- --maintain --vacuum
+//!   cargo run --bin the-desk-storage -- --compact-into X:\TheDesk\state\data_compacted.db
 
 use chrono::{Datelike, Days, Local, NaiveDate};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -17,6 +18,9 @@ struct Args {
     status: bool,
     archive: bool,
     vacuum: bool,
+    compact_into: Option<String>,
+    verify_db: Option<String>,
+    compare_db: Option<String>,
     cutoff: Option<String>,
     retention_days: Option<u64>,
 }
@@ -45,12 +49,18 @@ Usage:
   the-desk-storage --status
   the-desk-storage --archive [--cutoff YYYY-MM-DD]
   the-desk-storage --maintain [--cutoff YYYY-MM-DD] [--vacuum]
+  the-desk-storage --compact-into PATH
+  the-desk-storage --verify-db PATH [--compare-db PATH] [--cutoff YYYY-MM-DD]
 
 Options:
   --status              Print raw tick coverage and storage settings.
   --archive             Archive raw_ticks older than the cutoff.
   --maintain            Archive raw_ticks older than the cutoff. Use with --vacuum to reclaim disk.
   --vacuum              Compact SQLite after archiving. Requires free disk space near current DB size.
+  --compact-into PATH   Checkpoint WAL, VACUUM INTO PATH, then verify destination integrity.
+                        Refuses to overwrite an existing destination file.
+  --verify-db PATH      Verify a database copy before a reclaim swap.
+  --compare-db PATH     With --verify-db, compare key table row counts against this source DB.
   --cutoff DATE         Archive rows with session_date < DATE. Default: today - warm_retention_days.
   --retention-days N    Override configured warm retention days when deriving cutoff.
   --help, -h            Show this help.
@@ -65,6 +75,9 @@ fn parse_args() -> Args {
         status: false,
         archive: false,
         vacuum: false,
+        compact_into: None,
+        verify_db: None,
+        compare_db: None,
         cutoff: None,
         retention_days: None,
     };
@@ -75,6 +88,9 @@ fn parse_args() -> Args {
             "--archive" => parsed.archive = true,
             "--maintain" => parsed.archive = true,
             "--vacuum" => parsed.vacuum = true,
+            "--compact-into" => parsed.compact_into = args.next(),
+            "--verify-db" => parsed.verify_db = args.next(),
+            "--compare-db" => parsed.compare_db = args.next(),
             "--cutoff" => parsed.cutoff = args.next(),
             "--retention-days" => {
                 parsed.retention_days = args.next().and_then(|s| s.parse::<u64>().ok());
@@ -91,7 +107,12 @@ fn parse_args() -> Args {
         }
     }
 
-    if !parsed.status && !parsed.archive && !parsed.vacuum {
+    if !parsed.status
+        && !parsed.archive
+        && !parsed.vacuum
+        && parsed.compact_into.is_none()
+        && parsed.verify_db.is_none()
+    {
         parsed.status = true;
     }
 
@@ -180,6 +201,8 @@ fn print_status(
     )?;
     let page_count: i64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
     let freelist_count: i64 = conn.query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
+    let page_size: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+    let freelist_size_gb = (freelist_count as f64 * page_size as f64) / 1024.0 / 1024.0 / 1024.0;
 
     println!("Database: {}", db_path.display());
     println!("Database size: {:.2} GB", db_size_gb(db_path));
@@ -198,7 +221,9 @@ fn print_status(
         sessions.1.as_deref().unwrap_or("none"),
         sessions.2
     );
-    println!("SQLite pages: total={page_count}, freelist={freelist_count}");
+    println!(
+        "SQLite pages: total={page_count}, freelist={freelist_count}, page_size={page_size}, freelist_size={freelist_size_gb:.2} GB"
+    );
     println!("Cold archive dir: {}", storage.cold_archive_dir);
     println!("Auto archive flag: {}", storage.auto_archive);
     Ok(())
@@ -379,6 +404,159 @@ fn run_vacuum(conn: &Connection, db_path: &Path) -> Result<(), Box<dyn std::erro
     Ok(())
 }
 
+fn verify_sqlite_integrity(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let integrity: String = conn.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
+    if integrity != "ok" {
+        return Err(format!("integrity_check failed for {}: {integrity}", path.display()).into());
+    }
+    Ok(())
+}
+
+fn open_readonly_db(path: &Path) -> Result<Connection, Box<dyn std::error::Error>> {
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    conn.busy_timeout(std::time::Duration::from_secs(30))?;
+    Ok(conn)
+}
+
+fn table_exists(conn: &Connection, table: &str) -> Result<bool, Box<dyn std::error::Error>> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(1) FROM sqlite_schema WHERE type='table' AND name=?1",
+        params![table],
+        |r| r.get(0),
+    )?;
+    Ok(count == 1)
+}
+
+fn table_row_count(conn: &Connection, table: &str) -> Result<i64, Box<dyn std::error::Error>> {
+    if !table
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    {
+        return Err(format!("unsafe table name: {table}").into());
+    }
+    let sql = format!("SELECT COUNT(1) FROM {table}");
+    Ok(conn.query_row(&sql, [], |r| r.get(0))?)
+}
+
+fn verify_reclaim_copy(
+    copy_path: &Path,
+    compare_path: Option<&Path>,
+    cutoff: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("Verifying database copy: {}", copy_path.display());
+    verify_sqlite_integrity(copy_path)?;
+    let copy = open_readonly_db(copy_path)?;
+
+    const REQUIRED_TABLES: &[&str] = &[
+        "raw_ticks",
+        "session_summaries",
+        "market_events",
+        "signal_outcomes",
+        "historical_job_runs",
+        "research_hypotheses",
+        "setups",
+        "playbook_signals",
+        "journal_entries",
+        "risk_state",
+        "account_state",
+    ];
+    for table in REQUIRED_TABLES {
+        if !table_exists(&copy, table)? {
+            return Err(format!("required table missing from copy: {table}").into());
+        }
+    }
+
+    let session_summaries = table_row_count(&copy, "session_summaries")?;
+    if session_summaries <= 0 {
+        return Err("session_summaries is empty in database copy".into());
+    }
+
+    let old_raw_ticks: i64 = copy.query_row(
+        "SELECT COUNT(1) FROM raw_ticks WHERE session_date < ?1",
+        params![cutoff],
+        |r| r.get(0),
+    )?;
+    if old_raw_ticks != 0 {
+        return Err(format!(
+            "database copy still contains {old_raw_ticks} raw_ticks rows older than {cutoff}"
+        )
+        .into());
+    }
+
+    if let Some(compare_path) = compare_path {
+        let source = open_readonly_db(compare_path)?;
+        for table in REQUIRED_TABLES {
+            let source_count = table_row_count(&source, table)?;
+            let copy_count = table_row_count(&copy, table)?;
+            if source_count != copy_count {
+                return Err(format!(
+                    "row-count mismatch for {table}: source={source_count}, copy={copy_count}"
+                )
+                .into());
+            }
+        }
+    }
+
+    println!(
+        "Database copy verified: integrity ok, session_summaries={session_summaries}, cutoff={cutoff}."
+    );
+    Ok(())
+}
+
+fn run_compact_into(
+    conn: &Connection,
+    db_path: &Path,
+    dest_path: &Path,
+    cutoff: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let started = Instant::now();
+
+    if dest_path.exists() {
+        return Err(format!(
+            "compact destination already exists, refusing to overwrite: {}",
+            dest_path.display()
+        )
+        .into());
+    }
+
+    let explicit_parent = dest_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    if let Some(parent) = explicit_parent {
+        fs::create_dir_all(parent)?;
+    }
+
+    let source = fs::canonicalize(db_path)?;
+    let dest_parent = if let Some(parent) = explicit_parent {
+        fs::canonicalize(parent)?
+    } else {
+        std::env::current_dir()?
+    };
+    let dest_name = dest_path
+        .file_name()
+        .ok_or("compact destination must include a file name")?;
+    let canonical_intent = dest_parent.join(dest_name);
+    if source == canonical_intent {
+        return Err("compact destination must be different from the source database".into());
+    }
+
+    println!("Checkpointing WAL before VACUUM INTO...");
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+
+    let dest = dest_path.to_string_lossy().to_string();
+    println!("Running VACUUM INTO {}...", dest_path.display());
+    conn.execute("VACUUM INTO ?1", params![dest])?;
+
+    verify_reclaim_copy(dest_path, Some(db_path), cutoff)?;
+    println!(
+        "VACUUM INTO complete in {:.1?}. Destination size is {:.2} GB.",
+        started.elapsed(),
+        db_size_gb(dest_path)
+    );
+    Ok(())
+}
+
 fn ensure_no_existing_archive_for_cutoff(
     archive_dir: &Path,
     conn: &Connection,
@@ -412,6 +590,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = parse_args();
     let cutoff = derive_cutoff(&args)?;
     let db_path = data_dir().join("data.db");
+
+    if let Some(path) = &args.verify_db {
+        let compare_path = args.compare_db.as_deref().map(Path::new);
+        verify_reclaim_copy(Path::new(path), compare_path, &cutoff)?;
+        return Ok(());
+    }
+
     let temp_dir = sqlite_temp_dir()?;
     println!("SQLite temp dir: {}", temp_dir.display());
     let mut conn = open_db(&db_path, &temp_dir)?;
@@ -435,6 +620,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if args.vacuum {
         run_vacuum(&conn, &db_path)?;
+    }
+
+    if let Some(dest) = &args.compact_into {
+        run_compact_into(&conn, &db_path, Path::new(dest), &cutoff)?;
     }
 
     print_status(&conn, &db_path, &cutoff)?;

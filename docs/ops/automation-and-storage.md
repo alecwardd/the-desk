@@ -2,6 +2,8 @@
 
 This runbook covers The Desk's local Windows ops automation: Sierra Chart lifecycle tasks, SQLite archival/pruning (raw ticks **and DOM depth**), database backups, low-disk alarms, and the one-time external-drive reclaim.
 
+> **See also:** [System Data Flow](../architecture/data-flow.md) — how Sierra Chart, the MCP server, agents, and this maintenance tooling fit together (who writes what, what server startup/shutdown triggers, and the on/off automation question). **Long maintenance jobs (the one-time depth reclaim) should run as a Windows Scheduled Task or in your own terminal — NOT from inside an agent session**, because an agent session restart kills its child processes and relaunches the MCP server (the `data.db` writer), which then contends. `scripts\ops\Run-Depth-Reclaim-Task.ps1` is the autonomous worker for the one-time reclaim.
+
 > **What actually consumes the disk:** the dominant table is **`depth_events`** (DOM depth ingested from Sierra `.depth` files), not `raw_ticks`. It reached 3.6 B rows / ~600 GB before any retention existed. `raw_ticks` is comparatively tiny (~1.75 M rows). The real reclaim and ongoing upkeep both hinge on **pruning `depth_events`** (`depth_retention_days`, default 7); the `.depth` files in `T:\SierraChart\Data\MarketDepthData` are the durable, re-ingestable source.
 
 ## Scheduled Tasks

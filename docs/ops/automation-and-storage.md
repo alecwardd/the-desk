@@ -1,6 +1,8 @@
 # Automation and Storage Runbook
 
-This runbook covers The Desk's local Windows ops automation: Sierra Chart lifecycle tasks, raw-tick archival, low-disk alarms, and the one-time external-drive reclaim.
+This runbook covers The Desk's local Windows ops automation: Sierra Chart lifecycle tasks, SQLite archival/pruning (raw ticks **and DOM depth**), database backups, low-disk alarms, and the one-time external-drive reclaim.
+
+> **What actually consumes the disk:** the dominant table is **`depth_events`** (DOM depth ingested from Sierra `.depth` files), not `raw_ticks`. It reached 3.6 B rows / ~600 GB before any retention existed. `raw_ticks` is comparatively tiny (~1.75 M rows). The real reclaim and ongoing upkeep both hinge on **pruning `depth_events`** (`depth_retention_days`, default 7); the `.depth` files in `T:\SierraChart\Data\MarketDepthData` are the durable, re-ingestable source.
 
 ## Scheduled Tasks
 
@@ -11,7 +13,7 @@ All tasks are registered under `\TheDesk\` by `scripts\ops\Register-DeskTasks.ps
 | `Sierra Watchdog` | Logon and every 4 minutes | Logon and every 4 minutes | Interactive user | During Sun 18:00 ET through Fri 17:00 ET, starts Sierra if `SierraChart_64` is not running. It does not close Sierra during the daily 17:00-18:00 ET maintenance halt. |
 | `Sierra Weekend Close` | Friday 17:10 ET | Friday 16:10 Central | Interactive user | Calls `CloseMainWindow()`, waits up to 60 seconds, then force-kills Sierra if it has not exited. |
 | `Sierra Sunday Open` | Sunday 17:50 ET | Sunday 16:50 Central | Interactive user | Starts Sierra about 10 minutes before Globex opens. |
-| `Weekly Storage Archive` | Saturday 10:00 ET | Saturday 09:00 Central | `SYSTEM`, highest privileges | Runs `the-desk-storage --maintain` only. It aborts if `the-desk-mcp` is running. It does not run vacuum. |
+| `Weekly Storage Archive` | Saturday 10:00 ET | Saturday 09:00 Central | `SYSTEM`, highest privileges | Runs `the-desk-storage --maintain`: archives old `raw_ticks` to cold zst **and prunes `depth_events` older than `depth_retention_days`**. Aborts if `the-desk-mcp` is running. Does not run vacuum (deleted pages are reused; compact only when needed). |
 | `T Drive Low Disk Alarm` | Every 30 minutes | Every 30 minutes | `SYSTEM`, highest privileges | Logs `T:` free space and alerts if free space is below 40 GB. |
 | `Monthly Storage Compaction` | First registered Saturday cadence, 12:00 ET | 11:00 Central | `SYSTEM`, highest privileges | Disabled by default. If enabled, compacts only when SQLite freelist size is at least 50 GB. |
 
@@ -42,15 +44,31 @@ X:\TheDesk\temp\               # SQLite temp files during maintenance
 X:\TheDesk\logs\               # ops logs
 ```
 
-`~\.the-desk\config.toml` should keep `warm_retention_days = 30` and use:
+`~\.the-desk\config.toml` should use:
 
 ```toml
 [storage]
+warm_retention_days = 30      # raw_ticks kept hot in SQLite
 cold_archive_dir = "X:\\TheDesk\\archive"
-auto_archive = true
+auto_archive = true           # vestigial (runtime ignores it; the scheduled task is the real automation)
+depth_retention_days = 7      # DOM depth_events kept hot; older pruned (re-ingestable from .depth)
+
+[backup]
+enabled = true                # set false only during a one-time reclaim
+directory = "X:\\TheDesk\\backups"   # on the 1.8 TB drive, NOT the near-full T:
+min_interval_hours = 24
 ```
 
-`auto_archive` is currently vestigial: the Rust/MCP runtime does not act on it. The scheduled `Weekly Storage Archive` task is the actual automation.
+`auto_archive` is vestigial: the Rust/MCP runtime does not act on it. The scheduled `Weekly Storage Archive` task is the actual automation.
+
+### Database backups — disk-fill hazard
+
+The MCP server takes an automatic **`VACUUM INTO` snapshot on startup** (`[backup]`, default dir `~/.the-desk/backups` → T:). The snapshot is ~the full DB size, so on a near-full drive — or before the DB has been compacted — it can **fill the disk** (observed: a 67 GB partial snapshot took T: to 0 GB free, which would halt recording). Two safeguards:
+
+- Point `[backup].directory` at **X:** so a full-size snapshot can never fill T:. Keep `enabled = false` only while a one-time reclaim runs, then re-enable once the DB is compacted (a snapshot is then small/fast).
+- `perform_backup` deletes the partial file if `VACUUM INTO` fails, so a doomed backup can't accumulate as an orphan.
+
+Note: the `the-desk-mcp` server is launched by **whatever Claude Code / Cursor session is active**, not only Cursor — so it can restart and re-trigger the startup backup. Stop it before any DB maintenance.
 
 ## One-Time Reclaim Runbook
 
@@ -83,8 +101,8 @@ During DB work the script stops only `the-desk-mcp`. Sierra Chart may keep runni
 1. Mounts `X:` as NTFS `DeskArchive`.
 2. Moves existing cold archives from `T:\TheDesk\archive` to `X:\TheDesk\archive`.
 3. Runs `the-desk-storage --status` to catch archive filename collisions.
-4. Runs `the-desk-storage --maintain --cutoff <ET-derived cutoff>`.
-5. Runs `the-desk-storage --compact-into X:\TheDesk\state\data_compacted.db`.
+4. Runs `the-desk-storage --maintain --cutoff <ET-derived cutoff>` — archives old `raw_ticks` **and prunes `depth_events`** to `depth_retention_days`. On a first run with years of accumulated DOM depth this is the slow step: a chunked, WAL-bounded delete of billions of rows that can take **several hours** (~150–200 K rows/s). It is safe to leave running; the WAL is checkpointed so it cannot fill T:.
+5. Runs `the-desk-storage --compact-into X:\TheDesk\state\data_compacted.db` — only now does the file shrink (delete moves pages to the freelist; `VACUUM INTO` copies just the live rows).
 6. Verifies the compacted copy: SQLite integrity, required tables, `session_summaries > 0`, row-count parity, and no `raw_ticks` older than the warm cutoff.
 7. Re-checks that `the-desk-mcp` is stopped and `data.db` is unlocked immediately before swapping.
 8. Copies the compacted DB to `T:` and verifies that copy before replacing the original when it fits; otherwise falls back to delete-then-move.
@@ -94,10 +112,13 @@ Logs are written to `X:\TheDesk\logs`; pre-format logs temporarily start under `
 
 ## Recovery Story
 
-The reclaim deletes old `raw_ticks` from SQLite only after monthly zstd archives are written and verified. The computed/research tables stay in the compacted SQLite DB. If old raw tick data is needed again, recover it from:
+The reclaim deletes old `raw_ticks` from SQLite only after monthly zstd archives are written and verified. Pruned `depth_events` are deleted outright (no zst archive) because the Sierra `.depth` files already hold the same data far more compactly. The computed/research tables stay in the compacted SQLite DB. If old data is needed again, recover it from:
 
-- `X:\TheDesk\archive\raw_ticks_*.csv.zst` for archived SQLite rows.
-- Sierra Chart `.scid` files in `T:\SierraChart\Data` for replay/backfill. The Desk reads `.scid`; it does not alter Sierra's recording files.
+- `X:\TheDesk\archive\raw_ticks_*.csv.zst` for archived raw-tick SQLite rows.
+- Sierra Chart `.scid` files in `T:\SierraChart\Data` for raw-tick replay/backfill.
+- Sierra Chart `.depth` files in `T:\SierraChart\Data\MarketDepthData` (~92 GB) to re-ingest pruned DOM `depth_events`.
+
+The Desk reads `.scid`/`.depth`; it does not alter Sierra's recording files.
 
 The hot DB remains on `T:` after compaction. Do not run The Desk from the USB drive.
 

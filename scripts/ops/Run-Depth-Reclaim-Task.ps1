@@ -31,10 +31,10 @@ Log "=== depth reclaim worker start ==="
 Log "stopping the-desk-mcp (the only data.db writer that contends)"
 Get-Process the-desk-mcp -ErrorAction SilentlyContinue | Stop-Process -Force
 
-Log "step 1/2: --prune-depth (resumes any prior partial prune)"
-& $exe --prune-depth *>> $log
-if ($LASTEXITCODE -ne 0) { Log "prune-depth FAILED exit $LASTEXITCODE; aborting before compaction."; exit $LASTEXITCODE }
-Log "prune-depth complete"
+Log "step 1/2: rowid-based depth prune (avoids the trading_day full-scan; resumes any prior partial prune)"
+& python "C:\the-desk\scripts\ops\fast_depth_prune.py" *>> $log
+if ($LASTEXITCODE -ne 0) { Log "fast_depth_prune FAILED exit $LASTEXITCODE; aborting before compaction."; exit $LASTEXITCODE }
+Log "depth prune complete"
 
 if (Test-Path $compacted) { Log "removing stale compacted copy $compacted"; Remove-Item $compacted -Force }
 

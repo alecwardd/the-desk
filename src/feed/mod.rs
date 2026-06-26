@@ -133,10 +133,18 @@ pub struct StorageConfig {
     /// Whether to auto-archive at session close.
     #[serde(default)]
     pub auto_archive: bool,
+    /// Days to keep DOM `depth_events` in SQLite. Default: 7. The `.depth` source
+    /// files remain the durable record, so older depth rows are re-ingestable.
+    #[serde(default = "default_depth_retention_days")]
+    pub depth_retention_days: u32,
 }
 
 fn default_warm_days() -> u32 {
     30
+}
+
+fn default_depth_retention_days() -> u32 {
+    7
 }
 
 fn default_archive_dir() -> String {
@@ -156,6 +164,7 @@ impl Default for StorageConfig {
             warm_retention_days: 30,
             cold_archive_dir: default_archive_dir(),
             auto_archive: false,
+            depth_retention_days: default_depth_retention_days(),
         }
     }
 }

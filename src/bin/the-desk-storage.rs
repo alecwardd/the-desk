@@ -23,6 +23,9 @@ struct Args {
     compare_db: Option<String>,
     cutoff: Option<String>,
     retention_days: Option<u64>,
+    prune_depth: bool,
+    depth_cutoff: Option<String>,
+    depth_retention_days: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -49,21 +52,26 @@ Usage:
   the-desk-storage --status
   the-desk-storage --archive [--cutoff YYYY-MM-DD]
   the-desk-storage --maintain [--cutoff YYYY-MM-DD] [--vacuum]
+  the-desk-storage --prune-depth [--depth-cutoff YYYY-MM-DD]
   the-desk-storage --compact-into PATH
   the-desk-storage --verify-db PATH [--compare-db PATH] [--cutoff YYYY-MM-DD]
 
 Options:
-  --status              Print raw tick coverage and storage settings.
-  --archive             Archive raw_ticks older than the cutoff.
-  --maintain            Archive raw_ticks older than the cutoff. Use with --vacuum to reclaim disk.
-  --vacuum              Compact SQLite after archiving. Requires free disk space near current DB size.
-  --compact-into PATH   Checkpoint WAL, VACUUM INTO PATH, then verify destination integrity.
-                        Refuses to overwrite an existing destination file.
-  --verify-db PATH      Verify a database copy before a reclaim swap.
-  --compare-db PATH     With --verify-db, compare key table row counts against this source DB.
-  --cutoff DATE         Archive rows with session_date < DATE. Default: today - warm_retention_days.
-  --retention-days N    Override configured warm retention days when deriving cutoff.
-  --help, -h            Show this help.
+  --status                  Print raw tick coverage and storage settings.
+  --archive                 Archive raw_ticks older than the cutoff (also prunes depth_events).
+  --maintain                Archive raw_ticks + prune depth_events. Use with --vacuum to reclaim disk.
+  --vacuum                  Compact SQLite after archiving. Requires free disk space near current DB size.
+  --prune-depth             Delete depth_events older than the depth cutoff (the .depth files remain
+                            the durable source, so pruned rows are re-ingestable). Chunked + WAL-bounded.
+  --depth-cutoff DATE       Prune depth_events with trading_day < DATE. Default: today - depth_retention_days.
+  --depth-retention-days N  Override configured depth retention days when deriving the depth cutoff.
+  --compact-into PATH       Checkpoint WAL, VACUUM INTO PATH, then verify destination integrity.
+                            Refuses to overwrite an existing destination file.
+  --verify-db PATH          Verify a database copy before a reclaim swap.
+  --compare-db PATH         With --verify-db, compare key table row counts against this source DB.
+  --cutoff DATE             Archive rows with session_date < DATE. Default: today - warm_retention_days.
+  --retention-days N        Override configured warm retention days when deriving cutoff.
+  --help, -h                Show this help.
 
 Config: ~/.the-desk/config.toml [storage]
 "#
@@ -80,6 +88,9 @@ fn parse_args() -> Args {
         compare_db: None,
         cutoff: None,
         retention_days: None,
+        prune_depth: false,
+        depth_cutoff: None,
+        depth_retention_days: None,
     };
 
     while let Some(arg) = args.next() {
@@ -94,6 +105,11 @@ fn parse_args() -> Args {
             "--cutoff" => parsed.cutoff = args.next(),
             "--retention-days" => {
                 parsed.retention_days = args.next().and_then(|s| s.parse::<u64>().ok());
+            }
+            "--prune-depth" => parsed.prune_depth = true,
+            "--depth-cutoff" => parsed.depth_cutoff = args.next(),
+            "--depth-retention-days" => {
+                parsed.depth_retention_days = args.next().and_then(|s| s.parse::<u64>().ok());
             }
             "--help" | "-h" => {
                 println!("{}", usage());
@@ -110,6 +126,7 @@ fn parse_args() -> Args {
     if !parsed.status
         && !parsed.archive
         && !parsed.vacuum
+        && !parsed.prune_depth
         && parsed.compact_into.is_none()
         && parsed.verify_db.is_none()
     {
@@ -134,6 +151,107 @@ fn derive_cutoff(args: &Args) -> Result<String, Box<dyn std::error::Error>> {
         .checked_sub_days(Days::new(retention_days))
         .ok_or("retention cutoff underflow")?;
     Ok(cutoff.format("%Y-%m-%d").to_string())
+}
+
+/// Derive the `depth_events` prune cutoff (`trading_day < cutoff`). Honors an explicit
+/// `--depth-cutoff`, else `today - depth_retention_days`.
+fn derive_depth_cutoff(args: &Args) -> Result<String, Box<dyn std::error::Error>> {
+    if let Some(cutoff) = &args.depth_cutoff {
+        NaiveDate::parse_from_str(cutoff, "%Y-%m-%d")?;
+        return Ok(cutoff.clone());
+    }
+
+    let storage = load_storage_config();
+    let days = args
+        .depth_retention_days
+        .unwrap_or(u64::from(storage.depth_retention_days));
+    let today = Local::now().date_naive();
+    let cutoff = today
+        .checked_sub_days(Days::new(days))
+        .ok_or("depth retention cutoff underflow")?;
+    Ok(cutoff.format("%Y-%m-%d").to_string())
+}
+
+/// Delete `depth_events` older than `cutoff` in bounded chunks.
+///
+/// `depth_events` can hold billions of rows, so we delete in batches and checkpoint
+/// the WAL periodically — a single giant `DELETE` would build a WAL larger than the
+/// (often near-full) data drive. The `.depth` source files remain the durable record,
+/// so pruned rows are re-ingestable. Rows with a NULL `trading_day` are left in place
+/// (they cannot be dated). Reclaim the freed pages afterward with `--compact-into`.
+fn prune_depth_events(conn: &Connection, cutoff: &str) -> Result<i64, Box<dyn std::error::Error>> {
+    if !table_exists(conn, "depth_events")? {
+        println!("No depth_events table; nothing to prune.");
+        return Ok(0);
+    }
+
+    println!("Pruning depth_events with trading_day < {cutoff} in chunks (.depth files remain the source)...");
+    const BATCH: i64 = 200_000;
+    let started = Instant::now();
+    let mut deleted_total: i64 = 0;
+    let mut batches: u64 = 0;
+    loop {
+        let n = conn.execute(
+            "DELETE FROM depth_events
+             WHERE rowid IN (
+                 SELECT rowid FROM depth_events WHERE trading_day < ?1 LIMIT ?2
+             )",
+            params![cutoff, BATCH],
+        )? as i64;
+        deleted_total += n;
+        batches += 1;
+        // Bound the WAL on a near-full drive: truncate-checkpoint every ~2M rows.
+        if batches.is_multiple_of(10) {
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+            println!(
+                "  pruned {deleted_total} depth rows so far in {:.0?}...",
+                started.elapsed()
+            );
+        }
+        if n < BATCH {
+            break;
+        }
+    }
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+    println!(
+        "Pruned {deleted_total} depth_events rows in {:.1?}. Run --compact-into to reclaim the freed pages.",
+        started.elapsed()
+    );
+    Ok(deleted_total)
+}
+
+/// Report DOM `depth_events` coverage. Uses index endpoints and `MAX(rowid)` only —
+/// never a full `COUNT(*)`, which would scan billions of rows.
+fn print_depth_status(
+    conn: &Connection,
+    depth_cutoff: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !table_exists(conn, "depth_events")? {
+        return Ok(());
+    }
+    // SQLite only index-optimizes ONE MIN/MAX aggregate per query; selecting both in
+    // a single statement forces a full scan of billions of rows. Query them separately
+    // so each resolves via an index endpoint.
+    let lo: Option<String> =
+        conn.query_row("SELECT MIN(trading_day) FROM depth_events", [], |r| {
+            r.get(0)
+        })?;
+    let hi: Option<String> =
+        conn.query_row("SELECT MAX(trading_day) FROM depth_events", [], |r| {
+            r.get(0)
+        })?;
+    let approx_rows: i64 = conn
+        .query_row("SELECT MAX(rowid) FROM depth_events", [], |r| {
+            r.get::<_, Option<i64>>(0)
+        })?
+        .unwrap_or(0);
+    println!(
+        "Depth events: {} through {}, approx_rows(max rowid)={approx_rows}",
+        lo.as_deref().unwrap_or("none"),
+        hi.as_deref().unwrap_or("none"),
+    );
+    println!("Depth prune cutoff: trading_day < {depth_cutoff}");
+    Ok(())
 }
 
 fn sqlite_temp_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
@@ -589,6 +707,7 @@ fn ensure_no_existing_archive_for_cutoff(
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = parse_args();
     let cutoff = derive_cutoff(&args)?;
+    let depth_cutoff = derive_depth_cutoff(&args)?;
     let db_path = data_dir().join("data.db");
 
     if let Some(path) = &args.verify_db {
@@ -603,7 +722,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if args.status {
         print_status(&conn, &db_path, &cutoff)?;
-        if !args.archive && !args.vacuum {
+        print_depth_status(&conn, &depth_cutoff)?;
+        if !args.archive && !args.vacuum && !args.prune_depth {
             return Ok(());
         }
     }
@@ -618,6 +738,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         archive_old_ticks(&mut conn, &cutoff)?;
     }
 
+    // --maintain/--archive and --prune-depth both prune DOM depth to its retention window.
+    if args.archive || args.prune_depth {
+        prune_depth_events(&conn, &depth_cutoff)?;
+    }
+
     if args.vacuum {
         run_vacuum(&conn, &db_path)?;
     }
@@ -627,5 +752,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     print_status(&conn, &db_path, &cutoff)?;
+    print_depth_status(&conn, &depth_cutoff)?;
     Ok(())
 }

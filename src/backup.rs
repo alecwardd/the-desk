@@ -194,7 +194,14 @@ pub fn perform_backup(
     let dest = unique_destination(dir, now);
     let dest_str = dest.to_string_lossy().into_owned();
 
-    db.backup_to(&dest_str)?;
+    // `VACUUM INTO` can fail partway through (most commonly: the destination drive
+    // fills up — which is exactly when this fires, since the snapshot is ~DB-sized).
+    // On failure it leaves a partial file behind; remove it so a doomed backup cannot
+    // accumulate as a multi-GB orphan that itself fills the drive.
+    if let Err(err) = db.backup_to(&dest_str) {
+        let _ = std::fs::remove_file(&dest);
+        return Err(err.into());
+    }
 
     let verified = verify_backup_file(&dest).unwrap_or(false);
     if !verified {

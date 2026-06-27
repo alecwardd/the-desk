@@ -2,8 +2,12 @@
 
 After PR1 (`regime`, `ib_extension_state`) and PR2 (`absorption_invalidated`), both ideas are
 backtestable through the standard hypothesis loop. Run these from a Cursor agent (or any MCP client)
-against the live `~/.the-desk/data.db`. The rules engine is at `RULES_ENGINE_SCHEMA_VERSION = 3`, so
+against the live `~/.the-desk/data.db`. The rules engine is at `RULES_ENGINE_SCHEMA_VERSION = 5`, so
 fresh backtests are current and will pass the engine-version freshness gate.
+
+> **New here?** Read [data-and-backtesting-guide.md](data-and-backtesting-guide.md) first for the
+> general method, the data model, freshness gates, and the isolated-DB setup. This doc holds the
+> concrete IDEA-000 / IDEA-012 registration templates.
 
 **Window:** `2025-11-28` → `2026-03-06` (the 81-session validated RTH sample). Regime states are rare
 (`up_only` was ~12 sessions in this window), so watch the `dryRun` projection — if `feasibleForN30`
@@ -148,9 +152,10 @@ longer have to eyeball N to catch a state-flag setup re-firing.
 
 - **Direction is now a field** (`absorption_invalidation_direction`, added 2026-06-23); v2 uses it
   instead of the looser `price_vs_vwap` scoping.
-- After this field addition the rules engine is at `RULES_ENGINE_SCHEMA_VERSION = 4` — rebuild
-  `target/release/the-desk-mcp.exe` and restart the Cursor MCP server before registering, or it will
-  reject the new field (see `docs/setup-ideas-and-backtesting.md` infra findings).
+- The rules engine is now at `RULES_ENGINE_SCHEMA_VERSION = 5`. After any field/operator change,
+  rebuild `target_alt/release/the-desk-mcp.exe` (the binary Cursor runs) and restart the MCP server
+  before registering, or it will reject the new field (see `docs/setup-ideas-and-backtesting.md`
+  infra findings).
 - Pass the contract that was front during the window (`NQH6.CME` for 2025-11-28…2026-03-06) with
   `force: true`. **Once the contract-routing change is deployed** (rebuild + restart), pass it directly
   to `run_backtest` as `{ "contract": "NQH6.CME" }` — this replays that contract's `.scid` without

@@ -140,6 +140,7 @@ Read these before working on related components:
 | Sierra SCID / feed | Before working on `.scid` tailing, symbol resolution, or `.depth` | `skills/trading-domain/SKILL.md` + `src/feed/` |
 | Compliance | Before writing prompts or marketing text | `skills/compliance-research/SKILL.md` |
 | MCP Tools | Before calling or adding MCP tools — scenario routing for agents | `skills/mcp-tools/SKILL.md` |
+| Data & Backtesting | **Before any backtesting or working with recorded data** — data model, where it lives, the backtest workflow | `docs/data-and-backtesting-guide.md` |
 
 ---
 

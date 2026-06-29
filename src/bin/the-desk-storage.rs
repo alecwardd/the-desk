@@ -172,20 +172,81 @@ fn derive_depth_cutoff(args: &Args) -> Result<String, Box<dyn std::error::Error>
     Ok(cutoff.format("%Y-%m-%d").to_string())
 }
 
-/// Delete `depth_events` older than `cutoff` in bounded chunks.
+/// Smallest rowid whose `trading_day >= cutoff`, found by binary search over the
+/// primary key. `depth_events.rowid` (the AUTOINCREMENT id) is monotonic with
+/// `trading_day` because ingestion is chronological, so each probe is an O(log n)
+/// primary-key lookup.
 ///
-/// `depth_events` can hold billions of rows, so we delete in batches and checkpoint
-/// the WAL periodically — a single giant `DELETE` would build a WAL larger than the
-/// (often near-full) data drive. The `.depth` source files remain the durable record,
-/// so pruned rows are re-ingestable. Rows with a NULL `trading_day` are left in place
-/// (they cannot be dated). Reclaim the freed pages afterward with `--compact-into`.
+/// This deliberately avoids `WHERE trading_day < cutoff`: once the table is large the
+/// planner abandons the trading_day index and full-scans the whole (multi-hundred-GB)
+/// table on every delete batch, collapsing the prune to ~8k rows/s. Returns `None` for
+/// an empty table. Near a day boundary, slight ingestion non-monotonicity can shift the
+/// threshold by a few rows — acceptable, since the `.depth` files are the source and a
+/// stray row is re-ingestable or pruned on the next run.
+fn depth_prune_threshold_rowid(
+    conn: &Connection,
+    cutoff: &str,
+) -> Result<Option<i64>, Box<dyn std::error::Error>> {
+    let min_rowid: Option<i64> =
+        conn.query_row("SELECT MIN(rowid) FROM depth_events", [], |r| r.get(0))?;
+    let max_rowid: Option<i64> =
+        conn.query_row("SELECT MAX(rowid) FROM depth_events", [], |r| r.get(0))?;
+    let (mut lo, mut hi) = match (min_rowid, max_rowid) {
+        (Some(lo), Some(hi)) => (lo, hi),
+        _ => return Ok(None),
+    };
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let probe: Option<(i64, Option<String>)> = conn
+            .query_row(
+                "SELECT rowid, trading_day FROM depth_events WHERE rowid >= ?1 ORDER BY rowid LIMIT 1",
+                params![mid],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()?;
+        match probe {
+            None => hi = mid,
+            // NULL trading_day (undatable) or older than cutoff -> on the delete side.
+            Some((rid, td)) if td.as_deref().is_none_or(|d| d < cutoff) => lo = rid + 1,
+            Some((rid, _)) => hi = rid,
+        }
+    }
+    Ok(Some(lo))
+}
+
+/// Delete `depth_events` older than `cutoff` in bounded chunks, by rowid.
+///
+/// We resolve the retention cutoff to a rowid boundary (see
+/// [`depth_prune_threshold_rowid`]) and then delete `rowid < threshold` in batches,
+/// checkpointing the WAL periodically — a single giant `DELETE` would build a WAL larger
+/// than the (often near-full) data drive. The `.depth` source files remain the durable
+/// record, so pruned rows are re-ingestable. Reclaim the freed pages with `--compact-into`.
 fn prune_depth_events(conn: &Connection, cutoff: &str) -> Result<i64, Box<dyn std::error::Error>> {
     if !table_exists(conn, "depth_events")? {
         println!("No depth_events table; nothing to prune.");
         return Ok(0);
     }
 
-    println!("Pruning depth_events with trading_day < {cutoff} in chunks (.depth files remain the source)...");
+    let threshold = match depth_prune_threshold_rowid(conn, cutoff)? {
+        Some(t) => t,
+        None => {
+            println!("depth_events is empty; nothing to prune.");
+            return Ok(0);
+        }
+    };
+    let min_rowid: i64 = conn
+        .query_row("SELECT MIN(rowid) FROM depth_events", [], |r| {
+            r.get::<_, Option<i64>>(0)
+        })?
+        .unwrap_or(threshold);
+    if threshold <= min_rowid {
+        println!("No depth_events older than {cutoff}; nothing to prune.");
+        return Ok(0);
+    }
+
+    println!(
+        "Pruning depth_events older than {cutoff} (rowid < {threshold}) in chunks (.depth files remain the source)..."
+    );
     const BATCH: i64 = 200_000;
     let started = Instant::now();
     let mut deleted_total: i64 = 0;
@@ -194,9 +255,9 @@ fn prune_depth_events(conn: &Connection, cutoff: &str) -> Result<i64, Box<dyn st
         let n = conn.execute(
             "DELETE FROM depth_events
              WHERE rowid IN (
-                 SELECT rowid FROM depth_events WHERE trading_day < ?1 LIMIT ?2
+                 SELECT rowid FROM depth_events WHERE rowid < ?1 LIMIT ?2
              )",
-            params![cutoff, BATCH],
+            params![threshold, BATCH],
         )? as i64;
         deleted_total += n;
         batches += 1;
@@ -754,4 +815,74 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     print_status(&conn, &db_path, &cutoff)?;
     print_depth_status(&conn, &depth_cutoff)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    /// Seed an in-memory `depth_events` with rows in chronological `(trading_day, count)`
+    /// order, so rowid is monotonic with trading_day (mirrors live ingestion).
+    fn seed(days: &[(&str, i64)]) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE depth_events (id INTEGER PRIMARY KEY AUTOINCREMENT, trading_day TEXT);",
+        )
+        .unwrap();
+        for (day, count) in days {
+            for _ in 0..*count {
+                conn.execute(
+                    "INSERT INTO depth_events (trading_day) VALUES (?1)",
+                    params![day],
+                )
+                .unwrap();
+            }
+        }
+        conn
+    }
+
+    #[test]
+    fn threshold_is_first_rowid_at_or_after_cutoff() {
+        // rowids 1..=3 -> 06-17, 4..=7 -> 06-18, 8..=12 -> 06-19
+        let conn = seed(&[("2026-06-17", 3), ("2026-06-18", 4), ("2026-06-19", 5)]);
+        let thr = depth_prune_threshold_rowid(&conn, "2026-06-19")
+            .unwrap()
+            .unwrap();
+        assert_eq!(thr, 8);
+    }
+
+    #[test]
+    fn prune_deletes_only_rows_older_than_cutoff() {
+        let conn = seed(&[("2026-06-17", 3), ("2026-06-18", 4), ("2026-06-19", 5)]);
+        let deleted = prune_depth_events(&conn, "2026-06-19").unwrap();
+        assert_eq!(deleted, 7);
+        let remaining: i64 = conn
+            .query_row("SELECT COUNT(*) FROM depth_events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining, 5);
+        let min_day: String = conn
+            .query_row("SELECT MIN(trading_day) FROM depth_events", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(min_day, "2026-06-19");
+    }
+
+    #[test]
+    fn prune_is_a_noop_when_nothing_is_older() {
+        let conn = seed(&[("2026-06-19", 5)]);
+        assert_eq!(prune_depth_events(&conn, "2026-06-19").unwrap(), 0);
+    }
+
+    #[test]
+    fn threshold_none_for_empty_table() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE depth_events (id INTEGER PRIMARY KEY, trading_day TEXT);")
+            .unwrap();
+        assert_eq!(
+            depth_prune_threshold_rowid(&conn, "2026-06-19").unwrap(),
+            None
+        );
+    }
 }

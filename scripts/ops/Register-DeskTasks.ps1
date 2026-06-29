@@ -80,6 +80,13 @@ $watchdogRepeat = New-ScheduledTaskTrigger -Once -At ((Get-Date).Date.AddMinutes
 $fridayClose = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Friday -At "16:10"
 $sundayOpen = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Sunday -At "16:50"
 $weeklyArchive = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Saturday -At "09:00"
+# Option A (retry-until-idle): repeat hourly across Saturday so maintenance runs the
+# first hour the MCP writer is down. Run-Weekly-Archive.ps1 aborts (exit 0) if the MCP
+# is up; the archive + rowid depth prune are idempotent, so later hourly fires that find
+# nothing aged-out are cheap no-ops. No forced app shutdown.
+$weeklyArchive.Repetition = (New-ScheduledTaskTrigger -Once -At "09:00" `
+        -RepetitionInterval (New-TimeSpan -Hours 1) `
+        -RepetitionDuration (New-TimeSpan -Hours 10)).Repetition
 $diskAlarm = New-ScheduledTaskTrigger -Once -At ((Get-Date).Date.AddMinutes(2)) -RepetitionInterval (New-TimeSpan -Minutes 30) -RepetitionDuration (New-TimeSpan -Days 3650)
 $monthlyCompact = New-ScheduledTaskTrigger -Weekly -WeeksInterval 4 -DaysOfWeek Saturday -At "11:00"
 
@@ -113,7 +120,7 @@ Register-DeskTask `
     -Triggers $weeklyArchive `
     -Principal $systemPrincipal `
     -Settings $maintenanceSettings `
-    -Description "Saturday 10:00 ET / 09:00 Central archive/delete of old raw_ticks. Aborts if the MCP writer is running."
+    -Description "Saturdays from 09:00 Central (10:00 ET), retrying hourly for 10h: archive old raw_ticks + fast rowid depth prune. Each fire aborts if the MCP writer is up, so it runs the first idle hour; later fires are idempotent no-ops."
 
 Register-DeskTask `
     -Name "T Drive Low Disk Alarm" `

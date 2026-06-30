@@ -9,3 +9,5 @@ Use these files for durable doctrine:
 - `identity.md` — who the trader is, account constraints, recurring behavioral guardrails
 - `playbook-doctrine.md` — setup-family rules of engagement and known false positives
 - `lessons-learned.md` — dated lessons, postmortems, and rules promoted from experience
+
+**Planned extension (social intelligence):** validated patterns from trusted external accounts will live primarily in SQLite (`agent_insights` categories) per [architecture.md](architecture.md#external-context-planned--idea-023--adr-020). Doctrine promotion to markdown remains deliberate. Feature track: [social-intelligence-roadmap.md](../social-intelligence-roadmap.md).

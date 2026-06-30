@@ -444,6 +444,18 @@ For trade discussions, the full risk-coach output replaces the brief footer:
 - Day-type and time-of-day notes
 - Active warnings (circuit breaker approaching, drawdown threshold, thin tape)
 
+## Planned: Social account confluence (ADR-020 — not yet built)
+
+When `get_account_confluence` ships (Phase A), extend setup checks and market reads:
+
+1. After baseline + structure calls, call `get_account_confluence` when the trader asks for confluence or during setup evaluation.
+2. Compare watchlist lean to structure + playbook using **confluence types** (directional, structural, regime, causal, divergent) — see `docs/social-intelligence-roadmap.md`.
+3. Attribute all third-party reads: "Account @handle posted…" — never "Twitter says take the trade."
+4. Flag divergence explicitly when the trader's read or playbook differs from the watchlist.
+5. Surface externally sourced setup hypotheses as **candidates for backtest** (Phase B+), not alerts.
+
+Social data never fires playbook conditions and never adjusts sizing unless the trader adds an explicit playbook rule.
+
 ## Compliance
 
 - Coaching-only language. No trade recommendations.

@@ -46,6 +46,30 @@ Sources:
 
 Coaching reminders are ranked and scoped. Agents must not dump all notes into every turn.
 
+### External context (planned — IDEA-023 / ADR-020)
+
+Third-party reads from a curated X watchlist are **not** a fourth aggregation engine competing with opportunity or execution stats. They are Layer-3 context that may produce **trader-validated coaching insights** after confluence checks.
+
+Planned sources (Phase A+):
+
+- `social_posts` cache (raw posts; agent synthesizes lean at conversation time)
+- `external_ideas` queue (promoted third-party hypotheses — Phase B+)
+- Research joins: `social_alignment` × `signal_outcomes` (Phase C)
+
+Planned insight categories:
+
+- `social_confluence` — patterns about when external reads aligned with your structure/playbook
+- `account_calibration` — per-handle timing and domain (early/late, macro/micro)
+- `external_hypothesis` — fate of promoted external setup ideas after backtest
+
+Rules:
+
+- External context never adjusts opportunity or execution aggregates directly.
+- Sample-size and reliability gates apply to any longitudinal social × outcome claim.
+- Third-party opinion surfaces with attribution; memory stores **your validated observations**, not influencer gospel.
+
+Full spec: [social-intelligence-roadmap.md](../social-intelligence-roadmap.md).
+
 ## Reliability
 
 Use one reliability helper everywhere:

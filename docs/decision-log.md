@@ -472,3 +472,39 @@ New `FeedConfig` fields (all serde-default): `max_ticks_per_poll` (5000), `analy
 - Carry only running high/low for outcome resolution instead of a pending set — rejected because it cannot reproduce the exact first-crossing target/stop semantics the DB tracker guarantees.
 
 **Consequences:** Rule and setup *firing* is now sampled (≤250 ms / 500 ticks) rather than evaluated on every tick — an accepted 100–250 ms alert-coalescing tradeoff for discretionary coaching. Outcome excursion accuracy stays per-tick exact. Parity tests assert capped == uncapped final pipeline state and coalesced == per-tick outcome extremes. `process_tick` is retained for tests and replay utilities but is no longer on the live path.
+
+---
+
+## Pending
+
+### ADR-020: Social intelligence as an isolated Layer-3 feature track
+
+**Date:** 2026-06-30
+**Status:** Pending
+**Related:** [social-intelligence-roadmap.md](social-intelligence-roadmap.md), [social-confluence-design.md](social-confluence-design.md) (Phase A spec), [setup-ideas-and-backtesting.md](setup-ideas-and-backtesting.md) IDEA-023, https://docs.x.com/tools/mcp
+
+**Context:** The trader wants trusted X accounts to inform live confluence checks, surface backtesting hypotheses, provide real-time context from voices they respect, and prompt subagents with externally sourced edge situations — while The Desk stays data-based and the deterministic core stays clean. X now exposes a hosted MCP server with read-only post/timeline/search access. Broader vision (continual learning via memory + research, external idea queue, subagent-scoped calibration) is documented in the roadmap; v1 is account confluence only. Two questions must be answered before building: (1) how this fits The Desk's strict layer separation, and (2) the X API access mode and cost, given X moved to pay-per-use (~$0.005/read, 2M/mo cap, then Enterprise $42k+/mo) with legacy Basic/Pro closed to new signups.
+
+**Decision (proposed, not yet committed):**
+
+1. **Phase A (v1):** Build **account confluence** as a new isolated `src/social/` module operating at Layer 3 only. Rust fetches + caches posts in a background task into a `social_posts` table; the agent synthesizes the lean (no Claude API from Rust); a read-only `get_account_confluence` MCP tool returns structured data. It never fires a playbook alert and never touches `pipelines/` or `rules/`. Feature-flagged with graceful degradation.
+
+2. **Phases B–D (follow-on, same ADR track):** Event logging when confluence is checked; research conditionals (`social_alignment` × structure × outcomes); memory promotion (`social_confluence`, `account_calibration`, `external_hypothesis` insight categories). Subagent "learning" is **system learning** (SQLite memory + research), not neural weight updates.
+
+3. **External idea queue:** Third-party setup ideas enter a trader-gated `external_ideas` queue → promoted to IDEA entries → backtested like internal hypotheses. Subagents prompt exploration; market data validates edge.
+
+4. **Deferred:** Open-firehose sentiment indicator; if pursued later, compute only over the curated watchlist (reusing cache), not the open platform.
+
+**Open items blocking "Decided":**
+- Access mode: read-only Bearer token vs OAuth 2.0 — **trader undecided**; cost ceiling TBD.
+- Watchlist contents and poll cadence (RTH-only vs 24h).
+- Whether a curated-list sentiment score ships in v1 or confluence-context only.
+- Idea extraction cadence (on poll vs on-demand) and which agent owns the hypothesis queue.
+
+**Alternatives considered:**
+- Put social data through the rules engine as a condition field — rejected (violates Rule #3: alerts must trace to the trader's own playbook).
+- RL / fine-tuning subagents on Twitter data — rejected for v1 (subagents are prompt frameworks; learning belongs in memory/research layers; compliance risk).
+- Open-platform full-archive sentiment index in v1 — rejected for now (read-cap/Enterprise cost, low signal quality: bots, sarcasm, sampling bias).
+- Separate repo/service — deferred; co-locating lets the agent pull market structure + social context in one conversation, provided isolation is strict.
+
+**Consequences:** A new optional network dependency enters the codebase, quarantined to Layer 3 behind a feature flag. Until ADR-020 is marked Decided, no live-credential wiring lands. [social-confluence-design.md](social-confluence-design.md) is the Phase A build spec; [social-intelligence-roadmap.md](social-intelligence-roadmap.md) is the working feature track for weeks/months ahead.

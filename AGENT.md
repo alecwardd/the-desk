@@ -99,6 +99,14 @@ When you need specialized help, spawn subagents for these tasks.
 **How:** Via orchestrator (automatic) or directly as `risk-coach` (defined in `agents/risk-coach.md`).
 **Capabilities:** Session-start balance/position confirmation, dynamic R derivation (compounding), 1/4 Kelly sizing with confidence scaling, consecutive-loss circuit breaker (3 losses = hard stop), drawdown-based size scaling (2R = half size, 3R = stopped), heat tracking (aggregate open exposure), day-type and time-of-day risk awareness, trade result recording via `record_trade_result` MCP tool.
 
+### Social intelligence & continual learning (planned — IDEA-023 / ADR-020)
+
+**When:** Comparing trusted X account posts to live structure/playbook; ingesting external backtest hypotheses; longitudinal research on social alignment × outcomes.
+
+**How:** Feature track documented in [docs/social-intelligence-roadmap.md](docs/social-intelligence-roadmap.md). Phase A adds `get_account_confluence` (Layer 3 only). Subagents stay data-based — "learning" is SQLite memory + research conditionals, not neural RL. Third-party ideas enter a trader-gated queue before backtest. Orchestrator and `backtest-analyst` are primary consumers; see roadmap for specialist roles.
+
+**Not yet built.** No live X credential wiring until ADR-020 is Decided.
+
 ---
 
 ## Implementation Workflow

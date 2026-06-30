@@ -8,6 +8,7 @@ Standalone deep-dive specs referenced by ideas in this document:
 
 - **Multi-instrument flow architecture (NQ / MNQ / ES / MES)** — [`docs/multi-instrument-flow-architecture.md`](multi-instrument-flow-architecture.md) (tracked as IDEA-021): share structure / separate flow, mini-vs-micro flow-agreement → conviction & sizing, cross-asset NQ↔ES.
 - **IDEA-000 / IDEA-012 backtest runbook** — [`docs/idea000-idea012-backtest-runbook.md`](idea000-idea012-backtest-runbook.md): copy-pasteable register → backtest → gate → activate sequence.
+- **Social intelligence & continual learning (X/Twitter)** — [`docs/social-intelligence-roadmap.md`](social-intelligence-roadmap.md) (master feature track), [`docs/social-confluence-design.md`](social-confluence-design.md) (Phase A v1 spec), [`decision-log.md`](decision-log.md) ADR-020 (Pending), **IDEA-023** below: curated watchlist confluence, external hypothesis queue, subagent-scoped memory/research learning — never a playbook alert source. Access mode + cost still undecided.
 
 ---
 
@@ -787,6 +788,8 @@ no further IDEA-020 backtest variations on NQH6.
   the regime classifier a second, independent signal (the v1 regime gate was too loose).
 - **DOM corroboration** (`dom_summary` bid/ask pull-rates): confirm the "original aggressor reloads +
   trapped passive side covers" mechanic on the retest. `dom_summary` is delayed context, not live book.
+  **Rally-side variant:** see **IDEA-022** (touch offer replenishment vs exhaustion) for the specific
+  DOM signature that marks many initiative rally ends — offers stop refilling after lifts.
 - **Tick-adjacency** for "consecutive levels" (Stage 1 uses consecutive entries in the sorted footprint,
   matching existing `stacked_imbalances`); revisit if gappy bands cause false zones.
 
@@ -794,6 +797,130 @@ no further IDEA-020 backtest variations on NQH6.
 > What is the R-distribution of entering on a retest of a held footprint zone with a tight (≤5-tick) stop?
 
 > Do sessions with a high abandoned-zone ratio close as trend days more often than the base rate?
+
+**Research extension — zone establishment age & clearance velocity (2026-06-30):**
+
+Live Globex observation (London handoff): overhead sell absorption / reoffer bands that had been
+defending for minutes were **cleared quickly** once buyers printed held rebid and pace turned — the
+push through **30036–30040** took far less time than the zones had been in place. Hypothesis: *how
+long a zone has existed* and *how fast opposing flow clears it* may be independent, actionable
+signals — not just zone status (`Held` / `Failed`).
+
+| Metric | Definition (derivable today) | Question |
+|--------|------------------------------|----------|
+| **`zone_age_ms`** | `now − timestamp_ms` at status transition | Do fresher zones hold more often than stale ones? |
+| **`time_to_retest_ms`** | `retested_ms − timestamp_ms` | Fast retest vs slow retest — which has better Held→continuation? |
+| **`time_to_clear_ms`** | `failure_cross_ms → Failed` (or first trade through band with acceptance) | Does a zone cleared in &lt;X s predict follow-through better than a grind? |
+| **`clearance_velocity_ticks_per_sec`** | Extension through band ÷ time from first cross to `Failed` | "Snap" clears vs slow acceptance — vacuum vs contested break |
+| **`establishment_vs_clear_ratio`** | `zone_age_ms / time_to_clear_ms` | Long-established shelf cleared instantly → initiative tell? |
+
+**Why this fits IDEA-020 (not a new pipeline):** `AccelerationZone` already stores `timestamp_ms`,
+`retested_ms`, and `failure_cross_ms`; acceptance dwell is `FAILURE_DWELL_MS` (~25 s). What's
+missing is **event logging + research queries** on those durations, not new detection logic.
+Mirror the absorption pipeline's `time_to_invalidation_ms` pattern (IDEA-012).
+
+**Backtesting hypotheses (add to queue once zone events are logged):**
+
+> When a held reoffer zone with `zone_age_ms > Y` is cleared with `time_to_clear_ms < X` and pace
+> percentile &gt; Z, what is 15/30-minute follow-through vs slow clears of the same band?
+
+> Do rebid zones that reach `Held` within `time_to_retest_ms < X` outperform slow-forming held zones
+> on MFE before MAE (same flat stop baseline as IDEA-020 Stage 1.5)?
+
+> On sessions where many long-established zones are cleared quickly in one direction, does close
+> direction align more often than the base rate? (Feeds IDEA-020 Stage 2 regime-from-zone-outcomes.)
+
+**Implementation note:** Log structured `zone_status_transition` events (from → to, durations above) into
+`market_events` during backfill/live; expose rolling "nearest zone age" on MCP for coaching context.
+Do **not** add playbook alerts until sample size ≥ 30 on live-recorded depth history — same guardrail
+as IDEA-022.
+
+---
+
+### IDEA-022: Rally Offer Replenishment / Touch Offer Exhaustion
+
+**Status:** Idea (2026-06-29)
+**Source:** Live London Globex DOM observation session 2026-06-29; trader doctrine — *price only rises when buyers lift willing sellers at the offer; rallies often end when offers stop replenishing after being consumed ("no one left to sell to the buyers")*
+**Complements:** IDEA-020 (DOM corroboration on zone lifecycle), IDEA-012 (liquidity vacuum after failed defense — different trigger, similar air-pocket mechanics), absorption/exhaustion pipelines
+**Targets:** Sierra Chart ACSIL study (execution chart) + The Desk `depth` pipeline + MCP DOM tools + optional rules-engine condition fields
+
+**Concept:** During an initiative rally, **sellers on the ask are fuel, not friction**. Each tick higher requires a buyer to lift displayed offer liquidity. A healthy uptrend shows a repeating microstructure loop:
+
+1. Buyer lifts the ask (trade at offer)
+2. Offer liquidity is consumed
+3. **Fresh offers reload** at the same or next tick up
+4. Repeat
+
+A rally often stalls or ends when step (3) fails — the touch goes **hollow**: lifts clear the ask, nothing meaningful reloads, price may still tick up briefly on air, then the auction pauses or reverses. The trader's discretionary read (~50% of local rally endings) is specifically this **offer-replenishment failure at the touch**, distinct from:
+
+- **Ask reload during extension** (healthy — sellers still willing to sell to buyers)
+- **Far-book positioning** (e.g. contingency walls several points away — not the immediate touch mechanic)
+- **Bid-side absorption** (defense below, not offer depletion above)
+- **Generic high churn** (activity without distinguishing fill→refill vs fill→vacuum)
+
+**Two measurable states:**
+
+| State | DOM signature | Rally implication |
+|-------|---------------|-----------------|
+| **Healthy offer reload** | Ask decreases classified as fills; stacked quantity returns at/near touch within short window; `near_touch_ask_depth` stable or cycling | Buyers still have liquidity to lift — rally mechanism intact |
+| **Touch offer exhaustion** | Lifts consume ask; reload latency rises or refill stops; `near_touch_ask_depth` collapses and stays thin; price may print new highs on minimal lift volume | "No one left to sell" — high-probability stall / end-of-leg tell |
+
+**Why this is quantifiable:** The Desk already ingests Sierra `MarketDepthData` `.depth` files and cross-references `.scid` trade volume to separate **likely fills from likely pulls** (`aggregate_trade_volume_by_level` in `src/depth/mod.rs`; exposed via `get_pull_stack_activity`, `get_liquidity_behavior_at_level`, `explain_book_reaction`). `DomSummary` already carries touch-adjacent fields: `near_touch_ask_depth`, `ask_pull_rate`, `refill_rate`, `touch_level_churn_per_minute`, `pull_stack_bias`. What does **not** exist yet is a **directional, rally-scoped** metric that answers: *after buyers lift the offer during an up-leg, does the offer come back?*
+
+**Proposed metrics (v1 — implementable without new data sources):**
+
+1. **`ask_refill_rate`** (ask-only) — same formula as today's combined `refill_rate` (`stacked / removed` on the ask side only), computed over a rolling 30–60s window at the touch band (best ask ± N ticks).
+2. **`post_fill_replenish_ratio`** — for each ask decrease classified as a **fill** at price *P*, did displayed ask quantity at *P* or *P + tick* return above threshold within *T* ms (e.g. 500 ms–2 s)? Ratio over the window = replenishment health.
+3. **`touch_offer_depletion_score`** — `ask_fills / (ask_fills + ask_post_fill_reloads)` during an up-tape segment (price making higher highs). Rises toward 1.0 as lifts stop being replenished.
+4. **`vacuum_lift_count`** — price ticks up ≥ N ticks while `near_touch_ask_depth` ≤ threshold and ask fill volume is below baseline — air-pocket lifts.
+5. **`rally_offer_exhaustion_state`** (enum) — `Healthy` | `Thinning` | `Exhausted`, derived from composite: new/high-near-high price + falling ask refill + collapsing near-touch ask depth + optional pace spike on low lift volume.
+
+**Context gating (avoid false signals):**
+
+- Scope to **initiative direction** — measure ask replenishment only when tape/regime indicates an up-leg (positive session or leg delta, price above VWAP, higher-high structure, or explicit "rally leg" detector). Mirror for down-legs on the bid side.
+- Distinguish **reload** from **spoof pull** — reload follows a classified fill; pull-without-fill is not replenishment failure.
+- Require **minimum touch churn** — exhaustion is meaningful only when the rally had been actively trading two-sided at the touch (avoid declaring exhaustion in a dead market).
+
+**Sierra Chart ACSIL study (trader-facing):**
+
+- Custom study or chart-region indicator on the execution chart, fed by Sierra's native market depth + last trade (no MCP dependency at screen time).
+- Display suggestions: offer-replenishment health meter (green/yellow/red), post-fill reload markers at the touch, optional alert when `Exhausted` fires on a new high.
+- Thresholds should be session-pace aware (London Globex vs RTH open) — same pattern as IDEA-019's adaptive volume bar logic.
+
+**The Desk / MCP integration (agent-facing):**
+
+- Add computed fields to `DomSummary` / `MarketState`: `ask_refill_rate`, `touch_offer_exhaustion_state`, optional rolling `post_fill_replenish_ratio`.
+- New or extended MCP tools: e.g. `get_touch_offer_health` (live + historical window) returning the metrics above with staleness and confidence labels; wire into `get_dom_regime_summary` narrative.
+- Optional rules-engine fields for playbook alerts: `touch_offer_exhaustion_state`, `ask_refill_rate_below`, `vacuum_lift_detected` — **coaching only**, framed as "your playbook watches for offer depletion after initiative legs."
+- Historical: replay `.depth` + `.scid` through backfill; log structured `touch_offer_exhaustion` events into `market_events` for frequency/conditional research (same pattern as absorption events).
+
+**Relationship to existing ideas:**
+
+- **IDEA-020 Stage 2** already lists "DOM corroboration" on zone retests — this idea is the **specific DOM mechanic** for rally-end detection at the touch, not zone lifecycle per se.
+- **IDEA-012** vacuum is **failed defense + break**; offer exhaustion is **successful rally + fuel runs out** — complementary, different entry location.
+- Today's `refill_rate` in `dom_summary` is **bid+ask combined** — useful context but **not sufficient** for the rally-offer thesis; ask-only and post-fill scoped variants are the core gap.
+
+**Backtesting hypotheses (when instrumented):**
+
+> During Globex/RTH up-legs that print a session or leg high, what fraction of highs are followed within 5–15 minutes by a ≥ X-tick pullback when `touch_offer_exhaustion_state = Exhausted` vs `Healthy`?
+
+> Does `post_fill_replenish_ratio` below threshold at a new high predict stall better than generic `ask_pull_rate` or combined `refill_rate`?
+
+> On IDEA-020 held buy-zone continuation entries, does ask replenishment staying healthy through the lift improve MFE before MAE vs entries where the touch was already hollow?
+
+**Implementation sequencing (suggested — not started):**
+
+1. **Rust prototype** — ask-only refill + post-fill replenish detector in `src/depth/mod.rs`; unit tests with synthetic `.depth` + trade alignment fixtures.
+2. **Live surface** — expose via MCP; add to `get_dom_regime_summary` liquidity narrative.
+3. **Sierra study** — parallel ACSIL indicator for discretionary chart (shared threshold constants in config doc, not hardcoded in both places).
+4. **Event detector + research** — log exhaustion transitions; run conditional queries once N ≥ 30 on live-recorded depth history.
+5. **Playbook** — only after backtest or live-eye validation; avoid repeating IDEA-012's over-firing mistake.
+
+**Open questions to resolve before prototyping:**
+
+- Default replenish window *T* (500 ms vs 2 s) and minimum reload size (contracts at touch for NQ).
+- Whether "touch" = best ask only or best ask + 1 tick (NQ often lifts through stacked offers).
+- Alert suppression after exhaustion (one-shot per leg vs recurring).
 
 ---
 
@@ -996,6 +1123,39 @@ Allow VWAP to be anchored from a user-specified event or time, not just the sess
 **Why it is non-trivial:** Today the architecture is optimized around a **primary** symbol stream (Sierra `.scid` tail + SQLite + `MarketState`). Multi-symbol implies duplicate or partitioned pipeline engines, feed scheduling, database keys or separate tables per instrument, MCP tool parameters (or namespaces) for “which symbol,” and clear rules for **never mixing RTH/Globex across symbols** in a single calculation by accident.
 
 **Sequencing:** Treat this as **Phase B** after IDEA-017 (and related MCP hardening): stabilize the agent contract first, then expand capacity so the same contract applies per symbol without ambiguity.
+
+---
+
+### IDEA-023: Social Intelligence & Continual Learning (X / Trusted Accounts)
+
+**Status:** Idea (exploration documented; Phase A build blocked on ADR-020 trader decisions)
+**Source:** Trader vision — trusted X accounts for live confluence, backtest hypothesis discovery, and subagent prompts from external edge situations
+**Complements:** All setup IDEAs (hypothesis source), orchestrator + specialists, trader memory layer, research query engine
+**Requires:** X Developer API access (pay-per-use; see cost model in spec), curated watchlist
+
+**Framing:** A **platform feature track**, not a single setup. Trusted accounts contribute in different ways: real-time confluence, regime framing, level callouts, backtest hypotheses, and edge-case prompts. The Desk compares external reads to **deterministic structure + the trader's playbook**; third-party ideas enter a **trader-gated queue** before any backtest or template work.
+
+**Architecture (non-negotiable):**
+- Layer 3 only (`src/social/`); pipelines and rules engine unchanged
+- Social data never fires playbook alerts (Rule #3)
+- Subagent "learning" = SQLite memory + research conditionals, not neural RL
+- Compliance: third-party attribution; hypotheses for *your* validation
+
+**Phased delivery:**
+
+| Phase | Deliverable | Doc |
+|-------|-------------|-----|
+| A | Watchlist cache + `get_account_confluence` MCP tool | [social-confluence-design.md](social-confluence-design.md) |
+| B | Confluence event logging | [social-intelligence-roadmap.md](social-intelligence-roadmap.md) |
+| C | Research conditionals (`social_alignment` × outcomes) | roadmap |
+| D | Memory categories + per-account calibration | roadmap + [trader-memory/architecture.md](trader-memory/architecture.md) |
+| E+ | RAG over post history; optional model training | roadmap (defer) |
+
+**Success criteria (Phase A):** During a setup check, the orchestrator can report watchlist lean vs structure vs playbook with explicit confluence/divergence typing, without any social-derived alert.
+
+**Success criteria (full track):** Externally sourced hypotheses flow into IDEA entries and backtests; longitudinal stats show when alignment with specific accounts correlated with the trader's setup outcomes (sample-size gated).
+
+**Open decisions:** Watchlist, API access mode, budget ceiling, poll cadence, idea extraction cadence — see [roadmap open questions](social-intelligence-roadmap.md#open-questions-trader-decisions).
 
 ---
 
@@ -1389,6 +1549,7 @@ Ordered by expected information value × implementation ease:
 | 13 | Three-session alignment → range extension beyond IB | IDEA-005 | multi-session data | Low |
 | 14 | Prior Globex VWAP as S/R in first 60 min of RTH on unwind days | IDEA-016 | session VWAP snapshots, ticks | Low |
 | 15 | Anchored VWAP from IB break: band respect vs session VWAP bands | IDEA-016 | IB break events, ticks | Low |
+| 16 | Zone establishment age vs clearance velocity → follow-through / regime | IDEA-020 | zone lifecycle events, pace | Medium |
 
 ---
 
@@ -1427,4 +1588,4 @@ Immediate next target: rerun IDEA-011 under this runbook and promote the verifie
 
 ---
 
-*Last updated: 2026-05-04*
+*Last updated: 2026-06-30*

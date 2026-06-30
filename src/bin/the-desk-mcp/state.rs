@@ -448,6 +448,8 @@ pub(crate) struct BoundarySessionCacheEntry {
     pub(crate) prior_reference: Option<PriorDayReference>,
     pub(crate) rollover_status: Option<ContractRolloverStatus>,
     pub(crate) prior_inventory: Vec<PriorSessionData>,
+    pub(crate) rth_rvol_curves: Vec<Vec<f64>>,
+    pub(crate) globex_rvol_curves: Vec<Vec<f64>>,
     #[allow(dead_code)]
     pub(crate) refreshed_at: Instant,
 }

@@ -1,10 +1,14 @@
 use serde::{Deserialize, Serialize};
 
-/// Number of 5-minute buckets in a 6.5-hour RTH session (9:30–16:00 ET).
-pub const RVOL_RTH_BUCKETS: usize = 78;
+/// Number of 5-minute buckets in a 6.75-hour RTH session (9:30–16:15 ET).
+pub const RVOL_RTH_BUCKETS: usize = 81;
 /// Number of 5-minute buckets in a Globex session (18:00–09:30 ET = 15.5h = 186 buckets).
 /// We use 18:00→09:30 because that's the overnight window before RTH opens.
 pub const RVOL_GLOBEX_BUCKETS: usize = 186;
+/// RVOL bucket size in minutes.
+pub const RVOL_BUCKET_SIZE_MINUTES: usize = 5;
+/// Minimum real same-session curves needed before the baseline is considered fully reliable.
+pub const RVOL_MIN_BASELINE_SESSIONS: usize = 5;
 /// Globex start in ET minutes from midnight (18:00 = 1080).
 const GLOBEX_START_ET: i32 = 1080;
 /// RTH open in ET minutes from midnight (09:30 = 570).
@@ -15,11 +19,22 @@ const RTH_OPEN_ET: i32 = 570;
 #[serde(rename_all = "camelCase")]
 #[derive(Default)]
 pub enum RvolClassification {
-    Low,
     #[default]
+    Unavailable,
+    Low,
     Normal,
     Elevated,
     High,
+}
+
+/// Quality state for the active RVOL baseline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RvolBaselineStatus {
+    Ok,
+    Partial,
+    Synthetic,
+    Unavailable,
 }
 
 /// Relative Volume pipeline: compares current session volume to N-day average at same time-of-day.
@@ -32,6 +47,7 @@ pub struct RvolPipeline {
     session_volume: f64,
     current_minute: i32,
     lookback_days: usize,
+    globex_lookback_days: usize,
     is_globex: bool,
 
     // --- Historical baseline ---
@@ -67,6 +83,7 @@ impl RvolPipeline {
             session_volume: 0.0,
             current_minute: 0,
             lookback_days: 20,
+            globex_lookback_days: 0,
             is_globex: false,
             historical_curve: Vec::new(),
             historical_ratios_at_bucket: Vec::new(),
@@ -118,6 +135,7 @@ impl RvolPipeline {
         let (avg, ratios) = Self::compute_curve_stats(curves);
         self.globex_historical_curve = avg;
         self.globex_ratios_at_bucket = ratios;
+        self.globex_lookback_days = curves.len();
     }
 
     /// Compute average curve and per-day ratios from a set of session curves.
@@ -157,17 +175,6 @@ impl RvolPipeline {
         (avg, ratios)
     }
 
-    /// Build a simple cumulative 5-minute baseline curve from total session volume.
-    /// Used as fallback when no real per-bucket curves are stored.
-    pub fn curve_from_total_volume(total_volume: f64) -> Vec<f64> {
-        if total_volume <= 0.0 {
-            return vec![0.0; RVOL_RTH_BUCKETS];
-        }
-        (1..=RVOL_RTH_BUCKETS)
-            .map(|i| total_volume * (i as f64 / RVOL_RTH_BUCKETS as f64))
-            .collect()
-    }
-
     /// Process a trade. For RTH, `minute_of_session` is minutes since 9:30 ET.
     /// For Globex, pass `et_minutes` (minutes since midnight ET) and call with is_globex=true.
     pub fn on_trade(&mut self, volume: f64, minute_of_session: i32) {
@@ -195,9 +202,14 @@ impl RvolPipeline {
                         self.bucket_volumes[b] = self.session_volume - volume;
                     }
                 }
-                // Record RVOL ratio at completed bucket
-                let ratio_at_complete = self.compute_ratio_at_bucket(bucket.saturating_sub(1));
-                self.bucket_ratios.push(ratio_at_complete);
+                // Record RVOL ratio at completed bucket only when that bucket
+                // has a real baseline; missing baselines must not poison
+                // velocity/acceleration with fabricated values.
+                if let Some(ratio_at_complete) =
+                    self.compute_ratio_at_bucket(bucket.saturating_sub(1))
+                {
+                    self.bucket_ratios.push(ratio_at_complete);
+                }
             }
         } else if bucket > 0 {
             // First trade is past bucket 0 — fill earlier buckets
@@ -220,7 +232,7 @@ impl RvolPipeline {
     }
 
     /// Compute RVOL ratio at a specific bucket index against the active historical curve.
-    fn compute_ratio_at_bucket(&self, bucket: usize) -> f64 {
+    fn compute_ratio_at_bucket(&self, bucket: usize) -> Option<f64> {
         let curve = self.active_curve();
         let expected = curve.get(bucket).copied().unwrap_or(0.0);
         let actual = self
@@ -229,12 +241,9 @@ impl RvolPipeline {
             .copied()
             .unwrap_or(self.session_volume);
         if expected <= 0.0 {
-            if actual > 0.0 {
-                return 2.0;
-            }
-            return 1.0;
+            return None;
         }
-        actual / expected
+        Some(actual / expected)
     }
 
     /// Return the active historical curve based on session type.
@@ -253,6 +262,18 @@ impl RvolPipeline {
         } else {
             &self.historical_ratios_at_bucket
         }
+    }
+
+    fn active_lookback_days(&self) -> usize {
+        if self.is_globex {
+            self.globex_lookback_days
+        } else {
+            self.lookback_days
+        }
+    }
+
+    fn bucket_lookback_days(&self, bucket: usize) -> usize {
+        self.active_ratios().get(bucket).map(Vec::len).unwrap_or(0)
     }
 
     /// Convert ET minutes to a Globex bucket index.
@@ -281,7 +302,7 @@ impl RvolPipeline {
         if self.is_globex {
             Self::globex_bucket_index(self.current_minute).unwrap_or(0)
         } else {
-            (self.current_minute / 5).max(0) as usize
+            (self.current_minute / RVOL_BUCKET_SIZE_MINUTES as i32).max(0) as usize
         }
     }
 
@@ -290,10 +311,7 @@ impl RvolPipeline {
         let idx = self.bucket_index();
         let expected = self.active_curve().get(idx).copied().unwrap_or(0.0);
         if expected <= 0.0 {
-            if self.session_volume > 0.0 {
-                return 2.0; // no baseline, default to "high" if volume exists
-            }
-            return 1.0;
+            return f64::NAN;
         }
         self.session_volume / expected
     }
@@ -305,7 +323,13 @@ impl RvolPipeline {
     }
 
     pub fn classification(&self) -> RvolClassification {
+        if !self.has_authoritative_baseline_at_current_bucket() {
+            return RvolClassification::Unavailable;
+        }
         let ratio = self.rvol_ratio() * 100.0;
+        if !ratio.is_finite() {
+            return RvolClassification::Unavailable;
+        }
         if ratio < 85.0 {
             RvolClassification::Low
         } else if ratio <= 100.0 {
@@ -320,8 +344,11 @@ impl RvolPipeline {
     /// Rate of change of RVOL ratio over the last completed bucket transition.
     /// Positive = volume accelerating vs expectation, negative = decelerating.
     pub fn rvol_velocity(&self) -> f64 {
+        if !self.has_authoritative_baseline_at_current_bucket() {
+            return f64::NAN;
+        }
         if self.bucket_ratios.len() < 2 {
-            return 0.0;
+            return f64::NAN;
         }
         let n = self.bucket_ratios.len();
         self.bucket_ratios[n - 1] - self.bucket_ratios[n - 2]
@@ -329,8 +356,11 @@ impl RvolPipeline {
 
     /// Second derivative: acceleration of RVOL velocity.
     pub fn rvol_acceleration(&self) -> f64 {
+        if !self.has_authoritative_baseline_at_current_bucket() {
+            return f64::NAN;
+        }
         if self.bucket_ratios.len() < 3 {
-            return 0.0;
+            return f64::NAN;
         }
         let n = self.bucket_ratios.len();
         let v1 = self.bucket_ratios[n - 1] - self.bucket_ratios[n - 2];
@@ -343,11 +373,14 @@ impl RvolPipeline {
     pub fn rvol_percentile(&self) -> f64 {
         let idx = self.bucket_index();
         let today_ratio = self.rvol_ratio();
+        if !today_ratio.is_finite() || !self.has_authoritative_baseline_at_current_bucket() {
+            return f64::NAN;
+        }
         let ratios = self.active_ratios();
 
         let historical = match ratios.get(idx) {
             Some(v) if !v.is_empty() => v,
-            _ => return 50.0, // default to median if no history
+            _ => return f64::NAN,
         };
 
         let count_below = historical.iter().filter(|&&r| r < today_ratio).count();
@@ -365,11 +398,60 @@ impl RvolPipeline {
     }
 
     pub fn lookback_days(&self) -> usize {
-        self.lookback_days
+        self.active_lookback_days()
     }
 
     pub fn is_globex(&self) -> bool {
         self.is_globex
+    }
+
+    pub fn baseline_status(&self) -> RvolBaselineStatus {
+        let idx = self.bucket_index();
+        let expected = self.active_curve().get(idx).copied().unwrap_or(0.0);
+        let bucket_lookback = self.bucket_lookback_days(idx);
+        if expected <= 0.0 || bucket_lookback == 0 {
+            RvolBaselineStatus::Unavailable
+        } else if bucket_lookback < RVOL_MIN_BASELINE_SESSIONS {
+            RvolBaselineStatus::Partial
+        } else {
+            RvolBaselineStatus::Ok
+        }
+    }
+
+    pub fn baseline_status_label(&self) -> &'static str {
+        match self.baseline_status() {
+            RvolBaselineStatus::Ok => "ok",
+            RvolBaselineStatus::Partial => "partial",
+            RvolBaselineStatus::Synthetic => "synthetic",
+            RvolBaselineStatus::Unavailable => "unavailable",
+        }
+    }
+
+    pub fn baseline_caveat(&self) -> Option<String> {
+        let loaded = self.bucket_lookback_days(self.bucket_index());
+        match self.baseline_status() {
+            RvolBaselineStatus::Ok => None,
+            RvolBaselineStatus::Partial => Some(format!(
+                "RVOL baseline is partial: {loaded}/20 same-session curves loaded."
+            )),
+            RvolBaselineStatus::Synthetic => Some(
+                "RVOL baseline is synthetic and is not treated as market evidence.".to_string(),
+            ),
+            RvolBaselineStatus::Unavailable => Some(format!(
+                "RVOL baseline unavailable: {loaded}/20 same-session curves loaded for this bucket."
+            )),
+        }
+    }
+
+    pub fn lookback_days_at_current_bucket(&self) -> usize {
+        self.bucket_lookback_days(self.bucket_index())
+    }
+
+    pub fn has_authoritative_baseline_at_current_bucket(&self) -> bool {
+        matches!(
+            self.baseline_status(),
+            RvolBaselineStatus::Ok | RvolBaselineStatus::Partial
+        )
     }
 }
 
@@ -378,19 +460,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rvol_with_no_history_defaults_high() {
+    fn rvol_with_no_history_is_unavailable() {
         let mut p = RvolPipeline::new();
         p.start_session(false);
         p.on_trade(100.0, 5);
-        // No historical curve → ratio defaults to 2.0 → High
-        assert_eq!(p.classification(), RvolClassification::High);
+        assert!(p.rvol_ratio().is_nan());
+        assert_eq!(p.classification(), RvolClassification::Unavailable);
+        assert_eq!(p.baseline_status(), RvolBaselineStatus::Unavailable);
     }
 
     #[test]
     fn rvol_tracks_ratio() {
         let mut p = RvolPipeline::new();
         p.start_session(false);
-        p.load_historical_curve(&[vec![1000.0, 2000.0, 3000.0]]);
+        p.load_historical_curve(&vec![vec![1000.0, 2000.0, 3000.0]; 5]);
         p.on_trade(500.0, 0);
         let ratio = p.rvol_ratio();
         assert!((ratio - 0.5).abs() < 0.01);
@@ -401,7 +484,7 @@ mod tests {
     fn rvol_elevated_range() {
         let mut p = RvolPipeline::new();
         p.start_session(false);
-        p.load_historical_curve(&[vec![1000.0]]);
+        p.load_historical_curve(&vec![vec![1000.0]; 5]);
         p.on_trade(1100.0, 0);
         assert_eq!(p.classification(), RvolClassification::Elevated);
     }
@@ -410,7 +493,7 @@ mod tests {
     fn bucket_volumes_captured_on_transition() {
         let mut p = RvolPipeline::new();
         p.start_session(false);
-        p.load_historical_curve(&[vec![100.0; 78]]);
+        p.load_historical_curve(&vec![vec![100.0; RVOL_RTH_BUCKETS]; 5]);
 
         // Trade in bucket 0 (minute 0-4)
         p.on_trade(50.0, 2);
@@ -445,7 +528,7 @@ mod tests {
         let mut p = RvolPipeline::new();
         p.start_session(false);
         // Historical: each bucket expects 100 cumulative
-        p.load_historical_curve(&[vec![100.0, 200.0, 300.0, 400.0]]);
+        p.load_historical_curve(&vec![vec![100.0, 200.0, 300.0, 400.0]; 5]);
 
         p.on_trade(110.0, 0); // bucket 0: ratio = 110/100 = 1.1
         p.on_trade(10.0, 5); // bucket 1: ratio = 120/200 = 0.6, records ratio at bucket 0
@@ -504,7 +587,7 @@ mod tests {
         assert_eq!(p.bucket_volumes.len(), RVOL_GLOBEX_BUCKETS);
 
         // Load Globex historical curve
-        p.load_globex_historical_curve(&[vec![50.0; RVOL_GLOBEX_BUCKETS]]);
+        p.load_globex_historical_curve(&vec![vec![50.0; RVOL_GLOBEX_BUCKETS]; 5]);
 
         // Trade at 18:00 ET (et_minutes = 1080, globex bucket 0)
         p.on_trade(60.0, 1080);
@@ -515,11 +598,31 @@ mod tests {
     }
 
     #[test]
-    fn curve_from_total_volume_fallback() {
-        let curve = RvolPipeline::curve_from_total_volume(7800.0);
-        assert_eq!(curve.len(), RVOL_RTH_BUCKETS);
-        // Linear: bucket 0 = 7800 * 1/78 = 100, bucket 77 = 7800
-        assert!((curve[0] - 100.0).abs() < 0.01);
-        assert!((curve[77] - 7800.0).abs() < 0.01);
+    fn missing_bucket_baseline_skips_ratio_recording() {
+        let mut p = RvolPipeline::new();
+        p.start_session(false);
+        p.load_historical_curve(&vec![vec![100.0]; 5]);
+
+        p.on_trade(50.0, 0);
+        p.on_trade(50.0, 5);
+        p.on_trade(50.0, 10);
+
+        assert_eq!(p.bucket_ratios.len(), 1);
+        assert!(p.rvol_velocity().is_nan());
+        assert!(p.rvol_percentile().is_nan());
+    }
+
+    #[test]
+    fn mixed_rth_curve_lengths_mark_late_buckets_partial() {
+        let mut p = RvolPipeline::new();
+        p.start_session(false);
+        let mut curves = vec![vec![100.0; 78]; 5];
+        curves.push(vec![100.0; RVOL_RTH_BUCKETS]);
+        p.load_historical_curve(&curves);
+
+        p.on_trade(100.0, 400);
+        assert_eq!(p.bucket_index(), 80);
+        assert_eq!(p.lookback_days_at_current_bucket(), 1);
+        assert_eq!(p.baseline_status(), RvolBaselineStatus::Partial);
     }
 }

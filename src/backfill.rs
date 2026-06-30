@@ -381,7 +381,11 @@ pub fn summary_from_state(
         excess_low: state.excess_low,
         poor_high: state.poor_high,
         poor_low: state.poor_low,
-        rvol_ratio: state.rvol_ratio,
+        rvol_ratio: if state.rvol_ratio.is_finite() {
+            state.rvol_ratio
+        } else {
+            0.0
+        },
         close_vs_ib_mid,
         close_vs_vwap,
         close_vs_poc,
@@ -564,20 +568,29 @@ where
         .map_err(runtime_err)?;
     }
 
-    let rvol_curves = options.rth_rvol_curves.unwrap_or_else(|| {
-        db.recent_session_volume_curves("RTH", 20)
-            .unwrap_or_default()
-    });
-    let globex_rvol_curves = options.globex_rvol_curves.unwrap_or_else(|| {
-        db.recent_session_volume_curves("Globex", 20)
-            .unwrap_or_default()
-    });
-
     let mut pipeline = PipelineEngine::new();
     let contract_metadata = options
         .contract_metadata
         .unwrap_or_else(|| resolve_contract_metadata(&load_feed_config()));
     pipeline.set_contract_metadata(contract_metadata.clone());
+    let rvol_curves = options.rth_rvol_curves.unwrap_or_else(|| {
+        db.recent_session_volume_curves_for_contract(
+            "RTH",
+            20,
+            Some(&contract_metadata.root_symbol),
+            Some(&contract_metadata.contract_symbol),
+        )
+        .unwrap_or_default()
+    });
+    let globex_rvol_curves = options.globex_rvol_curves.unwrap_or_else(|| {
+        db.recent_session_volume_curves_for_contract(
+            "Globex",
+            20,
+            Some(&contract_metadata.root_symbol),
+            Some(&contract_metadata.contract_symbol),
+        )
+        .unwrap_or_default()
+    });
     let mut state = BackfillRunState {
         pipeline,
         rvol_curves,
@@ -963,7 +976,12 @@ where
                                     max_adverse_excursion: None,
                                     r_result: None,
                                     time_to_outcome_ms: None,
-                                    rvol_at_fire: Some(state.pipeline.rvol.rvol_ratio()),
+                                    rvol_at_fire: state
+                                        .pipeline
+                                        .rvol
+                                        .rvol_ratio()
+                                        .is_finite()
+                                        .then(|| state.pipeline.rvol.rvol_ratio()),
                                     rvol_bucket_at_fire: Some(
                                         state.pipeline.rvol.bucket_index() as i32
                                     ),
@@ -1275,7 +1293,14 @@ where
 
         // Persist the actual per-bucket Globex volume curve and update rolling baseline.
         let curve = state.pipeline.rvol.current_curve();
-        let _ = db.save_volume_curve(current_date, "Globex", &curve);
+        let metadata = state.pipeline.contract_metadata();
+        let _ = db.save_volume_curve_with_contract(
+            current_date,
+            "Globex",
+            &curve,
+            Some(&metadata.root_symbol),
+            Some(&metadata.contract_symbol),
+        );
         state.globex_rvol_curves.push(curve);
         if state.globex_rvol_curves.len() > 20 {
             state.globex_rvol_curves.remove(0);
@@ -1371,7 +1396,14 @@ where
 
         // Persist the actual per-bucket RTH volume curve and update rolling baseline.
         let curve = state.pipeline.rvol.current_curve();
-        let _ = db.save_volume_curve(current_date, "RTH", &curve);
+        let metadata = state.pipeline.contract_metadata();
+        let _ = db.save_volume_curve_with_contract(
+            current_date,
+            "RTH",
+            &curve,
+            Some(&metadata.root_symbol),
+            Some(&metadata.contract_symbol),
+        );
         state.rvol_curves.push(curve);
         if state.rvol_curves.len() > 20 {
             state.rvol_curves.remove(0);

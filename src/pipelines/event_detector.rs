@@ -727,7 +727,9 @@ impl EventDetector {
         if matches!(
             state.rvol_classification,
             crate::pipelines::RvolClassification::High
-        ) && state.rvol_ratio > 1.15
+        ) && state.rvol_ratio.is_finite()
+            && state.rvol_ratio > 1.15
+            && matches!(state.rvol_baseline_status.as_str(), "ok" | "partial")
         {
             let event_key = "rvol_spike";
             if self.should_emit(event_key, timestamp_ms) {
@@ -746,6 +748,7 @@ impl EventDetector {
                         metadata: Some(serde_json::json!({
                             "rvolRatio": state.rvol_ratio,
                             "rvolVelocity": state.rvol_velocity,
+                            "rvolBaselineStatus": state.rvol_baseline_status,
                         })),
                         session_type: String::new(),
                         session_segment: String::new(),
@@ -757,7 +760,7 @@ impl EventDetector {
 
         // RVOL snapshot at IB close (bucket 12 = minute 60, end of Initial Balance period).
         // Fires once per session to record the RVOL regime context at the IB close.
-        if state.rvol_bucket_index == 12 {
+        if state.rvol_bucket_index == 12 && state.rvol_ratio.is_finite() {
             let event_key = "rvol_at_ib_close";
             if self.should_emit(event_key, timestamp_ms) {
                 self.push_event_with_context(
@@ -777,6 +780,7 @@ impl EventDetector {
                             "rvolClassification": format!("{:?}", state.rvol_classification),
                             "rvolPercentile": state.rvol_percentile,
                             "rvolVelocity": state.rvol_velocity,
+                            "rvolBaselineStatus": state.rvol_baseline_status,
                             "bucket": state.rvol_bucket_index,
                         })),
                         session_type: String::new(),
@@ -1166,6 +1170,10 @@ mod tests {
             rvol_acceleration: 0.0,
             rvol_percentile: 50.0,
             rvol_bucket_index: 0,
+            rvol_baseline_status: "ok".to_string(),
+            rvol_lookback_days_actual: 20,
+            rvol_expected_volume: 100.0,
+            rvol_caveat: None,
             day_type: DayType::Normal,
             profile_shape: ProfileShape::Gaussian,
             balance_state: BalanceState::Balanced,

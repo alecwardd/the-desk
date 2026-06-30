@@ -32,7 +32,7 @@ pub use rebid_reoffer::{
     AccelerationZone, RebidReofferPipeline, ZoneAcceptance, ZoneSignal, ZoneStatus, ZoneType,
 };
 pub use regime::{classify_regime, ib_extension_state_from_range, Regime, RegimeInputs};
-pub use rvol::{RvolClassification, RvolPipeline};
+pub use rvol::{RvolBaselineStatus, RvolClassification, RvolPipeline, RVOL_BUCKET_SIZE_MINUTES};
 pub use session_inventory::{
     InventoryDirection, InventoryState, PriorSessionData, SessionInventoryPipeline,
 };
@@ -274,7 +274,7 @@ pub struct MarketState {
     pub or5_mid_retested: bool,
 
     // --- Relative Volume ---
-    /// RVOL ratio (1.0 = tracking average).
+    /// RVOL ratio (1.0 = tracking average). Serializes as null when unavailable.
     pub rvol_ratio: f64,
     /// RVOL classification.
     pub rvol_classification: RvolClassification,
@@ -286,6 +286,14 @@ pub struct MarketState {
     pub rvol_percentile: f64,
     /// Current 5-minute bucket index.
     pub rvol_bucket_index: usize,
+    /// RVOL baseline quality: ok, partial, synthetic, or unavailable.
+    pub rvol_baseline_status: String,
+    /// Number of historical same-session curves available at the current bucket.
+    pub rvol_lookback_days_actual: usize,
+    /// Expected cumulative volume at the current bucket from the baseline.
+    pub rvol_expected_volume: f64,
+    /// Human-readable caveat when the baseline is partial or unavailable.
+    pub rvol_caveat: Option<String>,
 
     // --- Day Type ---
     /// Current day type classification.
@@ -605,6 +613,11 @@ impl PipelineEngine {
         };
         let tape = self.tape_pace.snapshot(timestamp_ms);
         let rvol_ratio = self.rvol.rvol_ratio();
+        let absorption_rvol_ratio = if rvol_ratio.is_finite() {
+            rvol_ratio
+        } else {
+            0.0
+        };
         let key_levels = self.levels.key_levels();
         self.absorption.on_trade(
             timestamp_ms,
@@ -614,7 +627,7 @@ impl PipelineEngine {
             is_buy,
             minute_of_session,
             tape.pace_percentile,
-            rvol_ratio,
+            absorption_rvol_ratio,
             &key_levels,
         );
         self.trade_size.on_trade(volume, price);
@@ -777,6 +790,12 @@ impl PipelineEngine {
             self.levels.session_high,
             self.levels.session_low,
         );
+        let rvol_ratio = self.rvol.rvol_ratio();
+        let regime_rvol_ratio = if rvol_ratio.is_finite() {
+            rvol_ratio
+        } else {
+            0.0
+        };
         let regime = classify_regime(&RegimeInputs {
             ib_extension_state: &ib_extension_state,
             day_type: self.day_type.day_type(),
@@ -784,7 +803,7 @@ impl PipelineEngine {
             last_price: self.levels.last_price,
             vwap,
             dnp: self.delta.dnp(),
-            rvol_ratio: self.rvol.rvol_ratio(),
+            rvol_ratio: regime_rvol_ratio,
             pace_percentile: tape.pace_percentile,
         });
         MarketState {
@@ -893,12 +912,16 @@ impl PipelineEngine {
             or5_break_direction: self.or5.break_direction(),
             or5_mid_retested: self.or5.mid_retested(),
 
-            rvol_ratio: self.rvol.rvol_ratio(),
+            rvol_ratio,
             rvol_classification: self.rvol.classification(),
             rvol_velocity: self.rvol.rvol_velocity(),
             rvol_acceleration: self.rvol.rvol_acceleration(),
             rvol_percentile: self.rvol.rvol_percentile(),
             rvol_bucket_index: self.rvol.bucket_index(),
+            rvol_baseline_status: self.rvol.baseline_status_label().to_string(),
+            rvol_lookback_days_actual: self.rvol.lookback_days_at_current_bucket(),
+            rvol_expected_volume: self.rvol.expected_volume_at_bucket(),
+            rvol_caveat: self.rvol.baseline_caveat(),
 
             day_type: self.day_type.day_type(),
             profile_shape: self.day_type.profile_shape(),

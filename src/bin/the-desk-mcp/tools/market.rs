@@ -826,6 +826,10 @@ impl TheDeskMcp {
                 "rvolRatio": rvol.rvol_ratio(),
                 "rvolClassification": format!("{:?}", rvol.classification()),
                 "rvolPercentile": rvol.rvol_percentile(),
+                "baselineStatus": rvol.baseline_status_label(),
+                "caveat": rvol.baseline_caveat(),
+                "sessionType": if rvol.is_globex() { "Globex" } else { "RTH" },
+                "bucketSizeMinutes": the_desk_backend::pipelines::RVOL_BUCKET_SIZE_MINUTES,
                 "currentBucket": bucket,
                 "totalBuckets": total,
                 "sessionProgress": session_pct,
@@ -835,6 +839,7 @@ impl TheDeskMcp {
                 "velocity": rvol.rvol_velocity(),
                 "acceleration": rvol.rvol_acceleration(),
                 "lookbackDays": rvol.lookback_days(),
+                "lookbackDaysActual": rvol.lookback_days_at_current_bucket(),
                 "dataAgeMs": compute_data_age(&db),
             })));
         }
@@ -843,6 +848,10 @@ impl TheDeskMcp {
             Ok(Some(s)) => Ok(text_result(serde_json::json!({
                 "rvolRatio": s.get("rvolRatio"),
                 "rvolClassification": s.get("rvolClassification"),
+                "baselineStatus": s.get("rvolBaselineStatus"),
+                "lookbackDaysActual": s.get("rvolLookbackDaysActual"),
+                "expectedVolume": s.get("rvolExpectedVolume"),
+                "caveat": s.get("rvolCaveat"),
                 "note": "Falling back to DB snapshot. Percentile, velocity, and bucket details not available.",
                 "dataAgeMs": compute_data_age(&db)
             }))),

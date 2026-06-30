@@ -445,7 +445,11 @@ fn buckets_from_snapshot(
     ContextBuckets {
         bucket_definition_version: BUCKET_DEFINITION_VERSION.to_string(),
         vwap_sigma: vwap_sigma_bucket(live.vwap_sigma),
-        rvol: rvol_bucket(live.rvol_ratio),
+        rvol: if rvol_bucket_unknown_from_snapshot(snapshot, live.rvol_ratio) {
+            "unknown".to_string()
+        } else {
+            rvol_bucket(live.rvol_ratio)
+        },
         time_of_day: time_of_day_bucket(timestamp_ms, &live.session_type, &live.session_segment),
         ib_state: live.ib_state.clone(),
         value_area_location: live.value_area_location.clone(),
@@ -976,6 +980,12 @@ fn rvol_bucket(rvol: f64) -> String {
         _ => "unknown",
     }
     .to_string()
+}
+
+fn rvol_bucket_unknown_from_snapshot(snapshot: &Value, rvol: f64) -> bool {
+    let status = json_string(snapshot, "rvolBaselineStatus");
+    matches!(status.as_str(), "unavailable" | "synthetic")
+        || (status.is_empty() && (rvol - 2.0).abs() < f64::EPSILON)
 }
 
 fn time_of_day_bucket(

@@ -785,6 +785,9 @@ fn evaluate_typed_condition(
 
         // --- Volume Context ---
         ConditionField::RvolClassification => {
+            if !matches!(market.rvol_baseline_status.as_str(), "ok" | "partial") {
+                return false;
+            }
             if let ConditionValue::Text(expected) = &cond.value {
                 let actual = format!("{:?}", market.rvol_classification);
                 return actual.to_lowercase() == expected.to_lowercase();
@@ -792,6 +795,11 @@ fn evaluate_typed_condition(
             return false;
         }
         ConditionField::RvolPercentile => {
+            if !matches!(market.rvol_baseline_status.as_str(), "ok" | "partial")
+                || !market.rvol_percentile.is_finite()
+            {
+                return false;
+            }
             if let ConditionValue::Number(threshold) = &cond.value {
                 return match &cond.operator {
                     ConditionOperator::GreaterThan | ConditionOperator::Above => {
@@ -806,6 +814,11 @@ fn evaluate_typed_condition(
             return false;
         }
         ConditionField::RvolVelocity => {
+            if !matches!(market.rvol_baseline_status.as_str(), "ok" | "partial")
+                || !market.rvol_velocity.is_finite()
+            {
+                return false;
+            }
             if let ConditionValue::Number(threshold) = &cond.value {
                 return match &cond.operator {
                     ConditionOperator::GreaterThan | ConditionOperator::Above => {

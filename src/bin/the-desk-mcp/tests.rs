@@ -243,6 +243,8 @@ fn cached_boundary_data_installs_before_first_rth_tick_without_db_lookup() {
                 dnva_low: 20935.0,
                 dnp: 21000.0,
             }],
+            rth_rvol_curves: Vec::new(),
+            globex_rvol_curves: Vec::new(),
             refreshed_at: std::time::Instant::now(),
         }),
     }));
@@ -2367,6 +2369,7 @@ fn persist_live_session_close_writes_summary_and_prior_day_together() {
             21_020.0, 20_980.0, 21_000.0, 21_015.0, 20_995.0, 21_005.0, 21_010.0, 20_990.0,
             21_000.0,
         ),
+        None,
     )
     .expect("atomic close");
 

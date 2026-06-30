@@ -25,7 +25,7 @@ use chrono_tz::US::Eastern;
 
 /// NQ session boundaries in Eastern Time (hour * 60 + minute).
 pub const RTH_OPEN_ET: i32 = 9 * 60 + 30; // 09:30
-pub const RTH_CLOSE_ET: i32 = 16 * 60; // 16:00
+pub const RTH_CLOSE_ET: i32 = 16 * 60 + 15; // 16:15
 pub const GLOBEX_OPEN_ET: i32 = 18 * 60; // 18:00
 pub const LONDON_OPEN_ET: i32 = 2 * 60; // 02:00
 

@@ -8142,6 +8142,18 @@ impl Database {
         session_type: &str,
         curve: &[f64],
     ) -> Result<(), DbError> {
+        self.save_volume_curve_with_contract(session_date, session_type, curve, None, None)
+    }
+
+    /// Save a per-bucket cumulative volume curve with optional contract metadata.
+    pub fn save_volume_curve_with_contract(
+        &self,
+        session_date: &str,
+        session_type: &str,
+        curve: &[f64],
+        root_symbol: Option<&str>,
+        contract_symbol: Option<&str>,
+    ) -> Result<(), DbError> {
         let tx = self.conn.unchecked_transaction()?;
         // Clear any existing curve for this session/type.
         tx.execute(
@@ -8150,9 +8162,17 @@ impl Database {
         )?;
         for (i, &vol) in curve.iter().enumerate() {
             tx.execute(
-                "INSERT INTO session_volume_curves (session_date, session_type, bucket_index, cumulative_volume)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![session_date, session_type, i as i64, vol],
+                "INSERT INTO session_volume_curves
+                 (session_date, session_type, bucket_index, cumulative_volume, root_symbol, contract_symbol)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    session_date,
+                    session_type,
+                    i as i64,
+                    vol,
+                    root_symbol,
+                    contract_symbol
+                ],
             )?;
         }
         tx.commit()?;
@@ -8161,49 +8181,123 @@ impl Database {
 
     /// Load recent session volume curves from the session_volume_curves table.
     /// Returns actual per-bucket cumulative volumes for up to `limit` sessions.
-    /// Falls back to `recent_rth_session_volumes` + linear interpolation if no curves stored.
     pub fn recent_session_volume_curves(
         &self,
         session_type: &str,
         limit: usize,
     ) -> Result<Vec<Vec<f64>>, DbError> {
-        // Get distinct session dates with stored curves.
-        let mut date_stmt = self.conn.prepare(
-            "SELECT DISTINCT session_date FROM session_volume_curves
-             WHERE session_type = ?1
-             ORDER BY session_date DESC
-             LIMIT ?2",
-        )?;
-        let dates: Vec<String> = date_stmt
-            .query_map(params![session_type, limit as i64], |row| {
-                row.get::<_, String>(0)
-            })?
-            .filter_map(|r| r.ok())
-            .collect();
+        self.recent_session_volume_curves_for_contract(session_type, limit, None, None)
+    }
+
+    /// Load recent session volume curves, preferring the active contract/root when provided.
+    pub fn recent_session_volume_curves_for_contract(
+        &self,
+        session_type: &str,
+        limit: usize,
+        root_symbol: Option<&str>,
+        contract_symbol: Option<&str>,
+    ) -> Result<Vec<Vec<f64>>, DbError> {
+        let attempts: Vec<(&str, Option<&str>)> =
+            if contract_symbol.is_some_and(|s| !s.trim().is_empty()) {
+                vec![
+                    ("contract_symbol", contract_symbol),
+                    ("root_symbol", root_symbol),
+                ]
+            } else if root_symbol.is_some_and(|s| !s.trim().is_empty()) {
+                vec![("root_symbol", root_symbol)]
+            } else {
+                Vec::new()
+            };
+
+        for (column, value) in attempts {
+            let curves = self.recent_session_volume_curves_filtered(
+                session_type,
+                limit,
+                Some((column, value.unwrap_or_default())),
+            )?;
+            if !curves.is_empty() {
+                return Ok(curves);
+            }
+        }
+
+        self.recent_session_volume_curves_filtered(session_type, limit, None)
+    }
+
+    fn recent_session_volume_curves_filtered(
+        &self,
+        session_type: &str,
+        limit: usize,
+        filter: Option<(&str, &str)>,
+    ) -> Result<Vec<Vec<f64>>, DbError> {
+        let (date_sql, bucket_sql) = match filter {
+            Some(("contract_symbol", _)) => (
+                "SELECT DISTINCT session_date FROM session_volume_curves
+                 WHERE session_type = ?1 AND contract_symbol = ?3
+                 ORDER BY session_date DESC
+                 LIMIT ?2",
+                "SELECT bucket_index, cumulative_volume FROM session_volume_curves
+                 WHERE session_date = ?1 AND session_type = ?2 AND contract_symbol = ?3
+                 ORDER BY bucket_index ASC",
+            ),
+            Some(("root_symbol", _)) => (
+                "SELECT DISTINCT session_date FROM session_volume_curves
+                 WHERE session_type = ?1 AND root_symbol = ?3
+                 ORDER BY session_date DESC
+                 LIMIT ?2",
+                "SELECT bucket_index, cumulative_volume FROM session_volume_curves
+                 WHERE session_date = ?1 AND session_type = ?2 AND root_symbol = ?3
+                 ORDER BY bucket_index ASC",
+            ),
+            _ => (
+                "SELECT DISTINCT session_date FROM session_volume_curves
+                 WHERE session_type = ?1
+                 ORDER BY session_date DESC
+                 LIMIT ?2",
+                "SELECT bucket_index, cumulative_volume FROM session_volume_curves
+                 WHERE session_date = ?1 AND session_type = ?2
+                 ORDER BY bucket_index ASC",
+            ),
+        };
+
+        let mut date_stmt = self.conn.prepare(date_sql)?;
+        let dates: Vec<String> = if let Some((_, value)) = filter {
+            date_stmt
+                .query_map(params![session_type, limit as i64, value], |row| {
+                    row.get::<_, String>(0)
+                })?
+                .filter_map(|r| r.ok())
+                .collect()
+        } else {
+            date_stmt
+                .query_map(params![session_type, limit as i64], |row| {
+                    row.get::<_, String>(0)
+                })?
+                .filter_map(|r| r.ok())
+                .collect()
+        };
 
         if dates.is_empty() {
-            // Fallback: build curves from total session volumes.
-            use crate::pipelines::RvolPipeline;
-            let volumes = self.recent_rth_session_volumes(limit)?;
-            return Ok(volumes
-                .into_iter()
-                .map(RvolPipeline::curve_from_total_volume)
-                .collect());
+            return Ok(Vec::new());
         }
 
         let mut curves = Vec::with_capacity(dates.len());
-        let mut bucket_stmt = self.conn.prepare(
-            "SELECT bucket_index, cumulative_volume FROM session_volume_curves
-             WHERE session_date = ?1 AND session_type = ?2
-             ORDER BY bucket_index ASC",
-        )?;
+        let mut bucket_stmt = self.conn.prepare(bucket_sql)?;
         for date in dates.iter().rev() {
-            let buckets: Vec<(usize, f64)> = bucket_stmt
-                .query_map(params![date, session_type], |row| {
-                    Ok((row.get::<_, i64>(0)? as usize, row.get::<_, f64>(1)?))
-                })?
-                .filter_map(|r| r.ok())
-                .collect();
+            let buckets: Vec<(usize, f64)> = if let Some((_, value)) = filter {
+                bucket_stmt
+                    .query_map(params![date, session_type, value], |row| {
+                        Ok((row.get::<_, i64>(0)? as usize, row.get::<_, f64>(1)?))
+                    })?
+                    .filter_map(|r| r.ok())
+                    .collect()
+            } else {
+                bucket_stmt
+                    .query_map(params![date, session_type], |row| {
+                        Ok((row.get::<_, i64>(0)? as usize, row.get::<_, f64>(1)?))
+                    })?
+                    .filter_map(|r| r.ok())
+                    .collect()
+            };
             if buckets.is_empty() {
                 continue;
             }
@@ -9967,10 +10061,32 @@ impl Database {
         &self,
         summary: &SessionSummary,
         prior_day: (f64, f64, f64, f64, f64, f64, f64, f64, f64),
+        volume_curve: Option<&[f64]>,
     ) -> Result<(), DbError> {
         self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
         let result = (|| -> Result<(), DbError> {
             self.upsert_session_summary(summary)?;
+            if let Some(curve) = volume_curve {
+                self.conn.execute(
+                    "DELETE FROM session_volume_curves WHERE session_date = ?1 AND session_type = ?2",
+                    params![summary.session_date, summary.session_type],
+                )?;
+                for (i, vol) in curve.iter().enumerate() {
+                    self.conn.execute(
+                        "INSERT INTO session_volume_curves
+                         (session_date, session_type, bucket_index, cumulative_volume, root_symbol, contract_symbol)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        params![
+                            summary.session_date,
+                            summary.session_type,
+                            i as i64,
+                            vol,
+                            summary.root_symbol,
+                            summary.contract_symbol
+                        ],
+                    )?;
+                }
+            }
             self.save_prior_day_full_with_dnva_contract(
                 &summary.session_date,
                 prior_day.0,
@@ -10359,6 +10475,41 @@ mod tests {
     fn test_db() -> Database {
         let file = NamedTempFile::new().expect("temp");
         Database::open(file.path().to_string_lossy().as_ref()).expect("open")
+    }
+
+    #[test]
+    fn session_volume_curve_loader_requires_real_curves_and_prefers_contract() {
+        let db = test_db();
+        assert!(db
+            .recent_session_volume_curves("RTH", 20)
+            .expect("empty curves")
+            .is_empty());
+
+        db.save_volume_curve_with_contract(
+            "2026-03-05",
+            "RTH",
+            &[10.0, 20.0],
+            Some("NQ"),
+            Some("NQH26"),
+        )
+        .expect("save nq");
+        db.save_volume_curve_with_contract(
+            "2026-03-06",
+            "RTH",
+            &[100.0, 200.0],
+            Some("ES"),
+            Some("ESH26"),
+        )
+        .expect("save es");
+
+        let nq = db
+            .recent_session_volume_curves_for_contract("RTH", 20, Some("NQ"), Some("NQH26"))
+            .expect("load nq");
+        assert_eq!(nq, vec![vec![10.0, 20.0]]);
+        let missing = db
+            .recent_session_volume_curves_for_contract("Globex", 20, Some("NQ"), Some("NQH26"))
+            .expect("load missing globex");
+        assert!(missing.is_empty());
     }
 
     #[test]

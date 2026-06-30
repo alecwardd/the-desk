@@ -307,7 +307,10 @@ pub(crate) fn persist_setup_evaluation(
             max_adverse_excursion: None,
             r_result: None,
             time_to_outcome_ms: None,
-            rvol_at_fire: Some(market_snapshot.rvol_ratio),
+            rvol_at_fire: market_snapshot
+                .rvol_ratio
+                .is_finite()
+                .then_some(market_snapshot.rvol_ratio),
             rvol_bucket_at_fire: Some(market_snapshot.rvol_bucket_index as i32),
             direction: None,
             entry_price: None,
@@ -1588,6 +1591,7 @@ pub(crate) fn finalize_rth_close(
         open_price: f64,
         tick_count: i64,
         total_volume: f64,
+        volume_curve: Vec<f64>,
         end_state: SessionEndState,
         close_ts: f64,
         session_delta: f64,
@@ -1619,6 +1623,7 @@ pub(crate) fn finalize_rth_close(
         let open_price = p.levels.session_open_price;
         let tick_count = p.vwap.trade_count() as i64;
         let total_volume = p.rvol.session_volume();
+        let volume_curve = p.rvol.current_curve();
         let end_state = p.session_end_state();
         let session_delta = snapshot.session_delta;
         CloseData {
@@ -1626,6 +1631,7 @@ pub(crate) fn finalize_rth_close(
             open_price,
             tick_count,
             total_volume,
+            volume_curve,
             end_state,
             close_ts,
             session_delta,
@@ -1689,7 +1695,7 @@ pub(crate) fn finalize_rth_close(
 
     db.lock()
         .map_err(|_| RthCloseFinalizeError::DbLockUnavailable)?
-        .persist_live_session_close(&summary, prior_day_tuple)
+        .persist_live_session_close(&summary, prior_day_tuple, Some(&close_data.volume_curve))
         .map_err(RthCloseFinalizeError::Persist)?;
 
     let mut p = pipelines
@@ -1826,6 +1832,22 @@ pub(crate) fn load_boundary_session_cache_entry(
         })
         .collect();
     prior_inventory.reverse();
+    let rth_rvol_curves = db
+        .recent_session_volume_curves_for_contract(
+            "RTH",
+            20,
+            Some(&contract_metadata.root_symbol),
+            Some(&contract_metadata.contract_symbol),
+        )
+        .unwrap_or_default();
+    let globex_rvol_curves = db
+        .recent_session_volume_curves_for_contract(
+            "Globex",
+            20,
+            Some(&contract_metadata.root_symbol),
+            Some(&contract_metadata.contract_symbol),
+        )
+        .unwrap_or_default();
 
     BoundarySessionCacheEntry {
         lookup_date,
@@ -1835,6 +1857,8 @@ pub(crate) fn load_boundary_session_cache_entry(
         prior_reference,
         rollover_status,
         prior_inventory,
+        rth_rvol_curves,
+        globex_rvol_curves,
         refreshed_at: std::time::Instant::now(),
     }
 }
@@ -1849,6 +1873,9 @@ fn apply_prepared_session_data(
     let (root_symbol, contract_symbol) = contract_scope(contract_metadata);
     if let Ok(mut p) = pipelines.lock() {
         p.reset_session_with_type(prepared.new_session == SessionType::Globex);
+        p.rvol.load_historical_curve(&prepared.rth_rvol_curves);
+        p.rvol
+            .load_globex_historical_curve(&prepared.globex_rvol_curves);
         if matches!(prepared.new_session, SessionType::Rth | SessionType::Globex) {
             if let Some(prior_ref) = prepared.prior_reference {
                 p.levels
@@ -1902,6 +1929,28 @@ fn apply_prepared_session_data(
         }
         p.session_inventory
             .load_prior_sessions(prepared.prior_inventory);
+    }
+}
+
+pub(crate) fn persist_current_globex_volume_curve(
+    pipelines: &Arc<Mutex<PipelineEngine>>,
+    db: &Arc<Mutex<Database>>,
+    boundary_tick_ts: f64,
+    contract_metadata: &the_desk_backend::feed::ContractMetadata,
+) {
+    let curve = match pipelines.lock() {
+        Ok(p) if p.rvol.is_globex() && p.rvol.session_volume() > 0.0 => p.rvol.current_curve(),
+        _ => return,
+    };
+    let session_date = session_date_from_timestamp_ms(boundary_tick_ts);
+    if let Ok(d) = db.lock() {
+        let _ = d.save_volume_curve_with_contract(
+            &session_date,
+            "Globex",
+            &curve,
+            Some(&contract_metadata.root_symbol),
+            Some(&contract_metadata.contract_symbol),
+        );
     }
 }
 
@@ -2162,6 +2211,14 @@ pub(crate) fn run_startup_warm_replay(
                 // 09:30 ET). Reuses prepare_for_new_session for consistency
                 // with the live path.
                 drop(pipelines_guard);
+                if current_session == SessionType::Globex && new_session == SessionType::Rth {
+                    persist_current_globex_volume_curve(
+                        pipelines,
+                        db,
+                        tick.timestamp_ms,
+                        contract_metadata,
+                    );
+                }
                 prepare_for_new_session(
                     pipelines,
                     db,

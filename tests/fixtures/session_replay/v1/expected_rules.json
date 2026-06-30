@@ -558,7 +558,7 @@
       "outcomeAtMs": 1772555700000.0,
       "rResult": 0.0375,
       "rootSymbol": "NQ",
-      "rvolAtFire": 2.0,
+      "rvolAtFire": null,
       "rvolBucketAtFire": 1,
       "sessionDate": "2026-03-03",
       "setupId": "golden_price_above_vwap",

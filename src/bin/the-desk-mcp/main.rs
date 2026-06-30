@@ -16,7 +16,7 @@ use the_desk_backend::feed::{load_feed_config, resolve_contract_metadata, TradeS
 use the_desk_backend::observability::{
     init_logging, load_logging_config, RuntimeEventLevel, RuntimeEventStore,
 };
-use the_desk_backend::pipelines::{MarketEvent, PipelineEngine, RvolPipeline};
+use the_desk_backend::pipelines::{MarketEvent, PipelineEngine};
 use the_desk_backend::research;
 use the_desk_backend::{
     classify_delta_segment, classify_session, et_minutes_from_timestamp, globex_open_ms,
@@ -87,12 +87,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut pipelines = PipelineEngine::new();
     pipelines.set_contract_metadata(contract_metadata.clone());
-    if let Ok(volumes) = db.recent_rth_session_volumes(20) {
-        let curves: Vec<Vec<f64>> = volumes
-            .into_iter()
-            .map(RvolPipeline::curve_from_total_volume)
-            .collect();
+    if let Ok(curves) = db.recent_session_volume_curves_for_contract(
+        "RTH",
+        20,
+        Some(&contract_metadata.root_symbol),
+        Some(&contract_metadata.contract_symbol),
+    ) {
         pipelines.rvol.load_historical_curve(&curves);
+    }
+    if let Ok(curves) = db.recent_session_volume_curves_for_contract(
+        "Globex",
+        20,
+        Some(&contract_metadata.root_symbol),
+        Some(&contract_metadata.contract_symbol),
+    ) {
+        pipelines.rvol.load_globex_historical_curve(&curves);
     }
 
     // Load prior-day levels so MCP tools return correct values before backfill.
@@ -738,6 +747,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             && new_session != SessionType::Unknown
                             && current_session != SessionType::Unknown
                         {
+                            if current_session == SessionType::Globex
+                                && new_session == SessionType::Rth
+                            {
+                                persist_current_globex_volume_curve(
+                                    &pipelines_bg,
+                                    &db_bg,
+                                    tick.timestamp_ms,
+                                    &contract_metadata,
+                                );
+                            }
                             // Other known→known transitions, e.g. Globex→RTH at
                             // 09:30 ET. Reuses the shared boundary helper.
                             prepare_for_new_session_with_cache(

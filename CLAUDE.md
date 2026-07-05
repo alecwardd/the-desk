@@ -13,7 +13,7 @@ These rules apply to ALL LLM coding agents working in this repository. Read full
 
 The Desk is a backend intelligence platform for discretionary NQ futures traders. It reads Sierra Chart's `.scid` tick data files, computes market structure and microstructure analytics in Rust, stores everything in SQLite, and exposes the intelligence layer via MCP (Model Context Protocol) — making any Cursor agent a trading partner.
 
-**It does NOT place or execute trades.** It is a trading partner — grounded in the trader's playbook and live market structure data. It can share opinions, flag concerns, and offer its read on the market, but the trader always makes the final call.
+**It does NOT place or execute trades.** It is a trading partner — grounded in the trader's playbook and live market structure data. It shares opinions, flags concerns, offers its read on the market, and proposes trade ideas with entries, stops, and targets when the data supports them (`AGENT.md` "Grounded Partnership"), but the trader always makes the final call.
 
 **Primary interface:** AI agents in Cursor (and Claude Code, Codex). This repository is backend-only: Rust, SQLite, and MCP.
 
@@ -118,9 +118,9 @@ These terms have precise meanings. Using them incorrectly will produce a broken 
 ## Never Do List
 
 1. **The Desk includes a deterministic market structure research module.** It logs structured events during pipeline processing, tracks signal outcomes, and answers historical queries (frequencies, conditional probabilities, distributions). It does NOT simulate order fills with slippage models -- it reports what actually happened in the market relative to computed levels.
-2. **Never place or manage trades.** The Desk is coaching only.
-3. **Never generate proprietary trading signals.** Every alert traces to the trader's own playbook rules.
-4. **Ground opinions in data and playbook rules.** Sharing a market read or saying "I like this" / "I'd be cautious here" is encouraged — but always tie it back to what the structure and the trader's rules show. The trader makes the final call.
+2. **Never place or manage trades.** The Desk never executes — the trader presses the buttons.
+3. **Layer 2 alerts fire only from the trader's own playbook rules.** The deterministic rules engine never invents signals. Agents (Layer 3) may propose new trade ideas — with entries, stops, and targets — when grounded per `AGENT.md` "Grounded Partnership"; ideas that should become durable go through the hypothesis → backtest → draft-setup lifecycle, never straight into the playbook.
+4. **Ground opinions in data and playbook rules.** Sharing a market read, saying "I like this" / "I'd be cautious here", and proposing explicit trades with entry, stop, and target are all encouraged — but always tied back to what the structure, the backtest data, and the trader's rules show (see `AGENT.md` "Grounded Partnership"). The trader makes the final call.
 5. **Never send raw market data to the Claude API.** Send structured summaries only.
 6. **Never store API keys in code or config files that get committed.** Use `.env` or system keychain.
 7. **Never block the main thread.** Long operations (feed I/O, LLM API, file I/O) run in background tasks.
@@ -138,7 +138,7 @@ Read these before working on related components:
 |-------|-------------|------|
 | Trading Domain | Before implementing any pipeline or playbook logic | `skills/trading-domain/SKILL.md` |
 | Sierra SCID / feed | Before working on `.scid` tailing, symbol resolution, or `.depth` | `skills/trading-domain/SKILL.md` + `src/feed/` |
-| Compliance | Before writing prompts or marketing text | `skills/compliance-research/SKILL.md` |
+| Grounded Partnership | Before writing agent prompts or any partner-facing language | `AGENT.md` "Grounded Partnership" |
 | MCP Tools | Before calling or adding MCP tools — scenario routing for agents | `skills/mcp-tools/SKILL.md` |
 | Data & Backtesting | **Before any backtesting or working with recorded data** — data model, where it lives, the backtest workflow | `docs/data-and-backtesting-guide.md` |
 
@@ -190,12 +190,12 @@ the-desk/
 ├── docs/
 │   ├── mcp/                          # MCP server architecture + generated tool reference
 │   ├── decision-log.md               # ADR-style decisions (living)
-│   └── archive/v0-tauri-gui/         # Pre-pivot planning docs (reference)
+│   └── archive/                      # Superseded docs (v0 GUI planning, archived compliance-research skill)
 ├── agents/                           # Cursor agent definitions
 ├── skills/                           # Domain knowledge for agents
 │   ├── trading-domain/SKILL.md       # TPO, delta, PTT methodology
-│   └── compliance-research/          # Coaching vs advisory
-├── commands/                         # Cursor slash-commands (/quick-check, /pipeline-test, /coaching-test, …)
+│   └── mcp-tools/SKILL.md            # Scenario → MCP tool routing
+├── commands/                         # Cursor slash-commands (/quick-check, /pipeline-test, /unknowns-pass, …)
 ├── .cursor/                          # Cursor IDE integration
 │   ├── mcp.example.json              # MCP server config template
 │   ├── agents/ → ../agents/

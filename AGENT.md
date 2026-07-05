@@ -66,8 +66,8 @@ When you need specialized help, spawn subagents for these tasks.
 **When:** After implementing or modifying a market structure pipeline
 **How:** Delegate to `pipeline-verifier` (defined in `agents/pipeline-verifier.md`)
 
-### Prompt Quality Evaluation
-**When:** After writing or modifying LLM coaching prompts
+### Prompt Quality / Grounding Evaluation
+**When:** After writing or modifying partner-facing prompts (trade-idea proposals, coaching, alerts) — verifies grounding, traceability, and sample-size discipline per "Grounded Partnership"
 **How:** Delegate to `prompt-quality-evaluator` (defined in `agents/prompt-quality-evaluator.md`)
 
 ### Options API Research
@@ -113,6 +113,8 @@ When you need specialized help, spawn subagents for these tasks.
 
 When implementing a feature:
 
+0. **Run the blindspot pass** (`commands/unknowns-pass.md`) if the change is substantial
+   or in an area you have not worked in before — it walks this repo's known failure modes
 1. **Read the relevant skill** from `skills/` for domain knowledge
 2. **Write the Rust code** in the appropriate module (`pipelines/`, `rules/`, `feed/`, `db/`)
 3. **Write tests** alongside the code — every pipeline must have unit tests
@@ -120,6 +122,89 @@ When implementing a feature:
 5. **Add `ConditionField` variants** if the rules engine needs to evaluate the new data
 6. **Add MCP tool** in the matching domain module under `src/bin/the-desk-mcp/tools/` if agents need access (checklist: `docs/mcp/README.md`), then regenerate `docs/mcp/tool-reference.md`
 7. **Run `cargo test`** before declaring done
+8. **Write the post-change explainer** for substantial changes (see Map vs Territory
+   Conventions below) — the trader maintains this system alone; a change he does not
+   understand is a liability
+
+---
+
+## Map vs Territory Conventions
+
+The map (prompts, specs, docs, assumptions) drifts from the territory (code, data,
+constraints). These conventions keep the gap managed. They are process for *coding
+agents working on the repo*, not for live trading sessions.
+
+### Blindspot pass before substantial work
+
+Run `commands/unknowns-pass.md` before: new pipelines or condition fields, MCP tool
+surface changes, setup-template work, backtests in a new area, or any change in an
+unfamiliar part of the repo. It is a checklist of failure modes this repo has already
+paid for once.
+
+### Interview protocol for ADR-scale features
+
+Features large enough to deserve an ADR start as a **Pending** entry in
+`docs/decision-log.md` with an explicit "Open items blocking Decided" list (ADR-020 is
+the model). Resolve open items with the trader **one question at a time, highest
+architectural impact first** — a question whose answer changes the architecture is worth
+a round-trip; a question with a conventional default is not (pick the default and note
+it). No implementation past an undecided ADR.
+
+### Implementation notes for mid-work deviations
+
+When the work deviates from the plan — a constraint discovered, a scope cut, a threshold
+left provisional — record a dated note in the doc nearest the work, using the existing
+pattern: `**Implementation note (YYYY-MM-DD):** …`. Research work → the relevant IDEA in
+`docs/setup-ideas-and-backtesting.md`; architecture → the ADR; tool-surface work →
+`docs/mcp/README.md`. Do not create new standalone note files; single-source docs only.
+
+### Post-change explainer (and quiz) for substantial changes
+
+After a substantial change, write a short explainer in the conversation (and, for
+lasting changes, as a dated section in the nearest doc — `docs/agent-interaction-guide.md`
+§7 is the model): what changed, why, what to verify, and **2–3 quiz questions targeting
+the domain semantics** ("after this change, which sessions populate
+`ib_extension_state`?"). Plans should **lead with the tweakable decisions** — thresholds,
+windows, weights — stated as a table with the chosen value and why, so the trader can
+adjust the knobs without re-deriving the design (IDEA-020's "Starting tunables" is the
+model). Quizzes are for code changes the trader must understand as sole maintainer —
+never for live-session coaching.
+
+---
+
+## Grounded Partnership (Trade Ideas & Opinions)
+
+The Desk is the trader's closest trading partner, not a hedged commentator. This section
+is the canonical doctrine for all agent output; it supersedes any older "non-advisory /
+coaching-only" phrasing.
+
+**Agents may — and should — proactively propose trade ideas**: direction, entry zone,
+stop, and target, plus a straight opinion ("I like this long", "I'd pass here"). The
+trader wants conviction, not hedging. What makes a proposal legitimate is **grounding**,
+not softened phrasing:
+
+1. **Every proposal cites its evidence** — playbook rules, live structure/flow readings,
+   or backtested statistics. "I like the long at the rebid zone retest: zone held, delta
+   confirms, and held-zone retests ran +0.22R avg (N=64)" is the standard. A naked "I'd
+   buy here" is not.
+2. **Every statistic carries `N` and its reliability tier** (see Research Sample Size
+   Policy below). `N >= 30` verified outcomes support a full-conviction proposal; below
+   that, frame the idea as directional or as a candidate for backtest — say so plainly.
+3. **Conflicts are reported, then you may lean.** When structure and flow disagree, state
+   both sides first; a grounded lean afterward is welcome ("mixed context, but I side
+   with the flow read because …"). Never silently resolve a conflict.
+4. **Risk rules outrank ideas.** Hard stops, circuit breakers, and the risk footer are
+   binary and untouched by this doctrine. No trade idea survives a triggered hard stop.
+5. **Data quality gates conviction.** Stale/partial data or unverified outcomes downgrade
+   an idea the same way a small sample does.
+6. **The trader presses the buttons.** The Desk never places, modifies, or cancels
+   orders, and Layer 2 alerts still fire only from the trader's own playbook rules —
+   agent-originated ideas that should become durable go through the hypothesis →
+   backtest → draft-setup lifecycle.
+
+This is a private tool for one trader. There is no compliance boundary to manage — the
+discipline that matters is **grounding**, and it is enforced everywhere phrasing rules
+used to be.
 
 ---
 
@@ -132,6 +217,7 @@ When implementing a feature:
 | Should I use the LLM for this? | If it can be computed deterministically → no LLM. If it requires synthesis → LLM. |
 | Should I add a new dependency? | Prefer existing deps. Check `Cargo.toml` first. |
 | Should I create a new file? | Prefer editing existing files. Only create new files for genuinely new modules. |
+| Is this feature ADR-scale? | Open a **Pending** ADR with an "Open items blocking Decided" list and resolve it with the trader one question at a time (see Map vs Territory Conventions). |
 
 ---
 
@@ -141,7 +227,7 @@ When implementing a feature:
 2. **Forgetting incremental updates.** Pipelines MUST update incrementally, not recalculate.
 3. **Blocking the main thread.** All I/O and computation in background tokio tasks.
 4. **Mixing RTH and Globex data.** Always scope calculations to the correct session.
-5. **Using advisory language in prompts.** "Your rules say..." not "You should..."
+5. **Ungrounded conviction in prompts.** Trade ideas and opinions are welcome — naked ones are not. Every "I like this" must cite structure, flow, a playbook rule, or backtest stats with `N` (see Grounded Partnership).
 6. **Skipping the rules engine.** Layer 2 MUST evaluate before any LLM is called.
 7. **Calling the Claude API from Rust.** LLM orchestration is a downstream consumer, not part of pipelines.
 8. **Putting market data math in TypeScript.** All pipeline calculations belong in Rust.
@@ -229,19 +315,19 @@ The MCP server (`src/bin/the-desk-mcp/`, domain modules under `tools/`) exposes 
 
 ### Full Tool List
 
-The complete per-tool catalog lives in **`docs/mcp/tool-reference.md`** (generated — do not edit by hand). Domains and counts:
+The complete per-tool catalog lives in **`docs/mcp/tool-reference.md`** (generated — do not edit by hand; per-domain tool counts live there so they can never drift). Domains:
 
-| Domain | Tools | Module |
-|--------|-------|--------|
-| Market | 24 | `src/bin/the-desk-mcp/tools/market.rs` |
-| DOM | 10 | `src/bin/the-desk-mcp/tools/dom.rs` |
-| Options | 3 | `src/bin/the-desk-mcp/tools/options.rs` |
-| Playbook | 16 | `src/bin/the-desk-mcp/tools/playbook.rs` |
-| Risk | 9 | `src/bin/the-desk-mcp/tools/risk.rs` |
-| Journal | 12 | `src/bin/the-desk-mcp/tools/journal.rs` |
-| Memory | 12 | `src/bin/the-desk-mcp/tools/memory.rs` |
-| Research | 23 | `src/bin/the-desk-mcp/tools/research.rs` |
-| Admin | 12 | `src/bin/the-desk-mcp/tools/admin.rs` |
+| Domain | Module |
+|--------|--------|
+| Market | `src/bin/the-desk-mcp/tools/market.rs` |
+| DOM | `src/bin/the-desk-mcp/tools/dom.rs` |
+| Options | `src/bin/the-desk-mcp/tools/options.rs` |
+| Playbook | `src/bin/the-desk-mcp/tools/playbook.rs` |
+| Risk | `src/bin/the-desk-mcp/tools/risk.rs` |
+| Journal | `src/bin/the-desk-mcp/tools/journal.rs` |
+| Memory | `src/bin/the-desk-mcp/tools/memory.rs` |
+| Research | `src/bin/the-desk-mcp/tools/research.rs` |
+| Admin | `src/bin/the-desk-mcp/tools/admin.rs` |
 
 ### Agent-to-Capability Mapping
 
@@ -258,6 +344,8 @@ The complete per-tool catalog lives in **`docs/mcp/tool-reference.md`** (generat
 | **data-integrity-validator** | Both | `validate_data_integrity`, `get_feed_health`, `get_session_summary` |
 
 ### Event Types for `query_event_frequency`
+
+Hand-maintained list — when adding event types, update this against the emitting code in `src/pipelines/event_detector.rs` (and the DOM/zone emitters it references).
 
 Structural: `ib_formed`, `or_formed`, `ib_mid_test`, `ib_extension_hit`, `ib_ext_0.5x_high`, `ib_ext_1.0x_high`, `ib_ext_1.5x_high`, `new_session_high`, `new_session_low`, `dnp_cross`, `day_type_change`, `poor_high_detected`, `poor_low_detected`, `excess_high_detected`, `excess_low_detected`, `or5_mid_retest`. Flow: `absorption_detected`, `pinch_detected`, `acceleration_zone_created`, `acceleration_zone_held`, `large_trade_cluster`, `rvol_spike`.
 

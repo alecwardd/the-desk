@@ -130,12 +130,14 @@ Each decision follows this structure:
 ### ADR-007: Coaching-only, never trade execution
 
 **Date:** 2026-02-20
-**Status:** Decided
+**Status:** Decided — amended by ADR-021 (2026-07-05)
 **Source:** CLAUDE.md, the-desk-vision.md, epic-brief.md
 
 **Decision:** The Desk never places, modifies, or cancels orders. It never connects to a trading API for execution purposes. It is a coaching and discipline tool.
 
 **Consequences:** Simplifies architecture (no order management), eliminates liability from execution errors, maintains clear regulatory positioning as a coaching tool rather than an investment advisory service.
+
+**Amendment (ADR-021):** The execution ban stands unchanged. The "coaching-only / regulatory positioning" framing is superseded — The Desk is a private single-trader tool and its agents follow the Grounded Partnership doctrine (proactive, grounded trade proposals).
 
 ---
 
@@ -472,6 +474,25 @@ New `FeedConfig` fields (all serde-default): `max_ticks_per_poll` (5000), `analy
 - Carry only running high/low for outcome resolution instead of a pending set — rejected because it cannot reproduce the exact first-crossing target/stop semantics the DB tracker guarantees.
 
 **Consequences:** Rule and setup *firing* is now sampled (≤250 ms / 500 ticks) rather than evaluated on every tick — an accepted 100–250 ms alert-coalescing tradeoff for discretionary coaching. Outcome excursion accuracy stays per-tick exact. Parity tests assert capped == uncapped final pipeline state and coalesced == per-tick outcome extremes. `process_tick` is retained for tests and replay utilities but is no longer on the live path.
+
+---
+
+### ADR-021: Grounded Partnership replaces non-advisory framing
+
+**Date:** 2026-07-05
+**Status:** Decided
+**Amends:** ADR-007 (execution ban retained; compliance framing dropped)
+
+**Context:** The agent surface enforced a public-product "non-advisory / coaching-only" boundary — forbidden-phrase lists ("never say you should buy/sell"), a compliance-research skill, orchestrator "never recommend" rules. The trader confirmed The Desk will never be a public tool and wants the opposite behavior: an agent that proactively proposes trade ideas with entries, stops, and targets, grounded in analyzed and backtested data. The map contradicted both CLAUDE.md rule #4 (opinions encouraged) and the owner's actual use.
+
+**Decision:** Replace phrasing-level compliance policing with a grounding doctrine, canonically in `AGENT.md` "Grounded Partnership": (1) proposals cite evidence — playbook rules, structure/flow, or backtest stats; (2) every statistic carries `N` + reliability tier, full conviction only at `N >= 30` verified; (3) conflicts reported before any lean; (4) risk rules outrank ideas — hard stops binary; (5) data quality gates conviction; (6) the trader executes, and Layer 2 alerts fire only from trader-owned rules (agent ideas route through the hypothesis → backtest → draft-setup lifecycle). `skills/compliance-research/` archived to `docs/archive/`; `prompt-quality-evaluator` re-missioned as the grounding evaluator (policing both ungrounded conviction *and* over-hedged grounded reads); `commands/coaching-test.md` rewritten to test grounding.
+
+**Alternatives considered:**
+- Keep the non-advisory framing — rejected (contradicts the owner's intent and produces systematically hedged output).
+- Edit only the orchestrator — rejected (evaluator, compliance skill, and coaching-test would still enforce the old doctrine, giving agents contradictory instructions).
+- Delete prompt-quality-evaluator — rejected (grounding still needs a dedicated quality gate; the failure mode moved, it didn't disappear).
+
+**Consequences:** Agents give conviction with evidence instead of hedged commentary. The risk spine (footers, circuit breakers, sample-size policy) is unchanged. No Rust or MCP tool behavior changed. If productization is ever revisited, this ADR and the archived skill are the starting point for re-drawing the boundary.
 
 ---
 

@@ -252,11 +252,14 @@ The agents are heavily structured, so small wording choices change the route.
   data-integrity gate and blocks analysis until it's clean — exactly what you want.
 
 **Don't:**
-- Don't ask for a buy/sell call. The system is non-advisory by design and will
-  reframe as "your rules indicate…". Ask "what do my rules say here?" instead.
-- Don't expect it to resolve conflicting reads into one answer — when structure
-  and flow disagree it will *say so* ("mixed-context environment"). Treat that as
-  a feature: ask which confirmation your playbook requires.
+- Don't accept hedging when you asked for a call. Under the Grounded Partnership
+  doctrine (`AGENT.md`), the agent gives straight opinions and trade proposals —
+  direction, entry, stop, target — when the data supports them. If it hedges, ask
+  "what evidence is missing?" — the honest answers are things like "N=14, below the
+  reportable threshold" or "data quality is degraded", not vague caution.
+- Don't expect it to hide conflicting reads — when structure and flow disagree it
+  will *say so* ("mixed-context environment") before offering its lean. Treat that
+  as a feature: you see the disagreement, then the grounded lean, then you decide.
 - Don't pile multiple intents into one turn. The orchestrator caps at two
   specialist routes per turn; one clear question per turn gets a sharper answer.
 
@@ -357,12 +360,67 @@ clients without an auto-spawn mechanism you drive routing yourself (this guide).
   handling baked into every agent.
 - The Research Sample Size Policy and reliability tiers applied consistently.
 - Hard non-advisory framing and the mandatory risk footer — these are the
-  product's spine and they are enforced everywhere.
+  product's spine and they are enforced everywhere. *(Superseded 2026-07-05: the
+  non-advisory framing was replaced by Grounded Partnership — see §8. The risk
+  footer, sample-size discipline, and hard stops remain the spine.)*
 - `skills/mcp-tools/SKILL.md` as a single, generated-doc-backed routing source.
 
 ---
 
-## 8. Quick reference card
+## 8. Grounded-partnership doctrine + map-vs-territory conventions — applied 2026-07-05
+
+A second full pass over the agent surface. Two changes, both docs/prompts only — no Rust
+or MCP tool behavior changed.
+
+### 8.1 Advisory language replaced by grounding discipline
+
+The repo's prompts enforced a public-product "non-advisory / coaching-only" boundary
+(never recommend, forbidden-phrase lists, a compliance-research skill) that contradicted
+both CLAUDE.md rule #4 and how the trader actually uses the system. Replaced everywhere
+with **Grounded Partnership** (canonical text: `AGENT.md`): agents proactively propose
+trade ideas — direction, entry, stop, target — and give straight opinions, with grounding
+mandatory (playbook rules, structure/flow evidence, or backtest stats with `N` +
+reliability tier). What did **not** change: risk footers, binary hard stops and circuit
+breakers, the sample-size policy, conflict reporting before any lean, Layer 2 alerts
+firing only from the trader's own rules, and the trader pressing the buttons.
+
+Touched: `CLAUDE.md`, `AGENT.md`, `.cursorrules`, `README.md`, `orchestrator`,
+`risk-coach`, `playbook-evaluator`, `market-structure-analyst`, `orderflow-analyst`,
+`levels-analyst`, `performance-analyst`, `backtest-analyst`, `options-api-researcher`,
+`prompt-quality-evaluator` (re-missioned as the grounding evaluator),
+`commands/coaching-test.md` (now tests grounding in both failure directions), and the
+social-intelligence docs. `skills/compliance-research/` is archived to
+`docs/archive/compliance-research/` with a banner.
+
+### 8.2 Map-vs-territory conventions added
+
+- **`/unknowns-pass`** (`commands/unknowns-pass.md`) — pre-implementation blindspot
+  checklist built from this repo's own paid-for incidents (stale rules binary, silent
+  contract mismatch, IDEA-000 gate/entry contradiction, over-firing state flags,
+  golden-bless discipline). Wired into `AGENT.md`'s workflow and the dev-facing agents.
+- **`AGENT.md` "Map vs Territory Conventions"** — interview protocol for ADR-scale
+  features (Pending ADR + one question at a time), dated implementation notes in the
+  nearest doc, and this very section's format as the post-change explainer standard.
+- **Idea template** in `docs/setup-ideas-and-backtesting.md` — tweakables first, known
+  unknowns / invalidation criteria, instrumentation dependencies, consistency check,
+  settled-verdict check.
+- **De-numbered** the per-domain tool-count table in `AGENT.md` (counts live in the
+  generated `docs/mcp/tool-reference.md`, which cannot drift).
+
+### 8.3 Check yourself (the quiz)
+
+1. *The agent says "I'd take this long here." What must accompany that sentence for it
+   to be valid output?* — Cited evidence: the playbook rule / structure / flow read, and
+   any statistic with `N` + reliability tier; full conviction only at `N ≥ 30` verified.
+2. *Can the agent propose a brand-new setup idea directly into the live playbook?* —
+   No. Agent ideas route through `register_hypothesis` → backtest → `propose_draft_setup`
+   → trader-confirmed `activate_draft_setup`. Layer 2 still fires only trader-owned rules.
+3. *You're at 3 consecutive losses and the agent has a grounded A+ setup read. What
+   happens?* — Hard stop wins. Circuit breakers are binary; no idea survives them.
+
+---
+
+## 9. Quick reference card
 
 ```
 SESSION START   → "Brief me"   (answer the balance + positions questions)

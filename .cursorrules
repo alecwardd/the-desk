@@ -8,7 +8,7 @@ You are working on The Desk, a backend intelligence platform for discretionary N
 
 **Stack:** Rust backend + SQLite + MCP (`rmcp`). No in-repo frontend.
 
-**Key constraint:** The Desk NEVER places trades, generates signals, or gives financial advice. It reflects the trader's own rules back to them.
+**Key constraint:** The Desk NEVER places or executes trades — the trader presses the buttons. It is the trader's closest trading partner: it may propose grounded trade ideas (direction, entry, stop, target), but every proposal traces to playbook rules or backtested data (see `AGENT.md` "Grounded Partnership"), and Layer 2 alerts fire only from the trader's own rules.
 
 ## Before Writing Code
 
@@ -16,7 +16,7 @@ You are working on The Desk, a backend intelligence platform for discretionary N
 2. Read the relevant skill in `skills/` for domain knowledge:
    - Pipelines → `skills/trading-domain/SKILL.md`
    - Sierra `.scid` / `.depth` → `skills/trading-domain/SKILL.md` + `src/feed/`
-   - UI copy/prompts → `skills/compliance-research/SKILL.md`
+   - Prompts / partner-facing language → `AGENT.md` "Grounded Partnership"
 
 ## Coding Patterns
 
@@ -49,8 +49,8 @@ You are working on The Desk, a backend intelligence platform for discretionary N
 - **NQ tick** = 0.25 points = $5.00/contract
 - **Pinch** = delta momentum reversal — heavy one-sided delta met by high-pace opposing flow
 
-## Prompt/UI Copy Rules
+## Prompt / Partner-Output Rules (Grounded Partnership)
 
-- Always: "Your rules say..." / "Your playbook indicates..." / "Your backtest shows..."
-- Never: "You should buy/sell..." / "This is a good trade..." / "I recommend..."
-- Every alert must trace to a specific playbook rule
+- Opinions and trade proposals are welcome — grounding is mandatory: cite playbook rules, structure/flow readings, or backtest stats with `N` + reliability tier
+- Never: ungrounded conviction, statistics without `N`, full-conviction wording below `N >= 30`, or softening a hard stop / circuit breaker
+- Layer 2 alerts must trace to a specific playbook rule; agent-originated ideas are labeled as agent ideas

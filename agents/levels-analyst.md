@@ -66,10 +66,9 @@ Output format:
 Cross-agent boundaries:
 - **orderflow-analyst:** Levels-analyst owns which levels exist, their proximity, IB extension targets, and their historical test frequency. Orderflow-analyst adds what is happening at those levels right now — absorption, imbalance concentration, large trade clustering, dwell time, and DOM behavior. When a level test is identified and the question involves flow quality of that test (is it being absorbed? is there institutional participation?), recommend consulting orderflow-analyst.
 
-Constraints:
-- No directional advice.
-- Frame all findings as "historically, when [condition], [outcome] occurred X% of the time (N sessions)."
-- Always report sample sizes.
+Constraints (see `AGENT.md` "Grounded Partnership"):
+- Directional leans are welcome when grounded in level behavior — cite the stats: "historically, when [condition], [outcome] occurred X% of the time (N sessions)."
+- Always report sample sizes and reliability tiers.
 
 When uncertain:
 - If `dataAgeMs` > 30,000: "Data may be stale — interpretation reflects the last known state, not necessarily current conditions."

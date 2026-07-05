@@ -132,7 +132,7 @@ Caveats:
 
 ## Guardrails
 
-- No trading advice. Use framing: "your setup has historically...", "your data shows...".
+- Ground everything in the trader's own data: "your setup has historically...", "your data shows...". Opinions on what deserves focus or more/less size attention are welcome when the stats support them (see `AGENT.md` "Grounded Partnership").
 - Always report sample size (`N`) with every statistic.
 - Never present low-sample stats as high-confidence conclusions.
 - Never compare the trader to other traders or public benchmarks.

@@ -101,9 +101,9 @@ Use `get_feed_health` and `validate_data_integrity` to confirm feed freshness an
 
 ## What It Does NOT Do
 
-- Place or manage trades
-- Generate proprietary signals
-- Give financial advice ("your playbook says..." not "you should buy/sell...")
+- Place or manage trades — the trader always executes
+- Fire playbook alerts that don't trace to the trader's own rules (agent-proposed ideas go through the hypothesis → backtest → draft-setup lifecycle)
+- Offer ungrounded opinions — every trade idea and opinion cites playbook rules, live structure/flow, or backtested stats with sample size (see `AGENT.md` "Grounded Partnership")
 - Require any additional data subscriptions beyond what Sierra Chart already provides
 
 ## Tech Stack
@@ -154,7 +154,7 @@ the-desk/
 │   ├── recording/mod.rs        # Session recording + replay
 ├── skills/                     # Domain knowledge for agents
 │   ├── trading-domain/SKILL.md # TPO, delta, PTT methodology
-│   └── compliance-research/    # Coaching vs advisory positioning
+│   └── mcp-tools/SKILL.md      # Scenario → MCP tool routing
 ├── docs/dom-replay.md          # Note on removed DOM visualizer (MCP depth tools remain)
 ├── agents/                     # Cursor agent definitions
 ├── CLAUDE.md                   # Project rules for all agents

@@ -1,7 +1,15 @@
 ---
 name: ComplianceResearch
-description: Securities compliance research for The Desk. USE WHEN regulatory questions arise, when reviewing marketing language, when positioning the product legally, or when a user asks about the coaching-vs-advisory distinction. Spawns a research subagent to investigate specific regulatory questions.
+description: ARCHIVED 2026-07-05. Securities compliance research for a public-product scenario that is not planned. Superseded by AGENT.md "Grounded Partnership".
 ---
+
+> **ARCHIVED (2026-07-05).** The Desk is a private, single-trader tool with no public
+> launch planned, so the coaching-vs-advisory phrasing boundary this skill enforced no
+> longer applies. The active doctrine is `AGENT.md` "Grounded Partnership": agents may
+> propose trade ideas with entries, stops, and targets — the discipline is evidence
+> grounding (playbook rules, structure/flow, backtested stats with `N`), not softened
+> phrasing. This file is retained only in case productization is ever revisited; if it
+> is, start with fresh counsel — do not treat this research as current.
 
 # Securities Compliance Research
 

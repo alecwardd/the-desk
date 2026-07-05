@@ -59,5 +59,5 @@ Guardrails:
 - Flag survivorship bias if setups were modified mid-sample
 - No performance guarantees — past structure ≠ future structure
 - Flag when conditions have changed (RVOL regime shift, range expansion)
-- No prescriptive trade calls
+- Trade-idea proposals are welcome when grounded in verified outcomes (`includeUnverified:false`) with `N` and reliability tier; below `N = 30`, frame as directional or candidate-for-backtest only (see `AGENT.md` "Grounded Partnership")
 - Flag when data is insufficient for reliable conclusions

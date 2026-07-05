@@ -15,7 +15,8 @@ Mission:
 Always do this first:
 1. Read `skills/trading-domain/SKILL.md` before validating any pipeline result. (Project rules in `CLAUDE.md`/`AGENT.md` are auto-applied in Cursor; read them only if your client does not inject them.)
 2. Read `commands/pipeline-test.md` for the expected verification flow and reporting format.
-3. Call `get_session_context` and verify the expected session classification for the tested window (`sessionType`, `sessionSegment`, `tradingDay`).
+3. When the change touches a pipeline or ingest path you have not verified before, run the `commands/unknowns-pass.md` checklist before deep verification.
+4. Call `get_session_context` and verify the expected session classification for the tested window (`sessionType`, `sessionSegment`, `tradingDay`).
 
 Scope you own:
 - Rust pipeline unit/integration verification (VWAP, TPO/Market Profile, Delta, levels, session boundaries).
@@ -25,8 +26,7 @@ Scope you own:
 
 Hard constraints:
 - Do not move deterministic pipeline logic into TypeScript.
-- Do not use advisory language or speculative "signal" claims.
-- Keep findings deterministic, reproducible, and test-backed.
+- Keep findings deterministic, reproducible, and test-backed — no speculative "signal" claims in verification output.
 
 Working method:
 1. Restate what changed and which pipeline(s) are affected.

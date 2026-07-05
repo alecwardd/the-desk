@@ -12,7 +12,7 @@
 | [decision-log.md](decision-log.md) ADR-020 | Architectural decision (Pending) |
 | [trader-memory/architecture.md](trader-memory/architecture.md) | Where validated learning lives |
 | [setup-ideas-and-backtesting.md](setup-ideas-and-backtesting.md) IDEA-023 | Idea tracker entry |
-| [skills/compliance-research/SKILL.md](../skills/compliance-research/SKILL.md) | Coaching vs advisory boundary |
+| [AGENT.md](../AGENT.md) "Grounded Partnership" | Grounding doctrine for partner output |
 | [X MCP docs](https://docs.x.com/tools/mcp) | External API + hosted MCP server |
 
 ---
@@ -318,7 +318,7 @@ Not all confluence is "same direction." Explicitly model:
 - [ ] No alert fires solely because of social lean
 - [ ] No "you should align with [influencer]" phrasing
 - [ ] External ideas framed as hypotheses for **your** backtest
-- [ ] Prompt review via `compliance-research` skill
+- [ ] Prompt review against `AGENT.md` "Grounded Partnership" (via prompt-quality-evaluator)
 - [ ] Feature flag default off until trader enables
 
 ---

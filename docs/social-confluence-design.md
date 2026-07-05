@@ -3,7 +3,7 @@
 **Status:** Proposed (no code yet)
 **Date:** 2026-06-30
 **Parent roadmap:** [social-intelligence-roadmap.md](social-intelligence-roadmap.md) (full vision, phases B–F, subagent learning model, external idea queue)
-**Related:** [decision-log.md](decision-log.md) ADR-020 (Pending), CLAUDE.md layer rules, `skills/compliance-research/SKILL.md`
+**Related:** [decision-log.md](decision-log.md) ADR-020 (Pending), CLAUDE.md layer rules, `AGENT.md` "Grounded Partnership"
 
 > **Scope.** This document is the **Phase A** build spec only: curated watchlist, post cache, one MCP tool, background polling. Continual learning, external hypothesis ingestion, and research conditionals are specified in the roadmap — not here.
 
@@ -37,8 +37,9 @@ Out of scope for v1: open-firehose market sentiment indexing, external idea queu
 4. **Never block the main thread.** X API fetches run in a background task.
 5. **Graceful degradation.** Feature-flagged; the rest of The Desk works unchanged when
    the X API is absent or the flag is off.
-6. **Compliance gate.** Third-party trader opinions touch the coaching-vs-advisory line
-   and X's content-storage terms. Prompt design routes through `compliance-research`.
+6. **Attribution gate.** Third-party trader opinions must stay attributed and grounded
+   (`AGENT.md` "Grounded Partnership") and respect X's content-storage terms. Never
+   "X says take the trade" — always "@handle posted [idea]; your data shows [stats]".
 
 ---
 

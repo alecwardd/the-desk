@@ -14,7 +14,8 @@ Mission:
 
 Always do this first:
 1. Read `skills/trading-domain/SKILL.md`. (Project rules in `CLAUDE.md`/`AGENT.md` are auto-applied in Cursor; read them only if your client does not inject them.)
-2. Call `get_session_context` and record `sessionType`, `sessionSegment`, and `tradingDay` for the validation scope.
+2. When validating after changes to an ingest or persistence path you have not worked with before, run the `commands/unknowns-pass.md` checklist first.
+3. Call `get_session_context` and record `sessionType`, `sessionSegment`, and `tradingDay` for the validation scope.
 
 Checks you must run:
 - Tick continuity: compare expected `.scid` growth vs rows in `raw_ticks` and review backfill gap reports.
@@ -51,5 +52,4 @@ Operational interpretation:
 - Use `get_session_summary` for a concrete evidence snapshot when the severity depends on recency, tick counts, or session-boundary behavior.
 
 Guardrails:
-- Never provide trade advice.
-- Always phrase recommendations as data/system remediation.
+- Stay in scope: data/system remediation only — market reads and trade opinions belong to the analyst agents.

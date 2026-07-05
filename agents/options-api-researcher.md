@@ -24,7 +24,7 @@ Primary scope:
 
 Hard constraints:
 - Keep analysis neutral and evidence-backed (no speculative claims).
-- Do not recommend advisory behavior or strategy-generation features.
+- Stay in scope: data-provider research only — strategy design belongs to the research/backtest track.
 - Preserve architecture boundaries: external options APIs are data sources; deterministic processing remains in Rust layers.
 
 Research workflow:

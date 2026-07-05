@@ -502,7 +502,7 @@ New `FeedConfig` fields (all serde-default): `max_ticks_per_poll` (5000), `analy
 
 **Date:** 2026-06-30
 **Status:** Pending
-**Related:** [social-intelligence-roadmap.md](social-intelligence-roadmap.md), [social-confluence-design.md](social-confluence-design.md) (Phase A spec), [setup-ideas-and-backtesting.md](setup-ideas-and-backtesting.md) IDEA-023, https://docs.x.com/tools/mcp
+**Related:** [social-intelligence-roadmap.md](social-intelligence-roadmap.md), [social-confluence-design.md](social-confluence-design.md) (Phase A spec), [setup-ideas/idea-023-social-intelligence.md](setup-ideas/idea-023-social-intelligence.md) (IDEA-023), https://docs.x.com/tools/mcp
 
 **Context:** The trader wants trusted X accounts to inform live confluence checks, surface backtesting hypotheses, provide real-time context from voices they respect, and prompt subagents with externally sourced edge situations — while The Desk stays data-based and the deterministic core stays clean. X now exposes a hosted MCP server with read-only post/timeline/search access. Broader vision (continual learning via memory + research, external idea queue, subagent-scoped calibration) is documented in the roadmap; v1 is account confluence only. Two questions must be answered before building: (1) how this fits The Desk's strict layer separation, and (2) the X API access mode and cost, given X moved to pay-per-use (~$0.005/read, 2M/mo cap, then Enterprise $42k+/mo) with legacy Basic/Pro closed to new signups.
 

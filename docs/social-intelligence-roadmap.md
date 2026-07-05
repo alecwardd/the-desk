@@ -11,7 +11,7 @@
 | [social-confluence-design.md](social-confluence-design.md) | v1 implementation spec (Layer-3 cache + MCP tool) |
 | [decision-log.md](decision-log.md) ADR-020 | Architectural decision (Pending) |
 | [trader-memory/architecture.md](trader-memory/architecture.md) | Where validated learning lives |
-| [setup-ideas-and-backtesting.md](setup-ideas-and-backtesting.md) IDEA-023 | Idea tracker entry |
+| [setup-ideas/idea-023-social-intelligence.md](setup-ideas/idea-023-social-intelligence.md) | Idea tracker entry (IDEA-023) |
 | [AGENT.md](../AGENT.md) "Grounded Partnership" | Grounding doctrine for partner output |
 | [X MCP docs](https://docs.x.com/tools/mcp) | External API + hosted MCP server |
 
@@ -184,7 +184,7 @@ The repo's **code** should not auto-mutate from tweets. **SQLite + curated markd
 
 ## External idea ingestion pipeline
 
-Third-party setup ideas and edge situations should flow through a **trader-gated queue**, mirroring how IDEA entries in `setup-ideas-and-backtesting.md` work.
+Third-party setup ideas and edge situations should flow through a **trader-gated queue**, mirroring how IDEA entries in `docs/setup-ideas/` work.
 
 ### Conceptual flow
 

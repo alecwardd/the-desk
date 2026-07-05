@@ -1,7 +1,7 @@
 # Multi-Instrument Flow Architecture (NQ / MNQ / ES / MES)
 
 **Status:** Spec — Stage A buildable (2026-06-23)
-**Tracking:** IDEA-021 in `setup-ideas-and-backtesting.md`
+**Tracking:** [IDEA-021](setup-ideas/idea-021-multi-instrument-flow.md)
 **Doctrine:** memory `multi-instrument-flow-architecture`, `rebid-reoffer-zone-doctrine`
 **Owner:** trader
 

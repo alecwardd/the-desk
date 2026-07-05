@@ -154,8 +154,8 @@ it). No implementation past an undecided ADR.
 
 When the work deviates from the plan — a constraint discovered, a scope cut, a threshold
 left provisional — record a dated note in the doc nearest the work, using the existing
-pattern: `**Implementation note (YYYY-MM-DD):** …`. Research work → the relevant IDEA in
-`docs/setup-ideas-and-backtesting.md`; architecture → the ADR; tool-surface work →
+pattern: `**Implementation note (YYYY-MM-DD):** …`. Research work → the relevant idea file
+in `docs/setup-ideas/`; architecture → the ADR; tool-surface work →
 `docs/mcp/README.md`. Do not create new standalone note files; single-source docs only.
 
 ### Post-change explainer (and quiz) for substantial changes

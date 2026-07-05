@@ -23,7 +23,7 @@ Read the nearest living doc for the area, then spot-check one of its claims agai
 | Rules / condition fields | `CLAUDE.md` + `src/rules/mod.rs` doc comments | `ConditionField`, `RULES_ENGINE_SCHEMA_VERSION` |
 | Backtesting / recorded data | `docs/data-and-backtesting-guide.md` | `src/backfill.rs`, `src/research/` |
 | MCP tool surface | `docs/mcp/README.md` (checklist) | `src/bin/the-desk-mcp/tools/`, generated `docs/mcp/tool-reference.md` |
-| Setup ideas | `docs/setup-ideas-and-backtesting.md` (statuses + verdicts) | `src/rules/setup_templates.rs` |
+| Setup ideas | `docs/setup-ideas/index.md` (catalog + verdicts, one file per idea) | `src/rules/setup_templates.rs` |
 
 If the map and the territory disagree, fix or flag the map as part of the change — do not
 silently work around it.
@@ -32,7 +32,7 @@ silently work around it.
 
 - Any **Pending ADR** in `docs/decision-log.md` touching this area? Do not implement past
   an undecided ADR — resolve its "open items" with the trader first.
-- Any relevant idea status in `docs/setup-ideas-and-backtesting.md`? Call
+- Any relevant idea status in the `docs/setup-ideas/` catalog? Call
   `list_hypotheses` and skim the verdicts — **never re-test a rejected idea** in its
   rejected form (IDEA-000 and IDEA-012 were rejected as specified but reconstructed in
   IDEA-020; know which form is settled).

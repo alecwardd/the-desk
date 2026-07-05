@@ -154,8 +154,8 @@ longer have to eyeball N to catch a state-flag setup re-firing.
   instead of the looser `price_vs_vwap` scoping.
 - The rules engine is now at `RULES_ENGINE_SCHEMA_VERSION = 5`. After any field/operator change,
   rebuild `target_alt/release/the-desk-mcp.exe` (the binary Cursor runs) and restart the MCP server
-  before registering, or it will reject the new field (see `docs/setup-ideas-and-backtesting.md`
-  infra findings).
+  before registering, or it will reject the new field (see the infrastructure findings in
+  `docs/setup-ideas/research-notes.md`).
 - Pass the contract that was front during the window (`NQH6.CME` for 2025-11-28…2026-03-06) with
   `force: true`. **Once the contract-routing change is deployed** (rebuild + restart), pass it directly
   to `run_backtest` as `{ "contract": "NQH6.CME" }` — this replays that contract's `.scid` without

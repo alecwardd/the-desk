@@ -189,6 +189,7 @@ the-desk/
 │   └── recording/mod.rs             # Session recording + replay
 ├── docs/
 │   ├── mcp/                          # MCP server architecture + generated tool reference
+│   ├── setup-ideas/                  # Setup-idea tracker (index, _template, one file per idea)
 │   ├── decision-log.md               # ADR-style decisions (living)
 │   └── archive/                      # Superseded docs (v0 GUI planning, archived compliance-research skill)
 ├── agents/                           # Cursor agent definitions

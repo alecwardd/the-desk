@@ -7,7 +7,7 @@ with high confidence. It links out to the specialized docs rather than duplicati
 
 Companion docs:
 - [System Data Flow](architecture/data-flow.md) — the moving parts (Sierra ↔ MCP ↔ agents ↔ storage).
-- [Setup Ideas & Backtesting log](setup-ideas-and-backtesting.md) — the running list of ideas + their verdicts.
+- [Setup Ideas & Backtesting tracker](setup-ideas/index.md) — the idea catalog + verdicts (one file per idea).
 - [MCP tool reference](mcp/tool-reference.md) (generated catalog) and [tool routing](../skills/mcp-tools/SKILL.md).
 - [Ops & Storage runbook](ops/automation-and-storage.md) — retention, archival, scheduled tasks.
 
@@ -93,8 +93,8 @@ Full schema is in `src/db/mod.rs`. The tables you actually care about for backte
 Backtests replay historical `.scid` through the **same** rules engine the live server uses, then
 record `signal_outcomes` you query for stats. Run from any MCP client (a Cursor agent is typical).
 
-**First, don't re-test a settled idea:** run `list_hypotheses` and skim
-[setup-ideas-and-backtesting.md](setup-ideas-and-backtesting.md) before registering anything new.
+**First, don't re-test a settled idea:** run `list_hypotheses` and skim the catalog in
+[setup-ideas/index.md](setup-ideas/index.md) before registering anything new.
 
 ### 4.0 Before you start — three freshness/safety gates
 1. **Rules-engine version:** `RULES_ENGINE_SCHEMA_VERSION` is currently **5**. If you changed any
@@ -181,6 +181,6 @@ Always check `get_research_summary` first for the baseline sample size.
 1. **This guide** — the model + workflow.
 2. [`skills/trading-domain/SKILL.md`](../skills/trading-domain/SKILL.md) — TPO/delta/PTT meaning (never misuse the terms).
 3. [`skills/mcp-tools/SKILL.md`](../skills/mcp-tools/SKILL.md) — which tool for which scenario.
-4. [`docs/setup-ideas-and-backtesting.md`](setup-ideas-and-backtesting.md) — current ideas + verdicts (don't re-litigate settled ones).
+4. [`docs/setup-ideas/index.md`](setup-ideas/index.md) — current ideas + verdicts (don't re-litigate settled ones).
 5. [`docs/idea000-idea012-backtest-runbook.md`](idea000-idea012-backtest-runbook.md) — concrete registration/run JSON templates.
 6. `AGENT.md` "Research Sample Size Policy" — how much to trust a result.

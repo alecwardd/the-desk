@@ -401,9 +401,11 @@ social-intelligence docs. `skills/compliance-research/` is archived to
 - **`AGENT.md` "Map vs Territory Conventions"** — interview protocol for ADR-scale
   features (Pending ADR + one question at a time), dated implementation notes in the
   nearest doc, and this very section's format as the post-change explainer standard.
-- **Idea template** in `docs/setup-ideas-and-backtesting.md` — tweakables first, known
+- **Idea template** — tweakables first, known
   unknowns / invalidation criteria, instrumentation dependencies, consistency check,
-  settled-verdict check.
+  settled-verdict check. *(Moved 2026-07-05 to `docs/setup-ideas/_template.md` when the
+  monolith was split into `docs/setup-ideas/` — one file per idea + index; the old path
+  is a pointer stub.)*
 - **De-numbered** the per-domain tool-count table in `AGENT.md` (counts live in the
   generated `docs/mcp/tool-reference.md`, which cannot drift).
 

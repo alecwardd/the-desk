@@ -149,6 +149,36 @@ cheap) that everything else trades off.
   MCP tool can return → tiny read-only prototype → decide paid tier / fallback.
   No subscription until the free spike proves the schema.
 
+## 2026-07-08 update — cvforge API access, corrected (hands-on + docs read)
+
+Alec created a cvforge account, and the public API docs were read directly
+([cvforge API docs](https://cvforge.convexvalue.com/docs/api/), accessed
+2026-07-08). This corrects the free-tier claim in the ranking/§cvforge above:
+
+- **API is real and publicly documented.** Base URL
+  `https://tap.convexvalue.com/api/data`; auth = Bearer token `cv_live_…`.
+  11+ endpoints incl. `/chains` (option chains), `/query` (SQL over options),
+  `/screen`, `/mas/*` (historical OHLC), `/fmp/stable/*` (fundamentals), `/ai/*`.
+  Params include `strike_price`, `implied_volatility`, `delta`. JSON responses.
+- **BUT "API on the free tier" was overstated.** In practice a usable `cv_live_`
+  data key required subscribing to a plan — Alec could **not** get an API key on
+  the bare free account. Core data endpoints (`/chains`, `/query`, `/mas`) are
+  **plan-gated**; Free's 20 req/hr is heavily limited and historical is
+  Research-tier only. Only the `/ai/*` routes are not plan-gated (prepaid AI
+  credits, metered).
+- **No advertised free trial.** Cheapest data tier = **Go $29.99/mo**
+  (month-to-month, cancel anytime).
+
+**Revised recommendation.** cvforge is still the best *architecture* fit
+(documented REST + SPX + agent/MCP-oriented, cheap) but is **not free to
+validate live**. Two-phase next step: (1) a **docs-based schema validation needs
+no key and no payment** — map the documented endpoints/fields to the-desk's
+needs, confirm SPX coverage/history, and produce a go/no-go + integration plan;
+(2) to smoke-test live, either ask ConvexValue (solo dev, reachable via
+Substack/X) for a short eval key, or take one month of Go ($30) — **not until
+Alec approves spend**. Fallback unchanged: Unusual Whales → GEXBot (re-check
+their trial/entry terms if pursued).
+
 ## Top risks / caveats
 
 - **SPX→NQ lead is an unproven assumption**, not a validated edge. Validate the

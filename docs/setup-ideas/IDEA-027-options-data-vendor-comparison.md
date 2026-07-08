@@ -179,6 +179,87 @@ Substack/X) for a short eval key, or take one month of Go ($30) — **not until
 Alec approves spend**. Fallback unchanged: Unusual Whales → GEXBot (re-check
 their trial/entry terms if pursued).
 
+## Phase 1 — cvforge docs-based validation (no key, no pay) — 2026-07-08
+
+Validated cvforge against the-desk's actual Phase-2 options needs
+(`docs/phase-2-options-databento-memo.md`, ADR-013) using only public docs
+([API](https://cvforge.convexvalue.com/docs/api/),
+[options snapshot schema](https://cvforge.convexvalue.com/docs/data/options-snapshot),
+[classic params](https://convexvalue.com/docs/params), all accessed 2026-07-08).
+**No key created, nothing subscribed, no code written.**
+
+### Endpoints available (from docs)
+- `GET/POST /chains/{symbol}?params=…` — per-contract option-chain snapshot (all plans).
+- `POST /screen` — cross-market screener over every contract (all plans).
+- `POST /query` — read-only SQL over the options snapshot (all plans).
+- `GET/POST /mas/v2/aggs/…`, `/mas/v1/open-close/…` — historical OHLC (**Research tier**).
+- `POST /mcp` — MCP server, JSON-RPC 2.0, for coding agents (all plans).
+- `/fmp/stable/*` fundamentals; `/ai/*` model access (credit-metered). Auth: Bearer
+  `cv_live_`. Rate limits/hr: Free 20 · Go 1,000 · Research 50,000.
+
+### Required fields for the-desk SPX dealer-flow work (per ADR-013 GEXAggregator)
+Per-contract: strike · expiration · option type · open interest · IV · **gamma** (+ delta) ·
+underlying price · contract multiplier → the-desk computes `GEX_strike = gamma × OI ×
+mult × sign(dealer)`, then zero-gamma / max-gamma / GEX-flip / dealer-positioning
+itself. charm & vanna wanted for the optional charm/vanna-flow (P1).
+
+### What cvforge appears to provide (maps cleanly)
+- **`/chains` snapshot for `I:SPX` (index options via `I:` prefix — SPX/VIX/NDX/RUT/XSP
+  explicitly supported).** Fields incl. `strike_price`, `expiration_date`,
+  `contract_type`, `open_interest`, `implied_volatility`, `delta`, `gamma`, `theta`,
+  `vega`, `shares_per_contract`, `underlying_price`, NBBO + day OHLCV. → **every raw
+  input the GEXAggregator needs is present.**
+- **Classic params system** adds `gamma`, `charm`, `vanna`, and the products `gxoi`
+  (gamma×OI), `gxvolm`, `charmxoi`, `vannaxoi`, etc., at contract **and** underlying
+  level — reachable via `/query`/`/screen`. So charm/vanna and a ready-made `gxoi`
+  are obtainable, just not in the default `/chains` payload.
+
+### Missing / unclear (the reasons a key is still needed)
+- **charm & vanna are NOT in the `/chains` snapshot schema** — only in the params
+  system (`/query`). Confirm they resolve for `I:SPX` on the **Go** tier, not just Research.
+- **No signed dealer-GEX aggregate** — cvforge gives raw gamma/OI; the-desk applies its
+  own `sign(dealer)`. (This is actually *better* ADR-013 alignment than a black-box GEX
+  vendor — but it means no turnkey "dealer positioning" field.)
+- **Real-time vs delayed** greeks/quotes on Go unclear; **0DTE completeness** (all SPXW
+  daily expirations + full strike ladder) unverified; **historical depth** is
+  Research-tier (`/mas`) — matters for the memo's SQLite/backtest persistence.
+- **Rate limits:** Free 20/hr is too low for a full SPX chain refresh; Go 1,000/hr is
+  likely fine for a 5-min RTH refresh — confirm a full chain = one request, not many.
+
+### Expected integration shape
+Drops into the memo's planned `options/` module with **less** work than Databento:
+swap `DatabentoClient` → a `CvforgeClient` (REST, `GET /chains/I:SPX?params=…`, Bearer
+`cv_live_`); **skip most of `GreeksEngine`** (delta/gamma are vendor-provided — pull
+charm/vanna via `/query` or keep computing them to stay ADR-013-pure); feed
+`gamma × open_interest × shares_per_contract × sign(dealer)` into the existing
+`GEXAggregator`; emit the same `OptionsState` → `MarketState` → `ConditionField`s
+(`gex_level`, `gamma_exposure_sign`, `dealer_positioning`). The `/mcp` endpoint also
+lets agents query cvforge directly. Trade-off: vendor-computed greeks are the black box
+ADR-013 exists to replace — acceptable for an **interim** bridge, revisited at Databento.
+
+### Go / No-Go (before any paid month)
+**Conditional GO.** The docs clear the architectural fit: `I:SPX` is supported and every
+raw field the-desk's own GEX model needs is in `/chains`, over a REST + MCP surface, at
+low cost — a *better* interim fit than the finished-GEX vendors because the-desk keeps
+its own aggregation. This is **not** a blind buy: one month of **Go ($29.99, cancel
+anytime)** — or an eval key — should confirm the four unknowns above (charm/vanna via
+`/query` on Go; real-time vs delayed; 0DTE completeness; a full-chain pull fits Go's
+rate limit). Take **Research ($59.99)** instead only if historical/backtest persistence
+is needed now. If charm/vanna or real-time turn out Research-gated or absent, re-weigh
+against **Unusual Whales** (turnkey pre-computed GEX + charm + vanna). Recommendation:
+proceed to a paid **Go**-tier Phase-2 smoke-test (or eval key) — do not stay blocked, but
+do not build the integration until that smoke-test confirms the unknowns.
+
+## Appendix — eval-key request draft (UNSENT; Alec to send via X)
+
+> Hi Juan — I'm building a systematic NQ-futures trading system and evaluating cvforge
+> as an interim SPX options/dealer-flow data source (I want the raw per-strike
+> gamma/OI/IV from `/chains` on `I:SPX`, plus charm/vanna via `/query`, to compute GEX
+> myself). The docs look like a strong fit. Before committing to a plan, would you be
+> open to a short temporary API key so I can validate the `I:SPX` schema, charm/vanna
+> availability, and rate limits against my pipeline? Happy to share what I find. Thanks
+> for building this — the API-first + MCP design is exactly what I was looking for.
+
 ## Top risks / caveats
 
 - **SPX→NQ lead is an unproven assumption**, not a validated edge. Validate the

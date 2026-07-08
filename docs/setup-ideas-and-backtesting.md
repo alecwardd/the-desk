@@ -2,6 +2,8 @@
 
 Living document for trade setup ideas, backtesting hypotheses, research findings, and cross-cutting infrastructure work (pipelines, MCP server surface, multi-instrument support). Each idea is tracked from concept through validation.
 
+> **Per-idea detail:** [`setup-ideas/index.md`](setup-ideas/index.md). This hub is being slimmed to cross-cutting material (snapshot, backtest results, roadmap, queue) plus a one-line stub per IDEA. Migration is in progress — IDEA bodies still below are not yet extracted.
+
 ### Companion specs
 
 Standalone deep-dive specs referenced by ideas in this document:
@@ -9,6 +11,7 @@ Standalone deep-dive specs referenced by ideas in this document:
 - **Multi-instrument flow architecture (NQ / MNQ / ES / MES)** — [`docs/multi-instrument-flow-architecture.md`](multi-instrument-flow-architecture.md) (tracked as IDEA-021): share structure / separate flow, mini-vs-micro flow-agreement → conviction & sizing, cross-asset NQ↔ES.
 - **IDEA-000 / IDEA-012 backtest runbook** — [`docs/idea000-idea012-backtest-runbook.md`](idea000-idea012-backtest-runbook.md): copy-pasteable register → backtest → gate → activate sequence.
 - **Social intelligence & continual learning (X/Twitter)** — [`docs/social-intelligence-roadmap.md`](social-intelligence-roadmap.md) (master feature track), [`docs/social-confluence-design.md`](social-confluence-design.md) (Phase A v1 spec), [`decision-log.md`](decision-log.md) ADR-020 (Pending), **IDEA-023** below: curated watchlist confluence, external hypothesis queue, subagent-scoped memory/research learning — never a playbook alert source. Access mode + cost still undecided.
+- **Market-maker pressure inference** — [`docs/setup-ideas/IDEA-024-market-maker-pressure-inference.md`](setup-ideas/IDEA-024-market-maker-pressure-inference.md): Avellaneda-Stoikov-inspired, DOM/tape-grounded taxonomy for inferring passive defense, retreat, replenishment, and adverse-selection pressure without claiming hidden participant intent.
 
 ---
 
@@ -1156,6 +1159,19 @@ Allow VWAP to be anchored from a user-specified event or time, not just the sess
 **Success criteria (full track):** Externally sourced hypotheses flow into IDEA entries and backtests; longitudinal stats show when alignment with specific accounts correlated with the trader's setup outcomes (sample-size gated).
 
 **Open decisions:** Watchlist, API access mode, budget ceiling, poll cadence, idea extraction cadence — see [roadmap open questions](social-intelligence-roadmap.md#open-questions-trader-decisions).
+
+---
+
+### IDEA-024: Market-Maker Pressure Inference
+
+**Status:** Idea (spec documented; no code implemented)
+**Source:** Trader request after reviewing Ruuj's Avellaneda-Stoikov article on X; existing DOM/tape tooling in The Desk
+**Complements:** IDEA-007, IDEA-012, IDEA-020, IDEA-022, DOM MCP tools, orderflow-analyst
+**Detail:** [setup-ideas/IDEA-024-market-maker-pressure-inference.md](setup-ideas/IDEA-024-market-maker-pressure-inference.md)
+
+**Framing:** A future deterministic inference layer that helps agents say when observable book/tape behavior is **consistent with** passive defense, liquidity retreat, replenishment, exhaustion, adverse-selection pressure, or liquidity vacuum. It must not claim to know named market-maker inventory or hidden intent.
+
+**First slice:** Level-based passive defense vs retreat around key levels using DOM pull/stack, same-window footprint, absorption/invalidation, and post-test acceptance.
 
 ---
 

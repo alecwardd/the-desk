@@ -250,7 +250,12 @@ against **Unusual Whales** (turnkey pre-computed GEX + charm + vanna). Recommend
 proceed to a paid **Go**-tier Phase-2 smoke-test (or eval key) — do not stay blocked, but
 do not build the integration until that smoke-test confirms the unknowns.
 
-## Appendix — eval-key request draft (UNSENT; Alec to send via X)
+## Appendix — eval-key request draft (UNSENT)
+
+Send by **email** — Juan's X DMs are off. Try **jb@convexvalue.com** (founder;
+search-derived, verify on send), or **support@convexvalue.com** / the contact
+form at convexvalue.com/contact as fallback.
+**Subject:** cvforge API — temporary eval key to validate SPX chains?
 
 > Hi Juan — I'm building a systematic NQ-futures trading system and evaluating cvforge
 > as an interim SPX options/dealer-flow data source (I want the raw per-strike

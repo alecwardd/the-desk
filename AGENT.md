@@ -385,3 +385,14 @@ These are operational diagnostics exposed by `get_runtime_events` and JSON logs.
 | `hypothesis.rejected` | A hypothesis or draft was rejected by the trader. |
 | `hypothesis.retired` | A hypothesis or draft was retired. |
 | `hypothesis.engine_version_drift` | Cached hypothesis metrics were stale relative to the current engine version. |
+
+## Second Brain
+
+Durable cross-project memory lives at `C:\Users\alecw\Claude\Projects\second-brain`
+(project page: `projects/the-desk.md`). Check it for prior decisions and open
+questions before large tasks. This repo is authoritative for all trading logic,
+research notes, backtests/verdicts, and engineering — never copy operational data,
+positions, or raw backtest output into the vault. External idea intake arrives via
+the vault's promotion pipeline (vault `raw/inbox/` → `docs/setup-ideas/` here →
+backtest → verdict). After significant sessions, append a ≤20-line after-session
+note per the vault's AGENTS.md.

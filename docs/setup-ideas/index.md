@@ -39,3 +39,5 @@ one-line stub anchor per IDEA pointing back here.
 | IDEA-023 | Social Intelligence & Continual Learning (X / Trusted Accounts) | [IDEA-023-social-intelligence-continual-learning.md](IDEA-023-social-intelligence-continual-learning.md) | ⬜ |
 | IDEA-024 | Market-Maker Pressure Inference | [IDEA-024-market-maker-pressure-inference.md](IDEA-024-market-maker-pressure-inference.md) | ✅ |
 | IDEA-025 | NQStats Statistical Setup Library | [IDEA-025-nqstats-stat-library-setups.md](IDEA-025-nqstats-stat-library-setups.md) | ✅ |
+| IDEA-026 | VolSignals VS3D Vendor Evaluation | [IDEA-026-volsignals-vs3d-vendor-eval.md](IDEA-026-volsignals-vs3d-vendor-eval.md) | ✅ |
+| IDEA-027 | Options-Data Vendor Comparison (API-accessible SPX bridge) | [IDEA-027-options-data-vendor-comparison.md](IDEA-027-options-data-vendor-comparison.md) | ✅ |

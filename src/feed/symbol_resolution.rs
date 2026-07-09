@@ -352,8 +352,10 @@ mod tests {
 
     #[test]
     fn builds_metadata_for_explicit_backtest_symbol() {
-        let mut config = FeedConfig::default();
-        config.sierra_data_dir = "C:/nonexistent-test-dir".to_string();
+        let config = FeedConfig {
+            sierra_data_dir: "C:/nonexistent-test-dir".to_string(),
+            ..FeedConfig::default()
+        };
         let meta = resolve_contract_metadata_for_symbol(&config, "  NQH6.CME  ");
         // Trims input and derives root/month from the symbol.
         assert_eq!(meta.contract_symbol, "NQH6.CME");

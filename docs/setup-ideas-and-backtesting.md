@@ -12,6 +12,10 @@ Standalone deep-dive specs referenced by ideas in this document:
 - **IDEA-000 / IDEA-012 backtest runbook** — [`docs/idea000-idea012-backtest-runbook.md`](idea000-idea012-backtest-runbook.md): copy-pasteable register → backtest → gate → activate sequence.
 - **Social intelligence & continual learning (X/Twitter)** — [`docs/social-intelligence-roadmap.md`](social-intelligence-roadmap.md) (master feature track), [`docs/social-confluence-design.md`](social-confluence-design.md) (Phase A v1 spec), [`decision-log.md`](decision-log.md) ADR-020 (Pending), **IDEA-023** below: curated watchlist confluence, external hypothesis queue, subagent-scoped memory/research learning — never a playbook alert source. Access mode + cost still undecided.
 - **Market-maker pressure inference** — [`docs/setup-ideas/IDEA-024-market-maker-pressure-inference.md`](setup-ideas/IDEA-024-market-maker-pressure-inference.md): Avellaneda-Stoikov-inspired, DOM/tape-grounded taxonomy for inferring passive defense, retreat, replenishment, and adverse-selection pressure without claiming hidden participant intent.
+- **SPX/VIX RTH context feed for agents** — [`docs/setup-ideas/IDEA-028-spx-vix-rth-context-feed.md`](setup-ideas/IDEA-028-spx-vix-rth-context-feed.md): proposal for a derived RTH-only broad-market context packet that pairs Sierra SPX/VIX chart context with options/GEX maps and source notes, never as a standalone signal.
+- **Sierra execution chart study context and exports** — [`docs/setup-ideas/IDEA-029-sierra-execution-chart-study-context.md`](setup-ideas/IDEA-029-sierra-execution-chart-study-context.md): docs-only promotion for adaptive volume-bar sizing, Tape Reader / Delta Dynamics review, leg-to-leg volume/delta profiles, and spreadsheet-study exports as context or offline research, never live chart automation.
+- **NQ balance-zone taxonomy** — [`docs/setup-ideas/IDEA-030-nq-balance-zone-taxonomy.md`](setup-ideas/IDEA-030-nq-balance-zone-taxonomy.md): research queue for defining balance across TPO, volume, delta, multi-session value overlap, and external options context before testing any composite state.
+- **Session range compression and expansion** — [`docs/setup-ideas/IDEA-031-session-range-compression-expansion.md`](setup-ideas/IDEA-031-session-range-compression-expansion.md): research queue for session-scoped range/realized-volatility transitions across RTH, Asia, London, and consecutive like sessions.
 
 ---
 
@@ -1172,6 +1176,60 @@ Allow VWAP to be anchored from a user-specified event or time, not just the sess
 **Framing:** A future deterministic inference layer that helps agents say when observable book/tape behavior is **consistent with** passive defense, liquidity retreat, replenishment, exhaustion, adverse-selection pressure, or liquidity vacuum. It must not claim to know named market-maker inventory or hidden intent.
 
 **First slice:** Level-based passive defense vs retreat around key levels using DOM pull/stack, same-window footprint, absorption/invalidation, and post-test acceptance.
+
+---
+
+### IDEA-028: SPX/VIX RTH Context Feed for Agents
+
+**Status:** Researched (proposal only; no code implemented)
+**Source:** Vault dispatch after Alec added SPX and VIX charts in Sierra; source pointer says @convexvalue-style SPX flowcharts are desired agent-visible context, not signals
+**Complements:** IDEA-008, IDEA-013, IDEA-023, IDEA-024, IDEA-027, options MCP tools
+**Detail:** [setup-ideas/IDEA-028-spx-vix-rth-context-feed.md](setup-ideas/IDEA-028-spx-vix-rth-context-feed.md)
+
+**Framing:** A future derived RTH-only snapshot of SPX price context and VIX volatility context for agent narration. It should pair with SPX options/GEX maps and human source notes, but it must not fire alerts, alter risk, or bypass NQ structure/flow/playbook gates.
+
+**First slice:** Explicitly configured SPX/VIX `.scid` context files -> read-only RTH scan -> compact MCP context card with freshness/staleness and "context only" caveats.
+
+---
+
+### IDEA-029: Sierra Execution Chart Study Context and Exports
+
+**Status:** Researched (docs-only; no code or chart changes)
+**Source:** Vault dispatch promoting 2026-07-08 Sierra execution-chart notes plus 2026-07-09 spreadsheet-study export follow-up
+**Complements:** IDEA-006, IDEA-019, IDEA-020, IDEA-022, IDEA-024, IDEA-028, order-flow MCP tools
+**Detail:** [setup-ideas/IDEA-029-sierra-execution-chart-study-context.md](setup-ideas/IDEA-029-sierra-execution-chart-study-context.md)
+
+**Framing:** Adaptive volume bars, Tape Reader / Delta Dynamics settings, leg-to-leg volume/delta profiles, and Sierra spreadsheet-study exports are candidate context/research inputs. They should stay advisory or offline until deterministic repo-native fields and dated backtests show incremental value over existing RVOL, tape pace, delta, footprint, imbalance, and absorption tools.
+
+**First slice:** Preserve current fixed chart-size context (NQ 250 / ES 500) as human-supplied baseline; design offline replays and export/import checks before any MCP tool or Sierra chart setting changes.
+
+---
+
+### IDEA-030: NQ Balance-Zone Taxonomy
+
+**Status:** Idea (research queue; no code or signal claim)
+**Source:** Trader-authored capture, 2026-07-10
+**Complements:** IDEA-000, IDEA-007, IDEA-013, IDEA-029
+**Detail:** [setup-ideas/IDEA-030-nq-balance-zone-taxonomy.md](setup-ideas/IDEA-030-nq-balance-zone-taxonomy.md)
+
+**Framing:** Define and separately test TPO/volume balance, delta balance,
+multi-session value overlap, and external options neutrality before considering
+whether a composite "balance zone" adds information over existing day type,
+profile shape, and balance-state fields.
+
+---
+
+### IDEA-031: Session Range Compression and Expansion
+
+**Status:** Idea (research queue; no code or signal claim)
+**Source:** Trader-authored capture, 2026-07-10
+**Complements:** IDEA-000, IDEA-005, IDEA-007, IDEA-014
+**Detail:** [setup-ideas/IDEA-031-session-range-compression-expansion.md](setup-ideas/IDEA-031-session-range-compression-expansion.md)
+
+**Framing:** Test session-specific compression/expansion transitions with
+separate baselines for RTH, Asia, London, and consecutive like sessions. The
+captured expectation that expansion tends to be followed by contraction is a
+hypothesis to measure, not a current edge.
 
 ---
 

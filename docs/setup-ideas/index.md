@@ -41,3 +41,7 @@ one-line stub anchor per IDEA pointing back here.
 | IDEA-025 | NQStats Statistical Setup Library | [IDEA-025-nqstats-stat-library-setups.md](IDEA-025-nqstats-stat-library-setups.md) | ✅ |
 | IDEA-026 | VolSignals VS3D Vendor Evaluation | [IDEA-026-volsignals-vs3d-vendor-eval.md](IDEA-026-volsignals-vs3d-vendor-eval.md) | ✅ |
 | IDEA-027 | Options-Data Vendor Comparison (API-accessible SPX bridge) | [IDEA-027-options-data-vendor-comparison.md](IDEA-027-options-data-vendor-comparison.md) | ✅ |
+| IDEA-028 | SPX/VIX RTH Context Feed for Agents | [IDEA-028-spx-vix-rth-context-feed.md](IDEA-028-spx-vix-rth-context-feed.md) | ✅ |
+| IDEA-029 | Sierra Execution Chart Study Context and Exports | [IDEA-029-sierra-execution-chart-study-context.md](IDEA-029-sierra-execution-chart-study-context.md) | ✅ |
+| IDEA-030 | NQ Balance-Zone Taxonomy | [IDEA-030-nq-balance-zone-taxonomy.md](IDEA-030-nq-balance-zone-taxonomy.md) | ✅ |
+| IDEA-031 | Session Range Compression and Expansion | [IDEA-031-session-range-compression-expansion.md](IDEA-031-session-range-compression-expansion.md) | ✅ |

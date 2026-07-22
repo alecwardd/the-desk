@@ -17,6 +17,7 @@ Standalone deep-dive specs referenced by ideas in this document:
 - **NQ balance-zone taxonomy** — [`docs/setup-ideas/IDEA-030-nq-balance-zone-taxonomy.md`](setup-ideas/IDEA-030-nq-balance-zone-taxonomy.md): research queue for defining balance across TPO, volume, delta, multi-session value overlap, and external options context before testing any composite state.
 - **Session range compression and expansion** — [`docs/setup-ideas/IDEA-031-session-range-compression-expansion.md`](setup-ideas/IDEA-031-session-range-compression-expansion.md): research queue for session-scoped range/realized-volatility transitions across RTH, Asia, London, and consecutive like sessions.
 - **HMM lecture-notes repo-fit (docs-only)** — [`docs/setup-ideas/IDEA-032-hmm-lecture-notes-repo-fit.md`](setup-ideas/IDEA-032-hmm-lecture-notes-repo-fit.md): Miller 2016 HMM notes assessed as **ADAPT** reference for a future offline regime-research design; not a live signal and not an implement-now task.
+- **Expected-range ATR / RV / IV research plan (docs-only)** — [`docs/setup-ideas/IDEA-033-expected-range-atr-rv-iv-research-plan.md`](setup-ideas/IDEA-033-expected-range-atr-rv-iv-research-plan.md): staged offline plan comparing ATR, realized vol, and provenance-gated IV (or labeled proxy) for session sizing vs runner decisions; no backtest executed.
 
 ---
 
@@ -1245,6 +1246,20 @@ hypothesis to measure, not a current edge.
 offline latent-regime experiment. Prefer existing deterministic `Regime` and
 IDEA-007’s simpler RV-ratio path before any HMM implementation or agent
 exposure.
+
+---
+
+### IDEA-033: Expected-range ATR vs RV vs IV (session sizing + runners)
+
+**Status:** Researched (docs-only study design; pre-backtest Adapt; no code or signal claim)
+**Source:** second-brain queue ready-for-agent (2026-07-22); assessed 2026-07-22
+**Complements:** IDEA-007, IDEA-027, IDEA-028, IDEA-031, IDEA-032
+**Detail:** [setup-ideas/IDEA-033-expected-range-atr-rv-iv-research-plan.md](setup-ideas/IDEA-033-expected-range-atr-rv-iv-research-plan.md)
+
+**Framing:** Offline expected-range plan with separate session-sizing and
+runner-decision tracks. ATR/RV are derivable from session summaries / `.scid`;
+IV is live-only via ConvexValue unless a provenance-complete history or
+explicitly labeled proxy (e.g. VIX) is added. No backtest executed in this pass.
 
 ---
 

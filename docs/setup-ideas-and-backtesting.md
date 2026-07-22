@@ -16,6 +16,7 @@ Standalone deep-dive specs referenced by ideas in this document:
 - **Sierra execution chart study context and exports** — [`docs/setup-ideas/IDEA-029-sierra-execution-chart-study-context.md`](setup-ideas/IDEA-029-sierra-execution-chart-study-context.md): docs-only promotion for adaptive volume-bar sizing, Tape Reader / Delta Dynamics review, leg-to-leg volume/delta profiles, and spreadsheet-study exports as context or offline research, never live chart automation.
 - **NQ balance-zone taxonomy** — [`docs/setup-ideas/IDEA-030-nq-balance-zone-taxonomy.md`](setup-ideas/IDEA-030-nq-balance-zone-taxonomy.md): research queue for defining balance across TPO, volume, delta, multi-session value overlap, and external options context before testing any composite state.
 - **Session range compression and expansion** — [`docs/setup-ideas/IDEA-031-session-range-compression-expansion.md`](setup-ideas/IDEA-031-session-range-compression-expansion.md): research queue for session-scoped range/realized-volatility transitions across RTH, Asia, London, and consecutive like sessions.
+- **HMM lecture-notes repo-fit (docs-only)** — [`docs/setup-ideas/IDEA-032-hmm-lecture-notes-repo-fit.md`](setup-ideas/IDEA-032-hmm-lecture-notes-repo-fit.md): Miller 2016 HMM notes assessed as **ADAPT** reference for a future offline regime-research design; not a live signal and not an implement-now task.
 
 ---
 
@@ -1230,6 +1231,20 @@ profile shape, and balance-state fields.
 separate baselines for RTH, Asia, London, and consecutive like sessions. The
 captured expectation that expansion tends to be followed by contraction is a
 hypothesis to measure, not a current edge.
+
+---
+
+### IDEA-032: Hidden Markov Models lecture notes — docs-only repo-fit
+
+**Status:** Researched (docs-only; verdict ADAPT — no code or signal claim)
+**Source:** Jeffrey W. Miller (2016) HMM lecture notes; trader capture 2026-07-13; assessed 2026-07-22
+**Complements:** IDEA-000, IDEA-007, IDEA-030, IDEA-031
+**Detail:** [setup-ideas/IDEA-032-hmm-lecture-notes-repo-fit.md](setup-ideas/IDEA-032-hmm-lecture-notes-repo-fit.md)
+
+**Framing:** Treat the PDF as methodology education for a possible later
+offline latent-regime experiment. Prefer existing deterministic `Regime` and
+IDEA-007’s simpler RV-ratio path before any HMM implementation or agent
+exposure.
 
 ---
 

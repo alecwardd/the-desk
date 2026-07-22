@@ -46,3 +46,4 @@ one-line stub anchor per IDEA pointing back here.
 | IDEA-030 | NQ Balance-Zone Taxonomy | [IDEA-030-nq-balance-zone-taxonomy.md](IDEA-030-nq-balance-zone-taxonomy.md) | ✅ |
 | IDEA-031 | Session Range Compression and Expansion | [IDEA-031-session-range-compression-expansion.md](IDEA-031-session-range-compression-expansion.md) | ✅ |
 | IDEA-032 | Hidden Markov Models lecture notes — docs-only repo-fit | [IDEA-032-hmm-lecture-notes-repo-fit.md](IDEA-032-hmm-lecture-notes-repo-fit.md) | ✅ |
+| IDEA-033 | Expected-range ATR vs RV vs IV (session sizing + runners) | [IDEA-033-expected-range-atr-rv-iv-research-plan.md](IDEA-033-expected-range-atr-rv-iv-research-plan.md) | ✅ |

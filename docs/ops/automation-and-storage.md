@@ -1,23 +1,54 @@
 # Automation and Storage Runbook
 
-This runbook covers The Desk's local Windows ops automation: Sierra Chart lifecycle tasks, SQLite archival/pruning (raw ticks **and DOM depth**), database backups, low-disk alarms, and the one-time external-drive reclaim.
+This runbook covers The Desk's local Windows ops automation: Sierra Chart lifecycle tasks, SQLite archival/pruning (raw ticks **and DOM depth**), database backups, low-disk alarms, weekend readiness checks, and the one-time external-drive reclaim.
 
 > **See also:** [System Data Flow](../architecture/data-flow.md) — how Sierra Chart, the MCP server, agents, and this maintenance tooling fit together (who writes what, what server startup/shutdown triggers, and the on/off automation question). **Long maintenance jobs (the one-time depth reclaim) should run as a Windows Scheduled Task or in your own terminal — NOT from inside an agent session**, because an agent session restart kills its child processes and relaunches the MCP server (the `data.db` writer), which then contends. `scripts\ops\Run-Depth-Reclaim-Task.ps1` is the autonomous worker for the one-time reclaim.
 
 > **What actually consumes the disk:** the dominant table is **`depth_events`** (DOM depth ingested from Sierra `.depth` files), not `raw_ticks`. It reached 3.6 B rows / ~600 GB before any retention existed. `raw_ticks` is comparatively tiny (~1.75 M rows). The real reclaim and ongoing upkeep both hinge on **pruning `depth_events`** (`depth_retention_days`, default 7); the `.depth` files in `T:\SierraChart\Data\MarketDepthData` are the durable, re-ingestable source.
 
+## Timezone note
+
+Scheduled task triggers use **machine local wall-clock** time. This trading workstation is expected to be set to **Central Time**. ET equivalents in the table below are CT+1 (standard offset used in descriptions; ignore DST edge cases for ops planning and prefer the local times on the box).
+
+## Exit codes (ops scripts)
+
+Shared convention (`scripts/ops/Desk-ExitCodes.ps1`):
+
+| Code | Meaning |
+| --- | --- |
+| 0 | Success |
+| 2 | Deferred (MCP writer active / maintenance blocked) — **not** silent success |
+| 3 | Config error (including `Register-DeskTasks.ps1 -Verify` mismatches) |
+| 4 | Integrity failure (stale/missing maintenance marker, health criticals) |
+| 5 | Storage failure (X: missing, free space critical, temp unusable) |
+| 1 | General failure |
+
+Weekend maintenance must not look green when it skipped: `Run-Weekly-Archive.ps1` exits **2** when `the-desk-mcp` is running, logs `DEFERRED`, and writes `X:\TheDesk\logs\last-deferred-maintenance.json`. On success it writes `X:\TheDesk\logs\last-successful-maintenance.json`.
+
 ## Scheduled Tasks
 
 All tasks are registered under `\TheDesk\` by `scripts\ops\Register-DeskTasks.ps1`.
 
-| Task | Trigger ET | Trigger Central | Account | Behavior |
+| Task | Trigger local (CT) | Trigger ET | Account | Behavior |
 | --- | --- | --- | --- | --- |
-| `Sierra Watchdog` | Logon and every 4 minutes | Logon and every 4 minutes | Interactive user | During Sun 18:00 ET through Fri 17:00 ET, starts Sierra if `SierraChart_64` is not running. It does not close Sierra during the daily 17:00-18:00 ET maintenance halt. |
-| `Sierra Weekend Close` | Friday 17:10 ET | Friday 16:10 Central | Interactive user | Calls `CloseMainWindow()`, waits up to 60 seconds, then force-kills Sierra if it has not exited. |
-| `Sierra Sunday Open` | Sunday 17:50 ET | Sunday 16:50 Central | Interactive user | Starts Sierra about 10 minutes before Globex opens. |
-| `Weekly Storage Archive` | Saturday 10:00 ET | Saturday 09:00 Central | `SYSTEM`, highest privileges | Runs `the-desk-storage --maintain`: archives old `raw_ticks` to cold zst **and prunes `depth_events` older than `depth_retention_days`**. Aborts if `the-desk-mcp` is running. Does not run vacuum (deleted pages are reused; compact only when needed). |
-| `T Drive Low Disk Alarm` | Every 30 minutes | Every 30 minutes | `SYSTEM`, highest privileges | Logs `T:` free space and alerts if free space is below 40 GB. |
-| `Monthly Storage Compaction` | First registered Saturday cadence, 12:00 ET | 11:00 Central | `SYSTEM`, highest privileges | Disabled by default. If enabled, compacts only when SQLite freelist size is at least 50 GB. |
+| `Sierra Watchdog` | Logon and every 4 minutes | same | Interactive user | During Sun 18:00 ET through Fri 17:00 ET, starts Sierra if `SierraChart_64` is not running. It does not close Sierra during the daily 17:00-18:00 ET maintenance halt. |
+| `Sierra Weekend Close` | Friday 16:10 | Friday 17:10 | Interactive user | Calls `CloseMainWindow()`, waits up to 60 seconds, then force-kills Sierra if it has not exited. |
+| `Friday Data Readiness` | Friday 16:20 | Friday 17:20 | `SYSTEM` | Runs `Invoke-FridayDataReadiness.ps1`: Sierra/SCID idle check, `the-desk-storage --status`, prints operator-gated catch-up MCP/CLI commands, writes `weekend-readiness-YYYYMMDD.json`. Does **not** ingest/backfill unless the operator runs those commands. |
+| `Weekly Storage Archive` | Saturday 09:00 + hourly for 10h | Saturday 10:00 + hourly | `SYSTEM`, highest privileges | Saturday storage maintenance (name retained). Runs `the-desk-storage --maintain`: archives old `raw_ticks` + prunes `depth_events`. **Exit 2** if MCP is up (deferred marker). Success marker on completion. Passes `--abort-if-mcp` when the binary advertises it. |
+| `Sunday Pre-Open Readiness` | Sunday 16:40 | Sunday 17:40 | `SYSTEM` | `Invoke-DeskHealthCheck.ps1 -Mode SundayPreOpen` — fails if last successful maintenance marker is missing/stale before Globex. |
+| `Sierra Sunday Open` | Sunday 16:50 | Sunday 17:50 | Interactive user | Starts Sierra about 10 minutes before Globex opens. |
+| `Storage Health Check` | Every 6 hours | Every 6 hours | `SYSTEM` | `Invoke-DeskHealthCheck.ps1 -Mode Daily` — T:/X: free space, task presence, maintenance/backup age, optional storage `--status`. Logs to `X:\TheDesk\logs\health-*.log`. |
+| `T Drive Low Disk Alarm` | Every 30 minutes | Every 30 minutes | `SYSTEM` | Logs `T:` (and `X:`) free space; alerts if `T:` &lt; 40 GB or `X:` &lt; 50 GB. SYSTEM `msg.exe` targets the interactive user via CIM when possible. |
+| `Monthly Storage Compaction` | First registered Saturday cadence, 11:00 | 12:00 | `SYSTEM` | Disabled by default. If enabled, compacts only when SQLite freelist size is at least 50 GB. |
+
+### Cadence (Fri → Sat → Sun → Daily)
+
+1. **Friday 16:10** — Sierra close
+2. **Friday 16:20** — data readiness manifest (no silent catch-up)
+3. **Saturday 09:00–19:00** — storage archive retries until MCP is idle (exit 2 while deferred)
+4. **Sunday 16:40** — pre-open health (maintenance must have succeeded)
+5. **Sunday 16:50** — Sierra open
+6. **Every 6 hours** — storage health check
 
 Register or refresh the tasks from an elevated PowerShell session:
 
@@ -26,7 +57,20 @@ cd C:\the-desk
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\ops\Register-DeskTasks.ps1
 ```
 
-Use `-DryRun` to preview registration. Use `-EnableMonthlyCompaction` only after the one-time reclaim has succeeded and the archive drive is stable.
+Optional: pass a profile path explicitly (defaults to `$env:USERPROFILE`):
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\ops\Register-DeskTasks.ps1 -UserProfilePath $env:USERPROFILE
+```
+
+Use `-DryRun` to preview registration (no `Register-ScheduledTask`). Use `-Verify` to PASS/FAIL-check existing tasks (existence, enabled state, action executable/script args, working directory, principal, triggers, next run) without elevating:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\ops\Register-DeskTasks.ps1 -DryRun
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\ops\Register-DeskTasks.ps1 -Verify
+```
+
+Use `-EnableMonthlyCompaction` only after the one-time reclaim has succeeded and the archive drive is stable.
 
 ## Sierra Chart Operating Requirement
 
@@ -43,8 +87,18 @@ T:\TheDesk\state\data.db       # hot SQLite DB on fast NVMe
 X:\TheDesk\archive\            # zstd cold raw_tick archives
 X:\TheDesk\state\              # reclaim scratch/compacted copy
 X:\TheDesk\temp\               # SQLite temp files during maintenance
-X:\TheDesk\logs\               # ops logs
+X:\TheDesk\logs\               # ops logs + maintenance/readiness markers
+X:\TheDesk\backups\            # VACUUM INTO snapshots
 ```
+
+Markers / manifests:
+
+| File | Written by |
+| --- | --- |
+| `X:\TheDesk\logs\last-successful-maintenance.json` | `Run-Weekly-Archive.ps1` on success |
+| `X:\TheDesk\logs\last-deferred-maintenance.json` | `Run-Weekly-Archive.ps1` when MCP blocks (exit 2) |
+| `X:\TheDesk\logs\weekend-readiness-YYYYMMDD.json` | `Invoke-FridayDataReadiness.ps1` |
+| `X:\TheDesk\logs\health-*.log` | `Invoke-DeskHealthCheck.ps1` |
 
 `~\.the-desk\config.toml` should use:
 
@@ -142,10 +196,13 @@ Enable-ScheduledTask -TaskPath "\TheDesk\" -TaskName "Sierra Weekend Close"
 Enable-ScheduledTask -TaskPath "\TheDesk\" -TaskName "Sierra Sunday Open"
 ```
 
-Disable storage automation:
+Disable storage / readiness automation:
 
 ```powershell
 Disable-ScheduledTask -TaskPath "\TheDesk\" -TaskName "Weekly Storage Archive"
+Disable-ScheduledTask -TaskPath "\TheDesk\" -TaskName "Friday Data Readiness"
+Disable-ScheduledTask -TaskPath "\TheDesk\" -TaskName "Sunday Pre-Open Readiness"
+Disable-ScheduledTask -TaskPath "\TheDesk\" -TaskName "Storage Health Check"
 Disable-ScheduledTask -TaskPath "\TheDesk\" -TaskName "T Drive Low Disk Alarm"
 Disable-ScheduledTask -TaskPath "\TheDesk\" -TaskName "Monthly Storage Compaction"
 ```
@@ -155,14 +212,21 @@ Disable-ScheduledTask -TaskPath "\TheDesk\" -TaskName "Monthly Storage Compactio
 Check archive/storage state:
 
 ```powershell
-$env:USERPROFILE = "C:\Users\alecw"
+$env:USERPROFILE = $env:USERPROFILE   # or an explicit profile path
 C:\the-desk\target_alt\release\the-desk-storage.exe --status
 ```
 
-Check current tasks:
+Check current tasks / verify registration:
 
 ```powershell
 Get-ScheduledTask -TaskPath "\TheDesk\" | Select-Object TaskName, State
+powershell -NoProfile -ExecutionPolicy Bypass -File C:\the-desk\scripts\ops\Register-DeskTasks.ps1 -Verify
+```
+
+Run a health check:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File C:\the-desk\scripts\ops\Invoke-DeskHealthCheck.ps1 -Mode Daily
 ```
 
 Check recent logs:

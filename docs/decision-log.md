@@ -353,8 +353,7 @@ When a tool blocks on `lock()`, the MCP server cannot process other requests (st
 ### ADR-015: Local storage tiers and maintenance command
 
 **Date:** 2026-04-26
-**Status:** Decided
-
+**Status:** Superseded by ADR-021
 **Context:** The Desk's runtime SQLite database grew large enough to pressure the primary `C:` drive. Source code and build artifacts were not the main issue; the dominant storage was `~/.the-desk/data.db` and its WAL, while Sierra Chart `.scid` data already lived on the trading/data drive.
 
 **Decision:** Keep all data local, but separate runtime state, cold archives, build cache, and maintenance temp space on the larger local trading/data drive. The recommended Windows layout is:
@@ -389,6 +388,7 @@ Add `the-desk-storage` as the operator-facing maintenance binary for local stora
 - Full SQLite compaction remains an explicit outside-market-hours operation because large `VACUUM` runs can take hours and temporarily require substantial free space.
 - The maintenance command is local-only and does not change the core architecture: Sierra `.scid` remains the canonical raw market-data source, deterministic Rust pipelines remain Layer 1, and MCP tools continue to expose structured data only.
 
+> **Supersession note:** Production later moved cold archives and backups to `X:\TheDesk\` (USB archive drive) and added depth/snapshot retention plus scheduled-task orchestration. See ADR-021.
 ---
 
 ### ADR-016: MCP runtime observability is structured, bounded, and queryable
@@ -431,7 +431,7 @@ Initial similarity weights are day type 0.30, profile shape 0.20, VWAP-sigma buc
 - LLM-generated interpretation inside Rust — rejected because Layers 1/2/2.5 must stay deterministic and network-free.
 - Fold context directly into every snapshot only — rejected for v1 so raw tools remain lean and agents can opt into richer framing.
 
-**Consequences:** Agents get prompt-ready context with explicit reliability tiers, sample sizes, bucket provenance, cache status, and caveats. Bucket changes must bump `bucketDefinitionVersion` and record a new decision-log note. Context frames are coaching context only: agents must phrase them as playbook/statistical framing, not advice or trade instructions. Pipeline snapshot retention remains a follow-up storage policy decision; until then, snapshot growth is bounded by cadence but not automatically pruned.
+**Consequences:** Agents get prompt-ready context with explicit reliability tiers, sample sizes, bucket provenance, cache status, and caveats. Bucket changes must bump `bucketDefinitionVersion` and record a new decision-log note. Context frames are coaching context only: agents must phrase them as playbook/statistical framing, not advice or trade instructions. Pipeline/DOM snapshot retention is configured under `[storage]` (`pipeline_snapshot_retention_days`, `dom_snapshot_retention_days`, `dom_feature_snapshot_retention_days`) and applied by `the-desk-storage --maintain` (see ADR-021).
 
 ---
 
@@ -508,3 +508,57 @@ New `FeedConfig` fields (all serde-default): `max_ticks_per_poll` (5000), `analy
 - Separate repo/service — deferred; co-locating lets the agent pull market structure + social context in one conversation, provided isolation is strict.
 
 **Consequences:** A new optional network dependency enters the codebase, quarantined to Layer 3 behind a feature flag. Until ADR-020 is marked Decided, no live-credential wiring lands. [social-confluence-design.md](social-confluence-design.md) is the Phase A build spec; [social-intelligence-roadmap.md](social-intelligence-roadmap.md) is the working feature track for weeks/months ahead.
+
+---
+
+### ADR-021: T:/X: storage layout, retention, task orchestration, and backup safety
+
+**Date:** 2026-07-11
+**Status:** Decided
+**Supersedes:** ADR-015 (layout portion)
+
+**Context:** After the one-time depth reclaim, production outgrew the all-on-`T:` layout in ADR-015. Cold raw-tick archives and full-DB backups must not compete with Sierra recording headroom on `T:`. Weekend Task Scheduler automation was never registered under `\TheDesk\`, so archival never ran. Snapshot tables (`pipeline_snapshots`, `dom_snapshots`, `dom_feature_snapshots`) had no retention. Existing `desk-*.db` backups on `X:` were found with **zeroed page 0** (SQLite magic missing) despite non-zero later pages — unusable as restore points. MCP-deferred weekly archive scripts previously exited `0`, making skips indistinguishable from success.
+
+**Decision:**
+
+Canonical production layout:
+
+```text
+T:\TheDesk\state\data.db     # hot SQLite (junction from %USERPROFILE%\.the-desk)
+T:\SierraChart\Data          # authoritative .scid / MarketDepthData .depth
+X:\TheDesk\archive           # cold raw_ticks *.csv.zst
+X:\TheDesk\backups           # verified VACUUM INTO snapshots
+X:\TheDesk\temp              # SQLite temp during maintenance
+X:\TheDesk\logs              # ops logs + maintenance manifests
+```
+
+Retention (config `[storage]`):
+- `warm_retention_days = 30` for `raw_ticks` (archive then delete)
+- `depth_retention_days = 7` for `depth_events` (`.depth` remains durable source)
+- `pipeline_snapshot_retention_days = 14`
+- `dom_snapshot_retention_days = 7`
+- `dom_feature_snapshot_retention_days = 7`
+- `auto_archive` remains vestigial; **scheduled tasks** run `the-desk-storage --maintain`
+
+Weekend cadence (machine-local wall-clock; this workstation is Central Time):
+1. Friday — Sierra close, then Data Readiness (gap/status manifest; catch-up is operator-gated)
+2. Saturday — Storage Maintenance (SYSTEM; hourly retries; exit **2** when MCP writer active)
+3. Sunday — Pre-Open Readiness + Sierra open
+4. Ongoing — disk/health checks
+
+Backup safety:
+- Verify SQLite header magic **and** `PRAGMA quick_check` **and** durable-table presence
+- Open snapshots read-only / immutable (never write-open a backup)
+- Never prune the newest header-valid backup
+- Default `min_interval_hours = 24`; backup directory must be an absolute path on `X:` (Rust does not expand `~`)
+
+Backtest isolation:
+- Heavy `run_backtest` requires `--database-mode backtest` (isolated DB) or explicit `allowLiveDatabase`
+- `--seed-backtest-db` refuses overwrite unless `--force` and records provenance
+
+**Consequences:**
+- Operators must register `\TheDesk\` tasks elevated and verify with `-Verify`
+- Deferred maintenance is observable (exit 2 + JSON markers)
+- Corrupt zero-header backups must be replaced with a freshly verified snapshot before destructive prune/compact
+- Snapshot prune reduces DOM research hot window to configured days; `.depth` / `.scid` remain rebuild sources for market data
+- Durable trader state (setups, hypotheses, journal, risk, memory, account) still requires verified full-DB backups — not recoverable from Sierra files alone

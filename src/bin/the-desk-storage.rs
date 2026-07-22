@@ -4,14 +4,63 @@
 //!   cargo run --bin the-desk-storage -- --status
 //!   cargo run --bin the-desk-storage -- --maintain --vacuum
 //!   cargo run --bin the-desk-storage -- --compact-into X:\TheDesk\state\data_compacted.db
+//!
+//! Exit codes:
+//!   0 = success
+//!   1 = general failure
+//!   2 = deferred (MCP writer active; `--abort-if-mcp`)
+//!   3 = config error
+//!   4 = integrity/validation failure
+//!   5 = storage I/O failure
 
-use chrono::{Datelike, Days, Local, NaiveDate};
+use chrono::{Datelike, Days, NaiveDate, TimeZone, Utc};
+use chrono_tz::US::Eastern;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use the_desk_backend::feed::load_storage_config;
+use thiserror::Error;
+
+/// Typed storage CLI failures mapped to process exit codes.
+#[derive(Debug, Error)]
+enum StorageError {
+    #[error("deferred: the-desk-mcp writer is active; refuse to mutate while MCP holds the DB")]
+    DeferredMcpActive,
+    #[error("config error: {0}")]
+    Config(String),
+    #[error("integrity/validation failure: {0}")]
+    Integrity(String),
+    #[error("storage I/O failure: {0}")]
+    Io(String),
+    #[error("{0}")]
+    General(String),
+}
+
+impl StorageError {
+    fn exit_code(&self) -> i32 {
+        match self {
+            Self::DeferredMcpActive => 2,
+            Self::Config(_) => 3,
+            Self::Integrity(_) => 4,
+            Self::Io(_) => 5,
+            Self::General(_) => 1,
+        }
+    }
+}
+
+impl From<rusqlite::Error> for StorageError {
+    fn from(e: rusqlite::Error) -> Self {
+        Self::Io(e.to_string())
+    }
+}
+
+impl From<std::io::Error> for StorageError {
+    fn from(e: std::io::Error) -> Self {
+        Self::Io(e.to_string())
+    }
+}
 
 #[derive(Debug)]
 struct Args {
@@ -26,6 +75,8 @@ struct Args {
     prune_depth: bool,
     depth_cutoff: Option<String>,
     depth_retention_days: Option<u64>,
+    prune_snapshots: bool,
+    abort_if_mcp: bool,
 }
 
 #[derive(Debug)]
@@ -34,6 +85,14 @@ struct ArchiveRange {
     start_date: String,
     end_date_exclusive: String,
     row_count: i64,
+}
+
+#[derive(Debug, Clone)]
+struct SnapshotCutoffs {
+    pipeline_date: String,
+    pipeline_ms: f64,
+    dom_date: String,
+    dom_feature_date: String,
 }
 
 fn data_dir() -> PathBuf {
@@ -53,31 +112,35 @@ Usage:
   the-desk-storage --archive [--cutoff YYYY-MM-DD]
   the-desk-storage --maintain [--cutoff YYYY-MM-DD] [--vacuum]
   the-desk-storage --prune-depth [--depth-cutoff YYYY-MM-DD]
+  the-desk-storage --prune-snapshots
   the-desk-storage --compact-into PATH
   the-desk-storage --verify-db PATH [--compare-db PATH] [--cutoff YYYY-MM-DD]
 
 Options:
-  --status                  Print raw tick coverage and storage settings.
-  --archive                 Archive raw_ticks older than the cutoff (also prunes depth_events).
-  --maintain                Archive raw_ticks + prune depth_events. Use with --vacuum to reclaim disk.
+  --status                  Print raw tick coverage, snapshot tables, and storage settings.
+  --archive                 Archive raw_ticks older than the cutoff (also prunes depth + snapshots).
+  --maintain                Archive raw_ticks + prune depth_events + prune snapshots. Use with --vacuum.
   --vacuum                  Compact SQLite after archiving. Requires free disk space near current DB size.
   --prune-depth             Delete depth_events older than the depth cutoff (the .depth files remain
                             the durable source, so pruned rows are re-ingestable). Chunked + WAL-bounded.
-  --depth-cutoff DATE       Prune depth_events with trading_day < DATE. Default: today - depth_retention_days.
+  --prune-snapshots         Delete old pipeline/dom/dom_feature snapshots past configured retention.
+  --depth-cutoff DATE       Prune depth_events with trading_day < DATE. Default: ET today - depth_retention_days.
   --depth-retention-days N  Override configured depth retention days when deriving the depth cutoff.
   --compact-into PATH       Checkpoint WAL, VACUUM INTO PATH, then verify destination integrity.
                             Refuses to overwrite an existing destination file.
   --verify-db PATH          Verify a database copy before a reclaim swap.
   --compare-db PATH         With --verify-db, compare key table row counts against this source DB.
-  --cutoff DATE             Archive rows with session_date < DATE. Default: today - warm_retention_days.
+  --cutoff DATE             Archive rows with session_date < DATE. Default: ET today - warm_retention_days.
   --retention-days N        Override configured warm retention days when deriving cutoff.
+  --abort-if-mcp            Exit 2 if the-desk-mcp is running before any mutating work.
   --help, -h                Show this help.
 
 Config: ~/.the-desk/config.toml [storage]
+Exit codes: 0 ok, 1 general, 2 deferred (MCP active), 3 config, 4 integrity, 5 I/O
 "#
 }
 
-fn parse_args() -> Args {
+fn parse_args() -> Result<Args, StorageError> {
     let mut args = std::env::args().skip(1);
     let mut parsed = Args {
         status: false,
@@ -91,6 +154,8 @@ fn parse_args() -> Args {
         prune_depth: false,
         depth_cutoff: None,
         depth_retention_days: None,
+        prune_snapshots: false,
+        abort_if_mcp: false,
     };
 
     while let Some(arg) = args.next() {
@@ -99,26 +164,59 @@ fn parse_args() -> Args {
             "--archive" => parsed.archive = true,
             "--maintain" => parsed.archive = true,
             "--vacuum" => parsed.vacuum = true,
-            "--compact-into" => parsed.compact_into = args.next(),
-            "--verify-db" => parsed.verify_db = args.next(),
-            "--compare-db" => parsed.compare_db = args.next(),
-            "--cutoff" => parsed.cutoff = args.next(),
+            "--compact-into" => {
+                parsed.compact_into = Some(args.next().ok_or_else(|| {
+                    StorageError::Config("--compact-into requires a PATH".into())
+                })?);
+            }
+            "--verify-db" => {
+                parsed.verify_db =
+                    Some(args.next().ok_or_else(|| {
+                        StorageError::Config("--verify-db requires a PATH".into())
+                    })?);
+            }
+            "--compare-db" => {
+                parsed.compare_db =
+                    Some(args.next().ok_or_else(|| {
+                        StorageError::Config("--compare-db requires a PATH".into())
+                    })?);
+            }
+            "--cutoff" => {
+                parsed.cutoff = Some(
+                    args.next()
+                        .ok_or_else(|| StorageError::Config("--cutoff requires a DATE".into()))?,
+                );
+            }
             "--retention-days" => {
-                parsed.retention_days = args.next().and_then(|s| s.parse::<u64>().ok());
+                let raw = args
+                    .next()
+                    .ok_or_else(|| StorageError::Config("--retention-days requires N".into()))?;
+                parsed.retention_days = Some(raw.parse::<u64>().map_err(|_| {
+                    StorageError::Config(format!("invalid --retention-days value: {raw}"))
+                })?);
             }
             "--prune-depth" => parsed.prune_depth = true,
-            "--depth-cutoff" => parsed.depth_cutoff = args.next(),
-            "--depth-retention-days" => {
-                parsed.depth_retention_days = args.next().and_then(|s| s.parse::<u64>().ok());
+            "--prune-snapshots" => parsed.prune_snapshots = true,
+            "--depth-cutoff" => {
+                parsed.depth_cutoff = Some(args.next().ok_or_else(|| {
+                    StorageError::Config("--depth-cutoff requires a DATE".into())
+                })?);
             }
+            "--depth-retention-days" => {
+                let raw = args.next().ok_or_else(|| {
+                    StorageError::Config("--depth-retention-days requires N".into())
+                })?;
+                parsed.depth_retention_days = Some(raw.parse::<u64>().map_err(|_| {
+                    StorageError::Config(format!("invalid --depth-retention-days value: {raw}"))
+                })?);
+            }
+            "--abort-if-mcp" => parsed.abort_if_mcp = true,
             "--help" | "-h" => {
                 println!("{}", usage());
                 std::process::exit(0);
             }
             _ => {
-                eprintln!("Unknown argument: {arg}");
-                eprintln!("{}", usage());
-                std::process::exit(1);
+                return Err(StorageError::Config(format!("Unknown argument: {arg}")));
             }
         }
     }
@@ -127,18 +225,57 @@ fn parse_args() -> Args {
         && !parsed.archive
         && !parsed.vacuum
         && !parsed.prune_depth
+        && !parsed.prune_snapshots
         && parsed.compact_into.is_none()
         && parsed.verify_db.is_none()
     {
         parsed.status = true;
     }
 
-    parsed
+    Ok(parsed)
 }
 
-fn derive_cutoff(args: &Args) -> Result<String, Box<dyn std::error::Error>> {
+fn will_mutate(args: &Args) -> bool {
+    args.archive
+        || args.vacuum
+        || args.prune_depth
+        || args.prune_snapshots
+        || args.compact_into.is_some()
+}
+
+/// Current calendar date in US Eastern (not Globex trading-day roll).
+fn et_today() -> NaiveDate {
+    Utc::now().with_timezone(&Eastern).date_naive()
+}
+
+fn parse_ymd(date: &str) -> Result<NaiveDate, StorageError> {
+    NaiveDate::parse_from_str(date, "%Y-%m-%d")
+        .map_err(|e| StorageError::Config(format!("invalid date '{date}': {e}")))
+}
+
+fn cutoff_from_retention_days(days: u64) -> Result<String, StorageError> {
+    let cutoff = et_today()
+        .checked_sub_days(Days::new(days))
+        .ok_or_else(|| StorageError::Config("retention cutoff underflow".into()))?;
+    Ok(cutoff.format("%Y-%m-%d").to_string())
+}
+
+/// Midnight US Eastern on `date` as epoch milliseconds.
+fn et_midnight_ms(date: &str) -> Result<f64, StorageError> {
+    let d = parse_ymd(date)?;
+    let naive = d
+        .and_hms_opt(0, 0, 0)
+        .ok_or_else(|| StorageError::Config(format!("invalid midnight for {date}")))?;
+    let dt = Eastern
+        .from_local_datetime(&naive)
+        .single()
+        .ok_or_else(|| StorageError::Config(format!("ambiguous ET midnight for {date}")))?;
+    Ok(dt.timestamp_millis() as f64)
+}
+
+fn derive_cutoff(args: &Args) -> Result<String, StorageError> {
     if let Some(cutoff) = &args.cutoff {
-        NaiveDate::parse_from_str(cutoff, "%Y-%m-%d")?;
+        parse_ymd(cutoff)?;
         return Ok(cutoff.clone());
     }
 
@@ -146,18 +283,14 @@ fn derive_cutoff(args: &Args) -> Result<String, Box<dyn std::error::Error>> {
     let retention_days = args
         .retention_days
         .unwrap_or(u64::from(storage.warm_retention_days));
-    let today = Local::now().date_naive();
-    let cutoff = today
-        .checked_sub_days(Days::new(retention_days))
-        .ok_or("retention cutoff underflow")?;
-    Ok(cutoff.format("%Y-%m-%d").to_string())
+    cutoff_from_retention_days(retention_days)
 }
 
 /// Derive the `depth_events` prune cutoff (`trading_day < cutoff`). Honors an explicit
-/// `--depth-cutoff`, else `today - depth_retention_days`.
-fn derive_depth_cutoff(args: &Args) -> Result<String, Box<dyn std::error::Error>> {
+/// `--depth-cutoff`, else `ET today - depth_retention_days`.
+fn derive_depth_cutoff(args: &Args) -> Result<String, StorageError> {
     if let Some(cutoff) = &args.depth_cutoff {
-        NaiveDate::parse_from_str(cutoff, "%Y-%m-%d")?;
+        parse_ymd(cutoff)?;
         return Ok(cutoff.clone());
     }
 
@@ -165,11 +298,57 @@ fn derive_depth_cutoff(args: &Args) -> Result<String, Box<dyn std::error::Error>
     let days = args
         .depth_retention_days
         .unwrap_or(u64::from(storage.depth_retention_days));
-    let today = Local::now().date_naive();
-    let cutoff = today
-        .checked_sub_days(Days::new(days))
-        .ok_or("depth retention cutoff underflow")?;
-    Ok(cutoff.format("%Y-%m-%d").to_string())
+    cutoff_from_retention_days(days)
+}
+
+fn derive_snapshot_cutoffs() -> Result<SnapshotCutoffs, StorageError> {
+    let storage = load_storage_config();
+    let pipeline_date =
+        cutoff_from_retention_days(u64::from(storage.pipeline_snapshot_retention_days))?;
+    let dom_date = cutoff_from_retention_days(u64::from(storage.dom_snapshot_retention_days))?;
+    let dom_feature_date =
+        cutoff_from_retention_days(u64::from(storage.dom_feature_snapshot_retention_days))?;
+    let pipeline_ms = et_midnight_ms(&pipeline_date)?;
+    Ok(SnapshotCutoffs {
+        pipeline_date,
+        pipeline_ms,
+        dom_date,
+        dom_feature_date,
+    })
+}
+
+/// True when a process named `the-desk-mcp` (or `.exe`) appears to be running.
+fn is_mcp_process_running() -> bool {
+    #[cfg(windows)]
+    {
+        let output = std::process::Command::new("tasklist")
+            .args(["/FI", "IMAGENAME eq the-desk-mcp.exe", "/NH"])
+            .output();
+        match output {
+            Ok(out) => {
+                let s = String::from_utf8_lossy(&out.stdout).to_ascii_lowercase();
+                s.contains("the-desk-mcp.exe")
+            }
+            Err(_) => false,
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let output = std::process::Command::new("pgrep")
+            .args(["-x", "the-desk-mcp"])
+            .output();
+        matches!(output, Ok(out) if out.status.success() && !out.stdout.is_empty())
+    }
+}
+
+fn abort_if_mcp_active(args: &Args) -> Result<(), StorageError> {
+    if !args.abort_if_mcp || !will_mutate(args) {
+        return Ok(());
+    }
+    if is_mcp_process_running() {
+        return Err(StorageError::DeferredMcpActive);
+    }
+    Ok(())
 }
 
 /// Smallest rowid whose `trading_day >= cutoff`, found by binary search over the
@@ -186,7 +365,7 @@ fn derive_depth_cutoff(args: &Args) -> Result<String, Box<dyn std::error::Error>
 fn depth_prune_threshold_rowid(
     conn: &Connection,
     cutoff: &str,
-) -> Result<Option<i64>, Box<dyn std::error::Error>> {
+) -> Result<Option<i64>, StorageError> {
     let min_rowid: Option<i64> =
         conn.query_row("SELECT MIN(rowid) FROM depth_events", [], |r| r.get(0))?;
     let max_rowid: Option<i64> =
@@ -221,7 +400,7 @@ fn depth_prune_threshold_rowid(
 /// checkpointing the WAL periodically — a single giant `DELETE` would build a WAL larger
 /// than the (often near-full) data drive. The `.depth` source files remain the durable
 /// record, so pruned rows are re-ingestable. Reclaim the freed pages with `--compact-into`.
-fn prune_depth_events(conn: &Connection, cutoff: &str) -> Result<i64, Box<dyn std::error::Error>> {
+fn prune_depth_events(conn: &Connection, cutoff: &str) -> Result<i64, StorageError> {
     if !table_exists(conn, "depth_events")? {
         println!("No depth_events table; nothing to prune.");
         return Ok(0);
@@ -281,12 +460,132 @@ fn prune_depth_events(conn: &Connection, cutoff: &str) -> Result<i64, Box<dyn st
     Ok(deleted_total)
 }
 
+/// Chunked delete for snapshot tables using an indexed predicate, with WAL checkpoints.
+fn prune_table_chunked(
+    conn: &Connection,
+    table: &str,
+    where_sql: &str,
+    bind: f64,
+    label: &str,
+) -> Result<i64, StorageError> {
+    if !table
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    {
+        return Err(StorageError::Config(format!("unsafe table name: {table}")));
+    }
+    if !table_exists(conn, table)? {
+        println!("No {table} table; nothing to prune.");
+        return Ok(0);
+    }
+
+    const BATCH: i64 = 50_000;
+    let started = Instant::now();
+    let mut deleted_total: i64 = 0;
+    let mut batches: u64 = 0;
+    let delete_sql = format!(
+        "DELETE FROM {table}
+         WHERE rowid IN (
+             SELECT rowid FROM {table} WHERE {where_sql} LIMIT ?2
+         )"
+    );
+
+    println!("Pruning {label}...");
+    loop {
+        let n = conn.execute(&delete_sql, params![bind, BATCH])? as i64;
+        deleted_total += n;
+        batches += 1;
+        if batches.is_multiple_of(10) {
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+            println!(
+                "  pruned {deleted_total} {table} rows so far in {:.0?}...",
+                started.elapsed()
+            );
+        }
+        if n < BATCH {
+            break;
+        }
+    }
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+    println!(
+        "Pruned {deleted_total} {table} rows in {:.1?}.",
+        started.elapsed()
+    );
+    Ok(deleted_total)
+}
+
+/// Chunked prune for tables keyed by `trading_day` string comparison.
+fn prune_table_by_trading_day(
+    conn: &Connection,
+    table: &str,
+    cutoff: &str,
+) -> Result<i64, StorageError> {
+    if !table
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    {
+        return Err(StorageError::Config(format!("unsafe table name: {table}")));
+    }
+    if !table_exists(conn, table)? {
+        println!("No {table} table; nothing to prune.");
+        return Ok(0);
+    }
+
+    const BATCH: i64 = 50_000;
+    let started = Instant::now();
+    let mut deleted_total: i64 = 0;
+    let mut batches: u64 = 0;
+    let delete_sql = format!(
+        "DELETE FROM {table}
+         WHERE rowid IN (
+             SELECT rowid FROM {table} WHERE trading_day < ?1 LIMIT ?2
+         )"
+    );
+
+    println!("Pruning {table} with trading_day < {cutoff}...");
+    loop {
+        let n = conn.execute(&delete_sql, params![cutoff, BATCH])? as i64;
+        deleted_total += n;
+        batches += 1;
+        if batches.is_multiple_of(10) {
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+            println!(
+                "  pruned {deleted_total} {table} rows so far in {:.0?}...",
+                started.elapsed()
+            );
+        }
+        if n < BATCH {
+            break;
+        }
+    }
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+    println!(
+        "Pruned {deleted_total} {table} rows in {:.1?}.",
+        started.elapsed()
+    );
+    Ok(deleted_total)
+}
+
+fn prune_snapshots(conn: &Connection, cutoffs: &SnapshotCutoffs) -> Result<i64, StorageError> {
+    let mut total = 0_i64;
+    total += prune_table_chunked(
+        conn,
+        "pipeline_snapshots",
+        "timestamp_ms < ?1",
+        cutoffs.pipeline_ms,
+        &format!(
+            "pipeline_snapshots timestamp_ms < {} (ET date {})",
+            cutoffs.pipeline_ms, cutoffs.pipeline_date
+        ),
+    )?;
+    total += prune_table_by_trading_day(conn, "dom_snapshots", &cutoffs.dom_date)?;
+    total += prune_table_by_trading_day(conn, "dom_feature_snapshots", &cutoffs.dom_feature_date)?;
+    Ok(total)
+}
+
 /// Report DOM `depth_events` coverage. Uses index endpoints and `MAX(rowid)` only —
 /// never a full `COUNT(*)`, which would scan billions of rows.
-fn print_depth_status(
-    conn: &Connection,
-    depth_cutoff: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn print_depth_status(conn: &Connection, depth_cutoff: &str) -> Result<(), StorageError> {
     if !table_exists(conn, "depth_events")? {
         return Ok(());
     }
@@ -315,7 +614,102 @@ fn print_depth_status(
     Ok(())
 }
 
-fn sqlite_temp_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
+fn print_snapshot_table_status_by_ms(
+    conn: &Connection,
+    table: &str,
+    cutoff_ms: f64,
+    cutoff_date: &str,
+    retention_days: u32,
+) -> Result<(), StorageError> {
+    if !table_exists(conn, table)? {
+        println!("{table}: (table missing)");
+        return Ok(());
+    }
+    let lo: Option<f64> =
+        conn.query_row(&format!("SELECT MIN(timestamp_ms) FROM {table}"), [], |r| {
+            r.get(0)
+        })?;
+    let hi: Option<f64> =
+        conn.query_row(&format!("SELECT MAX(timestamp_ms) FROM {table}"), [], |r| {
+            r.get(0)
+        })?;
+    let rows: i64 = conn.query_row(&format!("SELECT COUNT(1) FROM {table}"), [], |r| r.get(0))?;
+    let reclaimable: i64 = conn.query_row(
+        &format!("SELECT COUNT(1) FROM {table} WHERE timestamp_ms < ?1"),
+        params![cutoff_ms],
+        |r| r.get(0),
+    )?;
+    println!(
+        "{table}: rows={rows}, timestamp_ms={} through {}, retention_days={retention_days}, cutoff_date(ET)={cutoff_date}, reclaimable={reclaimable}",
+        lo.map(|v| format!("{v:.0}")).as_deref().unwrap_or("none"),
+        hi.map(|v| format!("{v:.0}")).as_deref().unwrap_or("none"),
+    );
+    Ok(())
+}
+
+fn print_snapshot_table_status_by_day(
+    conn: &Connection,
+    table: &str,
+    cutoff: &str,
+    retention_days: u32,
+) -> Result<(), StorageError> {
+    if !table_exists(conn, table)? {
+        println!("{table}: (table missing)");
+        return Ok(());
+    }
+    let lo: Option<String> =
+        conn.query_row(&format!("SELECT MIN(trading_day) FROM {table}"), [], |r| {
+            r.get(0)
+        })?;
+    let hi: Option<String> =
+        conn.query_row(&format!("SELECT MAX(trading_day) FROM {table}"), [], |r| {
+            r.get(0)
+        })?;
+    let rows: i64 = conn.query_row(&format!("SELECT COUNT(1) FROM {table}"), [], |r| r.get(0))?;
+    let reclaimable: i64 = conn.query_row(
+        &format!("SELECT COUNT(1) FROM {table} WHERE trading_day < ?1"),
+        params![cutoff],
+        |r| r.get(0),
+    )?;
+    println!(
+        "{table}: rows={rows}, trading_day={} through {}, retention_days={retention_days}, cutoff={cutoff}, reclaimable={reclaimable}",
+        lo.as_deref().unwrap_or("none"),
+        hi.as_deref().unwrap_or("none"),
+    );
+    Ok(())
+}
+
+fn print_snapshot_status(conn: &Connection, cutoffs: &SnapshotCutoffs) -> Result<(), StorageError> {
+    let storage = load_storage_config();
+    println!(
+        "Snapshot retention (config): pipeline={}d, dom={}d, dom_feature={}d",
+        storage.pipeline_snapshot_retention_days,
+        storage.dom_snapshot_retention_days,
+        storage.dom_feature_snapshot_retention_days
+    );
+    print_snapshot_table_status_by_ms(
+        conn,
+        "pipeline_snapshots",
+        cutoffs.pipeline_ms,
+        &cutoffs.pipeline_date,
+        storage.pipeline_snapshot_retention_days,
+    )?;
+    print_snapshot_table_status_by_day(
+        conn,
+        "dom_snapshots",
+        &cutoffs.dom_date,
+        storage.dom_snapshot_retention_days,
+    )?;
+    print_snapshot_table_status_by_day(
+        conn,
+        "dom_feature_snapshots",
+        &cutoffs.dom_feature_date,
+        storage.dom_feature_snapshot_retention_days,
+    )?;
+    Ok(())
+}
+
+fn sqlite_temp_dir() -> Result<PathBuf, StorageError> {
     let storage = load_storage_config();
     let archive_dir = PathBuf::from(storage.cold_archive_dir);
     let base_dir = archive_dir
@@ -333,8 +727,9 @@ fn sqlite_temp_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
     Ok(temp_dir)
 }
 
-fn open_db(path: &Path, temp_dir: &Path) -> Result<Connection, Box<dyn std::error::Error>> {
-    let conn = Connection::open(path)?;
+fn open_db(path: &Path, temp_dir: &Path) -> Result<Connection, StorageError> {
+    let conn = Connection::open(path)
+        .map_err(|e| StorageError::Io(format!("failed to open {}: {e}", path.display())))?;
     conn.busy_timeout(std::time::Duration::from_secs(30))?;
     let temp_sql = temp_dir.to_string_lossy().replace('\'', "''");
     conn.execute_batch(&format!(
@@ -352,11 +747,7 @@ fn db_size_gb(path: &Path) -> f64 {
         .unwrap_or(0.0)
 }
 
-fn print_status(
-    conn: &Connection,
-    db_path: &Path,
-    cutoff: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn print_status(conn: &Connection, db_path: &Path, cutoff: &str) -> Result<(), StorageError> {
     let storage = load_storage_config();
     let raw: (Option<String>, Option<String>, i64) = conn.query_row(
         "SELECT MIN(session_date), MAX(session_date), COUNT(1) FROM raw_ticks",
@@ -392,6 +783,7 @@ fn print_status(
         raw.2
     );
     println!("Archive cutoff: session_date < {cutoff}");
+    println!("Warm retention days: {}", storage.warm_retention_days);
     println!("Rows to archive: {archive_count}");
     println!("Rows to keep warm: {keep_count}");
     println!(
@@ -405,23 +797,23 @@ fn print_status(
     );
     println!("Cold archive dir: {}", storage.cold_archive_dir);
     println!("Auto archive flag: {}", storage.auto_archive);
+    println!("Depth retention days: {}", storage.depth_retention_days);
     Ok(())
 }
 
-fn month_after(month: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let date = NaiveDate::parse_from_str(&format!("{month}-01"), "%Y-%m-%d")?;
+fn month_after(month: &str) -> Result<String, StorageError> {
+    let date = parse_ymd(&format!("{month}-01"))?;
     let next = if date.month() == 12 {
-        NaiveDate::from_ymd_opt(date.year() + 1, 1, 1).ok_or("invalid next year")?
+        NaiveDate::from_ymd_opt(date.year() + 1, 1, 1)
+            .ok_or_else(|| StorageError::General("invalid next year".into()))?
     } else {
-        NaiveDate::from_ymd_opt(date.year(), date.month() + 1, 1).ok_or("invalid next month")?
+        NaiveDate::from_ymd_opt(date.year(), date.month() + 1, 1)
+            .ok_or_else(|| StorageError::General("invalid next month".into()))?
     };
     Ok(next.format("%Y-%m-%d").to_string())
 }
 
-fn archive_ranges(
-    conn: &Connection,
-    cutoff: &str,
-) -> Result<Vec<ArchiveRange>, Box<dyn std::error::Error>> {
+fn archive_ranges(conn: &Connection, cutoff: &str) -> Result<Vec<ArchiveRange>, StorageError> {
     let mut stmt = conn.prepare(
         "SELECT substr(session_date, 1, 7) AS month,
                 MIN(session_date),
@@ -457,18 +849,17 @@ fn archive_range(
     conn: &Connection,
     archive_dir: &Path,
     range: &ArchiveRange,
-) -> Result<i64, Box<dyn std::error::Error>> {
+) -> Result<i64, StorageError> {
     fs::create_dir_all(archive_dir)?;
     let final_path = archive_dir.join(format!(
         "raw_ticks_{}_{}_to_{}.csv.zst",
         range.month, range.start_date, range.end_date_exclusive
     ));
     if final_path.exists() {
-        return Err(format!(
+        return Err(StorageError::Integrity(format!(
             "archive file already exists, refusing to overwrite: {}",
             final_path.display()
-        )
-        .into());
+        )));
     }
 
     let temp_path = final_path.with_extension("csv.zst.tmp");
@@ -478,7 +869,8 @@ fn archive_range(
 
     let file = File::create(&temp_path)?;
     let writer = BufWriter::new(file);
-    let mut encoder = zstd::stream::write::Encoder::new(writer, 3)?;
+    let mut encoder = zstd::stream::write::Encoder::new(writer, 3)
+        .map_err(|e| StorageError::Io(format!("zstd encoder create failed: {e}")))?;
     writeln!(
         encoder,
         "timestamp_ms,price,volume,bid,ask,is_buy,session_date,root_symbol,contract_symbol"
@@ -509,15 +901,16 @@ fn archive_range(
         )?;
         written += 1;
     }
-    encoder.finish()?;
+    encoder
+        .finish()
+        .map_err(|e| StorageError::Io(format!("zstd finish failed: {e}")))?;
 
     if written != range.row_count {
         fs::remove_file(&temp_path).ok();
-        return Err(format!(
+        return Err(StorageError::Integrity(format!(
             "archive row count mismatch for {}: expected {}, wrote {}",
             range.month, range.row_count, written
-        )
-        .into());
+        )));
     }
 
     fs::rename(&temp_path, &final_path)?;
@@ -528,10 +921,7 @@ fn archive_range(
     Ok(deleted as i64)
 }
 
-fn archive_old_ticks(
-    conn: &mut Connection,
-    cutoff: &str,
-) -> Result<i64, Box<dyn std::error::Error>> {
+fn archive_old_ticks(conn: &mut Connection, cutoff: &str) -> Result<i64, StorageError> {
     let storage = load_storage_config();
     let archive_dir = PathBuf::from(storage.cold_archive_dir);
     let ranges = archive_ranges(conn, cutoff)?;
@@ -568,7 +958,7 @@ fn archive_old_ticks(
     Ok(deleted_total)
 }
 
-fn run_vacuum(conn: &Connection, db_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn run_vacuum(conn: &Connection, db_path: &Path) -> Result<(), StorageError> {
     let started = Instant::now();
     println!("Checkpointing WAL before VACUUM...");
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
@@ -583,22 +973,25 @@ fn run_vacuum(conn: &Connection, db_path: &Path) -> Result<(), Box<dyn std::erro
     Ok(())
 }
 
-fn verify_sqlite_integrity(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn verify_sqlite_integrity(path: &Path) -> Result<(), StorageError> {
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let integrity: String = conn.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
     if integrity != "ok" {
-        return Err(format!("integrity_check failed for {}: {integrity}", path.display()).into());
+        return Err(StorageError::Integrity(format!(
+            "integrity_check failed for {}: {integrity}",
+            path.display()
+        )));
     }
     Ok(())
 }
 
-fn open_readonly_db(path: &Path) -> Result<Connection, Box<dyn std::error::Error>> {
+fn open_readonly_db(path: &Path) -> Result<Connection, StorageError> {
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     conn.busy_timeout(std::time::Duration::from_secs(30))?;
     Ok(conn)
 }
 
-fn table_exists(conn: &Connection, table: &str) -> Result<bool, Box<dyn std::error::Error>> {
+fn table_exists(conn: &Connection, table: &str) -> Result<bool, StorageError> {
     let count: i64 = conn.query_row(
         "SELECT COUNT(1) FROM sqlite_schema WHERE type='table' AND name=?1",
         params![table],
@@ -607,12 +1000,12 @@ fn table_exists(conn: &Connection, table: &str) -> Result<bool, Box<dyn std::err
     Ok(count == 1)
 }
 
-fn table_row_count(conn: &Connection, table: &str) -> Result<i64, Box<dyn std::error::Error>> {
+fn table_row_count(conn: &Connection, table: &str) -> Result<i64, StorageError> {
     if !table
         .chars()
         .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
     {
-        return Err(format!("unsafe table name: {table}").into());
+        return Err(StorageError::Config(format!("unsafe table name: {table}")));
     }
     let sql = format!("SELECT COUNT(1) FROM {table}");
     Ok(conn.query_row(&sql, [], |r| r.get(0))?)
@@ -622,7 +1015,7 @@ fn verify_reclaim_copy(
     copy_path: &Path,
     compare_path: Option<&Path>,
     cutoff: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), StorageError> {
     println!("Verifying database copy: {}", copy_path.display());
     verify_sqlite_integrity(copy_path)?;
     let copy = open_readonly_db(copy_path)?;
@@ -642,13 +1035,17 @@ fn verify_reclaim_copy(
     ];
     for table in REQUIRED_TABLES {
         if !table_exists(&copy, table)? {
-            return Err(format!("required table missing from copy: {table}").into());
+            return Err(StorageError::Integrity(format!(
+                "required table missing from copy: {table}"
+            )));
         }
     }
 
     let session_summaries = table_row_count(&copy, "session_summaries")?;
     if session_summaries <= 0 {
-        return Err("session_summaries is empty in database copy".into());
+        return Err(StorageError::Integrity(
+            "session_summaries is empty in database copy".into(),
+        ));
     }
 
     let old_raw_ticks: i64 = copy.query_row(
@@ -657,10 +1054,9 @@ fn verify_reclaim_copy(
         |r| r.get(0),
     )?;
     if old_raw_ticks != 0 {
-        return Err(format!(
+        return Err(StorageError::Integrity(format!(
             "database copy still contains {old_raw_ticks} raw_ticks rows older than {cutoff}"
-        )
-        .into());
+        )));
     }
 
     if let Some(compare_path) = compare_path {
@@ -669,10 +1065,9 @@ fn verify_reclaim_copy(
             let source_count = table_row_count(&source, table)?;
             let copy_count = table_row_count(&copy, table)?;
             if source_count != copy_count {
-                return Err(format!(
+                return Err(StorageError::Integrity(format!(
                     "row-count mismatch for {table}: source={source_count}, copy={copy_count}"
-                )
-                .into());
+                )));
             }
         }
     }
@@ -688,15 +1083,14 @@ fn run_compact_into(
     db_path: &Path,
     dest_path: &Path,
     cutoff: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), StorageError> {
     let started = Instant::now();
 
     if dest_path.exists() {
-        return Err(format!(
+        return Err(StorageError::Integrity(format!(
             "compact destination already exists, refusing to overwrite: {}",
             dest_path.display()
-        )
-        .into());
+        )));
     }
 
     let explicit_parent = dest_path
@@ -712,12 +1106,14 @@ fn run_compact_into(
     } else {
         std::env::current_dir()?
     };
-    let dest_name = dest_path
-        .file_name()
-        .ok_or("compact destination must include a file name")?;
+    let dest_name = dest_path.file_name().ok_or_else(|| {
+        StorageError::Config("compact destination must include a file name".into())
+    })?;
     let canonical_intent = dest_parent.join(dest_name);
     if source == canonical_intent {
-        return Err("compact destination must be different from the source database".into());
+        return Err(StorageError::Config(
+            "compact destination must be different from the source database".into(),
+        ));
     }
 
     println!("Checkpointing WAL before VACUUM INTO...");
@@ -740,7 +1136,7 @@ fn ensure_no_existing_archive_for_cutoff(
     archive_dir: &Path,
     conn: &Connection,
     cutoff: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), StorageError> {
     for range in archive_ranges(conn, cutoff)? {
         let final_path = archive_dir.join(format!(
             "raw_ticks_{}_{}_to_{}.csv.zst",
@@ -754,21 +1150,23 @@ fn ensure_no_existing_archive_for_cutoff(
                     |r| r.get(0),
                 )
                 .optional()?;
-            return Err(format!(
+            return Err(StorageError::Integrity(format!(
                 "archive target already exists while {} matching rows remain in SQLite: {}",
                 archived_rows.unwrap_or(0),
                 final_path.display()
-            )
-            .into());
+            )));
         }
     }
     Ok(())
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = parse_args();
+fn run() -> Result<(), StorageError> {
+    let args = parse_args()?;
+    abort_if_mcp_active(&args)?;
+
     let cutoff = derive_cutoff(&args)?;
     let depth_cutoff = derive_depth_cutoff(&args)?;
+    let snapshot_cutoffs = derive_snapshot_cutoffs()?;
     let db_path = data_dir().join("data.db");
 
     if let Some(path) = &args.verify_db {
@@ -784,7 +1182,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.status {
         print_status(&conn, &db_path, &cutoff)?;
         print_depth_status(&conn, &depth_cutoff)?;
-        if !args.archive && !args.vacuum && !args.prune_depth {
+        print_snapshot_status(&conn, &snapshot_cutoffs)?;
+        if !args.archive && !args.vacuum && !args.prune_depth && !args.prune_snapshots {
             return Ok(());
         }
     }
@@ -804,6 +1203,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         prune_depth_events(&conn, &depth_cutoff)?;
     }
 
+    // --maintain/--archive and --prune-snapshots prune snapshot tables after depth.
+    if args.archive || args.prune_snapshots {
+        prune_snapshots(&conn, &snapshot_cutoffs)?;
+    }
+
     if args.vacuum {
         run_vacuum(&conn, &db_path)?;
     }
@@ -814,7 +1218,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     print_status(&conn, &db_path, &cutoff)?;
     print_depth_status(&conn, &depth_cutoff)?;
+    print_snapshot_status(&conn, &snapshot_cutoffs)?;
     Ok(())
+}
+
+fn main() {
+    match run() {
+        Ok(()) => std::process::exit(0),
+        Err(err) => {
+            eprintln!("{err}");
+            if matches!(err, StorageError::Config(_)) {
+                eprintln!("{}", usage());
+            }
+            std::process::exit(err.exit_code());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -839,6 +1257,35 @@ mod tests {
                 .unwrap();
             }
         }
+        conn
+    }
+
+    fn seed_snapshots() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE pipeline_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp_ms REAL NOT NULL,
+                payload TEXT NOT NULL
+             );
+             CREATE INDEX idx_pipeline_snapshots_ts ON pipeline_snapshots(timestamp_ms);
+             CREATE TABLE dom_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp_ms REAL NOT NULL,
+                trading_day TEXT NOT NULL,
+                payload TEXT NOT NULL
+             );
+             CREATE INDEX idx_dom_snapshots_day ON dom_snapshots(trading_day, timestamp_ms);
+             CREATE TABLE dom_feature_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp_ms REAL NOT NULL,
+                trading_day TEXT NOT NULL,
+                payload TEXT NOT NULL
+             );
+             CREATE INDEX idx_dom_feature_snapshots_day
+               ON dom_feature_snapshots(trading_day, timestamp_ms);",
+        )
+        .unwrap();
         conn
     }
 
@@ -883,6 +1330,170 @@ mod tests {
         assert_eq!(
             depth_prune_threshold_rowid(&conn, "2026-06-19").unwrap(),
             None
+        );
+    }
+
+    #[test]
+    fn storage_error_exit_codes() {
+        assert_eq!(StorageError::General("x".into()).exit_code(), 1);
+        assert_eq!(StorageError::DeferredMcpActive.exit_code(), 2);
+        assert_eq!(StorageError::Config("x".into()).exit_code(), 3);
+        assert_eq!(StorageError::Integrity("x".into()).exit_code(), 4);
+        assert_eq!(StorageError::Io("x".into()).exit_code(), 5);
+    }
+
+    #[test]
+    fn abort_if_mcp_skipped_when_flag_off_or_read_only() {
+        let read_only = Args {
+            status: true,
+            archive: false,
+            vacuum: false,
+            compact_into: None,
+            verify_db: None,
+            compare_db: None,
+            cutoff: None,
+            retention_days: None,
+            prune_depth: false,
+            depth_cutoff: None,
+            depth_retention_days: None,
+            prune_snapshots: false,
+            abort_if_mcp: true,
+        };
+        // Status-only never mutates, so MCP presence is irrelevant.
+        assert!(abort_if_mcp_active(&read_only).is_ok());
+
+        let mutate_no_flag = Args {
+            archive: true,
+            abort_if_mcp: false,
+            ..read_only
+        };
+        assert!(abort_if_mcp_active(&mutate_no_flag).is_ok());
+    }
+
+    #[test]
+    fn et_midnight_ms_is_eastern_boundary() {
+        // 2026-06-19 00:00 EDT = 2026-06-19 04:00 UTC
+        let ms = et_midnight_ms("2026-06-19").unwrap();
+        assert_eq!(ms, 1_781_841_600_000.0);
+
+        // Winter: 2026-01-15 00:00 EST = 2026-01-15 05:00 UTC
+        let ms_winter = et_midnight_ms("2026-01-15").unwrap();
+        assert_eq!(ms_winter, 1_768_453_200_000.0);
+    }
+
+    #[test]
+    fn et_midnight_rejects_bad_date() {
+        assert!(matches!(
+            et_midnight_ms("not-a-date"),
+            Err(StorageError::Config(_))
+        ));
+    }
+
+    #[test]
+    fn snapshot_prune_respects_boundaries_and_is_idempotent() {
+        let conn = seed_snapshots();
+        let cutoff = SnapshotCutoffs {
+            pipeline_date: "2026-06-19".into(),
+            pipeline_ms: et_midnight_ms("2026-06-19").unwrap(),
+            dom_date: "2026-06-19".into(),
+            dom_feature_date: "2026-06-19".into(),
+        };
+
+        // pipeline: one before, one at, one after midnight ET
+        conn.execute(
+            "INSERT INTO pipeline_snapshots (timestamp_ms, payload) VALUES (?1, 'a')",
+            params![cutoff.pipeline_ms - 1.0],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO pipeline_snapshots (timestamp_ms, payload) VALUES (?1, 'b')",
+            params![cutoff.pipeline_ms],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO pipeline_snapshots (timestamp_ms, payload) VALUES (?1, 'c')",
+            params![cutoff.pipeline_ms + 1.0],
+        )
+        .unwrap();
+
+        for day in ["2026-06-17", "2026-06-18", "2026-06-19"] {
+            conn.execute(
+                "INSERT INTO dom_snapshots (timestamp_ms, trading_day, payload) VALUES (1, ?1, 'd')",
+                params![day],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO dom_feature_snapshots (timestamp_ms, trading_day, payload)
+                 VALUES (1, ?1, 'f')",
+                params![day],
+            )
+            .unwrap();
+        }
+
+        let deleted = prune_snapshots(&conn, &cutoff).unwrap();
+        // 1 pipeline + 2 dom + 2 feature = 5
+        assert_eq!(deleted, 5);
+
+        let pipe_left: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pipeline_snapshots", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(pipe_left, 2);
+        let min_pipe: f64 = conn
+            .query_row(
+                "SELECT MIN(timestamp_ms) FROM pipeline_snapshots",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(min_pipe, cutoff.pipeline_ms);
+
+        let dom_left: i64 = conn
+            .query_row("SELECT COUNT(*) FROM dom_snapshots", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(dom_left, 1);
+        let feat_left: i64 = conn
+            .query_row("SELECT COUNT(*) FROM dom_feature_snapshots", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(feat_left, 1);
+
+        // Idempotent second pass.
+        assert_eq!(prune_snapshots(&conn, &cutoff).unwrap(), 0);
+    }
+
+    #[test]
+    fn snapshot_prune_empty_tables_is_noop() {
+        let conn = seed_snapshots();
+        let cutoff = SnapshotCutoffs {
+            pipeline_date: "2026-06-19".into(),
+            pipeline_ms: et_midnight_ms("2026-06-19").unwrap(),
+            dom_date: "2026-06-19".into(),
+            dom_feature_date: "2026-06-19".into(),
+        };
+        assert_eq!(prune_snapshots(&conn, &cutoff).unwrap(), 0);
+    }
+
+    #[test]
+    fn storage_config_snapshot_defaults_are_backward_compatible() {
+        let cfg: the_desk_backend::feed::StorageConfig = toml::from_str(
+            r#"
+            warm_retention_days = 30
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.pipeline_snapshot_retention_days, 14);
+        assert_eq!(cfg.dom_snapshot_retention_days, 7);
+        assert_eq!(cfg.dom_feature_snapshot_retention_days, 7);
+        assert_eq!(cfg.depth_retention_days, 7);
+    }
+
+    #[test]
+    fn backup_default_min_interval_is_24h() {
+        assert_eq!(the_desk_backend::backup::DEFAULT_MIN_INTERVAL_HOURS, 24);
+        assert_eq!(
+            the_desk_backend::backup::BackupConfig::default().min_interval_hours,
+            24
         );
     }
 }

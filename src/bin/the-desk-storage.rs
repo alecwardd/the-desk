@@ -4,6 +4,7 @@
 //!   cargo run --bin the-desk-storage -- --status
 //!   cargo run --bin the-desk-storage -- --maintain --vacuum
 //!   cargo run --bin the-desk-storage -- --compact-into X:\TheDesk\state\data_compacted.db
+//!   cargo run --bin the-desk-storage -- --backup --abort-if-mcp
 //!
 //! Exit codes:
 //!   0 = success
@@ -20,6 +21,8 @@ use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+use the_desk_backend::backup::{self, BackupConfig, BackupError, BackupOutcome};
+use the_desk_backend::db::Database;
 use the_desk_backend::feed::load_storage_config;
 use thiserror::Error;
 
@@ -67,6 +70,7 @@ struct Args {
     status: bool,
     archive: bool,
     vacuum: bool,
+    backup: bool,
     compact_into: Option<String>,
     verify_db: Option<String>,
     compare_db: Option<String>,
@@ -113,6 +117,7 @@ Usage:
   the-desk-storage --maintain [--cutoff YYYY-MM-DD] [--vacuum]
   the-desk-storage --prune-depth [--depth-cutoff YYYY-MM-DD]
   the-desk-storage --prune-snapshots
+  the-desk-storage --backup [--abort-if-mcp]
   the-desk-storage --compact-into PATH
   the-desk-storage --verify-db PATH [--compare-db PATH] [--cutoff YYYY-MM-DD]
 
@@ -124,6 +129,9 @@ Options:
   --prune-depth             Delete depth_events older than the depth cutoff (the .depth files remain
                             the durable source, so pruned rows are re-ingestable). Chunked + WAL-bounded.
   --prune-snapshots         Delete old pipeline/dom/dom_feature snapshots past configured retention.
+  --backup                  Create a verified full backup in the configured [backup] directory.
+                            Uses desk-<UTC timestamp>.db naming and keeps unarchived history.
+                            Ignores backup enabled/min_interval; standard retention pruning applies.
   --depth-cutoff DATE       Prune depth_events with trading_day < DATE. Default: ET today - depth_retention_days.
   --depth-retention-days N  Override configured depth retention days when deriving the depth cutoff.
   --compact-into PATH       Checkpoint WAL, VACUUM INTO PATH, then verify destination integrity.
@@ -135,7 +143,7 @@ Options:
   --abort-if-mcp            Exit 2 if the-desk-mcp is running before any mutating work.
   --help, -h                Show this help.
 
-Config: ~/.the-desk/config.toml [storage]
+Config: ~/.the-desk/config.toml [storage] and [backup]
 Exit codes: 0 ok, 1 general, 2 deferred (MCP active), 3 config, 4 integrity, 5 I/O
 "#
 }
@@ -146,6 +154,7 @@ fn parse_args() -> Result<Args, StorageError> {
         status: false,
         archive: false,
         vacuum: false,
+        backup: false,
         compact_into: None,
         verify_db: None,
         compare_db: None,
@@ -164,6 +173,7 @@ fn parse_args() -> Result<Args, StorageError> {
             "--archive" => parsed.archive = true,
             "--maintain" => parsed.archive = true,
             "--vacuum" => parsed.vacuum = true,
+            "--backup" => parsed.backup = true,
             "--compact-into" => {
                 parsed.compact_into = Some(args.next().ok_or_else(|| {
                     StorageError::Config("--compact-into requires a PATH".into())
@@ -224,6 +234,7 @@ fn parse_args() -> Result<Args, StorageError> {
     if !parsed.status
         && !parsed.archive
         && !parsed.vacuum
+        && !parsed.backup
         && !parsed.prune_depth
         && !parsed.prune_snapshots
         && parsed.compact_into.is_none()
@@ -238,9 +249,32 @@ fn parse_args() -> Result<Args, StorageError> {
 fn will_mutate(args: &Args) -> bool {
     args.archive
         || args.vacuum
+        || args.backup
         || args.prune_depth
         || args.prune_snapshots
         || args.compact_into.is_some()
+}
+
+fn validate_modes(args: &Args) -> Result<(), StorageError> {
+    if args.backup
+        && (args.status
+            || args.archive
+            || args.vacuum
+            || args.compact_into.is_some()
+            || args.verify_db.is_some()
+            || args.compare_db.is_some()
+            || args.cutoff.is_some()
+            || args.retention_days.is_some()
+            || args.prune_depth
+            || args.depth_cutoff.is_some()
+            || args.depth_retention_days.is_some()
+            || args.prune_snapshots)
+    {
+        return Err(StorageError::Config(
+            "--backup is a standalone mode; only --abort-if-mcp may accompany it".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Current calendar date in US Eastern (not Globex trading-day roll).
@@ -1011,6 +1045,20 @@ fn table_row_count(conn: &Connection, table: &str) -> Result<i64, StorageError> 
     Ok(conn.query_row(&sql, [], |r| r.get(0))?)
 }
 
+fn verify_reclaim_retention(copy: &Connection, cutoff: &str) -> Result<(), StorageError> {
+    let old_raw_ticks: i64 = copy.query_row(
+        "SELECT COUNT(1) FROM raw_ticks WHERE session_date < ?1",
+        params![cutoff],
+        |r| r.get(0),
+    )?;
+    if old_raw_ticks != 0 {
+        return Err(StorageError::Integrity(format!(
+            "database copy still contains {old_raw_ticks} raw_ticks rows older than {cutoff}"
+        )));
+    }
+    Ok(())
+}
+
 fn verify_reclaim_copy(
     copy_path: &Path,
     compare_path: Option<&Path>,
@@ -1048,16 +1096,7 @@ fn verify_reclaim_copy(
         ));
     }
 
-    let old_raw_ticks: i64 = copy.query_row(
-        "SELECT COUNT(1) FROM raw_ticks WHERE session_date < ?1",
-        params![cutoff],
-        |r| r.get(0),
-    )?;
-    if old_raw_ticks != 0 {
-        return Err(StorageError::Integrity(format!(
-            "database copy still contains {old_raw_ticks} raw_ticks rows older than {cutoff}"
-        )));
-    }
+    verify_reclaim_retention(&copy, cutoff)?;
 
     if let Some(compare_path) = compare_path {
         let source = open_readonly_db(compare_path)?;
@@ -1074,6 +1113,46 @@ fn verify_reclaim_copy(
 
     println!(
         "Database copy verified: integrity ok, session_summaries={session_summaries}, cutoff={cutoff}."
+    );
+    Ok(())
+}
+
+fn map_backup_error(error: BackupError) -> StorageError {
+    match error {
+        error @ (BackupError::VerificationFailed { .. } | BackupError::Sqlite(_)) => {
+            StorageError::Integrity(error.to_string())
+        }
+        error @ (BackupError::Db(_) | BackupError::Io(_)) => StorageError::Io(error.to_string()),
+    }
+}
+
+fn create_verified_backup(
+    db_path: &Path,
+    config: &BackupConfig,
+    now: chrono::DateTime<Utc>,
+) -> Result<BackupOutcome, StorageError> {
+    let db = Database::open(&db_path.to_string_lossy())
+        .map_err(|error| StorageError::Io(error.to_string()))?;
+    backup::perform_backup(
+        &db,
+        &config.directory_path(),
+        now,
+        config.retention_days,
+        config.max_backups,
+    )
+    .map_err(map_backup_error)
+}
+
+fn run_backup(db_path: &Path) -> Result<(), StorageError> {
+    let config = backup::load_backup_config();
+    let started = Instant::now();
+    let outcome = create_verified_backup(db_path, &config, Utc::now())?;
+    println!(
+        "Backup verified in {:.1?}: {} ({:.2} GB); pruned {} expired backup(s).",
+        started.elapsed(),
+        outcome.path.display(),
+        outcome.size_bytes as f64 / 1_000_000_000.0,
+        outcome.pruned.len()
     );
     Ok(())
 }
@@ -1162,13 +1241,17 @@ fn ensure_no_existing_archive_for_cutoff(
 
 fn run() -> Result<(), StorageError> {
     let args = parse_args()?;
+    validate_modes(&args)?;
     abort_if_mcp_active(&args)?;
+
+    let db_path = data_dir().join("data.db");
+    if args.backup {
+        return run_backup(&db_path);
+    }
 
     let cutoff = derive_cutoff(&args)?;
     let depth_cutoff = derive_depth_cutoff(&args)?;
     let snapshot_cutoffs = derive_snapshot_cutoffs()?;
-    let db_path = data_dir().join("data.db");
-
     if let Some(path) = &args.verify_db {
         let compare_path = args.compare_db.as_deref().map(Path::new);
         verify_reclaim_copy(Path::new(path), compare_path, &cutoff)?;
@@ -1340,6 +1423,14 @@ mod tests {
         assert_eq!(StorageError::Config("x".into()).exit_code(), 3);
         assert_eq!(StorageError::Integrity("x".into()).exit_code(), 4);
         assert_eq!(StorageError::Io("x".into()).exit_code(), 5);
+        assert_eq!(
+            map_backup_error(BackupError::VerificationFailed {
+                path: "copy.db".into(),
+                detail: "quick_check failed".into(),
+            })
+            .exit_code(),
+            4
+        );
     }
 
     #[test]
@@ -1348,6 +1439,7 @@ mod tests {
             status: true,
             archive: false,
             vacuum: false,
+            backup: false,
             compact_into: None,
             verify_db: None,
             compare_db: None,
@@ -1368,6 +1460,72 @@ mod tests {
             ..read_only
         };
         assert!(abort_if_mcp_active(&mutate_no_flag).is_ok());
+    }
+
+    #[test]
+    fn backup_mode_is_standalone_and_mutating() {
+        let backup = Args {
+            status: false,
+            archive: false,
+            vacuum: false,
+            backup: true,
+            compact_into: None,
+            verify_db: None,
+            compare_db: None,
+            cutoff: None,
+            retention_days: None,
+            prune_depth: false,
+            depth_cutoff: None,
+            depth_retention_days: None,
+            prune_snapshots: false,
+            abort_if_mcp: true,
+        };
+        assert!(will_mutate(&backup));
+        assert!(validate_modes(&backup).is_ok());
+
+        let conflicting = Args {
+            compact_into: Some("copy.db".into()),
+            ..backup
+        };
+        assert!(matches!(
+            validate_modes(&conflicting),
+            Err(StorageError::Config(_))
+        ));
+    }
+
+    #[test]
+    fn backup_keeps_unarchived_rows_while_reclaim_verification_rejects_them() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_path = temp.path().join("source.db");
+        let db = Database::open(&source_path.to_string_lossy()).unwrap();
+        db.insert_raw_tick(1.0, 20_000.0, 1.0, 19_999.75, 20_000.0, true, "2026-01-01")
+            .unwrap();
+        drop(db);
+
+        let backup_dir = temp.path().join("backups");
+        let config = BackupConfig {
+            enabled: false,
+            directory: backup_dir.to_string_lossy().into_owned(),
+            retention_days: 0,
+            max_backups: 0,
+            min_interval_hours: 24,
+        };
+        let now = Utc
+            .with_ymd_and_hms(2026, 7, 22, 1, 15, 0)
+            .single()
+            .unwrap();
+        let outcome = create_verified_backup(&source_path, &config, now).unwrap();
+
+        assert!(outcome.verified);
+        assert_eq!(
+            outcome.path.file_name().and_then(|name| name.to_str()),
+            Some("desk-2026-07-22-011500.db")
+        );
+        assert!(!outcome.path.with_extension("db-journal").exists());
+
+        let backup = open_readonly_db(&outcome.path).unwrap();
+        let reclaim_result = verify_reclaim_retention(&backup, "2026-06-22");
+        assert!(matches!(reclaim_result, Err(StorageError::Integrity(_))));
     }
 
     #[test]

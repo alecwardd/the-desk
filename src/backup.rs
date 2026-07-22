@@ -29,7 +29,7 @@ pub const DEFAULT_RETENTION_DAYS: u32 = 14;
 /// count cap (age-based pruning still applies).
 pub const DEFAULT_MAX_BACKUPS: usize = 30;
 /// Default minimum hours between automatic startup backups.
-pub const DEFAULT_MIN_INTERVAL_HOURS: u64 = 12;
+pub const DEFAULT_MIN_INTERVAL_HOURS: u64 = 24;
 
 const FILE_PREFIX: &str = "desk-";
 const FILE_SUFFIX: &str = ".db";
@@ -180,8 +180,9 @@ pub enum StartupBackupReport {
 /// Take a backup now, verify it, and prune old backups.
 ///
 /// Creates `dir` if needed, writes `desk-<timestamp>.db`, verifies it with
-/// `PRAGMA quick_check`, then prunes by age and count. Ignores
-/// [`BackupConfig::enabled`] and the minimum interval — those gate the
+/// SQLite header magic + `PRAGMA quick_check` + durable-table presence, then
+/// prunes by age and count — never deleting the last header-valid backup.
+/// Ignores [`BackupConfig::enabled`] and the minimum interval — those gate the
 /// automatic startup path ([`run_startup_backup`]), not explicit requests.
 pub fn perform_backup(
     db: &Database,
@@ -200,18 +201,37 @@ pub fn perform_backup(
     // accumulate as a multi-GB orphan that itself fills the drive.
     if let Err(err) = db.backup_to(&dest_str) {
         let _ = std::fs::remove_file(&dest);
+        let _ = std::fs::remove_file(format!("{dest_str}-journal"));
         return Err(err.into());
     }
 
-    let verified = verify_backup_file(&dest).unwrap_or(false);
-    if !verified {
-        // A snapshot that fails verification is worse than none — remove it so
-        // it can never be mistaken for a good restore point.
+    // Re-read magic from the filesystem after VACUUM INTO returns so a truncated
+    // or zeroed first page cannot be mistaken for a restore point.
+    if !has_sqlite_header(&dest)? {
         let _ = std::fs::remove_file(&dest);
+        let _ = std::fs::remove_file(format!("{dest_str}-journal"));
         return Err(BackupError::VerificationFailed {
             path: dest_str,
-            detail: "PRAGMA quick_check did not return ok".to_string(),
+            detail: "SQLite header magic missing after VACUUM INTO (page 0 zeroed or truncated)"
+                .to_string(),
         });
+    }
+
+    match verify_backup_file(&dest) {
+        Ok(true) => {}
+        Ok(false) => {
+            let _ = std::fs::remove_file(&dest);
+            let _ = std::fs::remove_file(format!("{dest_str}-journal"));
+            return Err(BackupError::VerificationFailed {
+                path: dest_str,
+                detail: "PRAGMA quick_check did not return ok".to_string(),
+            });
+        }
+        Err(err) => {
+            let _ = std::fs::remove_file(&dest);
+            let _ = std::fs::remove_file(format!("{dest_str}-journal"));
+            return Err(err);
+        }
     }
 
     let size_bytes = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
@@ -220,7 +240,7 @@ pub fn perform_backup(
     Ok(BackupOutcome {
         path: dest,
         size_bytes,
-        verified,
+        verified: true,
         pruned,
     })
 }
@@ -294,7 +314,8 @@ pub fn list_backups(dir: &Path) -> Vec<BackupFileInfo> {
 ///
 /// Age and count limits are independent: `0` disables that limit. Returns the
 /// paths removed. Only files matching the `desk-<timestamp>.db` pattern are ever
-/// touched.
+/// touched. **Never deletes the newest header-valid backup** — corrupt/zero-header
+/// files do not count as a safety net.
 pub fn prune_backups(
     dir: &Path,
     retention_days: u32,
@@ -307,6 +328,13 @@ pub fn prune_backups(
     let age_cutoff =
         (retention_days > 0).then(|| now - chrono::Duration::days(retention_days as i64));
 
+    // Pin the newest header-valid restore point so pruning cannot wipe the only
+    // known-good snapshot (corrupt zero-header files are not a safety net).
+    let protected = backups
+        .iter()
+        .find(|b| has_sqlite_header(&b.path).unwrap_or(false))
+        .map(|b| b.path.clone());
+
     let mut kept = 0usize;
     for backup in backups {
         let too_old = match (age_cutoff, backup.created_at) {
@@ -314,9 +342,11 @@ pub fn prune_backups(
             _ => false,
         };
         let over_cap = max_backups > 0 && kept >= max_backups;
+        let is_protected = protected.as_ref().is_some_and(|p| p == &backup.path);
 
-        if too_old || over_cap {
+        if (too_old || over_cap) && !is_protected {
             if std::fs::remove_file(&backup.path).is_ok() {
+                let _ = std::fs::remove_file(format!("{}-journal", backup.path.display()));
                 removed.push(backup.path);
             }
         } else {
@@ -324,6 +354,97 @@ pub fn prune_backups(
         }
     }
     removed
+}
+
+/// Durable trader/control tables that must be present in a verified full backup.
+pub const BACKUP_DURABLE_TABLES: &[&str] = &[
+    "session_summaries",
+    "setups",
+    "research_hypotheses",
+    "risk_config",
+    "risk_state",
+    "account_state",
+];
+
+/// True when `path` begins with the SQLite database header magic.
+pub fn has_sqlite_header(path: &Path) -> Result<bool, BackupError> {
+    let mut file = std::fs::File::open(path)?;
+    let mut magic = [0u8; 16];
+    use std::io::Read;
+    let n = file.read(&mut magic)?;
+    Ok(n >= 16 && magic.starts_with(b"SQLite format 3\0"))
+}
+
+/// Operator-facing backup directory health (latest file, header validity, free space).
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupHealthReport {
+    pub directory: String,
+    pub backup_count: usize,
+    pub header_valid_count: usize,
+    pub latest: Option<BackupFileInfoJson>,
+    pub latest_header_valid: bool,
+    pub warnings: Vec<String>,
+}
+
+/// JSON-friendly backup file metadata.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupFileInfoJson {
+    pub path: String,
+    pub file_name: String,
+    pub size_bytes: u64,
+    pub created_at: Option<String>,
+    pub header_valid: bool,
+}
+
+/// Inspect backup directory health without mutating files.
+pub fn backup_health_report(dir: &Path) -> BackupHealthReport {
+    let backups = list_backups(dir);
+    let mut warnings = Vec::new();
+    let mut header_valid_count = 0usize;
+    let mut latest_json = None;
+    let mut latest_header_valid = false;
+
+    for (i, b) in backups.iter().enumerate() {
+        let header_valid = has_sqlite_header(&b.path).unwrap_or(false);
+        if header_valid {
+            header_valid_count += 1;
+        } else {
+            warnings.push(format!(
+                "backup {} missing SQLite header magic (page 0 zeroed or truncated)",
+                b.file_name
+            ));
+        }
+        if i == 0 {
+            latest_header_valid = header_valid;
+            latest_json = Some(BackupFileInfoJson {
+                path: b.path.to_string_lossy().into_owned(),
+                file_name: b.file_name.clone(),
+                size_bytes: b.size_bytes,
+                created_at: b.created_at.map(|t| t.to_rfc3339()),
+                header_valid,
+            });
+        }
+    }
+
+    if backups.is_empty() {
+        warnings.push("no desk-*.db backups found in directory".to_string());
+    } else if header_valid_count == 0 {
+        warnings.push(
+            "NO header-valid backups remain — create a verified full backup before any destructive maintenance"
+                .to_string(),
+        );
+    }
+
+    BackupHealthReport {
+        directory: dir.to_string_lossy().into_owned(),
+        backup_count: backups.len(),
+        header_valid_count,
+        latest: latest_json,
+        latest_header_valid,
+        warnings,
+    }
 }
 
 /// Build a unique destination path. `VACUUM INTO` refuses to overwrite, so if a
@@ -343,13 +464,54 @@ fn unique_destination(dir: &Path, now: DateTime<Utc>) -> PathBuf {
     base
 }
 
-/// Open `path` read-only and run `PRAGMA quick_check`, returning whether it
-/// reports `ok`.
+/// Open `path` read-only and verify header + `PRAGMA quick_check` + durable tables.
+///
+/// Never opens with write flags — write opens against a snapshot have been observed
+/// to leave orphan `*-journal` files and a zeroed page 0.
 fn verify_backup_file(path: &Path) -> Result<bool, BackupError> {
-    let conn =
-        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    if !has_sqlite_header(path)? {
+        return Err(BackupError::VerificationFailed {
+            path: path.to_string_lossy().into_owned(),
+            detail: "SQLite header magic missing".to_string(),
+        });
+    }
+
+    // URI + immutable avoids journal creation even if a caller upgrades flags later.
+    let uri = format!(
+        "file:{}?mode=ro&immutable=1",
+        path.to_string_lossy().replace('\\', "/")
+    );
+    let conn = rusqlite::Connection::open_with_flags(
+        &uri,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )?;
     let result: String = conn.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
-    Ok(result.eq_ignore_ascii_case("ok"))
+    if !result.eq_ignore_ascii_case("ok") {
+        return Ok(false);
+    }
+
+    for table in BACKUP_DURABLE_TABLES {
+        let exists: i64 = conn.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
+            rusqlite::params![table],
+            |r| r.get(0),
+        )?;
+        if exists == 0 {
+            return Err(BackupError::VerificationFailed {
+                path: path.to_string_lossy().into_owned(),
+                detail: format!("required durable table missing: {table}"),
+            });
+        }
+    }
+
+    // Re-check magic after opening — catch mid-verify corruption.
+    if !has_sqlite_header(path)? {
+        return Err(BackupError::VerificationFailed {
+            path: path.to_string_lossy().into_owned(),
+            detail: "SQLite header magic disappeared after verification open".to_string(),
+        });
+    }
+    Ok(true)
 }
 
 /// Whether `name` matches the `desk-<...>.db` backup pattern.
@@ -396,6 +558,43 @@ mod tests {
 
     fn touch_backup(dir: &Path, name: &str) {
         std::fs::write(dir.join(name), b"not-a-real-db").expect("write fixture");
+    }
+
+    #[test]
+    fn prune_never_deletes_newest_header_valid_backup() {
+        let (_db_dir, db) = seeded_db();
+        let dir = tempfile::tempdir().expect("dir");
+        let good = perform_backup(&db, dir.path(), ts("2026-06-13 09:00:00"), 0, 0).expect("good");
+        assert!(has_sqlite_header(&good.path).unwrap());
+        // Corrupt-looking older siblings (no magic) plus age/cap pressure.
+        touch_backup(dir.path(), "desk-2026-05-01-090000.db");
+        touch_backup(dir.path(), "desk-2026-05-02-090000.db");
+        let removed = prune_backups(dir.path(), 1, 1, ts("2026-06-13 09:00:00"));
+        assert!(
+            good.path.exists(),
+            "newest header-valid backup must survive"
+        );
+        assert!(
+            removed.iter().all(|p| p != &good.path),
+            "protected path must not appear in removed list"
+        );
+        assert!(
+            has_sqlite_header(&good.path).unwrap(),
+            "protected backup header must remain valid"
+        );
+    }
+
+    #[test]
+    fn verify_rejects_zero_header_file() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("desk-2026-06-13-090000.db");
+        // Simulate observed production corruption: page 0 zeroed, junk after.
+        let mut bytes = vec![0u8; 8192];
+        bytes[4096] = 5;
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(!has_sqlite_header(&path).unwrap());
+        let err = verify_backup_file(&path).expect_err("zero header must fail");
+        assert!(matches!(err, BackupError::VerificationFailed { .. }));
     }
 
     #[test]

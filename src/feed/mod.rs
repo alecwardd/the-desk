@@ -137,6 +137,15 @@ pub struct StorageConfig {
     /// files remain the durable record, so older depth rows are re-ingestable.
     #[serde(default = "default_depth_retention_days")]
     pub depth_retention_days: u32,
+    /// Days to keep `pipeline_snapshots` in SQLite. Default: 14.
+    #[serde(default = "default_pipeline_snapshot_retention_days")]
+    pub pipeline_snapshot_retention_days: u32,
+    /// Days to keep `dom_snapshots` in SQLite. Default: 7.
+    #[serde(default = "default_dom_snapshot_retention_days")]
+    pub dom_snapshot_retention_days: u32,
+    /// Days to keep `dom_feature_snapshots` in SQLite. Default: 7.
+    #[serde(default = "default_dom_feature_snapshot_retention_days")]
+    pub dom_feature_snapshot_retention_days: u32,
 }
 
 fn default_warm_days() -> u32 {
@@ -144,6 +153,18 @@ fn default_warm_days() -> u32 {
 }
 
 fn default_depth_retention_days() -> u32 {
+    7
+}
+
+fn default_pipeline_snapshot_retention_days() -> u32 {
+    14
+}
+
+fn default_dom_snapshot_retention_days() -> u32 {
+    7
+}
+
+fn default_dom_feature_snapshot_retention_days() -> u32 {
     7
 }
 
@@ -165,6 +186,9 @@ impl Default for StorageConfig {
             cold_archive_dir: default_archive_dir(),
             auto_archive: false,
             depth_retention_days: default_depth_retention_days(),
+            pipeline_snapshot_retention_days: default_pipeline_snapshot_retention_days(),
+            dom_snapshot_retention_days: default_dom_snapshot_retention_days(),
+            dom_feature_snapshot_retention_days: default_dom_feature_snapshot_retention_days(),
         }
     }
 }

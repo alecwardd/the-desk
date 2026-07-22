@@ -126,6 +126,54 @@ The MCP server takes an automatic **`VACUUM INTO` snapshot on startup** (`[backu
 
 Note: the `the-desk-mcp` server is launched by **whatever Claude Code / Cursor session is active**, not only Cursor — so it can restart and re-trigger the startup backup. Stop it before any DB maintenance.
 
+### On-demand verified backups (`--backup`)
+
+Take a verified full backup from the CLI without the MCP server:
+
+```powershell
+C:\the-desk\target_alt\release\the-desk-storage.exe --backup --abort-if-mcp
+```
+
+`--backup` writes `desk-<UTC timestamp>.db` to the configured `[backup]` directory via the same
+`perform_backup` path as the MCP startup snapshot: SQLite header magic + `PRAGMA quick_check` +
+durable-table verification, read-only/immutable opens, orphan-journal cleanup, and retention
+pruning that never deletes the newest header-valid backup. It ignores `[backup].enabled` and
+`min_interval_hours` (those gate only the automatic startup path). It is a standalone mode: only
+`--abort-if-mcp` may accompany it (anything else exits 3).
+
+**Backups are not reclaim copies.** `--backup` deliberately **keeps unarchived history** — a
+restore point containing rows older than the warm-retention cutoff is the safe direction.
+`--compact-into` is the reclaim-swap tool and keeps its strict assertion that no `raw_ticks`
+predate the cutoff (exit 4 otherwise), because a reclaim copy that still carries unarchived rows
+means the archive step was skipped. Use `--backup` for restore points; use `--compact-into` only
+inside the reclaim flow.
+
+## Storage Binary Deployment
+
+The scheduled tasks and ops scripts run `target_alt\release\the-desk-storage.exe` (built with
+`CARGO_TARGET_DIR=target_alt` so storage builds never contend with the main `target\` dir). To
+deploy a new build safely:
+
+1. **Build from a committed ref, not the working tree** — a dirty tree leaks uncommitted library
+   code into the binary. Use a detached worktree with a temporary target dir:
+
+   ```powershell
+   git -C C:\the-desk worktree add $env:TEMP\deploy-storage <commit>
+   $env:CARGO_TARGET_DIR = "$env:TEMP\deploy-target"
+   cargo build --manifest-path $env:TEMP\deploy-storage\Cargo.toml --release --bin the-desk-storage
+   cargo test  --manifest-path $env:TEMP\deploy-storage\Cargo.toml --bin the-desk-storage
+   ```
+
+2. Record the candidate's SHA-256 (`Get-FileHash`).
+3. Pick a window **off-market and at least 10–15 minutes clear of the six-hourly Storage Health
+   Check marks** (00:03 / 06:03 / 12:03 / 18:03 CT); confirm no `the-desk-storage.exe` process
+   is running.
+4. Copy the current exe to a dated `.bak.exe` beside it, then copy the candidate over
+   `the-desk-storage.exe`.
+5. Re-hash the deployed file against the recorded SHA-256 and smoke-test: `--help` must exit 0,
+   and a conflicting-mode call such as `--backup --status` must exit 3. Roll back from the
+   `.bak.exe` on any mismatch.
+
 ## One-Time Reclaim Runbook
 
 Do this from an elevated PowerShell session. The script has two destructive gates: formatting Disk 2 and replacing the original `data.db`. Both require explicit `-Confirm` and runtime verification.
@@ -222,6 +270,16 @@ Check current tasks / verify registration:
 Get-ScheduledTask -TaskPath "\TheDesk\" | Select-Object TaskName, State
 powershell -NoProfile -ExecutionPolicy Bypass -File C:\the-desk\scripts\ops\Register-DeskTasks.ps1 -Verify
 ```
+
+> **Scheduler visibility gotcha:** the storage/readiness tasks run as `SYSTEM`, and
+> **non-elevated folder listings silently omit tasks the caller cannot read** — from a normal
+> session, `Get-ScheduledTask -TaskPath "\TheDesk\"` shows only the interactive Sierra tasks,
+> which looks exactly like "tasks were never registered." To check registration without
+> elevating, query each task **by name**: `schtasks /Query /TN "\TheDesk\Storage Health Check"`
+> returning `Access is denied` proves the task **exists**; only "cannot find" means absent.
+> Alternatively, fresh `health-Daily-*.log` files under `X:\TheDesk\logs` (written every 6 hours
+> at :03) prove the health task is live. Known defect: non-elevated `-Verify` currently labels
+> access-denied tasks as missing — run `-Verify` elevated until that is fixed.
 
 Run a health check:
 

@@ -562,3 +562,12 @@ Backtest isolation:
 - Corrupt zero-header backups must be replaced with a freshly verified snapshot before destructive prune/compact
 - Snapshot prune reduces DOM research hot window to configured days; `.depth` / `.scid` remain rebuild sources for market data
 - Durable trader state (setups, hypotheses, journal, risk, memory, account) still requires verified full-DB backups — not recoverable from Sierra files alone
+
+> **Implementation note (2026-07-22, commit `f412f3d`):** verified full backups and reclaim-swap
+> compaction are now distinct CLI operations. `the-desk-storage --backup` runs the standard
+> verifier (header magic + `quick_check` + durable tables via `backup::perform_backup`) and
+> **retains unarchived history** — extra old rows in a restore point are the safe direction.
+> `--compact-into` keeps the reclaim-only cutoff assertion (`verify_reclaim_retention`): a
+> reclaim copy still holding pre-cutoff `raw_ticks` fails exit 4 because the archive step was
+> skipped. The split resolved a same-day incident where a fully verified backup exited 4 solely
+> because weekly archival had never run.

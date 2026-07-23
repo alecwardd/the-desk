@@ -22,7 +22,10 @@ pub use day_type::{
     DayType, DayTypeClassifier, ProfileShape, SinglePrintsDirection,
 };
 pub use delta::DeltaPipeline;
-pub use event_detector::{EventDetector, MarketEvent, IB_EXTENSION_RATIO};
+pub use event_detector::{
+    crossed_level, EventDetector, MarketEvent, IB_EXTENSION_DIRECTION_DOWN,
+    IB_EXTENSION_DIRECTION_UP, IB_EXTENSION_RATIO,
+};
 pub use flow_event_emitter::FlowEventEmitter;
 pub use footprint::{FootprintLevel, FootprintPipeline, StackedZone};
 pub use levels::{KeyLevel, KeyLevelType, LevelsPipeline, ProximityLevel};

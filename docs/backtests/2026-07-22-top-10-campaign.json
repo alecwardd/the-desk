@@ -1,0 +1,316 @@
+{
+  "schema_version": 1,
+  "campaign_id": "2026-07-22-top-10-campaign",
+  "recorded_at": "2026-07-22T20:17:00-05:00",
+  "timezone": "America/Chicago",
+  "development_end": "2026-07-21",
+  "overall_status": "mixed_completed_and_blocked",
+  "executive_summary": "2 completed development studies (IDEA-011+025B underperformed primary gate — do not promote; IDEA-025D promising directional-overlay evidence — PARK_FORWARD_VALIDATION, not an entry system). 8 studies honestly parked behind definition/data blockers. No live activation.",
+  "orchestration": {
+    "cursor_model": "cursor-grok-4.5-high",
+    "implementer_chat": "8c77ae4f-8473-472c-89b7-b8c10474863b",
+    "planner_chat": "69e1daf5-1b3f-40ca-b87a-0443b526a0b4",
+    "wrapper_skill_path": "C:\\Users\\alecw\\.codex\\skills\\cursor-cli-orchestrator\\SKILL.md",
+    "git_commit_at_runs": "5ecf648aba7a310a2c79f392a86916a42f194308",
+    "git_dirty_at_runs": true,
+    "notes": "Orchestration metadata only; no email, auth tokens, API keys, or prompt bodies recorded."
+  },
+  "studies": [
+    {
+      "number": 1,
+      "idea_ids": ["IDEA-011", "IDEA-025B"],
+      "name": "Unified IB — one_sided_acceptance_30m vs ungated_baseline @ 1R",
+      "status": "completed_development",
+      "decision": "PARK_FORWARD_VALIDATION; primary gate underperformed — do not promote",
+      "canonical_run": "T:\\TheDesk\\temp\\backtests\\ib-campaign-2026-07-22\\v2\\run-20260722T175513Z",
+      "code_paths": [
+        "C:\\the-desk\\src\\research\\ib_campaign.rs",
+        "C:\\the-desk\\src\\bin\\the-desk-ib-campaign.rs"
+      ],
+      "metrics": {
+        "population_sessions": 154,
+        "usable_sessions": 119,
+        "excluded_sessions": 35,
+        "primary_treated_gate": "one_sided_acceptance_30m",
+        "primary_control_gate": "ungated_baseline",
+        "target_r": 1.0,
+        "matched_n": 11,
+        "gross_treated_avg_r": 0.09090909090909091,
+        "gross_control_avg_r": 0.2727272727272727,
+        "gross_delta_avg_r": -0.18181818181818182,
+        "weekly_bootstrap_ci95": [-0.75, 0.0],
+        "weekly_bootstrap_n_blocks": 7,
+        "contract_bootstrap_ci95": [-0.2222222222222222, 0.0],
+        "contract_bootstrap_n_blocks": 2,
+        "verdict_result": "DEVELOPMENT_RESULT",
+        "verdict_disposition": "PARK_FORWARD_VALIDATION",
+        "must_not_promote": true,
+        "report_json_sha256": "e69d40b9fee2218cc7e9e5df00dc1c64b00b75290eb392e2889f02a25eeb4757",
+        "report_md_sha256": "f9c9636e825e287a489ba72094437204f229a50da112656b251695e1bd45fd8b",
+        "binary_path": "C:\\the-desk\\target\\release\\the-desk-ib-campaign.exe",
+        "binary_sha256": "7bf25fcf765447b2362c3a0681a401507cc8823b4ccb32f68debcf1f086c4666",
+        "source_file_hashes": [
+          {
+            "path": "C:\\the-desk\\src\\bin\\the-desk-ib-campaign.rs",
+            "sha256": "50e5c121ce802bb2a1eedfc939bc56449ad13228da3a35d9656a612e4a51fef4"
+          },
+          {
+            "path": "C:\\the-desk\\src\\research\\ib_campaign.rs",
+            "sha256": "b00715af17e8c25286e5f8fef6181bcd8aa8cba4376cbbca8113c550be18522f"
+          }
+        ]
+      },
+      "blockers": [],
+      "revisit_condition": "Only as a disciplined untouched matched holdout after 2026-07-21; discovery underperformance is not a promotion candidate."
+    },
+    {
+      "number": 2,
+      "idea_ids": ["IDEA-020"],
+      "name": "Footprint lifecycle",
+      "status": "blocked_data",
+      "decision": "Parked pending clean event accrual",
+      "canonical_run": null,
+      "code_paths": [],
+      "metrics": null,
+      "blockers": [
+        "Clean post-2026-06-23 / live-eye event accrual to N>=30",
+        "Do not retune exhausted NQH6 history"
+      ],
+      "revisit_condition": "Resume when clean post-2026-06-23 lifecycle events reach N>=30 without NQH6 retune."
+    },
+    {
+      "number": 3,
+      "idea_ids": ["IDEA-014"],
+      "name": "London unwind",
+      "status": "blocked_definition",
+      "decision": "Parked pending predicate locks",
+      "canonical_run": null,
+      "code_paths": [],
+      "metrics": null,
+      "blockers": [
+        "Lock 'trended materially' predicate",
+        "Lock reclaim predicate",
+        "Lock handoff-state predicate"
+      ],
+      "revisit_condition": "Resume immediately after trended-materially / reclaim / handoff-state predicates are locked."
+    },
+    {
+      "number": 4,
+      "idea_ids": ["IDEA-025A"],
+      "name": "AM TBR",
+      "status": "blocked_definition",
+      "decision": "Parked pending percent-net-change scope lock",
+      "canonical_run": null,
+      "code_paths": [],
+      "metrics": null,
+      "blockers": [
+        "Lock prior-session percent-net-change scope (RTH, Globex, or custom TBR)"
+      ],
+      "revisit_condition": "Resume immediately after percent-net-change scope is locked."
+    },
+    {
+      "number": 5,
+      "idea_ids": ["IDEA-001"],
+      "name": "Open Drive",
+      "status": "blocked_definition",
+      "decision": "Parked pending OpenDrive contract locks",
+      "canonical_run": null,
+      "code_paths": [],
+      "metrics": null,
+      "blockers": [
+        "Lock OpenDrive decision clock / retrace predicate",
+        "Lock VWAP entry/fill",
+        "Lock risk/exit",
+        "Lock RVOL gate/freeze",
+        "Lock primary matched control"
+      ],
+      "revisit_condition": "Resume immediately after OpenDrive clock/VWAP/risk/RVOL/matched-control locks."
+    },
+    {
+      "number": 6,
+      "idea_ids": ["IDEA-031"],
+      "name": "Compression / expansion",
+      "status": "blocked_definition",
+      "decision": "Parked pending percentile/threshold and trade contract locks",
+      "canonical_run": null,
+      "code_paths": [],
+      "metrics": null,
+      "blockers": [
+        "Lock percentile/threshold predicates",
+        "Lock outcome/trade contract"
+      ],
+      "revisit_condition": "Resume immediately after percentile/threshold + trade contract locks."
+    },
+    {
+      "number": 7,
+      "idea_ids": ["IDEA-033"],
+      "name": "Stage A (RV / volatility)",
+      "status": "blocked_definition",
+      "decision": "Parked pending RV method locks (or authorized ATR-only Stage A-prime)",
+      "canonical_run": null,
+      "code_paths": [],
+      "metrics": null,
+      "blockers": [
+        "Lock RV bar size",
+        "Lock annualization",
+        "Lock RV-to-points mapping",
+        "Lock naive median lookback",
+        "Lock interval method",
+        "Lock walk-forward folds",
+        "Or explicitly authorize ATR-only Stage A-prime and lock its remaining choices"
+      ],
+      "revisit_condition": "Resume after RV (or authorized ATR A-prime) method locks."
+    },
+    {
+      "number": 8,
+      "idea_ids": ["IDEA-025D"],
+      "name": "9AM hour continuation (directional overlay / event probability)",
+      "status": "completed_development",
+      "decision": "PARK_FORWARD_VALIDATION; promising overlay evidence — not an entry system; ACCEPT structurally impossible",
+      "canonical_run": "T:\\TheDesk\\temp\\backtests\\nine-am-continuation-campaign-2026-07-22\\v1\\run-stage2-reviewfix-20260722-192008",
+      "code_paths": [
+        "C:\\the-desk\\src\\research\\nine_am_continuation.rs",
+        "C:\\the-desk\\src\\bin\\the-desk-nine-am-continuation.rs"
+      ],
+      "metrics": {
+        "population_sessions": 155,
+        "usable_sessions": 132,
+        "excluded_sessions": 23,
+        "green_ny_n": 72,
+        "green_ny_wins": 48,
+        "green_ny_losses": 24,
+        "green_ny_continuation_rate": 0.6666666666666666,
+        "green_ny_wilson_ci95": [0.5517938807199863, 0.7646551393428815],
+        "green_ny_unconditional_base": 0.5151515151515151,
+        "green_ny_lift_vs_base": 0.1515151515151515,
+        "red_ny_n": 60,
+        "red_ny_wins": 40,
+        "red_ny_losses": 20,
+        "red_ny_continuation_rate": 0.6666666666666666,
+        "red_ny_wilson_ci95": [0.540566298666634, 0.7727090578407217],
+        "red_ny_unconditional_base": 0.48484848484848486,
+        "red_ny_lift_vs_base": 0.18181818181818177,
+        "pooled_ny_n": 132,
+        "pooled_ny_continuation_rate": 0.6666666666666666,
+        "full_session_denominator": 131,
+        "excursion_diagnostic_n": 132,
+        "reliability_tier_primary": "reportable",
+        "primary_is_trade_system": false,
+        "accept_structurally_impossible": true,
+        "verdict_result": "DEVELOPMENT_RESULT",
+        "verdict_disposition": "PARK_FORWARD_VALIDATION",
+        "report_json_sha256": "6aeb8ff7380eb9c5d153ed533b14271ce51ccf80b3e3e50d475734ae32613a54",
+        "report_md_sha256": "35283e55b09b20b13fd04465cb513c0c290ab0026686b21156bf1c1e8033fb5a",
+        "binary_path": "C:\\the-desk\\target\\release\\the-desk-nine-am-continuation.exe",
+        "binary_sha256": "85cc74e07a4e2c8f43a179dbc35451400ca55b0acf9c1ef71509f8af60cc6931",
+        "source_file_hashes": [
+          {
+            "path": "C:\\the-desk\\src\\bin\\the-desk-nine-am-continuation.rs",
+            "sha256": "efd2e23607f8db997f016709d6a0fcb19d1304cb9732ecd740694610377376f6"
+          },
+          {
+            "path": "C:\\the-desk\\src\\research\\nine_am_continuation.rs",
+            "sha256": "a658d1540614bf295db4bf5917fa0c9f35d26e03818fb59b0264655a9f5e321c"
+          }
+        ]
+      },
+      "blockers": [],
+      "revisit_condition": "Untouched holdout after 2026-07-21 required; keep overlay-only framing; never ACCEPT from development alone."
+    },
+    {
+      "number": 9,
+      "idea_ids": ["IDEA-003"],
+      "name": "Naked VPOC",
+      "status": "blocked_definition",
+      "decision": "Parked pending VPOC contract locks",
+      "canonical_run": null,
+      "code_paths": [],
+      "metrics": null,
+      "blockers": [
+        "Lock TPO POC vs true VPOC",
+        "Lock fill predicate/tolerance",
+        "Lock RTH vs Globex horizon",
+        "Lock duplicate origin policy",
+        "Lock roll carry/censor"
+      ],
+      "revisit_condition": "Resume immediately after VPOC/fill/horizon/duplicate/roll locks."
+    },
+    {
+      "number": 10,
+      "idea_ids": ["IDEA-004"],
+      "name": "CVD divergence",
+      "status": "blocked_data_and_definition",
+      "decision": "Parked pending MTF CVD definition and data accrual",
+      "canonical_run": null,
+      "code_paths": [],
+      "metrics": null,
+      "blockers": [
+        "Define true MTF CVD (1m/5m/15m) object/extreme/divergence predicates",
+        "Accrue supporting data",
+        "Do not substitute absorption delta_divergence"
+      ],
+      "revisit_condition": "Resume after MTF CVD definition and data accrual; never substitute absorption delta_divergence."
+    }
+  ],
+  "canonical_runs": [
+    {
+      "study_number": 1,
+      "role": "canonical",
+      "path": "T:\\TheDesk\\temp\\backtests\\ib-campaign-2026-07-22\\v2\\run-20260722T175513Z",
+      "isolated_db": "T:\\TheDesk\\temp\\backtests\\ib-campaign-2026-07-22\\v2\\run-20260722T175513Z\\ib-campaign.db",
+      "report_json_sha256": "e69d40b9fee2218cc7e9e5df00dc1c64b00b75290eb392e2889f02a25eeb4757",
+      "report_md_sha256": "f9c9636e825e287a489ba72094437204f229a50da112656b251695e1bd45fd8b",
+      "provenance_json_sha256": "c2bf17835e622789f004f5c9975c7aff1e53d3d8b122e53b3f15d5a9295aa98a",
+      "rollover_evidence_json_sha256": "3cdd4bcc31c57837ae3edd188b3841b844fb23a84a5ac52f2fb42597e3d6574e"
+    },
+    {
+      "study_number": 8,
+      "role": "canonical",
+      "path": "T:\\TheDesk\\temp\\backtests\\nine-am-continuation-campaign-2026-07-22\\v1\\run-stage2-reviewfix-20260722-192008",
+      "isolated_db": "T:\\TheDesk\\temp\\backtests\\nine-am-continuation-campaign-2026-07-22\\v1\\run-stage2-reviewfix-20260722-192008\\nine-am-continuation.db",
+      "report_json_sha256": "6aeb8ff7380eb9c5d153ed533b14271ce51ccf80b3e3e50d475734ae32613a54",
+      "report_md_sha256": "35283e55b09b20b13fd04465cb513c0c290ab0026686b21156bf1c1e8033fb5a",
+      "provenance_json_sha256": "9d609e9f714cea532a0de22613bb701a186ec375ed97c8798d03258f72075453",
+      "rollover_evidence_json_sha256": "3cdd4bcc31c57837ae3edd188b3841b844fb23a84a5ac52f2fb42597e3d6574e"
+    }
+  ],
+  "audit_predecessors": [
+    {
+      "study_number": 1,
+      "role": "audit_predecessor_pre_bootstrap_correction",
+      "path": "T:\\TheDesk\\temp\\backtests\\ib-campaign-2026-07-22\\v2\\run-20260722T174033Z",
+      "report_json_sha256": "d282bb32b966659665fc3bf33d229439376f50df8ae63f1eb9286f0220e87e85",
+      "report_md_sha256": "409c06a3219fd4cad03be80458327ce1a90c23fc1c40e2ce8c6eb3f48e5822e1",
+      "note": "Noncanonical; retained for audit only."
+    },
+    {
+      "study_number": 8,
+      "role": "audit_predecessor_pre_report_eligibility_correction",
+      "path": "T:\\TheDesk\\temp\\backtests\\nine-am-continuation-campaign-2026-07-22\\v1\\run-stage2-20260722-190807",
+      "report_json_sha256": "4250512e91e93146fc4fcc64aaa029fba88160437c7d798f7c010c2d40a6390e",
+      "report_md_sha256": "c4032de3d693ab8ca7b1fce58d1f8f668ede38fa17bb661883ff8e27a7bc5e58",
+      "note": "Noncanonical; retained for audit only (excursion/exclusion-count defect)."
+    }
+  ],
+  "safety": [
+    "Campaign binaries reject live DB paths and used isolated DBs only.",
+    "No live config / risk controls / playbooks modified for this documentation write.",
+    "No git commit or push performed for this request.",
+    "Run artifacts remain outside git under T:\\TheDesk\\temp\\backtests\\.",
+    "These docs/backtests files are the durable index/decision record, not a substitute for artifact hashes.",
+    "Prompts, secrets, and auth data are not recorded.",
+    "No live activation from this campaign."
+  ],
+  "next_actions": [
+    "After untouched post-2026-07-21 holdout exists: revisit #8 IDEA-025D as overlay-only PARK_FORWARD_VALIDATION.",
+    "After clean post-2026-06-23 events reach N>=30: resume #2 IDEA-020 (no NQH6 retune).",
+    "Lock London unwind predicates then resume #3 IDEA-014.",
+    "Lock AM TBR percent-net-change scope then resume #4 IDEA-025A.",
+    "Lock OpenDrive contract then resume #5 IDEA-001.",
+    "Lock compression/expansion contract then resume #6 IDEA-031.",
+    "Lock naked VPOC contract then resume #9 IDEA-003.",
+    "Lock RV or authorize ATR Stage A-prime then resume #7 IDEA-033.",
+    "Define MTF CVD and accrue data then resume #10 IDEA-004 (no absorption substitute).",
+    "Do not promote #1 IB discovery underperformance; holdout-only revisit if at all."
+  ]
+}

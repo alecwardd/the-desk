@@ -40,7 +40,10 @@ pub struct MarketEvent {
     pub trading_day: String,
 }
 
-fn crossed_level(prev_price: f64, cur_price: f64, level: f64) -> Option<String> {
+/// Shared level-crossing primitive used by EventDetector IB extension hits.
+///
+/// Uses a 2-tick (0.50 NQ point) proximity band identical to live detection.
+pub fn crossed_level(prev_price: f64, cur_price: f64, level: f64) -> Option<String> {
     if level <= 0.0 || prev_price <= 0.0 {
         return None;
     }

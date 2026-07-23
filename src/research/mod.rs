@@ -1,6 +1,7 @@
 pub mod context_frame;
 pub mod hypothesis;
 pub mod ib_campaign;
+pub mod nine_am_continuation;
 
 use crate::db::{Database, SessionScopeFilter};
 use crate::depth::DomSummary;

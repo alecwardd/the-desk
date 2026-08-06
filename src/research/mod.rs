@@ -1,6 +1,7 @@
 pub mod context_frame;
 pub mod hypothesis;
 pub mod ib_campaign;
+pub mod idea034_bucket_stats;
 pub mod nine_am_continuation;
 
 use crate::db::{Database, SessionScopeFilter};

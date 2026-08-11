@@ -418,6 +418,8 @@ pub struct TheDeskMcp {
     pub(crate) context_frame_cache:
         Arc<Mutex<HashMap<String, research::context_frame::ContextFrame>>>,
     pub(crate) tool_router: ToolRouter<Self>,
+    /// SIL-M0 per-tool call counts / approx token cost (MCP dispatch path).
+    pub(crate) tool_telemetry: Arc<crate::tool_telemetry::ToolTelemetry>,
 }
 
 #[derive(Debug)]

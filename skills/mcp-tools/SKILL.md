@@ -139,10 +139,15 @@ This is the canonical "potential trade" flow — keep state in the system, not i
 
 ## Adding or Changing Tools
 
+> **SIL-M0 freeze:** **no new specialty market tools** (`tools/market.rs`) until
+> Desk Catalog v0 exists. After Catalog v0, the rule becomes **no catalog entry →
+> no new market tool**. Do not delete existing tools under this policy.
+
 When the tool surface changes, regenerate the catalog and keep guards green:
 
 ```
 cargo run --bin the-desk-mcp -- --write-tool-docs
+cargo run --bin the-desk-mcp -- --write-sil-m0-baseline
 cargo test --bin the-desk-mcp
 ```
 

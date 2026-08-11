@@ -33,6 +33,7 @@ mod params;
 mod read_pool;
 mod service;
 mod state;
+mod tool_telemetry;
 mod tools;
 
 #[cfg(test)]
@@ -45,6 +46,9 @@ use crate::{helpers::*, lifecycle::*, params::*, state::*};
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::args().any(|a| a == "--write-tool-docs") {
         return docs::write_tool_reference();
+    }
+    if std::env::args().any(|a| a == "--write-sil-m0-baseline") {
+        return write_sil_m0_baseline_async().await;
     }
     if std::env::args().any(|a| a == "--seed-templates") {
         let activate = std::env::args().any(|a| a == "--activate");
@@ -1302,5 +1306,54 @@ fn seed_templates_cli(activate: bool) -> Result<(), Box<dyn std::error::Error>> 
              or run them through the backtest loop before activating."
         );
     }
+    Ok(())
+}
+
+async fn write_sil_m0_baseline_async() -> Result<(), Box<dyn std::error::Error>> {
+    let surface = TheDeskMcp::tool_router().list_all().len();
+    let db = Database::open(":memory:")?;
+    let server = TheDeskMcp::with_runtime_events(
+        db,
+        PipelineEngine::new(),
+        ":memory:".into(),
+        Arc::new(RuntimeEventStore::new(
+            &the_desk_backend::observability::LoggingConfig {
+                destination: "none".to_string(),
+                ..the_desk_backend::observability::LoggingConfig::default()
+            },
+        )),
+    );
+    // One cold orientation-chain probe — durable numeric before-figure for M1b.
+    let probe = tool_telemetry::ToolTelemetry::new();
+    for tool in tool_telemetry::ORIENTATION_CHAIN {
+        let result = match *tool {
+            "get_session_context" => server.get_session_context().await,
+            "get_market_snapshot" => server.get_market_snapshot().await,
+            "get_risk_state" => server.get_risk_state().await,
+            "get_risk_config" => server.get_risk_config().await,
+            "get_account_state" => server.get_account_state().await,
+            other => {
+                return Err(format!("ORIENTATION_CHAIN tool not wired for probe: {other}").into())
+            }
+        };
+        probe.record(tool, &result);
+    }
+    let baseline = tool_telemetry::baseline_with_orientation_probe(surface, &probe);
+    if !baseline.orientation_chain_cost.fully_observed {
+        return Err("orientation-chain probe did not observe every chain tool".into());
+    }
+    let path = tool_telemetry::checked_in_baseline_path();
+    tool_telemetry::write_snapshot_file(&path, &baseline)?;
+    let verified = tool_telemetry::read_snapshot_file(&path)?;
+    if verified.tool_surface_count != surface {
+        return Err("SIL-M0 baseline round-trip surface count mismatch".into());
+    }
+    println!(
+        "Wrote SIL-M0 telemetry baseline ({} tools on surface; orientation ≈{} tokens / {} calls) to {}",
+        surface,
+        baseline.orientation_chain_cost.total_approx_tokens,
+        baseline.orientation_chain_cost.call_count,
+        path.display()
+    );
     Ok(())
 }

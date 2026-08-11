@@ -112,12 +112,13 @@ Every MCP `tools/call` is observed in `ServerHandler::call_tool`:
   `get_risk_config` / `get_account_state`)
 
 The checked-in baseline is
-[sil-m0-tool-telemetry-baseline.json](sil-m0-tool-telemetry-baseline.json)
-(regenerate with `cargo run --bin the-desk-mcp -- --write-sil-m0-baseline`).
-It includes a cold orientation-chain probe (one call per chain tool on an empty
-in-memory server) so M1b can compare call count and approximate token cost
-against a durable before-figure. Live counters also accumulate in-process and
-periodically flush to `~/.the-desk/telemetry/tool-call-snapshot.json`.
+[sil-m0-tool-telemetry-baseline.json](sil-m0-tool-telemetry-baseline.json).
+It is the **immutable M0 before-figure** for M1b (orientation-chain tools, freeze
+set, and cold probe costs). Do not regenerate it as part of routine tool-surface
+churn; re-bless only with an intentional
+`cargo run --bin the-desk-mcp -- --write-sil-m0-baseline` when the orientation-chain
+contract itself changes. Live counters accumulate in-process and periodically
+flush to `~/.the-desk/telemetry/tool-call-snapshot.json`.
 
 ## Runtime Model
 

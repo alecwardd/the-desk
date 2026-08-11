@@ -216,7 +216,21 @@ pub(crate) fn write_snapshot_file(
     }
     let body = serde_json::to_string_pretty(snapshot)
         .map_err(|e| format!("serialize telemetry snapshot: {e}"))?;
-    fs::write(path, format!("{body}\n")).map_err(|e| format!("write telemetry snapshot: {e}"))
+    let body = format!("{body}\n");
+    // Atomic replace: write a sibling temp file, then rename into place so readers
+    // never observe a truncated JSON payload.
+    let file_name = path.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
+        format!(
+            "telemetry snapshot path missing file name: {}",
+            path.display()
+        )
+    })?;
+    let tmp_path = path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()));
+    fs::write(&tmp_path, &body).map_err(|e| format!("write telemetry snapshot temp: {e}"))?;
+    fs::rename(&tmp_path, path).map_err(|e| {
+        let _ = fs::remove_file(&tmp_path);
+        format!("replace telemetry snapshot: {e}")
+    })
 }
 
 pub(crate) fn read_snapshot_file(path: &Path) -> Result<ToolTelemetrySnapshot, String> {
@@ -351,6 +365,26 @@ mod tests {
         assert_eq!(
             loaded.policy,
             "specialty_market_tools_frozen_until_catalog_v0"
+        );
+    }
+
+    #[test]
+    fn snapshot_write_is_atomic_replace() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("snap.json");
+        let telemetry = ToolTelemetry::new();
+        telemetry.record_raw("get_session_context", 12, false);
+        telemetry.write_snapshot_file(&path, 121).expect("write");
+        assert!(path.is_file());
+        let leftovers: Vec<_> = fs::read_dir(dir.path())
+            .expect("read_dir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name())
+            .filter(|n| n.to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp snapshot files must be renamed away: {leftovers:?}"
         );
     }
 }

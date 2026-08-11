@@ -145,10 +145,14 @@ This is the canonical "potential trade" flow — keep state in the system, not i
 
 When the tool surface changes, regenerate the catalog and keep guards green:
 
-```
+```bash
 cargo run --bin the-desk-mcp -- --write-tool-docs
-cargo run --bin the-desk-mcp -- --write-sil-m0-baseline
 cargo test --bin the-desk-mcp
 ```
+
+Do **not** routinely regenerate `docs/mcp/sil-m0-tool-telemetry-baseline.json` —
+that file is the immutable M0 before-figure for M1b. Re-bless only with an
+intentional `--write-sil-m0-baseline` when the orientation-chain contract itself
+changes.
 
 See [docs/mcp/README.md](../../docs/mcp/README.md) for the server architecture and the add-a-tool checklist.

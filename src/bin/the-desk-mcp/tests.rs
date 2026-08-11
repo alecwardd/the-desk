@@ -838,9 +838,10 @@ fn specialty_market_tools_are_frozen_until_catalog_v0() {
     assert_eq!(
         sorted_live, frozen,
         "SIL-M0 freeze: specialty market tools must not change until Catalog v0. \
-         After Catalog v0 the rule becomes no-catalog-entry → no new market tool. \
-         If this change is intentional and Catalog v0 exists, update FROZEN_MARKET_TOOLS \
-         and the SIL-M0 baseline together."
+         After Catalog v0 the rule becomes no-catalog-entry → no new market tool \
+         (enforced when Catalog v0 lands in #4). \
+         If this change is intentional before Catalog v0, update FROZEN_MARKET_TOOLS \
+         only — do not re-bless the SIL-M0 telemetry baseline."
     );
     assert!(
         crate::tool_telemetry::FROZEN_MARKET_TOOLS
@@ -874,7 +875,6 @@ fn sil_m0_telemetry_baseline_is_durable_and_current() {
     let path = crate::tool_telemetry::checked_in_baseline_path();
     let on_disk = crate::tool_telemetry::read_snapshot_file(&path)
         .unwrap_or_else(|e| panic!("missing SIL-M0 baseline at {}: {e}", path.display()));
-    let surface = TheDeskMcp::tool_router().list_all().len();
 
     assert_eq!(
         on_disk.schema_version,
@@ -898,11 +898,12 @@ fn sil_m0_telemetry_baseline_is_durable_and_current() {
             .map(|s| (*s).to_string())
             .collect::<Vec<_>>()
     );
-    assert_eq!(on_disk.tool_surface_count, surface);
+    // toolSurfaceCount is frozen at the M0 capture moment — do not couple it to
+    // the live router (workflow domains may still grow; the baseline stays put).
+    assert_eq!(on_disk.tool_surface_count, 121);
     assert!(
         on_disk.orientation_chain_cost.fully_observed,
-        "checked-in baseline must include a cold orientation-chain probe (regenerate with \
-         `cargo run --bin the-desk-mcp -- --write-sil-m0-baseline`)"
+        "checked-in baseline must include a cold orientation-chain probe"
     );
     assert_eq!(
         on_disk.orientation_chain_cost.call_count,
@@ -911,9 +912,13 @@ fn sil_m0_telemetry_baseline_is_durable_and_current() {
     );
     assert!(on_disk.orientation_chain_cost.total_approx_tokens > 0);
     for tool in crate::tool_telemetry::ORIENTATION_CHAIN {
-        assert!(
-            on_disk.per_tool.contains_key(*tool),
-            "baseline missing orientation probe for {tool}"
+        let stats = on_disk
+            .per_tool
+            .get(*tool)
+            .unwrap_or_else(|| panic!("baseline missing orientation probe for {tool}"));
+        assert_eq!(
+            stats.error_count, 0,
+            "baseline probe for {tool} must be error-free"
         );
     }
 }

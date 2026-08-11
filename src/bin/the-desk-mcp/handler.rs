@@ -4,7 +4,8 @@ use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::service::RequestContext;
 use rmcp::{model::*, ErrorData as McpError, RoleServer, ServerHandler};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use tokio::sync::Mutex as AsyncMutex;
 
 #[allow(unused_imports)]
 use crate::state::*;
@@ -13,6 +14,7 @@ use crate::state::*;
 const TELEMETRY_PERSIST_EVERY_N: u64 = 25;
 
 static TOOL_CALLS_SINCE_PERSIST: AtomicU64 = AtomicU64::new(0);
+static TELEMETRY_PERSIST_LOCK: OnceLock<AsyncMutex<()>> = OnceLock::new();
 
 impl ServerHandler for TheDeskMcp {
     fn get_info(&self) -> ServerInfo {
@@ -78,7 +80,11 @@ fn maybe_persist_tool_telemetry(server: &TheDeskMcp) {
     let path = crate::tool_telemetry::runtime_snapshot_path();
     let surface = server.tool_router.list_all().len();
     // File I/O stays off the MCP request path (CLAUDE.md / AGENT.md: no blocking I/O).
+    // Persist tasks are serialized so a delayed older write cannot overwrite a newer one;
+    // each write takes a fresh snapshot under the lock.
     tokio::spawn(async move {
+        let lock = TELEMETRY_PERSIST_LOCK.get_or_init(|| AsyncMutex::new(()));
+        let _guard = lock.lock().await;
         let write =
             tokio::task::spawn_blocking(move || telemetry.write_snapshot_file(&path, surface))
                 .await;

@@ -1336,11 +1336,20 @@ async fn write_sil_m0_baseline_async() -> Result<(), Box<dyn std::error::Error>>
                 return Err(format!("ORIENTATION_CHAIN tool not wired for probe: {other}").into())
             }
         };
-        probe.record(tool, &result);
+        let result =
+            result.map_err(|e| format!("orientation-chain probe failed for `{tool}`: {e}"))?;
+        probe.record(tool, &Ok(result));
     }
     let baseline = tool_telemetry::baseline_with_orientation_probe(surface, &probe);
     if !baseline.orientation_chain_cost.fully_observed {
         return Err("orientation-chain probe did not observe every chain tool".into());
+    }
+    if baseline
+        .per_tool
+        .values()
+        .any(|stats| stats.error_count > 0)
+    {
+        return Err("orientation-chain probe recorded tool errors; refusing baseline write".into());
     }
     let path = tool_telemetry::checked_in_baseline_path();
     tool_telemetry::write_snapshot_file(&path, &baseline)?;

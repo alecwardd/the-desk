@@ -1,0 +1,84 @@
+{
+  "schemaVersion": 1,
+  "capturedAtUnixMs": 1786473605886,
+  "policy": "specialty_market_tools_frozen_until_catalog_v0",
+  "orientationChain": [
+    "get_session_context",
+    "get_market_snapshot",
+    "get_risk_state",
+    "get_risk_config",
+    "get_account_state"
+  ],
+  "frozenMarketTools": [
+    "check_delta_confirmation",
+    "get_absorption_events",
+    "get_context_frame",
+    "get_day_type",
+    "get_delta_at_price",
+    "get_delta_profile",
+    "get_footprint",
+    "get_footprint_window",
+    "get_imbalances",
+    "get_key_levels",
+    "get_market_snapshot",
+    "get_or5_status",
+    "get_pinch_events",
+    "get_proximity_report",
+    "get_rebid_reoffer_zones",
+    "get_rvol",
+    "get_session_context",
+    "get_session_inventory",
+    "get_session_summary",
+    "get_snapshot_at",
+    "get_tape_pace",
+    "get_tpo_detail",
+    "get_tpo_profile",
+    "get_trade_size_profile"
+  ],
+  "toolSurfaceCount": 121,
+  "perTool": {
+    "get_account_state": {
+      "callCount": 1,
+      "totalResponseBytes": 313,
+      "totalApproxTokens": 79,
+      "errorCount": 0
+    },
+    "get_market_snapshot": {
+      "callCount": 1,
+      "totalResponseBytes": 130,
+      "totalApproxTokens": 33,
+      "errorCount": 0
+    },
+    "get_risk_config": {
+      "callCount": 1,
+      "totalResponseBytes": 174,
+      "totalApproxTokens": 44,
+      "errorCount": 0
+    },
+    "get_risk_state": {
+      "callCount": 1,
+      "totalResponseBytes": 26,
+      "totalApproxTokens": 7,
+      "errorCount": 0
+    },
+    "get_session_context": {
+      "callCount": 1,
+      "totalResponseBytes": 28,
+      "totalApproxTokens": 7,
+      "errorCount": 0
+    }
+  },
+  "orientationChainCost": {
+    "tools": [
+      "get_session_context",
+      "get_market_snapshot",
+      "get_risk_state",
+      "get_risk_config",
+      "get_account_state"
+    ],
+    "callCount": 5,
+    "totalResponseBytes": 671,
+    "totalApproxTokens": 170,
+    "fullyObserved": true
+  }
+}

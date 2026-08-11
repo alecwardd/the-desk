@@ -823,6 +823,140 @@ fn tool_reference_doc_is_current() {
 }
 
 #[test]
+fn specialty_market_tools_are_frozen_until_catalog_v0() {
+    let live: Vec<String> = TheDeskMcp::market_router()
+        .list_all()
+        .into_iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    let mut sorted_live = live.clone();
+    sorted_live.sort();
+    let frozen: Vec<String> = crate::tool_telemetry::FROZEN_MARKET_TOOLS
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    assert_eq!(
+        sorted_live, frozen,
+        "SIL-M0 freeze: specialty market tools must not change until Catalog v0. \
+         After Catalog v0 the rule becomes no-catalog-entry → no new market tool \
+         (enforced when Catalog v0 lands in #4). \
+         If this change is intentional before Catalog v0, update FROZEN_MARKET_TOOLS \
+         only — do not re-bless the SIL-M0 telemetry baseline."
+    );
+    assert!(
+        crate::tool_telemetry::FROZEN_MARKET_TOOLS
+            .windows(2)
+            .all(|w| w[0] < w[1]),
+        "FROZEN_MARKET_TOOLS must stay sorted"
+    );
+}
+
+#[test]
+fn docs_state_specialty_market_tool_freeze_policy() {
+    let readme = include_str!("../../../docs/mcp/README.md");
+    let skill = include_str!("../../../skills/mcp-tools/SKILL.md");
+    for (path, contents) in [
+        ("docs/mcp/README.md", readme),
+        ("skills/mcp-tools/SKILL.md", skill),
+    ] {
+        assert!(
+            contents.contains("no new specialty market tools"),
+            "{path} must document the SIL-M0 freeze: no new specialty market tools"
+        );
+        assert!(
+            contents.contains("no catalog entry"),
+            "{path} must document the post-Catalog-v0 rule: no catalog entry → no new market tool"
+        );
+    }
+}
+
+#[test]
+fn sil_m0_telemetry_baseline_is_durable_and_current() {
+    let path = crate::tool_telemetry::checked_in_baseline_path();
+    let on_disk = crate::tool_telemetry::read_snapshot_file(&path)
+        .unwrap_or_else(|e| panic!("missing SIL-M0 baseline at {}: {e}", path.display()));
+
+    assert_eq!(
+        on_disk.schema_version,
+        crate::tool_telemetry::BASELINE_SCHEMA_VERSION
+    );
+    assert_eq!(
+        on_disk.policy,
+        "specialty_market_tools_frozen_until_catalog_v0"
+    );
+    assert_eq!(
+        on_disk.orientation_chain,
+        crate::tool_telemetry::ORIENTATION_CHAIN
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        on_disk.frozen_market_tools,
+        crate::tool_telemetry::FROZEN_MARKET_TOOLS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect::<Vec<_>>()
+    );
+    // toolSurfaceCount is frozen at the M0 capture moment — do not couple it to
+    // the live router (workflow domains may still grow; the baseline stays put).
+    assert_eq!(on_disk.tool_surface_count, 121);
+    assert!(
+        on_disk.orientation_chain_cost.fully_observed,
+        "checked-in baseline must include a cold orientation-chain probe"
+    );
+    assert_eq!(
+        on_disk.orientation_chain_cost.call_count,
+        crate::tool_telemetry::ORIENTATION_CHAIN.len() as u64,
+        "probe records exactly one call per orientation-chain tool"
+    );
+    assert!(on_disk.orientation_chain_cost.total_approx_tokens > 0);
+    for tool in crate::tool_telemetry::ORIENTATION_CHAIN {
+        let stats = on_disk
+            .per_tool
+            .get(*tool)
+            .unwrap_or_else(|| panic!("baseline missing orientation probe for {tool}"));
+        assert_eq!(
+            stats.error_count, 0,
+            "baseline probe for {tool} must be error-free"
+        );
+    }
+}
+
+#[tokio::test]
+async fn mcp_dispatch_records_tool_call_telemetry() {
+    let server = test_server();
+    // Domain methods bypass ServerHandler::call_tool; exercise the same
+    // observation helper the handler invokes after router dispatch.
+    let result = server.get_session_context().await;
+    server.tool_telemetry.record("get_session_context", &result);
+    result.expect("session context");
+
+    let snap = server
+        .tool_telemetry
+        .snapshot(TheDeskMcp::tool_router().list_all().len());
+    let stats = snap
+        .per_tool
+        .get("get_session_context")
+        .expect("telemetry for get_session_context");
+    assert_eq!(stats.call_count, 1);
+    assert!(stats.total_response_bytes > 0);
+    assert!(stats.total_approx_tokens > 0);
+    assert!(snap.orientation_chain_cost.call_count >= 1);
+
+    // Handler wiring smoke: ServerHandler::call_tool must record telemetry.
+    let handler_src = include_str!("handler.rs");
+    assert!(
+        handler_src.contains("tool_telemetry.record"),
+        "ServerHandler::call_tool must record into tool_telemetry"
+    );
+    assert!(
+        handler_src.contains("maybe_persist_tool_telemetry"),
+        "ServerHandler::call_tool must periodically persist the runtime snapshot"
+    );
+}
+
+#[test]
 fn pipeline_lock_recently_contended_uses_a_latched_window() {
     let runtime = McpFeedRuntimeState::default();
     runtime.record_pipeline_lock_sample(true, 10_000);

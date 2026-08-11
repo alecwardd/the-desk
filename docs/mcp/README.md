@@ -69,6 +69,13 @@ guarantees the two lists can never diverge.
 
 ## How to Add a Tool
 
+> **SIL-M0 freeze:** **no new specialty market tools** until Desk Catalog v0
+> exists. Specialty market tools are the `market` domain router
+> (`tools/market.rs`). After Catalog v0, the rule becomes **no catalog entry →
+> no new market tool**. Workflow domains (playbook / risk / journal / memory /
+> research / admin) and the later read-kernel operators are not covered by the
+> flat freeze; do not delete existing tools in the name of this policy.
+
 1. Pick the domain module under `tools/` (or create a new one — add it to
    `tools/mod.rs`, `service.rs`'s combiner, and `docs.rs`'s `tool_domains()`).
 2. Add the parameter struct to `params.rs` deriving
@@ -91,6 +98,27 @@ guarantees the two lists can never diverge.
      combined router, with no tool in two domains.
    - `tool_reference_doc_is_current` — tool-reference.md matches the compiled
      server.
+   - `specialty_market_tools_are_frozen_until_catalog_v0` — market tool names
+     match the SIL-M0 freeze set.
+
+## SIL-M0 tool-call telemetry
+
+Every MCP `tools/call` is observed in `ServerHandler::call_tool`:
+
+- per-tool call counts
+- approximate response token cost (`ceil(response_bytes / 4)`)
+- orientation-chain cost for the documented session-start sequence
+  (`get_session_context` → `get_market_snapshot` → `get_risk_state` /
+  `get_risk_config` / `get_account_state`)
+
+The checked-in baseline is
+[sil-m0-tool-telemetry-baseline.json](sil-m0-tool-telemetry-baseline.json).
+It is the **immutable M0 before-figure** for M1b (orientation-chain tools, freeze
+set, and cold probe costs). Do not regenerate it as part of routine tool-surface
+churn; re-bless only with an intentional
+`cargo run --bin the-desk-mcp -- --write-sil-m0-baseline` when the orientation-chain
+contract itself changes. Live counters accumulate in-process and periodically
+flush to `~/.the-desk/telemetry/tool-call-snapshot.json`.
 
 ## Runtime Model
 

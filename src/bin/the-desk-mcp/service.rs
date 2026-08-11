@@ -84,6 +84,7 @@ impl TheDeskMcp {
             boundary_cache: Arc::new(Mutex::new(BoundarySessionCache::default())),
             context_frame_cache: Arc::new(Mutex::new(HashMap::new())),
             tool_router: Self::tool_router(),
+            tool_telemetry: Arc::new(crate::tool_telemetry::ToolTelemetry::new()),
         }
     }
 

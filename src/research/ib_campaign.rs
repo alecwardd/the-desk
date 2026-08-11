@@ -5009,7 +5009,7 @@ mod tests {
         ));
         assert!(!excluded.quality.usable);
 
-        let summary1 = summarize_descriptive(&[usable.clone()]);
+        let summary1 = summarize_descriptive(std::slice::from_ref(&usable));
         assert!(summary1.rejection_counts_reconciled);
         assert_eq!(summary1.excluded_sessions, 0);
 

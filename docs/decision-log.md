@@ -571,3 +571,21 @@ Backtest isolation:
 > reclaim copy still holding pre-cutoff `raw_ticks` fails exit 4 because the archive step was
 > skipped. The split resolved a same-day incident where a fully verified backup exited 4 solely
 > because weekly archival had never run.
+
+---
+
+### Decision note: SIL-M0 specialty market tool freeze + orientation telemetry
+
+**Date:** 2026-08-11
+**Status:** Decided (implements [alecwardd/the-desk#3](https://github.com/alecwardd/the-desk/issues/3); Part of #2)
+
+**Context:** Before Catalog v0 and the read-kernel shims land, the specialty market tool surface must stop growing, and later deprecation decisions need a measurable orientation-chain baseline rather than estimates.
+
+**Decision:**
+
+1. **Flat freeze:** no new specialty market tools (`tools/market.rs` / `market_router`) until Desk Catalog v0 exists. After Catalog v0, the rule becomes **no catalog entry → no new market tool**. Existing tools are not deleted under this policy. Enforced by `specialty_market_tools_are_frozen_until_catalog_v0`.
+2. **Telemetry:** every MCP `tools/call` records per-tool call counts and approximate response token cost (`ceil(bytes/4)`), plus orientation-chain cost for the documented session-start sequence. Structural baseline: `docs/mcp/sil-m0-tool-telemetry-baseline.json`. Runtime counters flush to `~/.the-desk/telemetry/tool-call-snapshot.json`.
+
+This note does not raise the Trust Ceiling and does not introduce Catalog v0.
+
+**Consequences:** M1b shim work can compare before/after orientation cost against the SIL-M0 baseline. Adding a market tool without Catalog v0 fails CI.

@@ -47,6 +47,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::args().any(|a| a == "--write-tool-docs") {
         return docs::write_tool_reference();
     }
+    if std::env::args().any(|a| a == "--write-catalog-docs") {
+        the_desk_backend::catalog::write_catalog_docs()?;
+        eprintln!(
+            "Wrote {} and {}",
+            the_desk_backend::catalog::catalog_json_path().display(),
+            the_desk_backend::catalog::catalog_markdown_path().display()
+        );
+        return Ok(());
+    }
     if std::env::args().any(|a| a == "--write-sil-m0-baseline") {
         return write_sil_m0_baseline_async().await;
     }

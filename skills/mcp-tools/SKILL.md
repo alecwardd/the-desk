@@ -29,6 +29,18 @@ Before deep historical analysis, call `get_research_summary` once — if session
 
 ## Scenario Routing
 
+### Catalog discovery (SIL — optional)
+
+When `[sil].catalog_discovery = true` in `~/.the-desk/config.toml`, three kernel
+operators appear (metadata only — never live market data):
+
+1. `describe_environment` — catalogVersion, Trust Ceiling (L3), domain list, Positioning stub status.
+2. `describe_domain` — one domain's field descriptors (unit, session scope, freshness, cost hint).
+3. `search_catalog` — text search over field ids / names / descriptions.
+
+Default off keeps the **121 MCP tools** surface unchanged. Artifacts:
+[docs/mcp/desk-catalog-v0.json](../../docs/mcp/desk-catalog-v0.json).
+
 ### Session start (every conversation)
 
 1. `get_session_context` — session type/segment, trading day, freshness, rollover status. Check `rolloverStatus` before trusting any carry-forward level.
@@ -139,14 +151,17 @@ This is the canonical "potential trade" flow — keep state in the system, not i
 
 ## Adding or Changing Tools
 
-> **SIL-M0 freeze:** **no new specialty market tools** (`tools/market.rs`) until
-> Desk Catalog v0 exists. After Catalog v0, the rule becomes **no catalog entry →
-> no new market tool**. Do not delete existing tools under this policy.
+> **SIL-M0 / Catalog v0:** **no new specialty market tools** (`tools/market.rs`)
+> without a Desk Catalog entry — **no catalog entry → no new market tool**.
+> Discovery operators (`describe_environment`, `describe_domain`, `search_catalog`)
+> are kernel tools behind `[sil].catalog_discovery`, not specialty market tools.
+> Do not delete existing tools under this policy.
 
 When the tool surface changes, regenerate the catalog and keep guards green:
 
 ```bash
 cargo run --bin the-desk-mcp -- --write-tool-docs
+cargo run --bin the-desk-mcp -- --write-catalog-docs
 cargo test --bin the-desk-mcp
 ```
 

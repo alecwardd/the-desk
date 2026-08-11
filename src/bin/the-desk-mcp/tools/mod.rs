@@ -2,6 +2,7 @@
 //! router; `TheDeskMcp::tool_router()` in `service.rs` combines them.
 
 pub(crate) mod admin;
+pub(crate) mod discovery;
 pub(crate) mod dom;
 pub(crate) mod journal;
 pub(crate) mod market;

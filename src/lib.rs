@@ -1,6 +1,7 @@
 pub mod attention;
 pub mod backfill;
 pub mod backup;
+pub mod catalog;
 pub mod db;
 pub mod depth;
 pub mod feed;

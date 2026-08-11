@@ -14,6 +14,20 @@ pub(crate) struct LimitParams {
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct DescribeDomainParams {
+    /// Catalog domain id (e.g. `location_structure`, `positioning`).
+    pub(crate) domain: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SearchCatalogParams {
+    /// Free-text query over field ids, names, descriptions, and domains.
+    pub(crate) query: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct OptionsSnapshotParams {
     /// Optional root symbol. Defaults to [options].convexvalue_probe_root.
     pub(crate) root: Option<String>,

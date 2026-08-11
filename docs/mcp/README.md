@@ -69,15 +69,20 @@ guarantees the two lists can never diverge.
 
 ## How to Add a Tool
 
-> **SIL-M0 freeze:** **no new specialty market tools** until Desk Catalog v0
-> exists. Specialty market tools are the `market` domain router
-> (`tools/market.rs`). After Catalog v0, the rule becomes **no catalog entry →
-> no new market tool**. Workflow domains (playbook / risk / journal / memory /
-> research / admin) and the later read-kernel operators are not covered by the
-> flat freeze; do not delete existing tools in the name of this policy.
+> **SIL-M0 / Catalog v0:** **no new specialty market tools** without a Desk
+> Catalog entry. Specialty market tools are the `market` domain router
+> (`tools/market.rs`). The rule is **no catalog entry → no new market tool**
+> (allowlist in `docs/mcp/desk-catalog-v0.json`). Workflow domains (playbook /
+> risk / journal / memory / research / admin) and SIL discovery operators
+> (`describe_*` / `search_catalog`, behind `[sil].catalog_discovery`) are not
+> specialty market tools; do not delete existing tools in the name of this policy.
 
 1. Pick the domain module under `tools/` (or create a new one — add it to
    `tools/mod.rs`, `service.rs`'s combiner, and `docs.rs`'s `tool_domains()`).
+   Exception: SIL discovery operators live in `tools/discovery.rs` and are
+   wired only via `tool_router_with_sil` when `[sil].catalog_discovery` is on —
+   they stay out of the default `tool_domains()` registry so the 121-tool
+   surface remains unchanged when the flag is off.
 2. Add the parameter struct to `params.rs` deriving
    `Deserialize + JsonSchema + Default` with `#[serde(rename_all = "camelCase")]`.
    For free-form JSON values use the `schemars_loose_object` schema helper —
@@ -100,6 +105,24 @@ guarantees the two lists can never diverge.
      server.
    - `specialty_market_tools_are_frozen_until_catalog_v0` — market tool names
      match the SIL-M0 freeze set.
+   - `specialty_market_tools_require_catalog_allowlist_entry` — market tools ⊆
+     Catalog v0 specialty allowlist.
+   - `desk_catalog_docs_are_current` — `desk-catalog-v0.json` / `.md` match
+     `build_catalog()`.
+
+## Desk Catalog v0 (SIL-M1a)
+
+The Desk Catalog is the schema waist: a generated, versioned inventory of
+domains and fields (unit, session scope, freshness, cost hint) derived from
+annotated `MarketState` plus the **Positioning** domain stub (grid / by-strike /
+Slice / Levels-Only Record; no live provider).
+
+- Artifacts: [desk-catalog-v0.json](desk-catalog-v0.json),
+  [desk-catalog-v0.md](desk-catalog-v0.md)
+- Regenerate: `cargo run --bin the-desk-mcp -- --write-catalog-docs`
+- Discovery operators (metadata only): `describe_environment`, `describe_domain`,
+  `search_catalog` — registered only when `[sil].catalog_discovery = true` in
+  `~/.the-desk/config.toml`. Default off → 121-tool surface unchanged.
 
 ## SIL-M0 tool-call telemetry
 

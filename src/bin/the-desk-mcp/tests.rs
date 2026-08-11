@@ -837,11 +837,12 @@ fn specialty_market_tools_are_frozen_until_catalog_v0() {
         .collect();
     assert_eq!(
         sorted_live, frozen,
-        "SIL-M0 freeze: specialty market tools must not change until Catalog v0. \
-         After Catalog v0 the rule becomes no-catalog-entry → no new market tool \
-         (enforced when Catalog v0 lands in #4). \
-         If this change is intentional before Catalog v0, update FROZEN_MARKET_TOOLS \
-         only — do not re-bless the SIL-M0 telemetry baseline."
+        "SIL-M0 freeze set remains the specialty market allowlist. Catalog v0 \
+         adds the enforceable rule no-catalog-entry → no new market tool \
+         (see specialty_market_tools_require_catalog_allowlist_entry). \
+         Expanding the set requires updating FROZEN_MARKET_TOOLS and the \
+         catalog specialty_market_tools allowlist together — do not re-bless \
+         the SIL-M0 telemetry baseline unless the orientation-chain contract changes."
     );
     assert!(
         crate::tool_telemetry::FROZEN_MARKET_TOOLS
@@ -849,6 +850,131 @@ fn specialty_market_tools_are_frozen_until_catalog_v0() {
             .all(|w| w[0] < w[1]),
         "FROZEN_MARKET_TOOLS must stay sorted"
     );
+}
+
+#[test]
+fn specialty_market_tools_require_catalog_allowlist_entry() {
+    let catalog = the_desk_backend::catalog::build_catalog();
+    let live: std::collections::BTreeSet<String> = TheDeskMcp::market_router()
+        .list_all()
+        .into_iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    let allow: std::collections::BTreeSet<String> =
+        catalog.specialty_market_tools.iter().cloned().collect();
+    assert_eq!(
+        live, allow,
+        "Catalog v0: every specialty market tool must have a catalog allowlist entry \
+         (no catalog entry → no new market tool)"
+    );
+}
+
+#[test]
+fn discovery_tools_absent_from_default_router() {
+    let names: std::collections::BTreeSet<_> = TheDeskMcp::tool_router()
+        .list_all()
+        .into_iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    for tool in ["describe_environment", "describe_domain", "search_catalog"] {
+        assert!(
+            !names.contains(tool),
+            "{tool} must be omitted from the default router when SIL discovery is off"
+        );
+    }
+    assert_eq!(names.len(), 121);
+}
+
+#[test]
+fn discovery_tools_present_when_sil_flag_on() {
+    let sil = the_desk_backend::catalog::SilConfig {
+        catalog_discovery: true,
+    };
+    let names: std::collections::BTreeSet<_> = TheDeskMcp::tool_router_with_sil(&sil)
+        .list_all()
+        .into_iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    for tool in ["describe_environment", "describe_domain", "search_catalog"] {
+        assert!(
+            names.contains(tool),
+            "{tool} must appear when [sil].catalog_discovery = true"
+        );
+    }
+    assert_eq!(names.len(), 124);
+}
+
+#[test]
+fn desk_catalog_docs_are_current() {
+    let catalog = the_desk_backend::catalog::build_catalog();
+    let expected_json = the_desk_backend::catalog::render_catalog_json(&catalog);
+    let expected_md = the_desk_backend::catalog::render_catalog_markdown(&catalog);
+    let json_path = the_desk_backend::catalog::catalog_json_path();
+    let md_path = the_desk_backend::catalog::catalog_markdown_path();
+    let on_disk_json = std::fs::read_to_string(&json_path)
+        .unwrap_or_default()
+        .replace("\r\n", "\n");
+    let on_disk_md = std::fs::read_to_string(&md_path)
+        .unwrap_or_default()
+        .replace("\r\n", "\n");
+    assert!(
+        on_disk_json == expected_json.replace("\r\n", "\n"),
+        "docs/mcp/desk-catalog-v0.json is stale; regenerate with \
+         `cargo run --bin the-desk-mcp -- --write-catalog-docs`"
+    );
+    assert!(
+        on_disk_md == expected_md.replace("\r\n", "\n"),
+        "docs/mcp/desk-catalog-v0.md is stale; regenerate with \
+         `cargo run --bin the-desk-mcp -- --write-catalog-docs`"
+    );
+}
+
+#[tokio::test]
+async fn discovery_tools_return_metadata_only() {
+    let server = test_server();
+    let env = parse_text_tool_result(
+        server
+            .describe_environment()
+            .await
+            .expect("describe_environment"),
+    );
+    assert_eq!(env["metadataOnly"], true);
+    assert!(env.get("catalogVersion").is_some());
+    assert!(env.get("lastPrice").is_none());
+    assert!(env.get("vwap").is_none());
+
+    let domain = parse_text_tool_result(
+        server
+            .describe_domain(Parameters(DescribeDomainParams {
+                domain: Some("positioning".into()),
+            }))
+            .await
+            .expect("describe_domain"),
+    );
+    assert_eq!(domain["metadataOnly"], true);
+    let kinds = domain["recordKinds"]
+        .as_array()
+        .expect("positioning recordKinds");
+    let kind_ids: std::collections::BTreeSet<_> = kinds
+        .iter()
+        .filter_map(|k| k.get("id").and_then(|v| v.as_str()))
+        .collect();
+    assert!(kind_ids.contains("position_grid"));
+    assert!(kind_ids.contains("positions_by_strike"));
+    assert!(kind_ids.contains("slice"));
+    assert!(kind_ids.contains("levels_only"));
+    assert!(domain.get("lastPrice").is_none());
+
+    let hits = parse_text_tool_result(
+        server
+            .search_catalog(Parameters(SearchCatalogParams {
+                query: Some("poc".into()),
+            }))
+            .await
+            .expect("search_catalog"),
+    );
+    assert_eq!(hits["metadataOnly"], true);
+    assert!(hits["hitCount"].as_u64().unwrap_or(0) >= 1);
 }
 
 #[test]

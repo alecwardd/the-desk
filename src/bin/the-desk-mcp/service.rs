@@ -27,7 +27,11 @@ use tokio::time::{sleep, Duration};
 use crate::{helpers::*, lifecycle::*, params::*, state::*};
 
 impl TheDeskMcp {
-    /// Combined router across all tool domain modules.
+    /// Combined router across all always-on tool domain modules (121 tools).
+    ///
+    /// Discovery operators are **not** included here so the default surface stays
+    /// unchanged when `[sil].catalog_discovery` is off. Use
+    /// [`Self::tool_router_with_sil`] when constructing a live server.
     pub(crate) fn tool_router() -> ToolRouter<Self> {
         Self::market_router()
             + Self::dom_router()
@@ -38,6 +42,18 @@ impl TheDeskMcp {
             + Self::memory_router()
             + Self::research_router()
             + Self::admin_router()
+    }
+
+    /// Combined router including discovery tools when the SIL flag is on.
+    pub(crate) fn tool_router_with_sil(
+        sil: &the_desk_backend::catalog::SilConfig,
+    ) -> ToolRouter<Self> {
+        let base = Self::tool_router();
+        if sil.catalog_discovery {
+            base + Self::discovery_router()
+        } else {
+            base
+        }
     }
 
     #[cfg(test)]
@@ -61,6 +77,17 @@ impl TheDeskMcp {
         db_path: String,
         runtime_events: Arc<RuntimeEventStore>,
     ) -> Self {
+        let sil_config = the_desk_backend::catalog::load_sil_config();
+        Self::with_runtime_events_and_sil(db, pipelines, db_path, runtime_events, sil_config)
+    }
+
+    pub(crate) fn with_runtime_events_and_sil(
+        db: Database,
+        pipelines: PipelineEngine,
+        db_path: String,
+        runtime_events: Arc<RuntimeEventStore>,
+        sil_config: the_desk_backend::catalog::SilConfig,
+    ) -> Self {
         let read_pool = crate::read_pool::ReadPool::new(
             db_path.clone(),
             crate::read_pool::DEFAULT_READ_POOL_SIZE,
@@ -83,8 +110,9 @@ impl TheDeskMcp {
             contract_cache: Arc::new(Mutex::new(ContractResolutionCache::default())),
             boundary_cache: Arc::new(Mutex::new(BoundarySessionCache::default())),
             context_frame_cache: Arc::new(Mutex::new(HashMap::new())),
-            tool_router: Self::tool_router(),
+            tool_router: Self::tool_router_with_sil(&sil_config),
             tool_telemetry: Arc::new(crate::tool_telemetry::ToolTelemetry::new()),
+            sil_config,
         }
     }
 

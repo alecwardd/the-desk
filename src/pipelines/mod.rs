@@ -126,13 +126,13 @@ pub struct MarketState {
     pub va_high: f64,
     /// TPO value area low (70% of TPOs).
     pub va_low: f64,
-    /// Point of control — price with highest TPO count.
+    /// Point of control - price with highest TPO count.
     pub poc: f64,
     /// Delta neutral value area high (70% of absolute delta).
     pub dnva_high: f64,
     /// Delta neutral value area low (70% of absolute delta).
     pub dnva_low: f64,
-    /// Delta Neutral Pivot — midpoint of DNVA high and low.
+    /// Delta Neutral Pivot - midpoint of DNVA high and low.
     pub dnp: f64,
     /// Segment delta: Asia-only, London-only, or RTH-only. Resets at Asia→London (2 AM) and RTH↔Globex.
     pub session_delta: f64,
@@ -204,20 +204,27 @@ pub struct MarketState {
     pub tape_volume_per_sec_30s: Option<f64>,
     /// Rolling 5-minute tape volume pace (contracts/sec).
     pub tape_volume_per_sec_5m: Option<f64>,
-    /// Longer-horizon tape regime baseline.
+    /// Longer-horizon tape regime baseline (ticks/sec EMA).
     pub tape_regime_ticks_per_sec_30m_ema: Option<f64>,
+    /// Longer-horizon tape regime baseline (volume/sec EMA).
     pub tape_regime_volume_per_sec_30m_ema: Option<f64>,
-    /// Window coverage ratios (0.0-1.0).
+    /// Window coverage ratio for the 5-second tape window (0.0-1.0).
     pub tape_coverage_5s: f64,
+    /// Window coverage ratio for the 30-second tape window (0.0-1.0).
     pub tape_coverage_30s: f64,
+    /// Window coverage ratio for the 5-minute tape window (0.0-1.0).
     pub tape_coverage_5m: f64,
-    /// Whether each tape window has enough event-time coverage to trust.
+    /// Whether the 5-second tape window has enough event-time coverage to trust.
     pub tape_valid_5s: bool,
+    /// Whether the 30-second tape window has enough event-time coverage to trust.
     pub tape_valid_30s: bool,
+    /// Whether the 5-minute tape window has enough event-time coverage to trust.
     pub tape_valid_5m: bool,
-    /// Event-time anchor and freshness metadata for the tape snapshot.
+    /// Event-time anchor timestamp for the tape snapshot (ms).
     pub tape_window_anchor_timestamp_ms: Option<f64>,
+    /// Timestamp of the last trade included in the tape snapshot (ms).
     pub tape_last_trade_timestamp_ms: Option<f64>,
+    /// Event-time lag between tape anchor and last trade (ms).
     pub tape_event_time_lag_ms: Option<f64>,
     /// Dwell time at the current price level using the event-time anchor.
     pub tape_dwell_at_current_price_ms: Option<f64>,
@@ -333,9 +340,9 @@ pub struct MarketState {
     pub rebid_zone_near: bool,
     /// A non-failed reoffer (sell/resistance) zone is within proximity of price.
     pub reoffer_zone_near: bool,
-    /// A rebid zone near price is at Retested status — the entry trigger.
+    /// A rebid zone near price is at Retested status - the entry trigger.
     pub rebid_zone_retested: bool,
-    /// A reoffer zone near price is at Retested status — the entry trigger.
+    /// A reoffer zone near price is at Retested status - the entry trigger.
     pub reoffer_zone_retested: bool,
     /// A rebid zone near price is at Held status.
     pub rebid_zone_held: bool,
@@ -350,14 +357,16 @@ pub struct MarketState {
     /// Distance in ticks to the nearest non-failed zone, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nearest_zone_distance_ticks: Option<f64>,
-    /// Band edges of the nearest rebid (buy/support) zone — exit anchors for longs.
+    /// Band low of the nearest rebid (buy/support) zone - exit anchor for longs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rebid_zone_low: Option<f64>,
+    /// Band high of the nearest rebid (buy/support) zone - exit anchor for longs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rebid_zone_high: Option<f64>,
-    /// Band edges of the nearest reoffer (sell/resistance) zone — exit anchors for shorts.
+    /// Band low of the nearest reoffer (sell/resistance) zone - exit anchor for shorts.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reoffer_zone_low: Option<f64>,
+    /// Band high of the nearest reoffer (sell/resistance) zone - exit anchor for shorts.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reoffer_zone_high: Option<f64>,
 

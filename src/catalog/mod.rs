@@ -243,6 +243,42 @@ mod tests {
     }
 
     #[test]
+    fn every_field_domain_id_resolves_to_a_domain_shell() {
+        let cat = build_catalog();
+        let domain_ids: BTreeSet<_> = cat.domains.iter().map(|d| d.id.as_str()).collect();
+        for field in &cat.fields {
+            assert!(
+                domain_ids.contains(field.domain_id.as_str()),
+                "field `{}` references unknown domain_id `{}`",
+                field.id,
+                field.domain_id
+            );
+        }
+        for domain in &cat.domains {
+            for field_id in &domain.field_ids {
+                assert!(
+                    cat.fields.iter().any(|f| f.id == *field_id),
+                    "domain `{}` lists unknown field_id `{}`",
+                    domain.id,
+                    field_id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn trust_ceiling_and_cost_hints_serialize_documented_labels() {
+        let cat = build_catalog();
+        let json = serde_json::to_value(&cat).expect("serialize");
+        assert_eq!(json["trustCeiling"], "L3");
+        let cost = json["fields"][0]["costHint"].as_str().expect("cost");
+        assert!(
+            matches!(cost, "R0" | "R1" | "R2" | "R3"),
+            "costHint wire label must be R0-R3, got {cost}"
+        );
+    }
+
+    #[test]
     fn every_market_state_field_has_catalog_entry() {
         let source = include_str!("../pipelines/mod.rs");
         let start = source

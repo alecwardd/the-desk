@@ -1,6 +1,6 @@
 {
   "catalogVersion": "0.1.0",
-  "trustCeiling": "l3",
+  "trustCeiling": "L3",
   "specialtyMarketTools": [
     "check_delta_confirmation",
     "get_absorption_events",
@@ -257,7 +257,7 @@
       "unit": "enumLabel",
       "sessionScope": "crossSession",
       "freshness": "sessionScoped",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.cross_market.inventoryState",
@@ -268,7 +268,7 @@
       "unit": "enumLabel",
       "sessionScope": "crossSession",
       "freshness": "sessionScoped",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.cross_market.sessionsInTrend",
@@ -279,7 +279,7 @@
       "unit": "count",
       "sessionScope": "crossSession",
       "freshness": "sessionScoped",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.flow.absorptionEventCount",
@@ -290,7 +290,7 @@
       "unit": "count",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.flow.avgTradeSize",
@@ -301,7 +301,7 @@
       "unit": "contracts",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.flow.confirmedAbsorptionEventCount",
@@ -312,7 +312,7 @@
       "unit": "count",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.flow.confirmedDeltaDivergenceEventCount",
@@ -323,7 +323,7 @@
       "unit": "count",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.flow.confirmedExhaustionEventCount",
@@ -334,7 +334,7 @@
       "unit": "count",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.flow.cumulativeDelta",
@@ -345,7 +345,7 @@
       "unit": "contracts",
       "sessionScope": "crossSession",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.flow.globexDelta",
@@ -356,7 +356,7 @@
       "unit": "contracts",
       "sessionScope": "globex",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.flow.hasRecentConfirmedAbsorption",
@@ -367,7 +367,7 @@
       "unit": "bool",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.flow.hasRecentConfirmedExhaustion",
@@ -378,7 +378,7 @@
       "unit": "bool",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.flow.hasRecentInvalidatedAbsorption",
@@ -389,7 +389,7 @@
       "unit": "bool",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.flow.imbalanceCount",
@@ -400,7 +400,7 @@
       "unit": "count",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.flow.pacePercentile",
@@ -411,7 +411,7 @@
       "unit": "ratio",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.flow.pinchEventCount",
@@ -422,7 +422,7 @@
       "unit": "count",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.flow.recentConfirmedAbsorptionAgeMs",
@@ -433,7 +433,7 @@
       "unit": "milliseconds",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.flow.recentConfirmedAbsorptionDirection",
@@ -444,7 +444,7 @@
       "unit": "enumLabel",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.flow.recentConfirmedAbsorptionDistanceTicks",
@@ -455,7 +455,7 @@
       "unit": "ticks",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.flow.recentConfirmedAbsorptionPrice",
@@ -466,7 +466,7 @@
       "unit": "pricePoints",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.flow.recentConfirmedExhaustionAgeMs",
@@ -477,7 +477,7 @@
       "unit": "milliseconds",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.flow.recentConfirmedExhaustionDirection",
@@ -488,7 +488,7 @@
       "unit": "enumLabel",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.flow.recentConfirmedExhaustionPrice",
@@ -499,7 +499,7 @@
       "unit": "pricePoints",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.flow.recentInvalidatedAbsorptionAgeMs",
@@ -510,7 +510,7 @@
       "unit": "milliseconds",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.flow.recentInvalidatedAbsorptionDirection",
@@ -521,7 +521,7 @@
       "unit": "enumLabel",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.flow.recentInvalidatedAbsorptionDistanceTicks",
@@ -532,7 +532,7 @@
       "unit": "ticks",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.flow.recentInvalidatedAbsorptionPrice",
@@ -543,7 +543,7 @@
       "unit": "pricePoints",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.flow.sessionDelta",
@@ -554,7 +554,7 @@
       "unit": "contracts",
       "sessionScope": "segment",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.flow.tapeAcceleration",
@@ -565,7 +565,7 @@
       "unit": "ratio",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.flow.tapeCoverage30S",
@@ -576,7 +576,7 @@
       "unit": "ratio",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.flow.tapeCoverage5M",
@@ -587,7 +587,7 @@
       "unit": "ratio",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.flow.tapeCoverage5S",
@@ -598,7 +598,7 @@
       "unit": "ratio",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.flow.tapeDwellAtCurrentPriceMs",
@@ -609,7 +609,7 @@
       "unit": "milliseconds",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.flow.tapeEventTimeLagMs",
@@ -620,7 +620,7 @@
       "unit": "milliseconds",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.flow.tapeLastTradeTimestampMs",
@@ -631,7 +631,7 @@
       "unit": "milliseconds",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.flow.tapePace30S",
@@ -642,7 +642,7 @@
       "unit": "ticksPerSec",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.flow.tapePace5M",
@@ -653,7 +653,7 @@
       "unit": "ticksPerSec",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.flow.tapePace5S",
@@ -664,7 +664,7 @@
       "unit": "ticksPerSec",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.flow.tapeRawAcceleration",
@@ -675,7 +675,7 @@
       "unit": "ratio",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.flow.tapeRegimeTicksPerSec30MEma",
@@ -686,7 +686,7 @@
       "unit": "ticksPerSec",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.flow.tapeRegimeVolumePerSec30MEma",
@@ -697,7 +697,7 @@
       "unit": "contractsPerSec",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.flow.tapeRollingPercentile",
@@ -708,7 +708,7 @@
       "unit": "ratio",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.flow.tapeValid30S",
@@ -719,7 +719,7 @@
       "unit": "bool",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.flow.tapeValid5M",
@@ -730,7 +730,7 @@
       "unit": "bool",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.flow.tapeValid5S",
@@ -741,7 +741,7 @@
       "unit": "bool",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.flow.tapeVolumePerSec30S",
@@ -752,7 +752,7 @@
       "unit": "contractsPerSec",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.flow.tapeVolumePerSec5M",
@@ -763,7 +763,7 @@
       "unit": "contractsPerSec",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.flow.tapeVolumePerSec5S",
@@ -774,7 +774,7 @@
       "unit": "contractsPerSec",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.flow.tapeWindowAnchorTimestampMs",
@@ -785,7 +785,7 @@
       "unit": "milliseconds",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.identity.carryForwardLevelsValid",
@@ -796,7 +796,7 @@
       "unit": "bool",
       "sessionScope": "crossSession",
       "freshness": "sessionScoped",
-      "costHint": "r0"
+      "costHint": "R0"
     },
     {
       "id": "market.identity.contractMonth",
@@ -807,7 +807,7 @@
       "unit": "text",
       "sessionScope": "crossSession",
       "freshness": "sessionScoped",
-      "costHint": "r0"
+      "costHint": "R0"
     },
     {
       "id": "market.identity.contractSymbol",
@@ -818,7 +818,7 @@
       "unit": "text",
       "sessionScope": "crossSession",
       "freshness": "sessionScoped",
-      "costHint": "r0"
+      "costHint": "R0"
     },
     {
       "id": "market.identity.priorDayContractSymbol",
@@ -829,7 +829,7 @@
       "unit": "text",
       "sessionScope": "crossSession",
       "freshness": "priorSessionCarry",
-      "costHint": "r0"
+      "costHint": "R0"
     },
     {
       "id": "market.identity.rolloverWarning",
@@ -840,7 +840,7 @@
       "unit": "text",
       "sessionScope": "crossSession",
       "freshness": "sessionScoped",
-      "costHint": "r0"
+      "costHint": "R0"
     },
     {
       "id": "market.identity.rootSymbol",
@@ -851,7 +851,7 @@
       "unit": "text",
       "sessionScope": "crossSession",
       "freshness": "sessionScoped",
-      "costHint": "r0"
+      "costHint": "R0"
     },
     {
       "id": "market.identity.sessionSegment",
@@ -862,7 +862,7 @@
       "unit": "enumLabel",
       "sessionScope": "session",
       "freshness": "sessionScoped",
-      "costHint": "r0"
+      "costHint": "R0"
     },
     {
       "id": "market.identity.sessionType",
@@ -873,7 +873,7 @@
       "unit": "enumLabel",
       "sessionScope": "session",
       "freshness": "sessionScoped",
-      "costHint": "r0"
+      "costHint": "R0"
     },
     {
       "id": "market.identity.symbolResolutionMode",
@@ -884,7 +884,7 @@
       "unit": "enumLabel",
       "sessionScope": "crossSession",
       "freshness": "sessionScoped",
-      "costHint": "r0"
+      "costHint": "R0"
     },
     {
       "id": "market.identity.symbolResolutionSource",
@@ -895,7 +895,7 @@
       "unit": "enumLabel",
       "sessionScope": "crossSession",
       "freshness": "sessionScoped",
-      "costHint": "r0"
+      "costHint": "R0"
     },
     {
       "id": "market.identity.tradingDay",
@@ -906,7 +906,7 @@
       "unit": "text",
       "sessionScope": "crossSession",
       "freshness": "sessionScoped",
-      "costHint": "r0"
+      "costHint": "R0"
     },
     {
       "id": "market.liquidity.domSummary",
@@ -917,7 +917,7 @@
       "unit": "structuredBlob",
       "sessionScope": "session",
       "freshness": "delayedDepthOptional",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.location_structure.ask",
@@ -928,7 +928,7 @@
       "unit": "pricePoints",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r0"
+      "costHint": "R0"
     },
     {
       "id": "market.location_structure.balanceState",
@@ -939,7 +939,7 @@
       "unit": "enumLabel",
       "sessionScope": "rth",
       "freshness": "sessionScoped",
-      "costHint": "r0"
+      "costHint": "R0"
     },
     {
       "id": "market.location_structure.bid",
@@ -950,7 +950,7 @@
       "unit": "pricePoints",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r0"
+      "costHint": "R0"
     },
     {
       "id": "market.location_structure.dayType",
@@ -961,7 +961,7 @@
       "unit": "enumLabel",
       "sessionScope": "rth",
       "freshness": "sessionScoped",
-      "costHint": "r0"
+      "costHint": "R0"
     },
     {
       "id": "market.location_structure.dnp",
@@ -972,7 +972,7 @@
       "unit": "pricePoints",
       "sessionScope": "rth",
       "freshness": "liveTickAnchored",
-      "costHint": "r0"
+      "costHint": "R0"
     },
     {
       "id": "market.location_structure.dnvaHigh",
@@ -983,7 +983,7 @@
       "unit": "pricePoints",
       "sessionScope": "rth",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.location_structure.dnvaLow",
@@ -994,7 +994,7 @@
       "unit": "pricePoints",
       "sessionScope": "rth",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.location_structure.excessHigh",
@@ -1005,7 +1005,7 @@
       "unit": "bool",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.location_structure.excessLow",
@@ -1016,7 +1016,7 @@
       "unit": "bool",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.location_structure.globexOr30High",
@@ -1027,7 +1027,7 @@
       "unit": "pricePoints",
       "sessionScope": "globex",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.location_structure.globexOr30Low",
@@ -1038,7 +1038,7 @@
       "unit": "pricePoints",
       "sessionScope": "globex",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.location_structure.ibExtensionState",
@@ -1049,7 +1049,7 @@
       "unit": "enumLabel",
       "sessionScope": "rth",
       "freshness": "sessionScoped",
-      "costHint": "r0"
+      "costHint": "R0"
     },
     {
       "id": "market.location_structure.ibHigh",
@@ -1060,7 +1060,7 @@
       "unit": "pricePoints",
       "sessionScope": "rth",
       "freshness": "liveTickAnchored",
-      "costHint": "r0"
+      "costHint": "R0"
     },
     {
       "id": "market.location_structure.ibLow",
@@ -1071,7 +1071,7 @@
       "unit": "pricePoints",
       "sessionScope": "rth",
       "freshness": "liveTickAnchored",
-      "costHint": "r0"
+      "costHint": "R0"
     },
     {
       "id": "market.location_structure.lastPrice",
@@ -1082,7 +1082,7 @@
       "unit": "pricePoints",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r0"
+      "costHint": "R0"
     },
     {
       "id": "market.location_structure.londonOr60High",
@@ -1093,7 +1093,7 @@
       "unit": "pricePoints",
       "sessionScope": "globex",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.location_structure.londonOr60Low",
@@ -1104,7 +1104,7 @@
       "unit": "pricePoints",
       "sessionScope": "globex",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.location_structure.or5BreakDirection",
@@ -1115,7 +1115,7 @@
       "unit": "enumLabel",
       "sessionScope": "rth",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.location_structure.or5High",
@@ -1126,7 +1126,7 @@
       "unit": "pricePoints",
       "sessionScope": "rth",
       "freshness": "liveTickAnchored",
-      "costHint": "r0"
+      "costHint": "R0"
     },
     {
       "id": "market.location_structure.or5Locked",
@@ -1137,7 +1137,7 @@
       "unit": "bool",
       "sessionScope": "rth",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.location_structure.or5Low",
@@ -1148,7 +1148,7 @@
       "unit": "pricePoints",
       "sessionScope": "rth",
       "freshness": "liveTickAnchored",
-      "costHint": "r0"
+      "costHint": "R0"
     },
     {
       "id": "market.location_structure.or5Mid",
@@ -1159,7 +1159,7 @@
       "unit": "pricePoints",
       "sessionScope": "rth",
       "freshness": "liveTickAnchored",
-      "costHint": "r0"
+      "costHint": "R0"
     },
     {
       "id": "market.location_structure.or5MidRetested",
@@ -1170,7 +1170,7 @@
       "unit": "bool",
       "sessionScope": "rth",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.location_structure.orHigh",
@@ -1181,7 +1181,7 @@
       "unit": "pricePoints",
       "sessionScope": "rth",
       "freshness": "liveTickAnchored",
-      "costHint": "r0"
+      "costHint": "R0"
     },
     {
       "id": "market.location_structure.orLow",
@@ -1192,7 +1192,7 @@
       "unit": "pricePoints",
       "sessionScope": "rth",
       "freshness": "liveTickAnchored",
-      "costHint": "r0"
+      "costHint": "R0"
     },
     {
       "id": "market.location_structure.overnightHigh",
@@ -1203,7 +1203,7 @@
       "unit": "pricePoints",
       "sessionScope": "crossSession",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.location_structure.overnightLow",
@@ -1214,7 +1214,7 @@
       "unit": "pricePoints",
       "sessionScope": "crossSession",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.location_structure.poc",
@@ -1225,7 +1225,7 @@
       "unit": "pricePoints",
       "sessionScope": "rth",
       "freshness": "liveTickAnchored",
-      "costHint": "r0"
+      "costHint": "R0"
     },
     {
       "id": "market.location_structure.poorHigh",
@@ -1236,7 +1236,7 @@
       "unit": "bool",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.location_structure.poorLow",
@@ -1247,7 +1247,7 @@
       "unit": "bool",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.location_structure.priorDayClose",
@@ -1258,7 +1258,7 @@
       "unit": "pricePoints",
       "sessionScope": "crossSession",
       "freshness": "priorSessionCarry",
-      "costHint": "r0"
+      "costHint": "R0"
     },
     {
       "id": "market.location_structure.priorDayHigh",
@@ -1269,7 +1269,7 @@
       "unit": "pricePoints",
       "sessionScope": "crossSession",
       "freshness": "priorSessionCarry",
-      "costHint": "r0"
+      "costHint": "R0"
     },
     {
       "id": "market.location_structure.priorDayLow",
@@ -1280,7 +1280,7 @@
       "unit": "pricePoints",
       "sessionScope": "crossSession",
       "freshness": "priorSessionCarry",
-      "costHint": "r0"
+      "costHint": "R0"
     },
     {
       "id": "market.location_structure.priorDnp",
@@ -1291,7 +1291,7 @@
       "unit": "pricePoints",
       "sessionScope": "crossSession",
       "freshness": "priorSessionCarry",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.location_structure.priorDnvaHigh",
@@ -1302,7 +1302,7 @@
       "unit": "pricePoints",
       "sessionScope": "crossSession",
       "freshness": "priorSessionCarry",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.location_structure.priorDnvaLow",
@@ -1313,7 +1313,7 @@
       "unit": "pricePoints",
       "sessionScope": "crossSession",
       "freshness": "priorSessionCarry",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.location_structure.priorPoc",
@@ -1324,7 +1324,7 @@
       "unit": "pricePoints",
       "sessionScope": "crossSession",
       "freshness": "priorSessionCarry",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.location_structure.priorVaHigh",
@@ -1335,7 +1335,7 @@
       "unit": "pricePoints",
       "sessionScope": "crossSession",
       "freshness": "priorSessionCarry",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.location_structure.priorVaLow",
@@ -1346,7 +1346,7 @@
       "unit": "pricePoints",
       "sessionScope": "crossSession",
       "freshness": "priorSessionCarry",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.location_structure.profileShape",
@@ -1357,7 +1357,7 @@
       "unit": "enumLabel",
       "sessionScope": "rth",
       "freshness": "sessionScoped",
-      "costHint": "r0"
+      "costHint": "R0"
     },
     {
       "id": "market.location_structure.regime",
@@ -1368,7 +1368,7 @@
       "unit": "enumLabel",
       "sessionScope": "rth",
       "freshness": "sessionScoped",
-      "costHint": "r0"
+      "costHint": "R0"
     },
     {
       "id": "market.location_structure.rthClosePrice",
@@ -1379,7 +1379,7 @@
       "unit": "pricePoints",
       "sessionScope": "rth",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.location_structure.sessionHigh",
@@ -1390,7 +1390,7 @@
       "unit": "pricePoints",
       "sessionScope": "rth",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.location_structure.sessionLow",
@@ -1401,7 +1401,7 @@
       "unit": "pricePoints",
       "sessionScope": "rth",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.location_structure.singlePrintsDirection",
@@ -1412,7 +1412,7 @@
       "unit": "enumLabel",
       "sessionScope": "rth",
       "freshness": "sessionScoped",
-      "costHint": "r0"
+      "costHint": "R0"
     },
     {
       "id": "market.location_structure.vaHigh",
@@ -1423,7 +1423,7 @@
       "unit": "pricePoints",
       "sessionScope": "rth",
       "freshness": "liveTickAnchored",
-      "costHint": "r0"
+      "costHint": "R0"
     },
     {
       "id": "market.location_structure.vaLow",
@@ -1434,7 +1434,7 @@
       "unit": "pricePoints",
       "sessionScope": "rth",
       "freshness": "liveTickAnchored",
-      "costHint": "r0"
+      "costHint": "R0"
     },
     {
       "id": "market.location_structure.vwap",
@@ -1445,7 +1445,7 @@
       "unit": "pricePoints",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r0"
+      "costHint": "R0"
     },
     {
       "id": "market.location_structure.vwap1SdLower",
@@ -1456,7 +1456,7 @@
       "unit": "pricePoints",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.location_structure.vwap1SdUpper",
@@ -1467,7 +1467,7 @@
       "unit": "pricePoints",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.location_structure.vwap2SdLower",
@@ -1478,7 +1478,7 @@
       "unit": "pricePoints",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.location_structure.vwap2SdUpper",
@@ -1489,7 +1489,7 @@
       "unit": "pricePoints",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.location_structure.vwap3SdLower",
@@ -1500,7 +1500,7 @@
       "unit": "pricePoints",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.location_structure.vwap3SdUpper",
@@ -1511,7 +1511,7 @@
       "unit": "pricePoints",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.response.activeZoneCount",
@@ -1522,7 +1522,7 @@
       "unit": "count",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.response.nearestZoneDirection",
@@ -1533,7 +1533,7 @@
       "unit": "enumLabel",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.response.nearestZoneDistanceTicks",
@@ -1544,7 +1544,7 @@
       "unit": "ticks",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.response.nearestZoneStatus",
@@ -1555,7 +1555,7 @@
       "unit": "enumLabel",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.response.rebidZoneHeld",
@@ -1566,7 +1566,7 @@
       "unit": "bool",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.response.rebidZoneHigh",
@@ -1577,7 +1577,7 @@
       "unit": "pricePoints",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.response.rebidZoneLow",
@@ -1588,7 +1588,7 @@
       "unit": "pricePoints",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.response.rebidZoneNear",
@@ -1599,7 +1599,7 @@
       "unit": "bool",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.response.rebidZoneRetested",
@@ -1610,7 +1610,7 @@
       "unit": "bool",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.response.reofferZoneHeld",
@@ -1621,7 +1621,7 @@
       "unit": "bool",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.response.reofferZoneHigh",
@@ -1632,7 +1632,7 @@
       "unit": "pricePoints",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.response.reofferZoneLow",
@@ -1643,7 +1643,7 @@
       "unit": "pricePoints",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.response.reofferZoneNear",
@@ -1654,7 +1654,7 @@
       "unit": "bool",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.response.reofferZoneRetested",
@@ -1665,7 +1665,7 @@
       "unit": "bool",
       "sessionScope": "session",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.volatility.rvolAcceleration",
@@ -1676,7 +1676,7 @@
       "unit": "ratio",
       "sessionScope": "rth",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.volatility.rvolBaselineStatus",
@@ -1687,7 +1687,7 @@
       "unit": "enumLabel",
       "sessionScope": "rth",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.volatility.rvolBucketIndex",
@@ -1698,7 +1698,7 @@
       "unit": "count",
       "sessionScope": "rth",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.volatility.rvolCaveat",
@@ -1709,7 +1709,7 @@
       "unit": "text",
       "sessionScope": "rth",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.volatility.rvolClassification",
@@ -1720,7 +1720,7 @@
       "unit": "enumLabel",
       "sessionScope": "rth",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.volatility.rvolExpectedVolume",
@@ -1731,7 +1731,7 @@
       "unit": "contracts",
       "sessionScope": "rth",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.volatility.rvolLookbackDaysActual",
@@ -1742,7 +1742,7 @@
       "unit": "count",
       "sessionScope": "rth",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.volatility.rvolPercentile",
@@ -1753,7 +1753,7 @@
       "unit": "percent",
       "sessionScope": "rth",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.volatility.rvolRatio",
@@ -1764,7 +1764,7 @@
       "unit": "ratio",
       "sessionScope": "rth",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "market.volatility.rvolVelocity",
@@ -1775,7 +1775,7 @@
       "unit": "ratio",
       "sessionScope": "rth",
       "freshness": "liveTickAnchored",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "positioning.capturedAt",
@@ -1786,7 +1786,7 @@
       "unit": "milliseconds",
       "sessionScope": "session",
       "freshness": "stubUnavailable",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "positioning.dataTime",
@@ -1797,7 +1797,7 @@
       "unit": "milliseconds",
       "sessionScope": "session",
       "freshness": "vendorTimestampFailClosed",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "positioning.derivedLevels",
@@ -1808,7 +1808,7 @@
       "unit": "structuredBlob",
       "sessionScope": "session",
       "freshness": "stubUnavailable",
-      "costHint": "r1"
+      "costHint": "R1"
     },
     {
       "id": "positioning.freshnessOk",
@@ -1819,7 +1819,7 @@
       "unit": "bool",
       "sessionScope": "session",
       "freshness": "stubUnavailable",
-      "costHint": "r0"
+      "costHint": "R0"
     },
     {
       "id": "positioning.recordKind",
@@ -1830,7 +1830,7 @@
       "unit": "enumLabel",
       "sessionScope": "session",
       "freshness": "stubUnavailable",
-      "costHint": "r1"
+      "costHint": "R1"
     }
   ],
   "positioningRecordKinds": [

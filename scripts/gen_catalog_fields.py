@@ -27,7 +27,9 @@ def extract_fields(body: str) -> list[tuple[str, str]]:
         elif s.startswith("pub "):
             m = re.match(r"pub ([a-zA-Z0-9_]+):", s)
             if m:
-                fields.append((m.group(1), " ".join(cur) if cur else m.group(1)))
+                # Empty description when no /// — matches CI drift test (no silent
+                # field-name fallback that would disagree with source docs).
+                fields.append((m.group(1), " ".join(cur) if cur else ""))
                 cur = []
         elif s.startswith("//"):
             cur = []

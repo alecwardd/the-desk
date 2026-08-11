@@ -7,14 +7,12 @@ pub const CATALOG_VERSION: &str = "0.1.0";
 
 /// Trust Ceiling mirrored into catalog environment metadata (ADR-022).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub enum TrustCeiling {
     L3,
 }
 
 /// Pull-band cost hint for a catalog field (resolution model R0–R3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub enum CostHint {
     /// Orientation-class field (cheap, expected in R0 reads).
     R0,

@@ -18,6 +18,7 @@ Standalone deep-dive specs referenced by ideas in this document:
 - **Session range compression and expansion** — [`docs/setup-ideas/IDEA-031-session-range-compression-expansion.md`](setup-ideas/IDEA-031-session-range-compression-expansion.md): research queue for session-scoped range/realized-volatility transitions across RTH, Asia, London, and consecutive like sessions.
 - **HMM lecture-notes repo-fit (docs-only)** — [`docs/setup-ideas/IDEA-032-hmm-lecture-notes-repo-fit.md`](setup-ideas/IDEA-032-hmm-lecture-notes-repo-fit.md): Miller 2016 HMM notes assessed as **ADAPT** reference for a future offline regime-research design; not a live signal and not an implement-now task.
 - **Expected-range ATR / RV / IV research plan (docs-only)** — [`docs/setup-ideas/IDEA-033-expected-range-atr-rv-iv-research-plan.md`](setup-ideas/IDEA-033-expected-range-atr-rv-iv-research-plan.md): staged offline plan comparing ATR, realized vol, and provenance-gated IV (or labeled proxy) for session sizing vs runner decisions; no backtest executed.
+- **Time-of-day liquidity-event calendar (offline research)** — [`docs/setup-ideas/IDEA-034-time-of-day-liquidity-events.md`](setup-ideas/IDEA-034-time-of-day-liquidity-events.md): bucket-stats evidence accepted after clean-`b63e83a` verification; calendar/event-rate extraction has not run, Stage 1 has not passed, and continuation/reversal remains gated.
 
 ---
 
@@ -1260,6 +1261,23 @@ exposure.
 runner-decision tracks. ATR/RV are derivable from session summaries / `.scid`;
 IV is live-only via ConvexValue unless a provenance-complete history or
 explicitly labeled proxy (e.g. VIX) is added. No backtest executed in this pass.
+
+### IDEA-034: Time-of-day liquidity-event calendar (participation anomalies + continuation/reversal)
+
+**Status:** Backtesting (bucket-stats evidence accepted 2026-08-11; calendar extraction not run; no signal claim)
+**Source:** second-brain queue ready-for-agent (2026-07-13) ← inbox note "large moves in the market based on time"; assessed 2026-07-24
+**Complements:** IDEA-007, IDEA-031, IDEA-033
+**Detail:** [setup-ideas/IDEA-034-time-of-day-liquidity-events.md](setup-ideas/IDEA-034-time-of-day-liquidity-events.md)
+
+**Framing:** Staged offline study testing whether large participation (executed
+volume / tape speed / signed delta, trade-side proxy — DOM parked) clusters at
+predictable clock times across the full segmented day (Globex 18:00 ET, London
+02:00 ET, RTH 09:30–16:15). The clean-`b63e83a` verification accepted the
+bucket-stats artifact and its reportable coverage; this is not a Stage 1 pass.
+Calendar/event-rate extraction remains a separate approval gate. Stage 2
+(gated) tests continuation/reversal after events vs matched same-bucket
+controls. Deliverable is a research calendar + gated verdicts only — no live
+integration. See [the verification record](backtests/2026-08-11-idea-034-bucket-stats-verification.md).
 
 ---
 

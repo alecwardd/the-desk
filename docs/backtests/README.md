@@ -13,3 +13,4 @@ This directory is the durable **index and decision record** for offline backtest
 | Campaign | Record |
 |----------|--------|
 | 2026-07-22 Top-10 offline campaign | [2026-07-22-top-10-campaign.md](./2026-07-22-top-10-campaign.md) · [2026-07-22-top-10-campaign.json](./2026-07-22-top-10-campaign.json) |
+| 2026-08-11 IDEA-034 bucket-stats provenance verification | [2026-08-11-idea-034-bucket-stats-verification.md](./2026-08-11-idea-034-bucket-stats-verification.md) |

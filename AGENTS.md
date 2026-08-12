@@ -17,13 +17,19 @@ best results — see **[docs/agent-interaction-guide.md](docs/agent-interaction-
 Durable, non-obvious notes for cloud agents. Standard lint/test/build/run commands
 already live in the README "Development" section — use those, don't duplicate them.
 
-- **Rust toolchain must be `stable` ≥ 1.85.** A transitive dependency
-  (`crypto-common`, via `sha2`) requires the `edition2024` feature. The VM's
-  pre-installed Rust 1.83 fails at manifest-parse time with an `edition2024 is
-  required` error. The environment is set up with the latest `stable` toolchain
-  as the `rustup` default; if you ever see that error, run
-  `rustup default stable` (matches CI's `dtolnay/rust-toolchain@stable`). No
-  `rust-toolchain.toml` is pinned in-repo.
+- **Rust toolchain is pinned via `rust-toolchain.toml`** (`channel = "stable"`,
+  components `rustfmt`/`clippy`). MSRV is also declared in `Cargo.toml`
+  (`rust-version = "1.87"`) — the code uses APIs stable since 1.87 (e.g.
+  `usize::is_multiple_of`), and a transitive dependency (`crypto-common`, via
+  `sha2`) additionally requires the `edition2024` feature (Rust ≥ 1.85). A base
+  VM shipping Rust 1.83 will fail at manifest-parse with an `edition2024 is
+  required` error unless rustup picks up the in-repo toolchain file (it does
+  automatically on `cargo`/`rustc` invocation). Do not hand-pin a different
+  channel.
+- **Repo-managed environment config:** `.cursor/environment.json` runs
+  `cargo fetch` + debug + release `the-desk-mcp` builds as the `install` step.
+  There is no `start` / `terminals` entry — the MCP server is stdio (launched by
+  Cursor via `.cursor/mcp.json`), not a long-running daemon.
 - **No external services.** SQLite is compiled in (`rusqlite` `bundled`, needs a C
   compiler — `clang` is present) and auto-creates `~/.the-desk/data.db`. There is
   no DB/broker/network daemon to start.

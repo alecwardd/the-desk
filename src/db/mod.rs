@@ -6953,7 +6953,7 @@ impl Database {
     ) -> Result<Vec<serde_json::Value>, DbError> {
         let limit = limit.clamp(1, 500);
         let mut sql = String::from(
-            "SELECT timestamp_ms, event_type, level_name, price, direction, metadata_json,
+            "SELECT timestamp_ms, event_type, level_name, price, direction, sequence_num, metadata_json,
                     session_date, session_type, session_segment, trading_day
              FROM market_events WHERE 1=1",
         );
@@ -6972,7 +6972,7 @@ impl Database {
 
         let mut stmt = self.conn.prepare(&sql)?;
         let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<serde_json::Value> {
-            let metadata_str: Option<String> = row.get(5)?;
+            let metadata_str: Option<String> = row.get(6)?;
             let metadata: serde_json::Value = metadata_str
                 .and_then(|s| serde_json::from_str(&s).ok())
                 .unwrap_or_else(|| serde_json::json!({}));
@@ -6982,11 +6982,12 @@ impl Database {
                 "levelName": row.get::<_, Option<String>>(2)?,
                 "price": row.get::<_, f64>(3)?,
                 "direction": row.get::<_, Option<String>>(4)?,
+                "sequenceNum": row.get::<_, Option<i64>>(5)?,
                 "metadata": metadata,
-                "sessionDate": row.get::<_, String>(6)?,
-                "sessionType": row.get::<_, Option<String>>(7)?,
-                "sessionSegment": row.get::<_, Option<String>>(8)?,
-                "tradingDay": row.get::<_, Option<String>>(9)?,
+                "sessionDate": row.get::<_, String>(7)?,
+                "sessionType": row.get::<_, Option<String>>(8)?,
+                "sessionSegment": row.get::<_, Option<String>>(9)?,
+                "tradingDay": row.get::<_, Option<String>>(10)?,
             }))
         };
 

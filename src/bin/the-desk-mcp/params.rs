@@ -29,7 +29,8 @@ pub(crate) struct SearchCatalogParams {
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct GetStateParams {
-    /// Optional symbol roots (e.g. `["NQ"]`). Multi-symbol MarketRouter is later work.
+    /// Optional symbol roots (e.g. `["NQ"]`). Until MarketRouter multi-symbol
+    /// ships, requests must match the resolved snapshot `rootSymbol` when known.
     pub(crate) symbols: Option<Vec<String>>,
     /// Optional catalog domain ids (e.g. `location_structure`, `flow`, `positioning`).
     pub(crate) domains: Option<Vec<String>>,

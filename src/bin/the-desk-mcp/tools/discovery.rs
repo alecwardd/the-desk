@@ -118,6 +118,32 @@ impl TheDeskMcp {
         let (snapshot_owned, snapshot_source, data_time, source_degraded, source_note, as_of) =
             self.resolve_state_snapshot(params.as_of).await?;
 
+        // MarketRouter multi-symbol is later work (#7). Until then, reject
+        // requests that ask for a symbol other than the resolved snapshot root.
+        if let Some(ref requested) = params.symbols {
+            let requested: Vec<&str> = requested
+                .iter()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !requested.is_empty() {
+                if let Some(root) = snapshot_owned
+                    .as_ref()
+                    .and_then(|s| s.get("rootSymbol"))
+                    .and_then(|v| v.as_str())
+                {
+                    let ok = requested.iter().any(|s| s.eq_ignore_ascii_case(root));
+                    if !ok {
+                        return Err(invalid_params_error(format!(
+                            "get_state symbols {:?} do not match resolved rootSymbol `{root}` \
+                             (MarketRouter multi-symbol is not shipped yet)",
+                            requested
+                        )));
+                    }
+                }
+            }
+        }
+
         let req = StateReadRequest {
             symbols: params.symbols,
             domains: params.domains,
@@ -131,8 +157,12 @@ impl TheDeskMcp {
             source_degraded,
             source_degraded_note: source_note,
         };
-        let envelope =
-            build_state_envelope(&catalog, req).map_err(|e| invalid_params_error(e.to_string()))?;
+        let envelope = build_state_envelope(&catalog, req).map_err(|e| match e {
+            the_desk_backend::catalog::EnvelopeError::MissingProvenance(_) => {
+                McpError::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None)
+            }
+            other => invalid_params_error(other.to_string()),
+        })?;
         let mut out = state_envelope_json(&envelope)
             .map_err(|e| McpError::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?;
         if let Some(obj) = out.as_object_mut() {
@@ -155,7 +185,14 @@ impl TheDeskMcp {
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty());
-        let since_ms = params.since_ms.filter(|t| t.is_finite() && *t > 0.0);
+        let since_ms = match params.since_ms {
+            Some(t) if !t.is_finite() || t <= 0.0 => {
+                return Err(invalid_params_error(
+                    "sinceMs must be a positive finite epoch-milliseconds value",
+                ));
+            }
+            other => other,
+        };
         let _symbols = params.symbols; // reserved for MarketRouter multi-symbol
 
         let rows = {

@@ -1098,6 +1098,15 @@ async fn get_state_rejects_r2_r3() {
         .await
         .expect_err("R2 must fail");
     assert!(err.to_string().contains("R0") || err.to_string().contains("R2"));
+
+    let err = server
+        .get_state(Parameters(GetStateParams {
+            resolution: Some("R3".into()),
+            ..Default::default()
+        }))
+        .await
+        .expect_err("R3 must fail");
+    assert!(err.to_string().contains("R0") || err.to_string().contains("R3"));
 }
 
 #[tokio::test]
@@ -1139,6 +1148,58 @@ async fn get_events_returns_identity_rows() {
     assert_eq!(evt["timestampMs"], 1_700_000_000_000.0);
     assert_eq!(evt["severity"], "high");
     assert!(evt["identityId"].as_str().unwrap().starts_with("evt_"));
+}
+
+#[tokio::test]
+async fn get_events_identity_distinguishes_sequence_num() {
+    let server = test_server_with_sil();
+    {
+        let db = server.db.lock().expect("db");
+        let base = MarketEvent {
+            session_date: "2026-08-11".into(),
+            timestamp_ms: 1_700_000_100_000.0,
+            event_type: "level_test".into(),
+            level_name: Some("vwap".into()),
+            price: 21000.0,
+            direction: Some("from_below".into()),
+            sequence_num: Some(1),
+            metadata: None,
+            session_type: "RTH".into(),
+            session_segment: "None".into(),
+            trading_day: "2026-08-11".into(),
+        };
+        let mut second = base.clone();
+        second.sequence_num = Some(2);
+        db.insert_market_events_batch(&[base, second])
+            .expect("insert events");
+    }
+    let out = parse_text_tool_result(
+        server
+            .get_events(Parameters(GetEventsParams {
+                event_type: Some("level_test".into()),
+                limit: Some(10),
+                ..Default::default()
+            }))
+            .await
+            .expect("get_events"),
+    );
+    assert_eq!(out["count"], 2);
+    let id0 = out["events"][0]["identityId"].as_str().expect("id0");
+    let id1 = out["events"][1]["identityId"].as_str().expect("id1");
+    assert_ne!(id0, id1, "sequence_num must differentiate identityId");
+}
+
+#[tokio::test]
+async fn get_events_rejects_invalid_since_ms() {
+    let server = test_server_with_sil();
+    let err = server
+        .get_events(Parameters(GetEventsParams {
+            since_ms: Some(-1.0),
+            ..Default::default()
+        }))
+        .await
+        .expect_err("invalid sinceMs");
+    assert!(err.to_string().contains("sinceMs"));
 }
 
 #[tokio::test]

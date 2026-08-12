@@ -305,12 +305,15 @@ Report:
 
 The agent proactively saves insights and follow-ups without being asked. Memory capture happens alongside the primary response — never delay or replace analysis to save an insight. Call save tools in parallel with the response when possible.
 
+**Positioning annotations:** Use category `positioning_annotation` with tags `positioning` plus `slice` or `levels_only`. Evidence must carry Catalog record kinds (`slice` / `levels_only`) and `derivedLevels` (flip, walls, BALANCE / UPSIDE / DOWNSIDE TEST). Historical backlog days enter as Levels-Only Records (first-class). Seed teaching corpus with `the-desk-mcp --seed-positioning-corpus`. Methodology: `docs/research/odte-mm-level-map-from-vs3d.md`. Frame coaching as "your annotated sessions / your methodology say…" — never advisory buy/sell language.
+
 **When to save (agent decides):**
 
 | Trigger | Tool | Category |
 |---------|------|----------|
 | Trader shares a market observation worth recalling ("NQ chopped around VWAP all Asia session", "that level held three times") | `save_agent_insight` | `market_observation` |
 | Trader or agent notes a regime/context pattern ("low RVOL sessions keep faking out OR breaks", "trend days after inside days") | `save_agent_insight` | `regime_note` |
+| Trader annotates Positioning (Slice or Levels-Only Record), including mid-day flip/wall/BALANCE→TEST re-reads | `save_agent_insight` | `positioning_annotation` |
 | Trader reflects on behavior, emotional state, or a lesson learned | `save_agent_insight` | `session_context` |
 | Trader says "next session", "tomorrow", "follow up on", or any forward-looking intent | `create_memory_followup` | — |
 | Agent recognizes a repeated pattern across the conversation (e.g., trader keeps asking about the same level, or keeps second-guessing entries) | `save_agent_insight` | `behavioral` |

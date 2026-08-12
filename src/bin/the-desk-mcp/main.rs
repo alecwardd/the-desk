@@ -63,6 +63,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let activate = std::env::args().any(|a| a == "--activate");
         return seed_templates_cli(activate);
     }
+    if std::env::args().any(|a| a == "--seed-positioning-corpus") {
+        return seed_positioning_corpus_cli();
+    }
     if std::env::args().any(|a| a == "--seed-backtest-db") {
         return seed_backtest_db_cli();
     }
@@ -1315,6 +1318,38 @@ fn seed_templates_cli(activate: bool) -> Result<(), Box<dyn std::error::Error>> 
              or run them through the backtest loop before activating."
         );
     }
+    Ok(())
+}
+
+/// Seed pinned Positioning interpretation exemplars into `agent_insights` and exit.
+///
+/// Invoked via `--seed-positioning-corpus`. Idempotent: existing insight ids are
+/// never modified. Levels-Only backlog days and Slice-annotated sessions both
+/// land as first-class Positioning teaching context (SIL-P-VS-c / #17).
+fn seed_positioning_corpus_cli() -> Result<(), Box<dyn std::error::Error>> {
+    let db_path = data_dir().join("data.db");
+    let db = Database::open(&db_path.to_string_lossy())?;
+    let report = the_desk_backend::memory::seed_positioning_exemplar_corpus(&db)?;
+    println!(
+        "Seeded Positioning exemplar corpus `{}` into {} ({} sessions)",
+        report.corpus_id,
+        db_path.display(),
+        report.session_count
+    );
+    println!(
+        "  inserted ({}): {}",
+        report.inserted.len(),
+        report.inserted.join(", ")
+    );
+    println!(
+        "  skipped existing ({}): {}",
+        report.skipped_existing.len(),
+        report.skipped_existing.join(", ")
+    );
+    println!(
+        "  Recall via recall_agent_insights(category=\"positioning_annotation\", tag=\"positioning\") \
+         or get_memory_brief."
+    );
     Ok(())
 }
 

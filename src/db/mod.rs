@@ -6991,10 +6991,9 @@ impl Database {
         };
 
         let rows = match (since_ms, event_type) {
-            (Some(since), Some(etype)) => {
-                stmt.query_map(rusqlite::params![since, etype], map_row)?
-                    .collect::<Result<Vec<_>, _>>()?
-            }
+            (Some(since), Some(etype)) => stmt
+                .query_map(rusqlite::params![since, etype], map_row)?
+                .collect::<Result<Vec<_>, _>>()?,
             (Some(since), None) => stmt
                 .query_map(rusqlite::params![since], map_row)?
                 .collect::<Result<Vec<_>, _>>()?,

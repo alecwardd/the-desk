@@ -206,9 +206,7 @@ fn select_domains(
 ) -> Result<Vec<String>, EnvelopeError> {
     match requested {
         None => Ok(catalog.domains.iter().map(|d| d.id.clone()).collect()),
-        Some(list) if list.is_empty() => {
-            Ok(catalog.domains.iter().map(|d| d.id.clone()).collect())
-        }
+        Some(list) if list.is_empty() => Ok(catalog.domains.iter().map(|d| d.id.clone()).collect()),
         Some(list) => {
             let known: std::collections::BTreeSet<_> =
                 catalog.domains.iter().map(|d| d.id.as_str()).collect();
@@ -264,7 +262,9 @@ fn domain_provenance(
                 source: req.snapshot_source,
                 data_time: req.data_time,
                 vendor: None,
-                note: Some("events domain descriptors reserved; use get_events for event rows".into()),
+                note: Some(
+                    "events domain descriptors reserved; use get_events for event rows".into(),
+                ),
             },
             true,
         );
@@ -304,7 +304,11 @@ fn extract_field_value(snapshot: Option<&Value>, field: &FieldDescriptor) -> Opt
     // MarketState serializes camelCase via `name` (catalog field name).
     snap.get(&field.name).cloned().or_else(|| {
         // Also accept catalog id tail after last '.' for resilient callers.
-        field.id.rsplit('.').next().and_then(|tail| snap.get(tail).cloned())
+        field
+            .id
+            .rsplit('.')
+            .next()
+            .and_then(|tail| snap.get(tail).cloned())
     })
 }
 
@@ -511,7 +515,9 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(env.values.contains_key("market.location_structure.lastPrice"));
+        assert!(env
+            .values
+            .contains_key("market.location_structure.lastPrice"));
         assert!(!env
             .values
             .keys()
@@ -539,10 +545,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(
-            env.provenance["identity"].source,
-            ProvenanceSource::Journal
-        );
+        assert_eq!(env.provenance["identity"].source, ProvenanceSource::Journal);
         assert_eq!(env.as_of, Some(1_700_000_000_000.0));
     }
 }

@@ -11,8 +11,8 @@ use rmcp::{
 };
 use the_desk_backend::catalog::{
     build_catalog, build_state_envelope, describe_domain, describe_environment,
-    kernel_event_from_db_row, search_catalog, state_envelope_json, EventsEnvelope, ProvenanceSource,
-    StateReadRequest, StateResolution, TrustLevel, KERNEL_READ_QUERY_TOOLS,
+    kernel_event_from_db_row, search_catalog, state_envelope_json, EventsEnvelope,
+    ProvenanceSource, StateReadRequest, StateResolution, TrustLevel, KERNEL_READ_QUERY_TOOLS,
 };
 
 #[allow(unused_imports)]
@@ -28,10 +28,7 @@ impl TheDeskMcp {
         let mut out = describe_environment(&catalog, self.sil_config.catalog_discovery);
         if let Some(obj) = out.as_object_mut() {
             obj.insert("trustLevel".into(), serde_json::json!(TrustLevel::L0));
-            obj.insert(
-                "mutationAuthority".into(),
-                serde_json::json!(false),
-            );
+            obj.insert("mutationAuthority".into(), serde_json::json!(false));
             obj.insert("orderAuthority".into(), serde_json::json!(false));
             obj.insert(
                 "kernelOperators".into(),
@@ -113,9 +110,7 @@ impl TheDeskMcp {
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| {
-                invalid_params_error("get_state requires `resolution` of R0 or R1")
-            })?;
+            .ok_or_else(|| invalid_params_error("get_state requires `resolution` of R0 or R1"))?;
         let resolution = StateResolution::parse(resolution_raw)
             .map_err(|e| invalid_params_error(e.to_string()))?;
 
@@ -136,8 +131,8 @@ impl TheDeskMcp {
             source_degraded,
             source_degraded_note: source_note,
         };
-        let envelope = build_state_envelope(&catalog, req)
-            .map_err(|e| invalid_params_error(e.to_string()))?;
+        let envelope =
+            build_state_envelope(&catalog, req).map_err(|e| invalid_params_error(e.to_string()))?;
         let mut out = state_envelope_json(&envelope)
             .map_err(|e| McpError::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?;
         if let Some(obj) = out.as_object_mut() {

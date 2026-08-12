@@ -117,7 +117,10 @@ pub fn kernel_event_from_db_row(row: &Value) -> KernelEvent {
         .get("direction")
         .and_then(|v| v.as_str())
         .map(str::to_string);
-    let sequence_num = row.get("sequenceNum").and_then(|v| v.as_i64()).map(|v| v as i32);
+    let sequence_num = row
+        .get("sequenceNum")
+        .and_then(|v| v.as_i64())
+        .map(|v| v as i32);
     let session_type = row
         .get("sessionType")
         .and_then(|v| v.as_str())

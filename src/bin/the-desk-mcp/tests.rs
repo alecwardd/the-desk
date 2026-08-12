@@ -932,7 +932,9 @@ fn discovery_tools_present_when_sil_flag_on() {
 fn kernel_read_query_tools_are_trust_level_l0_without_mutation_authority() {
     let caps = the_desk_backend::catalog::kernel_read_query_capabilities();
     for tool in the_desk_backend::catalog::KERNEL_READ_QUERY_TOOLS {
-        let cap = caps.get(tool).unwrap_or_else(|| panic!("missing cap for {tool}"));
+        let cap = caps
+            .get(tool)
+            .unwrap_or_else(|| panic!("missing cap for {tool}"));
         assert_eq!(
             cap.trust_level,
             the_desk_backend::catalog::TrustLevel::L0,
@@ -942,7 +944,10 @@ fn kernel_read_query_tools_are_trust_level_l0_without_mutation_authority() {
             !cap.mutation_authority,
             "{tool} must not carry mutation authority"
         );
-        assert!(!cap.order_authority, "{tool} must not carry order authority");
+        assert!(
+            !cap.order_authority,
+            "{tool} must not carry order authority"
+        );
         assert!(
             !the_desk_backend::catalog::tool_name_implies_mutation(tool),
             "{tool} must not match mutation-verb naming"
@@ -1069,7 +1074,10 @@ async fn get_state_returns_provenance_and_degraded_flags() {
             provenance.contains_key(domain),
             "missing provenance for {domain}"
         );
-        assert!(degraded.contains_key(domain), "missing degraded for {domain}");
+        assert!(
+            degraded.contains_key(domain),
+            "missing degraded for {domain}"
+        );
     }
     // Positioning stub always degraded + present (never silently omitted).
     assert_eq!(degraded["positioning"], true);
@@ -1199,10 +1207,7 @@ async fn opinionated_bundles_remain_available() {
     ] {
         assert!(names.contains(tool), "{tool} must remain available");
     }
-    let _ = server
-        .evaluate_playbook()
-        .await
-        .expect("evaluate_playbook");
+    let _ = server.evaluate_playbook().await.expect("evaluate_playbook");
     let _ = server
         .get_attention_inbox(Parameters(AttentionInboxParams::default()))
         .await

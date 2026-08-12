@@ -150,6 +150,15 @@ pub fn validate_positioning_exemplar_corpus(
             "asia",
             "london",
         ];
+        match &session.scope {
+            Value::Object(_) | Value::Null => {}
+            other => {
+                return Err(MemoryError::Validation(format!(
+                    "exemplar `{}` scope must be a JSON object (got {other})",
+                    session.id
+                )));
+            }
+        }
         if let Some(bucket) = session.scope.get("timeBucket").and_then(|v| v.as_str()) {
             if !allowed_buckets.contains(&bucket) {
                 return Err(MemoryError::Validation(format!(

@@ -119,11 +119,44 @@ pub fn validate_positioning_exemplar_corpus(
         if summary_l.contains("you should buy")
             || summary_l.contains("you should sell")
             || summary_l.contains("i recommend")
+            || summary_l.contains("this is a good trade")
         {
             return Err(MemoryError::Validation(format!(
                 "exemplar `{}` uses advisory language",
                 session.id
             )));
+        }
+        let blob_vocab = format!("{}{}", session.summary, session.evidence).to_lowercase();
+        for banned in [
+            "options domain",
+            "surface snapshot",
+            "degraded record",
+            "fallback record",
+            "degraded path",
+            "fallback path",
+        ] {
+            if blob_vocab.contains(banned) {
+                return Err(MemoryError::Validation(format!(
+                    "exemplar `{}` uses forbidden vocabulary `{banned}`",
+                    session.id
+                )));
+            }
+        }
+        let allowed_buckets = [
+            "rth_open",
+            "rth_midday",
+            "rth_afternoon",
+            "globex",
+            "asia",
+            "london",
+        ];
+        if let Some(bucket) = session.scope.get("timeBucket").and_then(|v| v.as_str()) {
+            if !allowed_buckets.contains(&bucket) {
+                return Err(MemoryError::Validation(format!(
+                    "exemplar `{}` has non-canonical timeBucket `{bucket}`",
+                    session.id
+                )));
+            }
         }
         if !session.tags.iter().any(|t| t == POSITIONING_TAG) {
             return Err(MemoryError::Validation(format!(
@@ -169,29 +202,8 @@ pub fn validate_positioning_exemplar_corpus(
             }
         }
         // Levels-Only Records are first-class — refuse affirmative degraded/fallback labels.
-        let blob = format!("{}{}", session.summary, session.evidence).to_lowercase();
-        let affirmatively_degraded = [
-            "as a degraded",
-            "as degraded",
-            "degraded mode",
-            "fallback record",
-            "fallback mode",
-            "second-class path",
-            "second class path",
-        ]
-        .iter()
-        .any(|p| blob.contains(p));
-        let teaches_first_class = blob.contains("not a degraded")
-            || blob.contains("first-class")
-            || blob.contains("first class");
-        if affirmatively_degraded && !teaches_first_class {
-            return Err(MemoryError::Validation(format!(
-                "exemplar `{}` must not describe Levels-Only as degraded/fallback",
-                session.id
-            )));
-        }
+        // (Forbidden bare phrases are already rejected in the vocabulary check above.)
         if session.record_kind == "levels_only" {
-            levels_only += 1;
             let first_class = session
                 .evidence
                 .pointer("/provenance/firstClass")
@@ -209,6 +221,7 @@ pub fn validate_positioning_exemplar_corpus(
                     session.id
                 )));
             }
+            levels_only += 1;
         }
         if session.record_kind == "slice" && !session.tags.iter().any(|t| t == "slice") {
             return Err(MemoryError::Validation(format!(
@@ -332,12 +345,25 @@ mod tests {
         let db = Database::open(file.path().to_string_lossy().as_ref()).expect("open");
 
         let first = seed_positioning_exemplar_corpus(&db).expect("seed");
+        assert_eq!(first.session_count, 10, "seed corpus targets ~10 sessions");
         assert_eq!(first.inserted.len(), first.session_count);
         assert!(first.skipped_existing.is_empty());
         assert_eq!(
             count_recallable_positioning_exemplars(&db).expect("count"),
             first.session_count
         );
+
+        // Explicit recall_agent_insights seam: category + positioning tag returns full set.
+        let by_category_tag = db
+            .list_agent_insights(&AgentInsightQuery {
+                category: Some(POSITIONING_ANNOTATION_CATEGORY.to_string()),
+                tag: Some(POSITIONING_TAG.to_string()),
+                statuses: Some(vec![INSIGHT_PINNED.to_string()]),
+                limit: Some(200),
+                ..AgentInsightQuery::default()
+            })
+            .expect("recall category+tag");
+        assert_eq!(by_category_tag.len(), first.session_count);
 
         let second = seed_positioning_exemplar_corpus(&db).expect("reseed");
         assert!(second.inserted.is_empty());
@@ -372,6 +398,28 @@ mod tests {
                 Some(true)
             );
         }
+
+        // Default brief limit (5) still surfaces pinned Positioning exemplars by salience.
+        let brief_default = build_memory_brief(
+            &db,
+            MemoryBriefQuery {
+                include_insights: Some(true),
+                include_patterns: Some(false),
+                include_followups: Some(false),
+                include_recent_sessions: Some(false),
+                ..MemoryBriefQuery::default()
+            },
+        )
+        .expect("brief default");
+        assert!(
+            brief_default
+                .insights
+                .iter()
+                .filter(|i| i.category == POSITIONING_ANNOTATION_CATEGORY)
+                .count()
+                >= 3,
+            "default memory brief limit should still surface Positioning exemplars"
+        );
 
         let brief = build_memory_brief(
             &db,

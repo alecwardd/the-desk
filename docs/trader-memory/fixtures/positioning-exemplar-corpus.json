@@ -74,7 +74,7 @@
         "midDayReads": [
           {
             "asOf": "2026-03-05T16:00:00Z",
-            "note": "Your methodology says re-rank against the migrated flip at 5825 after the wall slide; do not coach off the open put wall."
+            "note": "Your methodology / annotated sessions say re-rank against the migrated flip at 5825 after the wall slide; the open put wall is no longer the live card."
           }
         ]
       }
@@ -87,7 +87,7 @@
       "completeness": "slice",
       "summary": "Your annotated sessions show spot-up/vol-up Positioning context: TEST levels expanded with vol, upside wall held then rolled higher, and charm had not yet compressed the afternoon card.",
       "tags": ["positioning", "slice", "spot_up_vol_up", "wall_migration"],
-      "scope": { "sessionType": "Rth", "dayType": "volatile", "timeBucket": "rth_mid" },
+      "scope": { "sessionType": "Rth", "dayType": "volatile", "timeBucket": "rth_midday" },
       "confidence": 0.8,
       "salience": 0.86,
       "evidence": {
@@ -161,7 +161,7 @@
       "completeness": "slice",
       "summary": "Your methodology highlights a clean BALANCE → UPSIDE TEST transition: two-sided hedging held into late morning, then spot accepted through the upside wall and the next Slice promoted UPSIDE TEST as the active probe.",
       "tags": ["positioning", "slice", "balance_to_upside_test"],
-      "scope": { "sessionType": "Rth", "dayType": "normal", "timeBucket": "rth_mid" },
+      "scope": { "sessionType": "Rth", "dayType": "normal", "timeBucket": "rth_midday" },
       "confidence": 0.86,
       "salience": 0.91,
       "evidence": {
@@ -185,7 +185,7 @@
         "midDayReads": [
           {
             "asOf": "2026-03-17T15:10:00Z",
-            "note": "Pre-transition BALANCE card superseded after acceptance above 5925; your playbook indicators should reference the UPSIDE TEST card."
+            "note": "Pre-transition BALANCE card superseded after acceptance above 5925; your methodology / annotated sessions say the UPSIDE TEST card is the active Positioning context."
           }
         ]
       }
@@ -198,7 +198,7 @@
       "completeness": "slice",
       "summary": "Your annotated sessions show BALANCE → DOWNSIDE TEST: midday acceptance below the put wall flipped the active probe lower while flip migrated with spot.",
       "tags": ["positioning", "slice", "balance_to_downside_test", "flip_migration"],
-      "scope": { "sessionType": "Rth", "dayType": "normal", "timeBucket": "rth_mid" },
+      "scope": { "sessionType": "Rth", "dayType": "normal", "timeBucket": "rth_midday" },
       "confidence": 0.85,
       "salience": 0.9,
       "evidence": {
@@ -235,7 +235,7 @@
       "completeness": "slice",
       "summary": "Your methodology says charm drift into expiration pulled TEST and flip inward versus the morning Slice; the final-hour annotation noted pin risk near the sticky flip without treating it as a signal.",
       "tags": ["positioning", "slice", "charm_drift_into_expiry"],
-      "scope": { "sessionType": "Rth", "dayType": "normal", "timeBucket": "rth_close" },
+      "scope": { "sessionType": "Rth", "dayType": "normal", "timeBucket": "rth_afternoon" },
       "confidence": 0.83,
       "salience": 0.92,
       "evidence": {
@@ -276,7 +276,7 @@
       "completeness": "slice",
       "summary": "Your annotated sessions show wall migration without a full trend day: the call wall relocated a full strike cluster by early afternoon while BALANCE roughly held until a late UPSIDE TEST probe.",
       "tags": ["positioning", "slice", "wall_migration", "range_balance"],
-      "scope": { "sessionType": "Rth", "dayType": "normal", "timeBucket": "rth_mid" },
+      "scope": { "sessionType": "Rth", "dayType": "normal", "timeBucket": "rth_midday" },
       "confidence": 0.78,
       "salience": 0.84,
       "evidence": {
@@ -311,7 +311,7 @@
       "archetype": "levels_only_backlog",
       "recordKind": "levels_only",
       "completeness": "levels_only",
-      "summary": "Your annotated backlog day entered as a Levels-Only Record (no Slice scrape): flip, walls, and BALANCE/TEST levels are first-class Positioning context from your hand map, not a degraded path.",
+      "summary": "Your annotated backlog day entered as a Levels-Only Record (no Slice scrape): flip, walls, and BALANCE/TEST levels are first-class Positioning context from your hand map.",
       "tags": ["positioning", "levels_only", "levels_only_backlog", "range_balance"],
       "scope": { "sessionType": "Rth", "dayType": "normal", "timeBucket": "rth_open" },
       "confidence": 0.75,
@@ -354,7 +354,7 @@
       "completeness": "levels_only",
       "summary": "Your Levels-Only Record for a historical trend day captures flip/wall migration from hand annotations: BALANCE → DOWNSIDE TEST without a Slice, remaining first-class Positioning for recall.",
       "tags": ["positioning", "levels_only", "levels_only_backlog", "trend_day_down", "balance_to_downside_test"],
-      "scope": { "sessionType": "Rth", "dayType": "trend", "timeBucket": "rth_mid" },
+      "scope": { "sessionType": "Rth", "dayType": "trend", "timeBucket": "rth_midday" },
       "confidence": 0.77,
       "salience": 0.89,
       "evidence": {

@@ -1,7 +1,7 @@
 # ODTE Market-Maker Level Map → Positioning Interpretation Layer
 
 **Status:** Living methodology (SIL-P-VS-c / #17)  
-**Authority:** Catalog v0 Positioning record kinds (`docs/mcp/desk-catalog-v0.md`), ADR-025 Levels-Only first-class path, SIL SPEC P-VS interpretation layer  
+**Authority:** Catalog v0 Positioning record kinds (`docs/mcp/desk-catalog-v0.md`), SIL SPEC P-VS interpretation layer (Levels-Only Record is first-class — Catalog / SIL ADR-025 note), SIL-P-VS-c / #17  
 **Trust Ceiling:** L3 — drafts context from the trader's annotated Positioning reads; the trader executes  
 **Not blocked on:** VolSignals ToS or `Vs3dProvider` (#16)
 
@@ -26,7 +26,7 @@ Never: "you should buy/sell" or "this is a good trade."
 | grid | `position_grid` | Primary capture panel (schema v1) when a provider exists |
 | by-strike | `positions_by_strike` | Desk-aggregated from grid when available |
 | **Slice** | `slice` | Price-indexed greek values at one moment + Desk-derived levels at ingest |
-| **Levels-Only Record** | `levels_only` | First-class record carrying only derived levels — manual entry and historical backlog path (ADR-025) |
+| **Levels-Only Record** | `levels_only` | First-class record carrying only derived levels — manual entry and historical backlog path (Catalog / SIL ADR-025 note) |
 
 Vendor forward projections are live context only; they are never durable facts inside a Slice or Levels-Only Record.
 
@@ -101,7 +101,7 @@ Use archetype tags on corpus insights (not as signals):
 
 ## 4. Levels-Only Records for historical backlog
 
-Historical backlog days **enter as Levels-Only Records**. That path is first-class (ADR-025), not a degraded mode:
+Historical backlog days **enter as Levels-Only Records**. That path is first-class (Catalog / SIL ADR-025 note), not a second-class mode:
 
 - No scrape and no `Vs3dProvider` required.
 - Completeness is `levels_only`; provenance is manual / as-of the trader's annotation time.

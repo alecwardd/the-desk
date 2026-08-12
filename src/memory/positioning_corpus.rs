@@ -263,7 +263,16 @@ pub fn seed_positioning_exemplar_corpus(
             continue;
         }
         let created_at_ms = base_ms + (idx as f64) * 86_400_000.0;
-        let mut scope = session.scope.clone();
+        let mut scope = match &session.scope {
+            Value::Object(_) => session.scope.clone(),
+            Value::Null => Value::Object(serde_json::Map::new()),
+            other => {
+                return Err(MemoryError::Validation(format!(
+                    "exemplar `{}` scope must be a JSON object (got {other})",
+                    session.id
+                )));
+            }
+        };
         if scope.get("tradingDay").is_none() {
             scope["tradingDay"] = Value::String(session.trading_day.clone());
         }

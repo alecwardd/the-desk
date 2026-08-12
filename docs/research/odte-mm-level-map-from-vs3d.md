@@ -90,13 +90,15 @@ Agents recalling corpus exemplars should name the transition the trader annotate
 
 Use archetype tags on corpus insights (not as signals):
 
-- `trend_day_up` / `trend_day_down` — one-sided acceptance with flip/wall migration
-- `spot_up_vol_up` / `spot_down_vol_up` — vol expansion with the spot move (TEST often expands)
-- `spot_up_vol_down` / `range_balance` — compress / two-sided BALANCE persistence
-- `charm_drift_into_expiry` — afternoon inward drift of TEST/flip
-- `wall_migration` — strike-cluster relocation without full trend day
-- `levels_only_backlog` — historical day entered without a Slice scrape
-
+| Archetype tag | What your annotations look for |
+|---------------|--------------------------------|
+| `trend_day_up` / `trend_day_down` | One-sided acceptance with flip/wall migration |
+| `spot_up_vol_up` / `spot_down_vol_up` | Vol expansion with the spot move (TEST often expands) |
+| `spot_up_vol_down` / `range_balance` | Compress / two-sided BALANCE persistence |
+| `balance_to_upside_test` / `balance_to_downside_test` | Explicit BALANCE → TEST transition cards (corpus teaching tags) |
+| `charm_drift_into_expiry` | Afternoon inward drift of TEST/flip |
+| `wall_migration` | Strike-cluster relocation without full trend day |
+| `levels_only_backlog` | Historical day entered without a Slice scrape |
 ---
 
 ## 4. Levels-Only Records for historical backlog

@@ -130,6 +130,7 @@ fn test_server_with_sil() -> TheDeskMcp {
         )),
         the_desk_backend::catalog::SilConfig {
             catalog_discovery: true,
+            ..Default::default()
         },
     );
     server
@@ -913,6 +914,7 @@ fn discovery_tools_absent_from_default_router() {
 fn discovery_tools_present_when_sil_flag_on() {
     let sil = the_desk_backend::catalog::SilConfig {
         catalog_discovery: true,
+        ..Default::default()
     };
     let names: std::collections::BTreeSet<_> = TheDeskMcp::tool_router_with_sil(&sil)
         .list_all()
@@ -956,6 +958,7 @@ fn kernel_read_query_tools_are_trust_level_l0_without_mutation_authority() {
     // Router surface: every kernel tool present under SIL must remain non-mutating.
     let sil = the_desk_backend::catalog::SilConfig {
         catalog_discovery: true,
+        ..Default::default()
     };
     let names: Vec<String> = TheDeskMcp::tool_router_with_sil(&sil)
         .list_all()

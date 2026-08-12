@@ -215,6 +215,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "scidAvailable": scid_available,
             "contractSymbol": contract_metadata.contract_symbol,
             "rootSymbol": contract_metadata.root_symbol,
+            "engineMode": server.sil_config.engine_mode.as_str(),
+            "engineBind": server.engine_bind_addr(),
         }),
     );
     server.hydrate_playbook_runtime_cache().map_err(|e| {
@@ -226,7 +228,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Take a verified database snapshot in the background (off the serving path).
     spawn_startup_backup(Arc::clone(&server.runtime_events), Arc::clone(&server.db));
 
-    if scid_available {
+    // SIL-M2a: external engine mode — MCP is a thin adapter; do not own ingest.
+    let external_engine = server.uses_external_engine();
+    if external_engine {
+        server.spawn_engine_adapter_refresh();
+        server
+            .feed_runtime
+            .rules_warm_replay_complete
+            .store(true, Ordering::Release);
+        record_runtime_event(
+            &server.runtime_events,
+            Some(&server.db),
+            RuntimeEventLevel::Info,
+            "engine.adapter_mode",
+            "engine",
+            "MCP running as external-engine adapter; ingest owned by the-desk-engine.",
+            serde_json::json!({
+                "engineMode": "external",
+                "engineBind": server.engine_bind_addr(),
+            }),
+        );
+    }
+
+    if !external_engine && scid_available {
         let (startup_cutover_tx, rx) = tokio::sync::oneshot::channel::<u64>();
         startup_cutover_rx = Some(rx);
         // Spawn background startup backfill from 2 Globex opens ago.
@@ -315,7 +339,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .store(true, Ordering::Release);
             let _ = startup_cutover_tx.send(startup.cutover_offset);
         });
-    } else {
+    } else if !external_engine {
         record_runtime_event(
             &server.runtime_events,
             Some(&server.db),
@@ -334,7 +358,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Background: poll .scid for new ticks and update pipeline engine + DB
-    if scid_available {
+    // (embedded mode only — external mode leaves ingest to the-desk-engine).
+    if !external_engine && scid_available {
         let startup_cutover_rx = startup_cutover_rx.take();
         let pipelines_bg = Arc::clone(&server.pipelines);
         let detector_bg = Arc::clone(&server.detector);

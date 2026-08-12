@@ -159,16 +159,32 @@ With `[sil].catalog_discovery = true`:
 - Opinionated bundles remain: `get_context_frame`, `get_attention_inbox`,
   `evaluate_playbook`.
 
+## SIL-M2a engine extract + embedded fallback
+
+- Default `[sil].engine_mode = "embedded"`: MCP owns ingest (today's topology /
+  true rollback).
+- `[sil].engine_mode = "external"`: MCP is a thin adapter over
+  `the-desk-engine`'s read-only localhost state socket (`engine_bind`, default
+  `127.0.0.1:17843`). Ingest/pipelines/events live in the engine so they survive
+  agent disconnect (Globex overnight coverage via Task Scheduler — see
+  `docs/ops/engine-lifecycle.md`).
+- Published coaching state uses a lock-free swap; kill-the-engine degrades
+  cleanly (`engine.adapter_degraded`) and recovers on reconnect.
+- `SourceProvider`: FileProvider (`.scid`/`.depth`) real; SierraProvider stubbed.
+- Trust Ceiling stays L3; read/query kernel remains Trust Level L0.
+
 ## Runtime Model
 
 - **State:** `TheDeskMcp` (in `state.rs`) holds `Arc`-shared handles: the SQLite
   `Database` writer behind a mutex, a bounded read-only WAL connection pool
   (`ReadPool`), the `PipelineEngine`, rules engine, event detector,
   attention/runtime-event stores, and caches (contract resolution, context
-  frames, options snapshots, playbook runtime).
-- **Feed loop:** `main.rs` spawns the `.scid` poll loop; `lifecycle.rs` owns
-  tick processing, depth polling, RTH close finalization, new-session
-  preparation, and startup warm replay.
+  frames, options snapshots, playbook runtime). In external engine mode it also
+  holds a lock-free `PublishedStateStore` refreshed from the engine socket.
+- **Feed loop:** In embedded mode, `main.rs` spawns the `.scid` poll loop;
+  `lifecycle.rs` owns tick processing, depth polling, RTH close finalization,
+  new-session preparation, and startup warm replay. In external mode, ingest is
+  owned by `the-desk-engine`.
 - **Concurrency model:** writes go through the single `Database` writer behind
   `Arc<Mutex<Database>>`; read-only tools borrow a dedicated
   `SQLITE_OPEN_READ_ONLY` connection from a bounded WAL pool (`read_pool.rs`,

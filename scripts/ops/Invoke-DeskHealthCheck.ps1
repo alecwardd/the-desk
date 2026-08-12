@@ -158,6 +158,12 @@ function Test-McpPresence {
     } else {
         Add-Finding -Severity "PASS" -Name "mcp process" -Detail "the-desk-mcp is not running (informational)."
     }
+    $engine = Get-Process -Name "the-desk-engine" -ErrorAction SilentlyContinue
+    if ($engine) {
+        Add-Finding -Severity "PASS" -Name "engine process" -Detail "the-desk-engine is running (pid=$(($engine | Select-Object -First 1).Id)) — ingest can survive MCP disconnect."
+    } else {
+        Add-Finding -Severity "PASS" -Name "engine process" -Detail "the-desk-engine is not running (informational; embedded MCP mode is the rollback)."
+    }
 }
 
 function Get-MarkerPath {

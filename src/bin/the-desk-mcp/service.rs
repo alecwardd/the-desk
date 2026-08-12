@@ -112,8 +112,91 @@ impl TheDeskMcp {
             context_frame_cache: Arc::new(Mutex::new(HashMap::new())),
             tool_router: Self::tool_router_with_sil(&sil_config),
             tool_telemetry: Arc::new(crate::tool_telemetry::ToolTelemetry::new()),
+            engine_published: match sil_config.engine_mode {
+                the_desk_backend::catalog::EngineMode::External => {
+                    Some(the_desk_backend::engine::PublishedStateStore::new())
+                }
+                the_desk_backend::catalog::EngineMode::Embedded => None,
+            },
+            engine_adapter_error: Arc::new(Mutex::new(None)),
             sil_config,
         }
+    }
+
+    /// Whether this MCP process owns ingest (embedded) or reads the engine socket.
+    pub(crate) fn uses_external_engine(&self) -> bool {
+        matches!(
+            self.sil_config.engine_mode,
+            the_desk_backend::catalog::EngineMode::External
+        )
+    }
+
+    /// Engine bind address for external mode (config override or default).
+    pub(crate) fn engine_bind_addr(&self) -> String {
+        self.sil_config
+            .engine_bind
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(the_desk_backend::engine::load_engine_bind_addr)
+    }
+
+    /// Start background refresh of published engine state (external mode only).
+    pub(crate) fn spawn_engine_adapter_refresh(&self) {
+        let Some(store) = self.engine_published.clone() else {
+            return;
+        };
+        let addr = self.engine_bind_addr();
+        let err_slot = Arc::clone(&self.engine_adapter_error);
+        let runtime_events = Arc::clone(&self.runtime_events);
+        let db = Arc::clone(&self.db);
+        tokio::spawn(async move {
+            use the_desk_backend::engine::EngineClient;
+            let client = EngineClient::new(addr);
+            let mut was_connected = false;
+            loop {
+                let published = client.get_published().await;
+                let connected = published.health.engine_alive && published.generation > 0;
+                // Prefer explicit transport error tracking from the client.
+                if let Some(err) = client.last_error() {
+                    if let Ok(mut g) = err_slot.lock() {
+                        *g = Some(err.clone());
+                    }
+                    if was_connected {
+                        record_runtime_event(
+                            &runtime_events,
+                            Some(&db),
+                            RuntimeEventLevel::Warn,
+                            "engine.adapter_degraded",
+                            "engine",
+                            "MCP engine adapter lost the engine state socket; live coaching path is degraded.",
+                            serde_json::json!({ "error": err }),
+                        );
+                    }
+                    was_connected = false;
+                } else {
+                    if let Ok(mut g) = err_slot.lock() {
+                        *g = None;
+                    }
+                    if !was_connected && connected {
+                        record_runtime_event(
+                            &runtime_events,
+                            Some(&db),
+                            RuntimeEventLevel::Info,
+                            "engine.adapter_recovered",
+                            "engine",
+                            "MCP engine adapter reconnected to the engine state socket.",
+                            serde_json::json!({
+                                "generation": published.generation,
+                                "enginePid": published.engine_pid,
+                            }),
+                        );
+                    }
+                    was_connected = connected || published.generation > 0;
+                }
+                store.store(published);
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        });
     }
 
     /// Run a read-only query on a pooled `SQLITE_OPEN_READ_ONLY` connection.
@@ -488,7 +571,53 @@ impl TheDeskMcp {
     }
 
     /// Single coherent live view: in-memory pipeline when available, else persisted `feature_state`.
+    ///
+    /// In external engine mode, prefer the lock-free published engine snapshot so the
+    /// live coaching path does not depend on a local pipeline mutex.
     pub(crate) fn resolve_live_market_view(&self) -> Option<LiveMarketResolution> {
+        if let Some(store) = self.engine_published.as_ref() {
+            let published = store.load();
+            let now_ms = chrono::Utc::now().timestamp_millis() as f64;
+            let as_of = published.data_time_ms.unwrap_or(now_ms);
+            let data_age_ms = (now_ms - as_of).max(0.0);
+            let adapter_err = self
+                .engine_adapter_error
+                .lock()
+                .ok()
+                .and_then(|g| g.clone());
+            let degradation_reason = if published.degraded {
+                published
+                    .degraded_note
+                    .clone()
+                    .or(adapter_err)
+                    .or_else(|| Some("external engine published state degraded".into()))
+            } else {
+                None
+            };
+            return Some(LiveMarketResolution {
+                snapshot: published.market_state.clone(),
+                snapshot_source: if published.degraded {
+                    "engine_socket_degraded"
+                } else {
+                    "engine_socket"
+                },
+                dom_summary: published
+                    .market_state
+                    .get("domSummary")
+                    .cloned()
+                    .filter(|v| !v.is_null()),
+                dom_source: "engine_published",
+                as_of_timestamp_ms: as_of,
+                pipeline_processed_through_ms: published.data_time_ms,
+                latest_db_tick_timestamp_ms: None,
+                latest_depth_timestamp_ms: None,
+                data_age_ms,
+                degradation_reason,
+                pipelines_contended: false,
+                db_contended: false,
+            });
+        }
+
         let now_wall_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
         let now_ms = now_wall_ms as f64;
         let atomic_ts = tick_ms_from_bits(

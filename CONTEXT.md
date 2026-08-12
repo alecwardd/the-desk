@@ -20,6 +20,12 @@ exactly in code, docs, ADRs, and agent copy. Do not invent synonyms.
 | **MarketRouter** | Concurrent per-symbol pipeline host (NQ+ES) on one clock — later milestone; not implemented in M1b. |
 | **StateEnvelope** | `get_state` response: `values`, per-domain `provenance`, per-domain `degraded`, `catalogVersion`. Absence of provenance is a failure. |
 | **Desk Catalog** | Versioned schema waist over annotated runtime fields + Positioning stub. Discovery is metadata-only. |
+| **SourceProvider** | Market-data provider seam for the engine host. **FileProvider** covers Sierra `.scid`/`.depth`; **SierraProvider** is stubbed until ACSIL (#23). |
+| **FileProvider** | Real SourceProvider adapter over on-disk `.scid` + discovered `.depth` paths. |
+| **SierraProvider** | Stubbed SourceProvider slot for a future ACSIL bridge — not implemented in M2a. |
+| **Engine host** | `the-desk-engine` process owning ingest, pipelines, and event detection so intelligence survives MCP/agent disconnect. |
+| **Embedded-engine fallback** | MCP-alone topology (`[sil].engine_mode = "embedded"`) — today's rollback when no external engine is running. |
+| **Published state** | Lock-free swapped coaching snapshot + health served on the engine's read-only state socket. |
 
 ## Resolution bands
 

@@ -97,6 +97,7 @@ This is the canonical "potential trade" flow — keep state in the system, not i
 
 - Read: `get_memory_brief` (by intent: session_start, setup_check, trade_review, weekly_review), `get_trader_context_fit` (typed envelope when the answer depends on trader memory), `recall_agent_insights`, `get_behavioral_patterns`.
 - Write: `save_agent_insight` (candidate/validated lifecycle), `create_memory_followup` / `resolve_memory_followup`, `acknowledge_agent_insight`.
+- Positioning interpretation corpus (SIL-P-VS-c): seed with `the-desk-mcp --seed-positioning-corpus`; recall via `recall_agent_insights(category="positioning_annotation", tag="positioning")` or `get_memory_brief`. Category `positioning_annotation` stores Slice / Levels-Only Record co-annotations. Methodology: `docs/research/odte-mm-level-map-from-vs3d.md`.
 - Maintenance: `refresh_memory_state` when `memoryMaintenance.refreshSuggested` is true or after memory-affecting writes in the same flow; `detect_behavioral_patterns` for explicit pattern sweeps.
 - Memory reports context only — it must never adjust sizing by itself.
 

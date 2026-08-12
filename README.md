@@ -231,6 +231,9 @@ cargo clippy --all-targets -- -D warnings
 # Run all tests (pipelines, rules, db, research, MCP helpers, etc.)
 cargo test
 
+# Seed pinned Positioning interpretation exemplars (Slice + Levels-Only) into agent_insights
+cargo run --bin the-desk-mcp -- --seed-positioning-corpus
+
 # Check compilation
 cargo check
 

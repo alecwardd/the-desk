@@ -6,7 +6,15 @@ use serde_json::json;
 use std::collections::HashMap;
 use thiserror::Error;
 
+pub mod positioning_corpus;
 pub mod trader_context;
+
+pub use positioning_corpus::{
+    count_recallable_positioning_exemplars, load_positioning_exemplar_corpus,
+    seed_positioning_exemplar_corpus, validate_positioning_exemplar_corpus,
+    PositioningCorpusSeedReport, PositioningExemplarCorpus, POSITIONING_ANNOTATION_CATEGORY,
+    POSITIONING_CORPUS_SOURCE, POSITIONING_TAG,
+};
 
 pub const INSIGHT_CANDIDATE: &str = "candidate";
 pub const INSIGHT_VALIDATED: &str = "validated";

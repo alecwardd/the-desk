@@ -9,5 +9,6 @@ Use these files for durable doctrine:
 - `identity.md` — who the trader is, account constraints, recurring behavioral guardrails
 - `playbook-doctrine.md` — setup-family rules of engagement and known false positives
 - `lessons-learned.md` — dated lessons, postmortems, and rules promoted from experience
+- `fixtures/positioning-exemplar-corpus.json` — co-annotated Positioning sessions (Slice + Levels-Only Record) seeded into `agent_insights` via `the-desk-mcp --seed-positioning-corpus` so `recall_agent_insights` / `get_memory_brief` can surface them (SIL-P-VS-c). Methodology: [`docs/research/odte-mm-level-map-from-vs3d.md`](../research/odte-mm-level-map-from-vs3d.md).
 
 **Planned extension (social intelligence):** validated patterns from trusted external accounts will live primarily in SQLite (`agent_insights` categories) per [architecture.md](architecture.md#external-context-planned--idea-023--adr-020). Doctrine promotion to markdown remains deliberate. Feature track: [social-intelligence-roadmap.md](../social-intelligence-roadmap.md).

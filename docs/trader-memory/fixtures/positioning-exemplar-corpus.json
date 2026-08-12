@@ -1,0 +1,597 @@
+{
+  "corpusId": "positioning-exemplar-corpus-v0",
+  "methodologyRef": "docs/research/odte-mm-level-map-from-vs3d.md",
+  "category": "positioning_annotation",
+  "source": "positioning_corpus_seed",
+  "trustCeiling": "L3",
+  "sessions": [
+    {
+      "id": "pos-ex-2026-03-03-trend-up",
+      "tradingDay": "2026-03-03",
+      "archetype": "trend_day_up",
+      "recordKind": "slice",
+      "completeness": "slice",
+      "summary": "Your annotated sessions show a trend-day-up Positioning read: flip migrated higher through spot after the open, call wall trailed the advance, and BALANCE gave way to UPSIDE TEST by mid-morning.",
+      "tags": [
+        "positioning",
+        "slice",
+        "trend_day_up",
+        "flip_migration",
+        "balance_to_upside_test"
+      ],
+      "scope": {
+        "sessionType": "Rth",
+        "dayType": "trend",
+        "timeBucket": "rth_open"
+      },
+      "confidence": 0.85,
+      "salience": 0.9,
+      "evidence": {
+        "methodologyRef": "docs/research/odte-mm-level-map-from-vs3d.md",
+        "recordKind": "slice",
+        "completeness": "slice",
+        "capturedAt": "2026-03-03T14:05:00Z",
+        "dataTime": "2026-03-03T14:00:00Z",
+        "sliceGreek": {
+          "primary": "gamma",
+          "also": [
+            "charm"
+          ]
+        },
+        "derivedLevels": {
+          "flip": 5925.0,
+          "walls": [
+            {
+              "strike": 5950.0,
+              "role": "call_wall"
+            },
+            {
+              "strike": 5900.0,
+              "role": "put_wall"
+            }
+          ],
+          "balance": 5910.0,
+          "upsideTest": 5965.0,
+          "downsideTest": 5885.0
+        },
+        "transitions": [
+          "BALANCE_to_UPSIDE_TEST"
+        ],
+        "midDayReads": [
+          {
+            "asOf": "2026-03-03T15:45:00Z",
+            "note": "Your mid-day re-read moved flip to 5940 as spot accepted higher; morning BALANCE card superseded."
+          }
+        ]
+      }
+    },
+    {
+      "id": "pos-ex-2026-03-05-trend-down",
+      "tradingDay": "2026-03-05",
+      "archetype": "trend_day_down",
+      "recordKind": "slice",
+      "completeness": "slice",
+      "summary": "Your annotated sessions show a trend-day-down Positioning read: flip ratcheted lower with spot, put wall migrated down a strike cluster, and BALANCE transitioned to DOWNSIDE TEST without a midday rebalance.",
+      "tags": [
+        "positioning",
+        "slice",
+        "trend_day_down",
+        "wall_migration",
+        "balance_to_downside_test"
+      ],
+      "scope": {
+        "sessionType": "Rth",
+        "dayType": "trend",
+        "timeBucket": "rth_open"
+      },
+      "confidence": 0.84,
+      "salience": 0.88,
+      "evidence": {
+        "methodologyRef": "docs/research/odte-mm-level-map-from-vs3d.md",
+        "recordKind": "slice",
+        "completeness": "slice",
+        "capturedAt": "2026-03-05T14:10:00Z",
+        "dataTime": "2026-03-05T14:05:00Z",
+        "sliceGreek": {
+          "primary": "gamma",
+          "also": [
+            "vanna"
+          ]
+        },
+        "derivedLevels": {
+          "flip": 5840.0,
+          "walls": [
+            {
+              "strike": 5800.0,
+              "role": "put_wall"
+            },
+            {
+              "strike": 5880.0,
+              "role": "call_wall"
+            }
+          ],
+          "balance": 5860.0,
+          "upsideTest": 5895.0,
+          "downsideTest": 5810.0
+        },
+        "transitions": [
+          "BALANCE_to_DOWNSIDE_TEST"
+        ],
+        "midDayReads": [
+          {
+            "asOf": "2026-03-05T16:00:00Z",
+            "note": "Your methodology / annotated sessions say re-rank against the migrated flip at 5825 after the wall slide; the open put wall is no longer the live card."
+          }
+        ]
+      }
+    },
+    {
+      "id": "pos-ex-2026-03-10-spot-up-vol-up",
+      "tradingDay": "2026-03-10",
+      "archetype": "spot_up_vol_up",
+      "recordKind": "slice",
+      "completeness": "slice",
+      "summary": "Your annotated sessions show spot-up/vol-up Positioning context: TEST levels expanded with vol, upside wall held then rolled higher, and charm had not yet compressed the afternoon card.",
+      "tags": [
+        "positioning",
+        "slice",
+        "spot_up_vol_up",
+        "wall_migration"
+      ],
+      "scope": {
+        "sessionType": "Rth",
+        "dayType": "volatile",
+        "timeBucket": "rth_midday"
+      },
+      "confidence": 0.8,
+      "salience": 0.86,
+      "evidence": {
+        "methodologyRef": "docs/research/odte-mm-level-map-from-vs3d.md",
+        "recordKind": "slice",
+        "completeness": "slice",
+        "capturedAt": "2026-03-10T15:00:00Z",
+        "dataTime": "2026-03-10T14:55:00Z",
+        "sliceGreek": {
+          "primary": "gamma",
+          "also": [
+            "vanna",
+            "charm"
+          ]
+        },
+        "derivedLevels": {
+          "flip": 5970.0,
+          "walls": [
+            {
+              "strike": 6000.0,
+              "role": "call_wall"
+            },
+            {
+              "strike": 5940.0,
+              "role": "put_wall"
+            }
+          ],
+          "balance": 5960.0,
+          "upsideTest": 6015.0,
+          "downsideTest": 5925.0
+        },
+        "transitions": [
+          "BALANCE_to_UPSIDE_TEST"
+        ],
+        "midDayReads": [
+          {
+            "asOf": "2026-03-10T17:30:00Z",
+            "note": "Vol expansion widened UPSIDE TEST versus the morning card; your playbook context stays tied to the expanded TEST, not the open print."
+          }
+        ]
+      }
+    },
+    {
+      "id": "pos-ex-2026-03-12-spot-down-vol-up",
+      "tradingDay": "2026-03-12",
+      "archetype": "spot_down_vol_up",
+      "recordKind": "slice",
+      "completeness": "slice",
+      "summary": "Your annotated sessions show spot-down/vol-up Positioning context: downside TEST expanded as vol rose, flip migrated lower, and the morning BALANCE map was superseded after the first cascade.",
+      "tags": [
+        "positioning",
+        "slice",
+        "spot_down_vol_up",
+        "flip_migration"
+      ],
+      "scope": {
+        "sessionType": "Rth",
+        "dayType": "volatile",
+        "timeBucket": "rth_open"
+      },
+      "confidence": 0.82,
+      "salience": 0.87,
+      "evidence": {
+        "methodologyRef": "docs/research/odte-mm-level-map-from-vs3d.md",
+        "recordKind": "slice",
+        "completeness": "slice",
+        "capturedAt": "2026-03-12T13:50:00Z",
+        "dataTime": "2026-03-12T13:45:00Z",
+        "sliceGreek": {
+          "primary": "gamma",
+          "also": [
+            "vanna"
+          ]
+        },
+        "derivedLevels": {
+          "flip": 5785.0,
+          "walls": [
+            {
+              "strike": 5750.0,
+              "role": "put_wall"
+            },
+            {
+              "strike": 5820.0,
+              "role": "call_wall"
+            }
+          ],
+          "balance": 5805.0,
+          "upsideTest": 5840.0,
+          "downsideTest": 5735.0
+        },
+        "transitions": [
+          "BALANCE_to_DOWNSIDE_TEST"
+        ],
+        "midDayReads": [
+          {
+            "asOf": "2026-03-12T15:20:00Z",
+            "note": "Your annotated re-read marked DOWNSIDE TEST expansion with vol; morning walls alone were insufficient context."
+          }
+        ]
+      }
+    },
+    {
+      "id": "pos-ex-2026-03-17-balance-to-upside-test",
+      "tradingDay": "2026-03-17",
+      "archetype": "balance_to_upside_test",
+      "recordKind": "slice",
+      "completeness": "slice",
+      "summary": "Your methodology highlights a clean BALANCE \u2192 UPSIDE TEST transition: two-sided hedging held into late morning, then spot accepted through the upside wall and the next Slice promoted UPSIDE TEST as the active probe.",
+      "tags": [
+        "positioning",
+        "slice",
+        "balance_to_upside_test"
+      ],
+      "scope": {
+        "sessionType": "Rth",
+        "dayType": "normal",
+        "timeBucket": "rth_midday"
+      },
+      "confidence": 0.86,
+      "salience": 0.91,
+      "evidence": {
+        "methodologyRef": "docs/research/odte-mm-level-map-from-vs3d.md",
+        "recordKind": "slice",
+        "completeness": "slice",
+        "capturedAt": "2026-03-17T14:00:00Z",
+        "dataTime": "2026-03-17T13:55:00Z",
+        "sliceGreek": {
+          "primary": "gamma"
+        },
+        "derivedLevels": {
+          "flip": 5900.0,
+          "walls": [
+            {
+              "strike": 5925.0,
+              "role": "call_wall"
+            },
+            {
+              "strike": 5875.0,
+              "role": "put_wall"
+            }
+          ],
+          "balance": 5895.0,
+          "upsideTest": 5940.0,
+          "downsideTest": 5860.0
+        },
+        "transitions": [
+          "BALANCE_to_UPSIDE_TEST"
+        ],
+        "midDayReads": [
+          {
+            "asOf": "2026-03-17T15:10:00Z",
+            "note": "Pre-transition BALANCE card superseded after acceptance above 5925; your methodology / annotated sessions say the UPSIDE TEST card is the active Positioning context."
+          }
+        ]
+      }
+    },
+    {
+      "id": "pos-ex-2026-03-19-balance-to-downside-test",
+      "tradingDay": "2026-03-19",
+      "archetype": "balance_to_downside_test",
+      "recordKind": "slice",
+      "completeness": "slice",
+      "summary": "Your annotated sessions show BALANCE \u2192 DOWNSIDE TEST: midday acceptance below the put wall flipped the active probe lower while flip migrated with spot.",
+      "tags": [
+        "positioning",
+        "slice",
+        "balance_to_downside_test",
+        "flip_migration"
+      ],
+      "scope": {
+        "sessionType": "Rth",
+        "dayType": "normal",
+        "timeBucket": "rth_midday"
+      },
+      "confidence": 0.85,
+      "salience": 0.9,
+      "evidence": {
+        "methodologyRef": "docs/research/odte-mm-level-map-from-vs3d.md",
+        "recordKind": "slice",
+        "completeness": "slice",
+        "capturedAt": "2026-03-19T14:20:00Z",
+        "dataTime": "2026-03-19T14:15:00Z",
+        "sliceGreek": {
+          "primary": "gamma",
+          "also": [
+            "charm"
+          ]
+        },
+        "derivedLevels": {
+          "flip": 5865.0,
+          "walls": [
+            {
+              "strike": 5850.0,
+              "role": "put_wall"
+            },
+            {
+              "strike": 5900.0,
+              "role": "call_wall"
+            }
+          ],
+          "balance": 5880.0,
+          "upsideTest": 5915.0,
+          "downsideTest": 5825.0
+        },
+        "transitions": [
+          "BALANCE_to_DOWNSIDE_TEST"
+        ],
+        "midDayReads": [
+          {
+            "asOf": "2026-03-19T16:05:00Z",
+            "note": "Failed bounce at the old BALANCE midline confirmed the transition in your annotation habit."
+          }
+        ]
+      }
+    },
+    {
+      "id": "pos-ex-2026-03-20-charm-drift",
+      "tradingDay": "2026-03-20",
+      "archetype": "charm_drift_into_expiry",
+      "recordKind": "slice",
+      "completeness": "slice",
+      "summary": "Your methodology says charm drift into expiration pulled TEST and flip inward versus the morning Slice; the final-hour annotation noted pin risk near the sticky flip without treating it as a signal.",
+      "tags": [
+        "positioning",
+        "slice",
+        "charm_drift_into_expiry"
+      ],
+      "scope": {
+        "sessionType": "Rth",
+        "dayType": "normal",
+        "timeBucket": "rth_afternoon"
+      },
+      "confidence": 0.83,
+      "salience": 0.92,
+      "evidence": {
+        "methodologyRef": "docs/research/odte-mm-level-map-from-vs3d.md",
+        "recordKind": "slice",
+        "completeness": "slice",
+        "capturedAt": "2026-03-20T18:05:00Z",
+        "dataTime": "2026-03-20T18:00:00Z",
+        "sliceGreek": {
+          "primary": "charm",
+          "also": [
+            "gamma"
+          ]
+        },
+        "derivedLevels": {
+          "flip": 5910.0,
+          "walls": [
+            {
+              "strike": 5925.0,
+              "role": "call_wall"
+            },
+            {
+              "strike": 5900.0,
+              "role": "put_wall"
+            }
+          ],
+          "balance": 5910.0,
+          "upsideTest": 5935.0,
+          "downsideTest": 5885.0
+        },
+        "transitions": [
+          "TEST_inward_charm_drift"
+        ],
+        "midDayReads": [
+          {
+            "asOf": "2026-03-20T18:30:00Z",
+            "note": "Afternoon Slice compressed UPSIDE/DOWNSIDE TEST toward spot; your same-day habit superseded the wider morning card."
+          },
+          {
+            "asOf": "2026-03-20T19:45:00Z",
+            "note": "Final-hour note: pin-risk context near flip \u2014 coaching stays L3 and playbook-tied."
+          }
+        ]
+      }
+    },
+    {
+      "id": "pos-ex-2026-03-24-wall-migration",
+      "tradingDay": "2026-03-24",
+      "archetype": "wall_migration",
+      "recordKind": "slice",
+      "completeness": "slice",
+      "summary": "Your annotated sessions show wall migration without a full trend day: the call wall relocated a full strike cluster by early afternoon while BALANCE roughly held until a late UPSIDE TEST probe.",
+      "tags": [
+        "positioning",
+        "slice",
+        "wall_migration",
+        "range_balance"
+      ],
+      "scope": {
+        "sessionType": "Rth",
+        "dayType": "normal",
+        "timeBucket": "rth_midday"
+      },
+      "confidence": 0.78,
+      "salience": 0.84,
+      "evidence": {
+        "methodologyRef": "docs/research/odte-mm-level-map-from-vs3d.md",
+        "recordKind": "slice",
+        "completeness": "slice",
+        "capturedAt": "2026-03-24T14:15:00Z",
+        "dataTime": "2026-03-24T14:10:00Z",
+        "sliceGreek": {
+          "primary": "gamma"
+        },
+        "derivedLevels": {
+          "flip": 5888.0,
+          "walls": [
+            {
+              "strike": 5920.0,
+              "role": "call_wall"
+            },
+            {
+              "strike": 5860.0,
+              "role": "put_wall"
+            }
+          ],
+          "balance": 5885.0,
+          "upsideTest": 5935.0,
+          "downsideTest": 5845.0
+        },
+        "transitions": [
+          "wall_migration",
+          "BALANCE_to_UPSIDE_TEST"
+        ],
+        "midDayReads": [
+          {
+            "asOf": "2026-03-24T17:00:00Z",
+            "note": "Call wall re-marked from 5900 to 5920; your methodology says do not coach off the vacated morning wall."
+          }
+        ]
+      }
+    },
+    {
+      "id": "pos-ex-2026-02-18-levels-only-backlog",
+      "tradingDay": "2026-02-18",
+      "archetype": "levels_only_backlog",
+      "recordKind": "levels_only",
+      "completeness": "levels_only",
+      "summary": "Your annotated backlog day entered as a Levels-Only Record (no Slice scrape): flip, walls, and BALANCE/TEST levels are first-class Positioning context from your hand map.",
+      "tags": [
+        "positioning",
+        "levels_only",
+        "levels_only_backlog",
+        "range_balance"
+      ],
+      "scope": {
+        "sessionType": "Rth",
+        "dayType": "normal",
+        "timeBucket": "rth_open"
+      },
+      "confidence": 0.75,
+      "salience": 0.88,
+      "evidence": {
+        "methodologyRef": "docs/research/odte-mm-level-map-from-vs3d.md",
+        "recordKind": "levels_only",
+        "completeness": "levels_only",
+        "capturedAt": "2026-02-18T21:00:00Z",
+        "dataTime": null,
+        "provenance": {
+          "source": "manual_levels_only",
+          "firstClass": true,
+          "note": "Historical backlog \u2014 ADR-025 Levels-Only Record; no vendor scrape required."
+        },
+        "derivedLevels": {
+          "flip": 5750.0,
+          "walls": [
+            {
+              "strike": 5800.0,
+              "role": "call_wall"
+            },
+            {
+              "strike": 5700.0,
+              "role": "put_wall"
+            }
+          ],
+          "balance": 5745.0,
+          "upsideTest": 5825.0,
+          "downsideTest": 5680.0
+        },
+        "transitions": [],
+        "midDayReads": [
+          {
+            "asOf": "2026-02-18T16:30:00Z",
+            "note": "Same-day habit still applies: mid-day re-mark of flip/walls even when only a Levels-Only Record exists."
+          }
+        ]
+      }
+    },
+    {
+      "id": "pos-ex-2026-02-26-levels-only-trend",
+      "tradingDay": "2026-02-26",
+      "archetype": "levels_only_backlog",
+      "recordKind": "levels_only",
+      "completeness": "levels_only",
+      "summary": "Your Levels-Only Record for a historical trend day captures flip/wall migration from hand annotations: BALANCE \u2192 DOWNSIDE TEST without a Slice, remaining first-class Positioning for recall.",
+      "tags": [
+        "positioning",
+        "levels_only",
+        "levels_only_backlog",
+        "trend_day_down",
+        "balance_to_downside_test"
+      ],
+      "scope": {
+        "sessionType": "Rth",
+        "dayType": "trend",
+        "timeBucket": "rth_midday"
+      },
+      "confidence": 0.77,
+      "salience": 0.89,
+      "evidence": {
+        "methodologyRef": "docs/research/odte-mm-level-map-from-vs3d.md",
+        "recordKind": "levels_only",
+        "completeness": "levels_only",
+        "capturedAt": "2026-02-26T22:00:00Z",
+        "dataTime": null,
+        "provenance": {
+          "source": "manual_levels_only",
+          "firstClass": true,
+          "note": "Backlog trend day as Levels-Only Record \u2014 equivalent envelope shape to slice-backed derived levels."
+        },
+        "derivedLevels": {
+          "flip": 5680.0,
+          "walls": [
+            {
+              "strike": 5650.0,
+              "role": "put_wall"
+            },
+            {
+              "strike": 5725.0,
+              "role": "call_wall"
+            }
+          ],
+          "balance": 5705.0,
+          "upsideTest": 5740.0,
+          "downsideTest": 5625.0
+        },
+        "transitions": [
+          "BALANCE_to_DOWNSIDE_TEST",
+          "flip_migration"
+        ],
+        "midDayReads": [
+          {
+            "asOf": "2026-02-26T15:40:00Z",
+            "note": "Hand re-mark moved flip from 5710 to 5680; your annotated sessions treat this as the live card for the afternoon."
+          }
+        ]
+      }
+    }
+  ]
+}

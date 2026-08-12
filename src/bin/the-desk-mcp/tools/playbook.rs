@@ -6,6 +6,7 @@ use rmcp::{
 use std::sync::atomic::Ordering;
 use the_desk_backend::db::{AttentionChangelogQuery, AttentionSignalQuery, TradeIdeaQuery};
 use the_desk_backend::observability::RuntimeEventLevel;
+use the_desk_backend::pipelines::MarketState;
 
 #[allow(unused_imports)]
 use crate::{helpers::*, lifecycle::*, params::*, state::*};
@@ -41,9 +42,27 @@ impl TheDeskMcp {
             (fallback_price - 0.25, fallback_price + 0.25)
         };
 
+        // External engine mode: evaluate against the lock-free published MarketState
+        // so your playbook path stays behavior-parity without a local ingest loop.
+        let published_market = self.engine_published.as_ref().and_then(|store| {
+            let published = store.load();
+            if published.degraded || published.market_state.is_null() {
+                None
+            } else {
+                serde_json::from_value::<MarketState>(published.market_state.clone()).ok()
+            }
+        });
+
         let mut setup_statuses: Vec<serde_json::Value> = Vec::new();
-        if let (Ok(pipelines), Ok(rules)) = (self.pipelines.try_lock(), self.rules.lock()) {
-            let market = pipelines.snapshot(bid, ask);
+        let market = if let Some(m) = published_market {
+            Some(m)
+        } else if let Ok(pipelines) = self.pipelines.try_lock() {
+            Some(pipelines.snapshot(bid, ask))
+        } else {
+            None
+        };
+
+        if let (Some(market), Ok(rules)) = (market, self.rules.lock()) {
             let mut preview_rules = rules.clone();
             for setup in setups.iter() {
                 let outcome = preview_rules.evaluate_detailed(setup, &market, risk_at_limit);

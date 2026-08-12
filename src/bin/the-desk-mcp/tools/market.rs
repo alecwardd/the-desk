@@ -12,10 +12,13 @@ use crate::{helpers::*, lifecycle::*, params::*, state::*};
 #[tool_router(router = market_router, vis = "pub(crate)")]
 impl TheDeskMcp {
     #[tool(
-        description = "Current market snapshot: last price, VWAP with 1/2/3 SD bands, TPO value area (high/low/POC), delta neutral value area (DNVA high/low/DNP), session delta, cumulative delta, key levels (prior day H/L/C, prior VA/POC, overnight range, OR, IB), Globex/London opening ranges, and session context (sessionType, sessionSegment, tradingDay), plus tape pace, imbalance count, absorption event count, and average trade size. Prefers live pipeline state; falls back to last persisted snapshot."
+        description = "Current market snapshot: last price, VWAP with 1/2/3 SD bands, TPO value area (high/low/POC), delta neutral value area (DNVA high/low/DNP), session delta, cumulative delta, key levels (prior day H/L/C, prior VA/POC, overnight range, OR, IB), Globex/London opening ranges, and session context (sessionType, sessionSegment, tradingDay), plus tape pace, imbalance count, absorption event count, and average trade size. Prefers live pipeline state; falls back to last persisted snapshot. When [sil].catalog_discovery is on, responses include deprecated:true and suggestedReplacementOperator=get_state."
     )]
     pub(crate) async fn get_market_snapshot(&self) -> Result<CallToolResult, McpError> {
         if let Some(out) = self.current_market_snapshot_payload() {
+            if self.sil_config.catalog_discovery {
+                return Ok(text_result_with_orientation_shim(out, "get_state"));
+            }
             return Ok(text_result(out));
         }
         Ok(no_data(
@@ -150,7 +153,7 @@ impl TheDeskMcp {
     }
 
     #[tool(
-        description = "Current session context: sessionType (RTH/Globex/Unknown), sessionSegment (Asia/London/None), tradingDay (6 PM ET roll), data freshness, and contract rollover status."
+        description = "Current session context: sessionType (RTH/Globex/Unknown), sessionSegment (Asia/London/None), tradingDay (6 PM ET roll), data freshness, and contract rollover status. When [sil].catalog_discovery is on, responses include deprecated:true and suggestedReplacementOperator=get_state."
     )]
     pub(crate) async fn get_session_context(&self) -> Result<CallToolResult, McpError> {
         if let Some(r) = self.resolve_live_market_view() {
@@ -207,6 +210,9 @@ impl TheDeskMcp {
             out["rolloverStatus"] =
                 serde_json::to_value(rollover_status).unwrap_or_else(|_| serde_json::json!({}));
             merge_tool_live_metadata(&mut out, &r);
+            if self.sil_config.catalog_discovery {
+                return Ok(text_result_with_orientation_shim(out, "get_state"));
+            }
             return Ok(text_result(out));
         }
         Ok(no_data("No session context available"))

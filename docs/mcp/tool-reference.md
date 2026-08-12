@@ -66,7 +66,7 @@ Key reference levels: prior day high/low/close, prior session value area high/lo
 
 ### `get_market_snapshot`
 
-Current market snapshot: last price, VWAP with 1/2/3 SD bands, TPO value area (high/low/POC), delta neutral value area (DNVA high/low/DNP), session delta, cumulative delta, key levels (prior day H/L/C, prior VA/POC, overnight range, OR, IB), Globex/London opening ranges, and session context (sessionType, sessionSegment, tradingDay), plus tape pace, imbalance count, absorption event count, and average trade size. Prefers live pipeline state; falls back to last persisted snapshot.
+Current market snapshot: last price, VWAP with 1/2/3 SD bands, TPO value area (high/low/POC), delta neutral value area (DNVA high/low/DNP), session delta, cumulative delta, key levels (prior day H/L/C, prior VA/POC, overnight range, OR, IB), Globex/London opening ranges, and session context (sessionType, sessionSegment, tradingDay), plus tape pace, imbalance count, absorption event count, and average trade size. Prefers live pipeline state; falls back to last persisted snapshot. When [sil].catalog_discovery is on, responses include deprecated:true and suggestedReplacementOperator=get_state.
 
 ### `get_or5_status`
 
@@ -90,7 +90,7 @@ Relative Volume: ratio of current session's cumulative volume vs the N-day avera
 
 ### `get_session_context`
 
-Current session context: sessionType (RTH/Globex/Unknown), sessionSegment (Asia/London/None), tradingDay (6 PM ET roll), data freshness, and contract rollover status.
+Current session context: sessionType (RTH/Globex/Unknown), sessionSegment (Asia/London/None), tradingDay (6 PM ET roll), data freshness, and contract rollover status. When [sil].catalog_discovery is on, responses include deprecated:true and suggestedReplacementOperator=get_state.
 
 ### `get_session_inventory`
 

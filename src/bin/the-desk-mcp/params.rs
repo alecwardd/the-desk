@@ -28,6 +28,36 @@ pub(crate) struct SearchCatalogParams {
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct GetStateParams {
+    /// Optional symbol roots (e.g. `["NQ"]`). Multi-symbol MarketRouter is later work.
+    pub(crate) symbols: Option<Vec<String>>,
+    /// Optional catalog domain ids (e.g. `location_structure`, `flow`, `positioning`).
+    pub(crate) domains: Option<Vec<String>>,
+    /// Optional catalog field ids or camelCase names to include.
+    pub(crate) fields: Option<Vec<String>>,
+    /// Resolution band: `R0` (orientation) or `R1` (state). R2/R3 rejected.
+    pub(crate) resolution: Option<String>,
+    /// Optional as-of timestamp (epoch ms). Served from persisted snapshots until Journal Frames land.
+    pub(crate) as_of: Option<f64>,
+    /// Soft token budget; envelope may truncate values and set `truncated: true`.
+    pub(crate) budget_tokens: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct GetEventsParams {
+    /// Optional symbol roots (informational until MarketRouter multi-symbol lands).
+    pub(crate) symbols: Option<Vec<String>>,
+    /// Optional event type filter (exact match).
+    pub(crate) event_type: Option<String>,
+    /// Optional lower bound timestamp (epoch ms).
+    pub(crate) since_ms: Option<f64>,
+    /// Maximum events to return (default 50, max 500).
+    pub(crate) limit: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct OptionsSnapshotParams {
     /// Optional root symbol. Defaults to [options].convexvalue_probe_root.
     pub(crate) root: Option<String>,

@@ -5,12 +5,13 @@ use serde::{Deserialize, Serialize};
 
 /// SIL (Sierra Intelligence Layer) configuration.
 ///
-/// Default-off: when `catalog_discovery` is false, discovery tools are omitted
-/// from the MCP router and today's 121-tool surface is unchanged.
+/// Default-off: when `catalog_discovery` is false, discovery / read-kernel tools
+/// are omitted from the MCP router and today's 121-tool surface is unchanged.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct SilConfig {
-    /// When true, register `describe_environment`, `describe_domain`, and
-    /// `search_catalog` on the MCP tool router.
+    /// When true, register catalog discovery + read-kernel operators
+    /// (`describe_environment`, `describe_domain`, `search_catalog`,
+    /// `get_state`, `get_events`) on the MCP tool router.
     #[serde(default)]
     pub catalog_discovery: bool,
 }

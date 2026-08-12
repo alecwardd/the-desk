@@ -157,6 +157,41 @@ pub(crate) fn no_data(msg: &str) -> CallToolResult {
     CallToolResult::success(vec![Content::text(msg.to_string())])
 }
 
+/// Attach orientation-shim deprecation fields when SIL catalog discovery is on.
+///
+/// When the flag is off, responses must match pre-M1b behavior exactly — call
+/// sites must gate on `sil_config.catalog_discovery` before invoking this.
+pub(crate) fn attach_orientation_shim(
+    mut json: serde_json::Value,
+    suggested_replacement_operator: &str,
+) -> serde_json::Value {
+    if let Some(obj) = json.as_object_mut() {
+        obj.insert("deprecated".into(), serde_json::json!(true));
+        obj.insert(
+            "suggestedReplacementOperator".into(),
+            serde_json::json!(suggested_replacement_operator),
+        );
+        obj.insert(
+            "shimNote".into(),
+            serde_json::json!(
+                "Orientation specialty getters shim to the SIL read kernel. Prefer get_state (R0/R1) for market orientation; opinionated bundles (get_context_frame, get_attention_inbox, evaluate_playbook) remain available. Your playbook / your rules say what to do with the data — this tool does not."
+            ),
+        );
+    }
+    json
+}
+
+/// Wrap a successful specialty-tool result with orientation shim markers.
+pub(crate) fn text_result_with_orientation_shim(
+    json: serde_json::Value,
+    suggested_replacement_operator: &str,
+) -> CallToolResult {
+    text_result(attach_orientation_shim(
+        json,
+        suggested_replacement_operator,
+    ))
+}
+
 pub(crate) fn record_runtime_event(
     runtime_events: &Arc<RuntimeEventStore>,
     db: Option<&Arc<Mutex<Database>>>,

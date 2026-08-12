@@ -69,17 +69,18 @@ guarantees the two lists can never diverge.
 
 ## How to Add a Tool
 
-> **SIL-M0 / Catalog v0:** **no new specialty market tools** without a Desk
+> **SIL-M0 / Catalog v0 / M1b:** **no new specialty market tools** without a Desk
 > Catalog entry. Specialty market tools are the `market` domain router
 > (`tools/market.rs`). The rule is **no catalog entry → no new market tool**
 > (allowlist in `docs/mcp/desk-catalog-v0.json`). Workflow domains (playbook /
-> risk / journal / memory / research / admin) and SIL discovery operators
-> (`describe_*` / `search_catalog`, behind `[sil].catalog_discovery`) are not
-> specialty market tools; do not delete existing tools in the name of this policy.
+> risk / journal / memory / research / admin) and SIL kernel operators
+> (`describe_*` / `search_catalog` / `get_state` / `get_events`, behind
+> `[sil].catalog_discovery`) are not specialty market tools; do not delete
+> existing tools in the name of this policy.
 
 1. Pick the domain module under `tools/` (or create a new one — add it to
    `tools/mod.rs`, `service.rs`'s combiner, and `docs.rs`'s `tool_domains()`).
-   Exception: SIL discovery operators live in `tools/discovery.rs` and are
+   Exception: SIL kernel operators live in `tools/discovery.rs` and are
    wired only via `tool_router_with_sil` when `[sil].catalog_discovery` is on —
    they stay out of the default `tool_domains()` registry so the 121-tool
    surface remains unchanged when the flag is off.
@@ -120,9 +121,11 @@ Slice / Levels-Only Record; no live provider).
 - Artifacts: [desk-catalog-v0.json](desk-catalog-v0.json),
   [desk-catalog-v0.md](desk-catalog-v0.md)
 - Regenerate: `cargo run --bin the-desk-mcp -- --write-catalog-docs`
-- Discovery operators (metadata only): `describe_environment`, `describe_domain`,
-  `search_catalog` — registered only when `[sil].catalog_discovery = true` in
+- Discovery / read-kernel operators: `describe_environment`, `describe_domain`,
+  `search_catalog`, `get_state` (StateEnvelope, R0|R1), `get_events` (identity
+  rows) — registered only when `[sil].catalog_discovery = true` in
   `~/.the-desk/config.toml`. Default off → 121-tool surface unchanged.
+  Trust Level L0 (no mutation / order authority). See [CONTEXT.md](../../CONTEXT.md).
 
 ## SIL-M0 tool-call telemetry
 
@@ -142,6 +145,19 @@ churn; re-bless only with an intentional
 `cargo run --bin the-desk-mcp -- --write-sil-m0-baseline` when the orientation-chain
 contract itself changes. Live counters accumulate in-process and periodically
 flush to `~/.the-desk/telemetry/tool-call-snapshot.json`.
+
+## SIL-M1b read kernel + orientation shims
+
+With `[sil].catalog_discovery = true`:
+
+- `get_state` returns a StateEnvelope (`values`, per-domain `provenance`,
+  per-domain `degraded`, `catalogVersion`). Missing provenance is a failure;
+  degraded domains set their flag and stay visible.
+- `get_events` returns identity rows for later lifecycle formalization.
+- `get_session_context` / `get_market_snapshot` still answer and include
+  `deprecated: true` + `suggestedReplacementOperator: "get_state"`.
+- Opinionated bundles remain: `get_context_frame`, `get_attention_inbox`,
+  `evaluate_playbook`.
 
 ## Runtime Model
 

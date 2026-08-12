@@ -114,6 +114,30 @@ fn test_server() -> TheDeskMcp {
     server
 }
 
+fn test_server_with_sil() -> TheDeskMcp {
+    let db = Database::open(":memory:").expect("db");
+    let logging_config = the_desk_backend::observability::LoggingConfig {
+        destination: "none".to_string(),
+        runtime_event_suppression_window_ms: 0,
+        ..the_desk_backend::observability::LoggingConfig::default()
+    };
+    let server = TheDeskMcp::with_runtime_events_and_sil(
+        db,
+        PipelineEngine::new(),
+        ":memory:".into(),
+        std::sync::Arc::new(the_desk_backend::observability::RuntimeEventStore::new(
+            &logging_config,
+        )),
+        the_desk_backend::catalog::SilConfig {
+            catalog_discovery: true,
+        },
+    );
+    server
+        .hydrate_playbook_runtime_cache()
+        .expect("hydrate playbook cache");
+    server
+}
+
 fn test_contract_metadata() -> the_desk_backend::feed::ContractMetadata {
     the_desk_backend::feed::ContractMetadata {
         root_symbol: "NQ".to_string(),
@@ -876,9 +900,9 @@ fn discovery_tools_absent_from_default_router() {
         .into_iter()
         .map(|t| t.name.to_string())
         .collect();
-    for tool in ["describe_environment", "describe_domain", "search_catalog"] {
+    for tool in the_desk_backend::catalog::KERNEL_READ_QUERY_TOOLS {
         assert!(
-            !names.contains(tool),
+            !names.contains(*tool),
             "{tool} must be omitted from the default router when SIL discovery is off"
         );
     }
@@ -895,13 +919,48 @@ fn discovery_tools_present_when_sil_flag_on() {
         .into_iter()
         .map(|t| t.name.to_string())
         .collect();
-    for tool in ["describe_environment", "describe_domain", "search_catalog"] {
+    for tool in the_desk_backend::catalog::KERNEL_READ_QUERY_TOOLS {
         assert!(
-            names.contains(tool),
+            names.contains(*tool),
             "{tool} must appear when [sil].catalog_discovery = true"
         );
     }
-    assert_eq!(names.len(), 124);
+    assert_eq!(names.len(), 126);
+}
+
+#[test]
+fn kernel_read_query_tools_are_trust_level_l0_without_mutation_authority() {
+    let caps = the_desk_backend::catalog::kernel_read_query_capabilities();
+    for tool in the_desk_backend::catalog::KERNEL_READ_QUERY_TOOLS {
+        let cap = caps.get(tool).unwrap_or_else(|| panic!("missing cap for {tool}"));
+        assert_eq!(
+            cap.trust_level,
+            the_desk_backend::catalog::TrustLevel::L0,
+            "{tool} must be Trust Level L0"
+        );
+        assert!(
+            !cap.mutation_authority,
+            "{tool} must not carry mutation authority"
+        );
+        assert!(!cap.order_authority, "{tool} must not carry order authority");
+        assert!(
+            !the_desk_backend::catalog::tool_name_implies_mutation(tool),
+            "{tool} must not match mutation-verb naming"
+        );
+    }
+    // Router surface: every kernel tool present under SIL must remain non-mutating.
+    let sil = the_desk_backend::catalog::SilConfig {
+        catalog_discovery: true,
+    };
+    let names: Vec<String> = TheDeskMcp::tool_router_with_sil(&sil)
+        .list_all()
+        .into_iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    for tool in the_desk_backend::catalog::KERNEL_READ_QUERY_TOOLS {
+        assert!(names.iter().any(|n| n == tool));
+        assert!(!the_desk_backend::catalog::tool_name_implies_mutation(tool));
+    }
 }
 
 #[test]
@@ -931,7 +990,7 @@ fn desk_catalog_docs_are_current() {
 
 #[tokio::test]
 async fn discovery_tools_return_metadata_only() {
-    let server = test_server();
+    let server = test_server_with_sil();
     let env = parse_text_tool_result(
         server
             .describe_environment()
@@ -942,6 +1001,8 @@ async fn discovery_tools_return_metadata_only() {
     assert!(env.get("catalogVersion").is_some());
     assert!(env.get("lastPrice").is_none());
     assert!(env.get("vwap").is_none());
+    assert_eq!(env["trustLevel"], "L0");
+    assert_eq!(env["mutationAuthority"], false);
 
     let domain = parse_text_tool_result(
         server
@@ -975,6 +1036,196 @@ async fn discovery_tools_return_metadata_only() {
     );
     assert_eq!(hits["metadataOnly"], true);
     assert!(hits["hitCount"].as_u64().unwrap_or(0) >= 1);
+}
+
+#[tokio::test]
+async fn get_state_returns_provenance_and_degraded_flags() {
+    let server = test_server_with_sil();
+    let out = parse_text_tool_result(
+        server
+            .get_state(Parameters(GetStateParams {
+                symbols: Some(vec!["NQ".into()]),
+                domains: Some(vec![
+                    "location_structure".into(),
+                    "positioning".into(),
+                    "identity".into(),
+                ]),
+                fields: None,
+                resolution: Some("R1".into()),
+                as_of: None,
+                budget_tokens: None,
+            }))
+            .await
+            .expect("get_state"),
+    );
+    assert_eq!(out["trustLevel"], "L0");
+    assert_eq!(out["mutationAuthority"], false);
+    assert_eq!(out["orderAuthority"], false);
+    assert_eq!(out["resolution"], "R1");
+    let provenance = out["provenance"].as_object().expect("provenance");
+    let degraded = out["degraded"].as_object().expect("degraded");
+    for domain in ["location_structure", "positioning", "identity"] {
+        assert!(
+            provenance.contains_key(domain),
+            "missing provenance for {domain}"
+        );
+        assert!(degraded.contains_key(domain), "missing degraded for {domain}");
+    }
+    // Positioning stub always degraded + present (never silently omitted).
+    assert_eq!(degraded["positioning"], true);
+    assert_eq!(provenance["positioning"]["source"], "provider");
+    // No live snapshot in empty test server → market domains degraded, not a hard fail.
+    assert_eq!(degraded["location_structure"], true);
+    assert_eq!(degraded["identity"], true);
+}
+
+#[tokio::test]
+async fn get_state_rejects_r2_r3() {
+    let server = test_server_with_sil();
+    let err = server
+        .get_state(Parameters(GetStateParams {
+            resolution: Some("R2".into()),
+            ..Default::default()
+        }))
+        .await
+        .expect_err("R2 must fail");
+    assert!(err.to_string().contains("R0") || err.to_string().contains("R2"));
+}
+
+#[tokio::test]
+async fn get_events_returns_identity_rows() {
+    let server = test_server_with_sil();
+    {
+        let db = server.db.lock().expect("db");
+        db.insert_market_events_batch(&[MarketEvent {
+            session_date: "2026-08-11".into(),
+            timestamp_ms: 1_700_000_000_000.0,
+            event_type: "ib_extension_hit".into(),
+            level_name: Some("ib_high".into()),
+            price: 21000.0,
+            direction: Some("from_below".into()),
+            sequence_num: Some(1),
+            metadata: Some(serde_json::json!({ "severity": "high" })),
+            session_type: "RTH".into(),
+            session_segment: "None".into(),
+            trading_day: "2026-08-11".into(),
+        }])
+        .expect("insert event");
+    }
+    let out = parse_text_tool_result(
+        server
+            .get_events(Parameters(GetEventsParams {
+                symbols: None,
+                event_type: Some("ib_extension_hit".into()),
+                since_ms: None,
+                limit: Some(10),
+            }))
+            .await
+            .expect("get_events"),
+    );
+    assert_eq!(out["trustLevel"], "L0");
+    assert_eq!(out["lifecycleFormalized"], false);
+    assert_eq!(out["count"], 1);
+    let evt = &out["events"][0];
+    assert_eq!(evt["eventType"], "ib_extension_hit");
+    assert_eq!(evt["timestampMs"], 1_700_000_000_000.0);
+    assert_eq!(evt["severity"], "high");
+    assert!(evt["identityId"].as_str().unwrap().starts_with("evt_"));
+}
+
+#[tokio::test]
+async fn orientation_specialty_getters_shim_when_sil_on() {
+    let server = test_server_with_sil();
+    *server.last_bid.lock().expect("bid") = 21000.0;
+    *server.last_ask.lock().expect("ask") = 21000.25;
+    {
+        let mut pipelines = server.pipelines.lock().expect("pipelines");
+        let ts = chrono::Utc::now().timestamp_millis() as f64;
+        pipelines.on_trade_with_timestamp(21000.0, 1.0, true, 30, ts);
+    }
+
+    let snap = parse_text_tool_result(
+        server
+            .get_market_snapshot()
+            .await
+            .expect("get_market_snapshot"),
+    );
+    assert_eq!(snap["deprecated"], true);
+    assert_eq!(snap["suggestedReplacementOperator"], "get_state");
+
+    let ctx = parse_text_tool_result(
+        server
+            .get_session_context()
+            .await
+            .expect("get_session_context"),
+    );
+    assert_eq!(ctx["deprecated"], true);
+    assert_eq!(ctx["suggestedReplacementOperator"], "get_state");
+}
+
+#[tokio::test]
+async fn orientation_shims_absent_when_sil_off() {
+    let server = test_server();
+    assert!(!server.sil_config.catalog_discovery);
+    *server.last_bid.lock().expect("bid") = 21000.0;
+    *server.last_ask.lock().expect("ask") = 21000.25;
+    {
+        let mut pipelines = server.pipelines.lock().expect("pipelines");
+        let ts = chrono::Utc::now().timestamp_millis() as f64;
+        pipelines.on_trade_with_timestamp(21000.0, 1.0, true, 30, ts);
+    }
+    let snap = parse_text_tool_result(
+        server
+            .get_market_snapshot()
+            .await
+            .expect("get_market_snapshot"),
+    );
+    assert!(snap.get("deprecated").is_none());
+    assert!(snap.get("suggestedReplacementOperator").is_none());
+}
+
+#[tokio::test]
+async fn opinionated_bundles_remain_available() {
+    let server = test_server_with_sil();
+    let names: std::collections::BTreeSet<_> = TheDeskMcp::tool_router()
+        .list_all()
+        .into_iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    for tool in [
+        "get_context_frame",
+        "get_attention_inbox",
+        "evaluate_playbook",
+    ] {
+        assert!(names.contains(tool), "{tool} must remain available");
+    }
+    let _ = server
+        .evaluate_playbook()
+        .await
+        .expect("evaluate_playbook");
+    let _ = server
+        .get_attention_inbox(Parameters(AttentionInboxParams::default()))
+        .await
+        .expect("get_attention_inbox");
+}
+
+#[test]
+fn sil_m0_baseline_untouched_by_m1b_shims() {
+    // Soft dependency: M0 baseline remains the frozen before-figure.
+    let path = crate::tool_telemetry::checked_in_baseline_path();
+    let on_disk = crate::tool_telemetry::read_snapshot_file(&path).expect("baseline");
+    assert_eq!(on_disk.tool_surface_count, 121);
+    assert_eq!(
+        on_disk.orientation_chain,
+        crate::tool_telemetry::ORIENTATION_CHAIN
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect::<Vec<_>>()
+    );
+    // Shim rollout must not re-bless this artifact.
+    let baseline_src = include_str!("../../../docs/mcp/sil-m0-tool-telemetry-baseline.json");
+    assert!(baseline_src.contains("\"toolSurfaceCount\": 121"));
+    assert!(!baseline_src.contains("get_state"));
 }
 
 #[test]

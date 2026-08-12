@@ -2,6 +2,10 @@
 name = "the-desk-backend"
 version = "0.1.0"
 edition = "2021"
+# MSRV: code uses APIs stable since 1.87 (e.g. usize::is_multiple_of). Transitive
+# deps also need >= 1.85 for edition2024 (crypto-common via sha2). Keep in sync
+# with rust-toolchain.toml (channel = "stable").
+rust-version = "1.87"
 default-run = "the-desk-mcp"
 description = "Local-first MCP intelligence backend for AI agents over deterministic market analytics"
 repository = "https://github.com/alecwardd/the-desk"

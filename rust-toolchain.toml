@@ -1,0 +1,8 @@
+# Pin the Rust toolchain for local, CI, and Cursor Cloud agents.
+# MSRV is 1.87 (see Cargo.toml rust-version): the code uses APIs stable since
+# 1.87, and a transitive dependency (crypto-common via sha2) requires
+# edition2024 (Rust >= 1.85). Channel "stable" matches CI
+# (dtolnay/rust-toolchain@stable).
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]

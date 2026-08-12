@@ -1,0 +1,3 @@
+{
+  "install": "cargo fetch\ncargo build\ncargo build --release --bin the-desk-mcp"
+}

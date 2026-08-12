@@ -102,14 +102,30 @@ async fn embedded_and_socket_paths_are_coaching_parity() {
     let serve = tokio::spawn(async move { server.serve(store_bg, rx).await });
 
     let client = EngineClient::new(bind);
+    for _ in 0..100 {
+        if client.ping().await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        client.ping().await.is_ok(),
+        "engine socket must accept connections before parity compare"
+    );
     let mut published = client.get_published().await;
-    for _ in 0..50 {
-        if !published.degraded && published.generation > 0 {
+    for _ in 0..100 {
+        if !published.degraded && published.generation > 0 && !published.market_state.is_null() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
         published = client.get_published().await;
     }
+    assert!(
+        !published.degraded && published.generation > 0,
+        "socket path must publish non-degraded coaching state before parity compare (gen={}, err={:?})",
+        published.generation,
+        client.last_error()
+    );
     let socket_fp = coaching_parity_fingerprint(&published);
     assert_eq!(embedded_fp, socket_fp);
     let _ = tx.send(true);

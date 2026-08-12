@@ -11,3 +11,38 @@ best results — see **[docs/agent-interaction-guide.md](docs/agent-interaction-
 > This file is intentionally a thin pointer so it cannot drift from the canonical
 > rules. Do not paste project rules or architecture here — edit `AGENT.md` and
 > `CLAUDE.md` instead.
+
+## Cursor Cloud specific instructions
+
+Durable, non-obvious notes for cloud agents. Standard lint/test/build/run commands
+already live in the README "Development" section — use those, don't duplicate them.
+
+- **Rust toolchain must be `stable` ≥ 1.85.** A transitive dependency
+  (`crypto-common`, via `sha2`) requires the `edition2024` feature. The VM's
+  pre-installed Rust 1.83 fails at manifest-parse time with an `edition2024 is
+  required` error. The environment is set up with the latest `stable` toolchain
+  as the `rustup` default; if you ever see that error, run
+  `rustup default stable` (matches CI's `dtolnay/rust-toolchain@stable`). No
+  `rust-toolchain.toml` is pinned in-repo.
+- **No external services.** SQLite is compiled in (`rusqlite` `bundled`, needs a C
+  compiler — `clang` is present) and auto-creates `~/.the-desk/data.db`. There is
+  no DB/broker/network daemon to start.
+- **The MCP server speaks JSON-RPC over stdio, not a TCP port.** `the-desk-mcp` is
+  normally launched by Cursor via `.cursor/mcp.json` (template:
+  `.cursor/mcp.example.json`). To exercise it manually, pipe newline-delimited
+  JSON-RPC (`initialize` → `notifications/initialized` → `tools/call`) into the
+  built binary's stdin. It exposes 121 tools.
+- **No live Sierra Chart `.scid` feed exists in cloud (it is Windows-only).** The
+  server still starts and serves every tool; it logs `scid.file_missing` and
+  live-market tools (`get_market_snapshot`, `get_session_context`) return
+  "no data". This is expected — it is not a broken environment.
+- **To validate the stack end-to-end without a feed:** seed the playbook with
+  `the-desk-mcp --seed-templates --activate` (writes 13 PTT setups to SQLite),
+  then call the `evaluate_playbook` tool — the rules engine (Layer 2) evaluates
+  the seeded setups and returns per-setup readiness. `cargo test` (494 tests,
+  incl. `tests/session_replay_golden.rs` and `tests/mcp_stdio.rs`) covers the
+  deterministic pipelines end-to-end.
+- **Config** lives at `~/.the-desk/config.toml` (not committed; see README for the
+  schema). It is optional — the server runs on defaults when it is absent.
+- **Pre-commit quality gate is opt-in:** `git config core.hooksPath .githooks`
+  runs fmt/clippy/tests + a secret/advisory-language scan (see `.githooks/pre-commit`).

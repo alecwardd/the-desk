@@ -29,8 +29,8 @@ use crate::{helpers::*, lifecycle::*, params::*, state::*};
 impl TheDeskMcp {
     /// Combined router across all always-on tool domain modules (121 tools).
     ///
-    /// Discovery operators are **not** included here so the default surface stays
-    /// unchanged when `[sil].catalog_discovery` is off. Use
+    /// Discovery / read-kernel operators are **not** included here so the default
+    /// surface stays unchanged when `[sil].catalog_discovery` is off. Use
     /// [`Self::tool_router_with_sil`] when constructing a live server.
     pub(crate) fn tool_router() -> ToolRouter<Self> {
         Self::market_router()
@@ -44,7 +44,7 @@ impl TheDeskMcp {
             + Self::admin_router()
     }
 
-    /// Combined router including discovery tools when the SIL flag is on.
+    /// Combined router including discovery + read-kernel tools when the SIL flag is on.
     pub(crate) fn tool_router_with_sil(
         sil: &the_desk_backend::catalog::SilConfig,
     ) -> ToolRouter<Self> {

@@ -5,21 +5,38 @@
 //! comments (CI fails if `///` text drifts from the catalog table). Unit,
 //! session scope, freshness, and cost hint are curated annotations beside
 //! those fields. Discovery operators serve this metadata only — never live
-//! market data. See ADR-022 (Trust Ceiling L3) and SIL SPEC M1a (#4).
+//! market data. Read-kernel operators (`get_state` / `get_events`) return
+//! provenance-carrying envelopes at Trust Level L0. See ADR-022 (Trust
+//! Ceiling L3), SIL-M1a (#4), and SIL-M1b (#5).
 
 mod config;
+mod envelope;
+mod events_kernel;
 mod market_state_fields;
 mod positioning;
 mod render;
 mod search;
+mod trust;
 mod types;
 
 pub use config::{load_sil_config, SilConfig};
+pub use envelope::{
+    build_state_envelope, state_envelope_json, DomainProvenance, EnvelopeError, ProvenanceSource,
+    StateEnvelope, StateReadRequest, StateResolution, TrustLevel,
+};
+pub use events_kernel::{
+    kernel_event_from_db_row, kernel_event_from_market_event, EventsEnvelope, KernelEvent,
+    SEVERITY_PLACEHOLDER,
+};
 pub use render::{
     catalog_json_path, catalog_markdown_path, render_catalog_json, render_catalog_markdown,
     write_catalog_docs,
 };
 pub use search::search_catalog;
+pub use trust::{
+    is_kernel_read_query_tool, kernel_read_query_capabilities, tool_name_implies_mutation,
+    ToolCapability, KERNEL_READ_QUERY_TOOLS,
+};
 pub use types::{
     CostHint, DeskCatalog, DomainDescriptor, FieldDescriptor, FieldSpec, FreshnessSemantics,
     PositioningRecordKind, SessionScope, TrustCeiling, Unit, CATALOG_VERSION,

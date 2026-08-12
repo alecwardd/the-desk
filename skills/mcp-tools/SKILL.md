@@ -31,22 +31,34 @@ Before deep historical analysis, call `get_research_summary` once — if session
 
 ### Catalog discovery (SIL — optional)
 
-When `[sil].catalog_discovery = true` in `~/.the-desk/config.toml`, three kernel
-operators appear (metadata only — never live market data):
+When `[sil].catalog_discovery = true` in `~/.the-desk/config.toml`, five kernel
+operators appear (Trust Level L0 — read/query, no mutation/order authority):
 
 1. `describe_environment` — catalogVersion, Trust Ceiling (L3), domain list, Positioning stub status.
 2. `describe_domain` — one domain's field descriptors (unit, session scope, freshness, cost hint).
 3. `search_catalog` — text search over field ids / names / descriptions.
+4. `get_state` — StateEnvelope (`values` + per-domain `provenance` + `degraded`; resolution R0|R1 only).
+5. `get_events` — event identity rows (type, time, severity placeholder, identityId); lifecycle formalization is later.
 
 Default off keeps the **121 MCP tools** surface unchanged. Artifacts:
 [docs/mcp/desk-catalog-v0.json](../../docs/mcp/desk-catalog-v0.json).
+Vocabulary: [CONTEXT.md](../../CONTEXT.md).
+
+When the flag is on, orientation specialty getters `get_session_context` and
+`get_market_snapshot` still answer but include `deprecated: true` and
+`suggestedReplacementOperator: "get_state"`. Prefer `get_state` for market
+orientation; keep opinionated bundles (`get_context_frame`,
+`get_attention_inbox`, `evaluate_playbook`).
 
 ### Session start (every conversation)
 
-1. `get_session_context` — session type/segment, trading day, freshness, rollover status. Check `rolloverStatus` before trusting any carry-forward level.
-2. `get_market_snapshot` — price, VWAP bands, VA/POC, DNVA/DNP, key levels.
+1. With SIL on: `describe_environment` then `get_state(resolution=R0)` (and risk tools).
+   With SIL off: `get_session_context` — session type/segment, trading day, freshness, rollover status. Check `rolloverStatus` before trusting any carry-forward level.
+2. With SIL off: `get_market_snapshot` — price, VWAP bands, VA/POC, DNVA/DNP, key levels.
 3. `get_risk_state` + `get_risk_config` + `get_account_state` (parallel) — hard-stop checks before any analysis.
 4. `get_pre_session_briefing` — memory brief + account + risk in one call (auto-refreshes dirty memory).
+
+Your playbook / your rules say how to act on this context — the tools report structure, they do not instruct trades.
 
 ### "What's the market doing?" / market read
 
@@ -152,11 +164,13 @@ This is the canonical "potential trade" flow — keep state in the system, not i
 
 ## Adding or Changing Tools
 
-> **SIL-M0 / Catalog v0:** **no new specialty market tools** (`tools/market.rs`)
+> **SIL-M0 / Catalog v0 / M1b:** **no new specialty market tools** (`tools/market.rs`)
 > without a Desk Catalog entry — **no catalog entry → no new market tool**.
-> Discovery operators (`describe_environment`, `describe_domain`, `search_catalog`)
-> are kernel tools behind `[sil].catalog_discovery`, not specialty market tools.
-> Do not delete existing tools under this policy.
+> Kernel operators (`describe_*`, `search_catalog`, `get_state`, `get_events`)
+> are behind `[sil].catalog_discovery`, not specialty market tools.
+> Do not delete existing tools under this policy. Do not re-bless
+> `docs/mcp/sil-m0-tool-telemetry-baseline.json` unless the orientation-chain
+> contract itself changes.
 
 When the tool surface changes, regenerate the catalog and keep guards green:
 

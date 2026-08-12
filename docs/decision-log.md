@@ -589,3 +589,21 @@ Backtest isolation:
 This note does not raise the Trust Ceiling and does not introduce Catalog v0.
 
 **Consequences:** M1b shim work can compare before/after orientation cost against the SIL-M0 baseline. Adding a market tool without Catalog v0 fails CI.
+
+---
+
+### Decision note: SIL-M1b get_state / get_events + orientation shims
+
+**Date:** 2026-08-12
+**Status:** Decided (implements [alecwardd/the-desk#5](https://github.com/alecwardd/the-desk/issues/5); Part of #2)
+
+**Context:** Catalog v0 and the M0 telemetry baseline are in place. Agents still orient via specialty getters; the read kernel needs provenance-carrying envelopes before engine extract / Journal Frames.
+
+**Decision:**
+
+1. **Read kernel behind `[sil].catalog_discovery`:** `get_state` (R0|R1 only) returns a **StateEnvelope** with per-domain `provenance` and `degraded` maps; absence of provenance is a failure. Degraded domains set their flag and remain in provenance (never silently omitted). `get_events` returns identity rows (`eventType`, `timestampMs`, severity placeholder, `identityId`) without formalizing lifecycle (#9).
+2. **Trust Level L0:** kernel read/query operators are tagged Trust Level L0 and cannot carry mutation or order authority (router/capability tests). Trust Ceiling stays L3.
+3. **Orientation shims:** when the SIL flag is on, specialty orientation getters `get_session_context` and `get_market_snapshot` still answer and include `deprecated: true` + `suggestedReplacementOperator: "get_state"`. Flag off → pre-M1b responses unchanged. Opinionated bundles (`get_context_frame`, `get_attention_inbox`, `evaluate_playbook`) remain.
+4. **M0 baseline immutable:** do not re-bless `docs/mcp/sil-m0-tool-telemetry-baseline.json`; shim deltas are attributable against that frozen before-figure.
+
+**Consequences:** Agents can migrate orientation to `get_state` from inside shim responses. Positioning remains a fail-closed stub domain inside every envelope until a provider lands.

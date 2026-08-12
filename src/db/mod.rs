@@ -6944,6 +6944,70 @@ impl Database {
         })
     }
 
+    /// Recent market events across types (newest first) for the SIL `get_events` kernel.
+    pub fn list_recent_market_events(
+        &self,
+        limit: usize,
+        since_ms: Option<f64>,
+        event_type: Option<&str>,
+    ) -> Result<Vec<serde_json::Value>, DbError> {
+        let limit = limit.clamp(1, 500);
+        let mut sql = String::from(
+            "SELECT timestamp_ms, event_type, level_name, price, direction, sequence_num, metadata_json,
+                    session_date, session_type, session_segment, trading_day
+             FROM market_events WHERE 1=1",
+        );
+        if since_ms.is_some() {
+            sql.push_str(" AND timestamp_ms >= ?1");
+        }
+        if event_type.is_some() {
+            if since_ms.is_some() {
+                sql.push_str(" AND event_type = ?2");
+            } else {
+                sql.push_str(" AND event_type = ?1");
+            }
+        }
+        sql.push_str(" ORDER BY timestamp_ms DESC LIMIT ");
+        sql.push_str(&limit.to_string());
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<serde_json::Value> {
+            let metadata_str: Option<String> = row.get(6)?;
+            let metadata: serde_json::Value = metadata_str
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_else(|| serde_json::json!({}));
+            Ok(serde_json::json!({
+                "timestampMs": row.get::<_, f64>(0)?,
+                "eventType": row.get::<_, String>(1)?,
+                "levelName": row.get::<_, Option<String>>(2)?,
+                "price": row.get::<_, f64>(3)?,
+                "direction": row.get::<_, Option<String>>(4)?,
+                "sequenceNum": row.get::<_, Option<i64>>(5)?,
+                "metadata": metadata,
+                "sessionDate": row.get::<_, String>(7)?,
+                "sessionType": row.get::<_, Option<String>>(8)?,
+                "sessionSegment": row.get::<_, Option<String>>(9)?,
+                "tradingDay": row.get::<_, Option<String>>(10)?,
+            }))
+        };
+
+        let rows = match (since_ms, event_type) {
+            (Some(since), Some(etype)) => stmt
+                .query_map(rusqlite::params![since, etype], map_row)?
+                .collect::<Result<Vec<_>, _>>()?,
+            (Some(since), None) => stmt
+                .query_map(rusqlite::params![since], map_row)?
+                .collect::<Result<Vec<_>, _>>()?,
+            (None, Some(etype)) => stmt
+                .query_map(rusqlite::params![etype], map_row)?
+                .collect::<Result<Vec<_>, _>>()?,
+            (None, None) => stmt
+                .query_map([], map_row)?
+                .collect::<Result<Vec<_>, _>>()?,
+        };
+        Ok(rows)
+    }
+
     pub fn list_market_events_by_type(
         &self,
         event_type: &str,

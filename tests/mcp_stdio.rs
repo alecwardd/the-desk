@@ -25,3 +25,12 @@ fn mcp_startup_does_not_write_logs_to_stdout() {
         String::from_utf8_lossy(&output.stdout)
     );
 }
+
+#[test]
+fn sil_config_defaults_keep_discovery_off_for_clean_home() {
+    // Process-spawn homes have no config.toml; SilConfig must default off so
+    // discovery tools stay omitted (paired with in-crate router tests).
+    let home = tempfile::tempdir().expect("temp home");
+    assert!(!home.path().join(".the-desk").join("config.toml").exists());
+    assert!(!the_desk_backend::catalog::SilConfig::default().catalog_discovery);
+}

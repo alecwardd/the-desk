@@ -420,6 +420,8 @@ pub struct TheDeskMcp {
     pub(crate) tool_router: ToolRouter<Self>,
     /// SIL-M0 per-tool call counts / approx token cost (MCP dispatch path).
     pub(crate) tool_telemetry: Arc<crate::tool_telemetry::ToolTelemetry>,
+    /// SIL feature flags (`[sil]` in config.toml); discovery tools omit when off.
+    pub(crate) sil_config: the_desk_backend::catalog::SilConfig,
 }
 
 #[derive(Debug)]

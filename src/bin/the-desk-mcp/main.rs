@@ -298,13 +298,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match router.poll_once(&mut providers, max_ticks) {
                     Ok(n) if n > 0 => {
                         if let Ok(db) = db_es.lock() {
-                            let _ = router.persist_journal(&db);
+                            if let Err(err) = router.persist_journal(&db) {
+                                tracing::warn!(error = %err, "market_router.journal_persist");
+                            }
                         }
                         continue;
                     }
                     Ok(_) => {
                         if let Ok(db) = db_es.lock() {
-                            let _ = router.persist_journal(&db);
+                            if let Err(err) = router.persist_journal(&db) {
+                                tracing::warn!(error = %err, "market_router.journal_persist");
+                            }
                         }
                     }
                     Err(err) => {
@@ -1236,7 +1240,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 if ticks_this_poll > 0 {
                     if let Ok(db) = db_bg.lock() {
-                        let _ = market_router_bg.persist_journal(&db);
+                        if let Err(err) = market_router_bg.persist_journal(&db) {
+                            tracing::warn!(error = %err, "scid.journal_persist");
+                        }
                     }
                 }
 

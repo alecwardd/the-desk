@@ -660,11 +660,11 @@ This note does not introduce Journal Frames, Capsules, Feature-IR, Positioning p
 
 **Decision:**
 
-1. **1 Hz Journal Frames** persist for **NQ** and **ES** on the shared **MarketRouter** clock (`clock_ms`, `frame_second = floor(clock_ms / 1000)`). Both roots in a second share the first observed clock of that second. Duplicate `(frame_second, root_symbol)` rows are ignored — a 250 ms publish loop cannot store 4 Hz frames. Capsules / 250 ms dumps are out of scope (#10).
-2. **Transition event rows** are written when detectors fire and join to frames on `(journal_frame_second, root_symbol)`. `get_events` remains identity rows (no open/updated/resolved — #9).
+1. **1 Hz Journal Frames** persist for **NQ** and **ES** on the shared **MarketRouter** clock. Each root is keyed by `floor(lane_market_time / 1000)` so a later print on the other root cannot copy last-known state onto a second that root did not print. Roots that print in the same second share the first pinned `clock_ms` of that second. Duplicate `(frame_second, root_symbol)` rows are ignored — a 250 ms publish loop cannot store 4 Hz frames. Capsules / 250 ms dumps are out of scope (#10).
+2. **Transition event rows** are written when detectors fire and join to frames on `(journal_frame_second, root_symbol)` where `journal_frame_second = floor(event.timestamp_ms / 1000)` (the printing root's second, not the max clock). `get_events` remains identity rows (no open/updated/resolved — #9).
 3. **`get_state(as_of=…)`** is served **only** from Journal Frames (provenance source = **Journal**). Live `get_state` without `as_of` stays the published/live path. Multi-symbol envelope shape from SIL-M2b is preserved. Per-domain provenance remains mandatory. `pipeline_snapshots` is not a silent dual source for `as_of`.
 4. **MFE/MAE / R-result** remain tick-driven (ADR-019). The journal writer persists already-computed state and does not sample outcome extremes from frames.
-5. **Embedded-engine fallback** still writes Journal Frames for both symbols (NQ shared coaching pipelines + ES lane). External `the-desk-engine` writes the same tables on the same clock. Trust Ceiling stays **L3**; read/query stays Trust Level **L0**.
+5. **Embedded-engine fallback** still writes Journal Frames for both symbols (NQ shared coaching pipelines + ES lane). External `the-desk-engine` writes the same tables on the same clock. Journal snapshot must not hold the pending-frame mutex across pipeline locks (embedded NQ ingest and ES poll are concurrent). Trust Ceiling stays **L3**; read/query stays Trust Level **L0**.
 
 This note does not introduce Capsules, event lifecycle formalization, the research query kernel, DuckDB, Positioning providers, Feature-IR, or ACSIL.
 

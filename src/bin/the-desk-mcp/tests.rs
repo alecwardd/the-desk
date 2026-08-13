@@ -1281,6 +1281,51 @@ async fn get_state_as_of_missing_frames_degrades_with_journal_provenance() {
 }
 
 #[tokio::test]
+async fn get_state_as_of_omitted_symbols_keeps_unprefixed_when_only_nq_frame() {
+    let server = test_server_with_sil();
+    let ts = 1_704_207_600_000.0;
+    server.market_router.apply_tick(
+        the_desk_backend::engine::RouterRoot::Nq,
+        &the_desk_backend::engine::SourceTick {
+            timestamp_ms: ts,
+            price: 20_000.0,
+            volume: 1.0,
+            bid: 19_999.75,
+            ask: 20_000.25,
+            side: TradeSide::Buy,
+            root_symbol: Some("NQ".into()),
+        },
+    );
+    {
+        let db = server.db.lock().expect("db");
+        server.market_router.persist_journal(&db).expect("nq frame");
+    }
+    let out = parse_text_tool_result(
+        server
+            .get_state(Parameters(GetStateParams {
+                symbols: None,
+                domains: Some(vec!["location_structure".into()]),
+                resolution: Some("R0".into()),
+                as_of: Some(ts + 100.0),
+                ..Default::default()
+            }))
+            .await
+            .expect("as_of omitted symbols"),
+    );
+    assert_eq!(out["trustLevel"], "L0");
+    assert_eq!(out["provenance"]["location_structure"]["source"], "journal");
+    let values = out["values"].as_object().expect("values");
+    assert!(
+        values.contains_key("market.location_structure.lastPrice"),
+        "omitted symbols with only NQ present must keep the M1b unprefixed envelope: {values:?}"
+    );
+    assert!(
+        !values.keys().any(|k| k.starts_with("ES.")),
+        "must not emit prefixed ES keys when ES has no Journal Frame: {values:?}"
+    );
+}
+
+#[tokio::test]
 async fn get_state_rejects_r2_r3() {
     let server = test_server_with_sil();
     let err = server

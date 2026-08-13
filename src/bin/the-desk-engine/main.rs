@@ -187,7 +187,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(db) = journal_db.as_ref() {
                     if let Ok(d) = db.lock() {
                         if let Err(err) = router_bg.persist_journal(&d) {
-                            tracing::debug!(error = %err, "the-desk-engine.journal_persist");
+                            tracing::warn!(error = %err, "the-desk-engine.journal_persist");
                         }
                     }
                 }

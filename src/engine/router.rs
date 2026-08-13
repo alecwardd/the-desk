@@ -373,31 +373,70 @@ impl MarketRouter {
         }
     }
 
-    /// Capture 1 Hz Journal Frames for every root that has a snapshot at this clock second.
+    /// Capture 1 Hz Journal Frames for every root that printed in its lane second.
     ///
-    /// First observation of a second pins the shared `clock_ms`. Later 250 ms ticks
-    /// in the same second do not replace the frame. A root that first prints later
-    /// in the second still joins at that pinned clock.
+    /// Each root is keyed by `floor(lane_market_time_ms / 1000)`, not the max
+    /// MarketRouter clock — a later ES print must not copy last-known NQ state
+    /// onto a second NQ did not print. Roots that print in the same second share
+    /// the first pinned `clock_ms` of that second. Later 250 ms ticks do not
+    /// replace the frame (`or_insert` + DB `INSERT OR IGNORE`).
+    ///
+    /// Snapshots are taken without holding `pending_journal_frames` so embedded
+    /// NQ ingest (`pipelines` lock) and ES `apply_tick` cannot deadlock.
     pub fn queue_journal_frames(&self) {
-        let Some(clock_ms) = self.clock_ms() else {
+        let mut needed: Vec<(i64, RouterRoot, f64)> = Vec::new();
+        for root in RouterRoot::ALL {
+            let Some(mt) = self.lane(root).market_time_ms() else {
+                continue;
+            };
+            let Some(frame_second) = journal_frame_second(mt) else {
+                continue;
+            };
+            needed.push((frame_second, root, mt));
+        }
+        if needed.is_empty() {
             return;
-        };
-        let Some(frame_second) = journal_frame_second(clock_ms) else {
-            return;
-        };
-        let aligned = {
-            let Ok(mut clocks) = self.journal_second_clock.lock() else {
+        }
+
+        let missing = {
+            let Ok(pending) = self.pending_journal_frames.lock() else {
                 return;
             };
-            *clocks.entry(frame_second).or_insert(clock_ms)
+            needed
+                .into_iter()
+                .filter(|(sec, root, _)| !pending.contains_key(&(*sec, *root)))
+                .collect::<Vec<_>>()
+        };
+        if missing.is_empty() {
+            return;
+        }
+
+        let mut built = Vec::with_capacity(missing.len());
+        for (frame_second, root, mt) in missing {
+            let snap = self.lane(root).snapshot_market_state();
+            if snap.is_null() {
+                continue;
+            }
+            built.push((frame_second, root, mt, snap));
+        }
+        if built.is_empty() {
+            return;
+        }
+
+        let Ok(mut clocks) = self.journal_second_clock.lock() else {
+            return;
         };
         let Ok(mut pending) = self.pending_journal_frames.lock() else {
             return;
         };
-        for (root, snap) in self.snapshots_by_root() {
+        for (frame_second, root, mt, snap) in built {
+            let aligned = *clocks.entry(frame_second).or_insert(mt);
             pending
                 .entry((frame_second, root))
                 .or_insert_with(|| journal_frame_from_snapshot(aligned, frame_second, root, &snap));
+        }
+        if let Some(max_sec) = clocks.keys().copied().max() {
+            clocks.retain(|&sec, _| sec + 1 >= max_sec);
         }
     }
 
@@ -414,7 +453,32 @@ impl MarketRouter {
             .lock()
             .map(|mut g| std::mem::take(&mut *g))
             .unwrap_or_default();
-        persist_journal_observation(db, &frames, &events)
+        match persist_journal_observation(db, &frames, &events) {
+            Ok(stats) => Ok(stats),
+            Err(err) => {
+                self.restore_pending_journal(frames, events);
+                Err(err)
+            }
+        }
+    }
+
+    fn restore_pending_journal(
+        &self,
+        frames: Vec<JournalFrameRecord>,
+        events: Vec<(RouterRoot, MarketEvent)>,
+    ) {
+        if let Ok(mut pending) = self.pending_journal_frames.lock() {
+            for frame in frames {
+                if let Ok(root) = RouterRoot::parse(&frame.root_symbol) {
+                    pending.entry((frame.frame_second, root)).or_insert(frame);
+                }
+            }
+        }
+        if let Ok(mut pending) = self.pending_journal_events.lock() {
+            let mut restored = events;
+            restored.append(&mut *pending);
+            *pending = restored;
+        }
     }
 
     fn advance_clock(&self, timestamp_ms: f64) {
@@ -660,6 +724,52 @@ mod tests {
         let nq = router.nq_host().snapshot_market_state();
         assert_eq!(nq["sessionType"], "RTH");
         assert_eq!(nq["lastPrice"], 20_000.0);
+    }
+
+    #[test]
+    fn journal_queue_does_not_deadlock_with_shared_nq_ingest() {
+        let nq_pipelines = Arc::new(Mutex::new(PipelineEngine::new()));
+        let last_bid = Arc::new(Mutex::new(20_000.0));
+        let last_ask = Arc::new(Mutex::new(20_000.25));
+        let router = Arc::new(MarketRouter::with_shared_nq(
+            Arc::clone(&nq_pipelines),
+            Arc::new(Mutex::new(EventDetector::new())),
+            Arc::new(Mutex::new(FlowEventEmitter::new())),
+            Arc::clone(&last_bid),
+            Arc::clone(&last_ask),
+            RouterRoot::Nq,
+            SourceProviderKind::File,
+            "embedded",
+        ));
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                for i in 0..80 {
+                    {
+                        let mut p = nq_pipelines.lock().unwrap();
+                        p.on_trade_with_timestamp(
+                            20_000.0 + i as f64 * 0.25,
+                            1.0,
+                            true,
+                            30,
+                            RTH_TS + i as f64 * 250.0,
+                        );
+                    }
+                    router.queue_journal_frames();
+                }
+            });
+            s.spawn(|| {
+                for i in 0..80 {
+                    router.apply_tick(
+                        RouterRoot::Es,
+                        &tick(RTH_TS + i as f64 * 250.0 + 10.0, 5_000.0),
+                    );
+                }
+            });
+        });
+        let db = Database::open(":memory:").expect("db");
+        let stats = router.persist_journal(&db).expect("persist");
+        assert!(stats.frames_written >= 2);
+        assert!(db.count_journal_frames().expect("count") >= 2);
     }
 
     #[test]

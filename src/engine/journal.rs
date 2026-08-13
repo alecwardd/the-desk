@@ -116,6 +116,7 @@ mod tests {
     use crate::pipelines::MarketEvent;
 
     const RTH_TS: f64 = 1_704_207_600_000.0;
+    const GLOBEX_TS: f64 = 1_704_243_600_000.0;
 
     fn tick(ts: f64, price: f64) -> SourceTick {
         SourceTick {
@@ -300,5 +301,79 @@ mod tests {
         assert_eq!(joined[0]["eventType"], "new_session_high");
         assert_eq!(joined[0]["rootSymbol"], "NQ");
         assert_eq!(joined[0]["frameRootSymbol"], "NQ");
+    }
+
+    #[test]
+    fn transition_event_joins_when_other_root_clock_is_ahead() {
+        let db = Database::open(":memory:").expect("db");
+        let router = MarketRouter::new(RouterRoot::Nq, SourceProviderKind::File, "join-ahead");
+        router.apply_tick(RouterRoot::Nq, &tick(RTH_TS, 20_000.0));
+        router.apply_tick(RouterRoot::Es, &tick(RTH_TS + 1_500.0, 5_000.0));
+        let event = MarketEvent {
+            session_date: "2024-01-02".into(),
+            timestamp_ms: RTH_TS + 100.0,
+            event_type: "new_session_high".into(),
+            level_name: None,
+            price: 20_000.25,
+            direction: Some("up".into()),
+            sequence_num: Some(1),
+            metadata: None,
+            session_type: "RTH".into(),
+            session_segment: "None".into(),
+            trading_day: "2024-01-02".into(),
+        };
+        router.note_transition_events(RouterRoot::Nq, &[event]);
+        router.persist_journal(&db).expect("persist");
+        let nq_second = journal_frame_second(RTH_TS).expect("nq second");
+        let es_second = journal_frame_second(RTH_TS + 1_500.0).expect("es second");
+        assert_ne!(nq_second, es_second);
+        let joined = db
+            .list_events_joined_to_journal_frame(nq_second)
+            .expect("join");
+        assert_eq!(joined.len(), 1);
+        assert_eq!(joined[0]["rootSymbol"], "NQ");
+        let frames = db.list_journal_frames().expect("list");
+        assert!(frames
+            .iter()
+            .any(|f| f.root_symbol == "NQ" && f.frame_second == nq_second));
+        assert!(!frames
+            .iter()
+            .any(|f| f.root_symbol == "NQ" && f.frame_second == es_second));
+    }
+
+    #[test]
+    fn later_root_does_not_copy_stale_session_onto_new_second() {
+        let db = Database::open(":memory:").expect("db");
+        let router = MarketRouter::new(RouterRoot::Nq, SourceProviderKind::File, "stale");
+        router.apply_tick(RouterRoot::Nq, &tick(RTH_TS, 20_000.0));
+        router.apply_tick(RouterRoot::Es, &tick(GLOBEX_TS, 5_000.0));
+        router.persist_journal(&db).expect("persist");
+        let rth_second = journal_frame_second(RTH_TS).expect("rth");
+        let globex_second = journal_frame_second(GLOBEX_TS).expect("globex");
+        let frames = db.list_journal_frames().expect("list");
+        let nq = frames
+            .iter()
+            .find(|f| f.root_symbol == "NQ")
+            .expect("nq frame");
+        let es = frames
+            .iter()
+            .find(|f| f.root_symbol == "ES")
+            .expect("es frame");
+        assert_eq!(nq.frame_second, rth_second);
+        assert_eq!(nq.session_type, "RTH");
+        assert_eq!(es.frame_second, globex_second);
+        assert_eq!(es.session_type, "Globex");
+        assert!(!frames
+            .iter()
+            .any(|f| f.root_symbol == "NQ" && f.frame_second == globex_second));
+        let as_of = db
+            .get_journal_frames_as_of(GLOBEX_TS)
+            .expect("as_of")
+            .expect("present");
+        assert!(as_of.by_root.contains_key("ES"));
+        assert!(
+            !as_of.by_root.contains_key("NQ"),
+            "NQ RTH must not appear co-recorded on the Globex second"
+        );
     }
 }

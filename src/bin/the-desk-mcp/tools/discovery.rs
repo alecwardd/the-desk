@@ -424,21 +424,48 @@ impl TheDeskMcp {
         }
 
         let clock_ms = journal.as_ref().map(|s| s.clock_ms);
-        let include_multi = requested_roots.len() > 1;
+        let caller_listed_both = params
+            .symbols
+            .as_ref()
+            .map(|list| {
+                parse_requested_roots(Some(list))
+                    .map(|v| v.len() > 1)
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+        let both_in_journal = requested_roots
+            .iter()
+            .filter(|root| {
+                journal
+                    .as_ref()
+                    .and_then(|snap| snap.by_root.get(root.as_str()))
+                    .is_some_and(|payload| !payload.is_null())
+            })
+            .count()
+            >= 2;
+        // Same rule as live get_state: merge only when the caller listed both
+        // roots, or both roots are actually present. Omitted symbols with a
+        // single frame keep the M1b unprefixed envelope (not ES-first BTreeMap).
+        let include_multi = requested_roots.len() > 1 && (caller_listed_both || both_in_journal);
         if include_multi {
             let envelope = merge_symbol_envelopes(by_root, clock_ms)
                 .map_err(|e| McpError::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?;
             return Ok(text_result(finish_state_envelope_json(&envelope)?));
         }
 
-        let envelope = by_root
-            .into_iter()
-            .next()
-            .map(|(_, mut env)| {
-                env.clock_ms = clock_ms;
-                env
-            })
-            .ok_or_else(|| invalid_params_error("get_state as_of required a MarketRouter root"))?;
+        let mut envelope = if requested_roots.len() == 1 {
+            by_root.remove(requested_roots[0].as_str()).ok_or_else(|| {
+                invalid_params_error("get_state as_of required a MarketRouter root")
+            })?
+        } else {
+            by_root
+                .remove(RouterRoot::Nq.as_str())
+                .or_else(|| by_root.into_values().next())
+                .ok_or_else(|| {
+                    invalid_params_error("get_state as_of required a MarketRouter root")
+                })?
+        };
+        envelope.clock_ms = clock_ms;
         Ok(text_result(finish_state_envelope_json(&envelope)?))
     }
 

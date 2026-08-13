@@ -7751,8 +7751,9 @@ impl Database {
 
     /// Batch-insert market events, stamping `root_symbol` and Journal Frame join key.
     ///
-    /// `journal_frame_second` is `floor(timestamp_ms / 1000)` so transition rows
-    /// join to 1 Hz Journal Frames on `(journal_frame_second, root_symbol)`.
+    /// `journal_frame_second` is `floor(event.timestamp_ms / 1000)` so a
+    /// transition row joins the Journal Frame for that root's print second —
+    /// not the max MarketRouter clock, which may already be on a later second.
     /// Returns the number of rows actually inserted (`INSERT OR IGNORE`).
     pub fn insert_market_events_batch_scoped(
         &self,

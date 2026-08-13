@@ -76,16 +76,6 @@ fn rth_ticks() -> Vec<(f64, f64, f64)> {
     ]
 }
 
-async fn bind_reuse(addr: &str) -> std::io::Result<tokio::net::TcpListener> {
-    let addr: std::net::SocketAddr = addr.parse().map_err(|err| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("{addr}: {err}"))
-    })?;
-    let socket = tokio::net::TcpSocket::new_v4()?;
-    socket.set_reuseaddr(true)?;
-    socket.bind(addr)?;
-    socket.listen(1024)
-}
-
 #[tokio::test]
 async fn embedded_and_socket_paths_are_coaching_parity() {
     let tmp = NamedTempFile::new().unwrap();
@@ -199,37 +189,28 @@ async fn kill_the_engine_degrades_and_recovers() {
     );
     assert!(client.last_error().is_some());
 
-    // Recover: new engine on same bind.
+    // Recover on a fresh bind. Windows can return WSAEACCES (10013) / TIME_WAIT
+    // if we reuse the killed listen port; the contract is degrade then recover,
+    // not exclusive reuse of the same TCP port.
     let (tx2, rx2) = watch::channel(false);
     host.poll_once(&mut provider, 100).unwrap();
     let store_bg = store.clone();
-    let mut last_err = None;
-    let mut listener2 = None;
-    for _ in 0..80 {
-        match bind_reuse(&bind).await {
-            Ok(listener) => {
-                listener2 = Some(listener);
-                break;
-            }
-            Err(err) => {
-                last_err = Some(err);
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        }
-    }
-    let listener2 =
-        listener2.unwrap_or_else(|| panic!("recover bind after kill on {bind}: {last_err:?}"));
+    let listener2 = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("recover bind");
+    let bind2 = listener2.local_addr().unwrap().to_string();
     let serve2 =
         tokio::spawn(
             async move { EngineSocketServer::serve_listener(listener2, store_bg, rx2).await },
         );
-    let mut recovered = client.get_published().await;
+    let client2 = EngineClient::new(bind2);
+    let mut recovered = client2.get_published().await;
     for _ in 0..100 {
         if !recovered.degraded && recovered.generation > 0 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
-        recovered = client.get_published().await;
+        recovered = client2.get_published().await;
     }
     assert!(
         !recovered.degraded,

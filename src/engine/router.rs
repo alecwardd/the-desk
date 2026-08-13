@@ -652,7 +652,7 @@ impl MarketRouter {
             let should_write = match lifecycle.as_deref() {
                 Some(state) if should_open_capsule(&cap.event_type, state) => true,
                 Some("updated") if !existed => false,
-                None if !existed => {
+                None if !existed && !cap.is_terminal() => {
                     keep.push(cap);
                     continue;
                 }
@@ -820,7 +820,11 @@ fn persist_router_event_attention(
 }
 
 /// Keep the fuller Capsule when persist raced an open of the same trigger.
-fn merge_pending_capsules(mut caps: Vec<PendingCapsule>) -> Vec<PendingCapsule> {
+fn merge_pending_capsules(caps: Vec<PendingCapsule>) -> Vec<PendingCapsule> {
+    bound_pending_capsules(collapse_pending_by_trigger(caps), PENDING_CAPSULES_MAX)
+}
+
+fn collapse_pending_by_trigger(mut caps: Vec<PendingCapsule>) -> Vec<PendingCapsule> {
     caps.sort_by(|a, b| a.trigger_identity_id.cmp(&b.trigger_identity_id));
     let mut out: Vec<PendingCapsule> = Vec::with_capacity(caps.len());
     for cap in caps {
@@ -837,11 +841,28 @@ fn merge_pending_capsules(mut caps: Vec<PendingCapsule>) -> Vec<PendingCapsule> 
         }
         out.push(cap);
     }
-    if out.len() > PENDING_CAPSULES_MAX {
-        let excess = out.len() - PENDING_CAPSULES_MAX;
-        out.drain(0..excess);
-    }
     out
+}
+
+/// Evict oldest, lowest-sample, non-terminal Capsules first — not hash order.
+fn bound_pending_capsules(mut caps: Vec<PendingCapsule>, max: usize) -> Vec<PendingCapsule> {
+    if caps.len() <= max {
+        return caps;
+    }
+    caps.sort_by(|a, b| {
+        a.is_terminal()
+            .cmp(&b.is_terminal())
+            .then_with(|| a.samples.len().cmp(&b.samples.len()))
+            .then_with(|| {
+                a.created_at_ms
+                    .partial_cmp(&b.created_at_ms)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| a.trigger_identity_id.cmp(&b.trigger_identity_id))
+    });
+    let excess = caps.len() - max;
+    caps.drain(0..excess);
+    caps
 }
 
 /// Stable one-clock order: market time, then NQ before ES on a timestamp tie.
@@ -1116,5 +1137,42 @@ mod tests {
         assert_eq!(events[1]["timestampMs"], 200.0);
         assert_eq!(events[2]["rootSymbol"], "ES");
         assert_eq!(events[2]["timestampMs"], 200.0);
+    }
+
+    fn pending_capsule(trigger: &str, created_ms: f64, samples: usize) -> PendingCapsule {
+        let event = MarketEvent {
+            session_date: "2024-01-02".into(),
+            timestamp_ms: created_ms,
+            event_type: "stop_run".into(),
+            level_name: None,
+            price: 20_000.0,
+            direction: Some("up".into()),
+            sequence_num: Some(1),
+            metadata: None,
+            session_type: "RTH".into(),
+            session_segment: "None".into(),
+            trading_day: "2024-01-02".into(),
+        };
+        let mut cap =
+            PendingCapsule::open_from_ring(RouterRoot::Nq, &event, &CapsuleRing::default());
+        cap.trigger_identity_id = trigger.into();
+        cap.created_at_ms = created_ms;
+        cap.samples = (0..samples).map(|i| serde_json::json!({"i": i})).collect();
+        cap
+    }
+
+    #[test]
+    fn pending_capsule_bound_keeps_fuller_and_newer() {
+        let old_thin = pending_capsule("aaa_old_thin", 1.0, 2);
+        let fuller = pending_capsule("zzz_fuller", 2.0, 40);
+        let newer_thin = pending_capsule("mmm_newer_thin", 3.0, 2);
+        let kept = bound_pending_capsules(vec![fuller, old_thin, newer_thin], 2);
+        let ids: Vec<_> = kept
+            .iter()
+            .map(|c| c.trigger_identity_id.as_str())
+            .collect();
+        assert!(ids.contains(&"zzz_fuller"));
+        assert!(ids.contains(&"mmm_newer_thin"));
+        assert!(!ids.contains(&"aaa_old_thin"));
     }
 }

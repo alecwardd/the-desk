@@ -452,7 +452,11 @@ fn event_root_symbol(event: &KernelEvent) -> Option<&str> {
 }
 
 fn capsule_matches_event_root(capsule: &CapsuleRecord, event: &KernelEvent) -> bool {
-    event_root_symbol(event).is_some_and(|root| capsule.root_symbol == root)
+    match event_root_symbol(event) {
+        Some(root) => capsule.root_symbol == root,
+        // Unscoped rows (embedded fallback / unscoped insert) fall back to identity.
+        None => true,
+    }
 }
 
 fn pick_capsule_for_event<'a>(
@@ -766,6 +770,23 @@ mod tests {
             "ES Capsule must not attach to an NQ event that shares occurrence identity"
         );
         assert_eq!(cap.completeness.as_deref(), Some("pending"));
+    }
+
+    #[test]
+    fn rootless_event_falls_back_to_identity_capsule_match() {
+        let event = MarketEvent {
+            event_type: "stop_run".into(),
+            ..sample()
+        };
+        let mut row = kernel_event_from_market_event(&event);
+        assert!(row.root_symbol.is_none());
+        assert!(row.frame_ref.root_symbol.is_none());
+        let cap = sample_capsule("cap_nq", &row.identity_id, "NQ");
+        attach_capsule_refs(std::slice::from_mut(&mut row), &[cap]);
+        assert_eq!(
+            row.capsule_ref.as_ref().and_then(|c| c.id.as_deref()),
+            Some("cap_nq")
+        );
     }
 
     #[test]

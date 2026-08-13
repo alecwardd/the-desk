@@ -1703,6 +1703,9 @@ impl Database {
         if version < 35 {
             self.migrate_v35()?;
         }
+        if version < 36 {
+            self.migrate_v36()?;
+        }
 
         Ok(())
     }
@@ -3352,6 +3355,21 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_market_events_identity
               ON market_events(identity_id);
             UPDATE schema_version SET version = 35;
+            ",
+        )?;
+        Ok(())
+    }
+
+    /// V36: identity_id index for Capsule persist lookups.
+    ///
+    /// v35 added this index in the same batch as the Capsules table. Branch
+    /// checkouts that already ran the first v35 batch skipped the later index.
+    fn migrate_v36(&self) -> Result<(), DbError> {
+        self.conn.execute_batch(
+            "
+            CREATE INDEX IF NOT EXISTS idx_market_events_identity
+              ON market_events(identity_id);
+            UPDATE schema_version SET version = 36;
             ",
         )?;
         Ok(())
@@ -7243,15 +7261,14 @@ impl Database {
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
              ON CONFLICT(id) DO UPDATE SET
                 completeness = CASE
-                  WHEN capsules.completeness IN ('complete', 'incomplete')
+                  WHEN capsules.completeness = 'complete' THEN capsules.completeness
+                  WHEN capsules.completeness = 'incomplete'
                        AND excluded.completeness = 'pending'
                   THEN capsules.completeness
-                  ELSE excluded.completeness
+                  WHEN excluded.sample_count >= capsules.sample_count THEN excluded.completeness
+                  ELSE capsules.completeness
                 END,
-                degraded = CASE
-                  WHEN excluded.sample_count >= capsules.sample_count THEN excluded.degraded
-                  ELSE capsules.degraded OR excluded.degraded
-                END,
+                degraded = capsules.degraded OR excluded.degraded,
                 sample_count = MAX(capsules.sample_count, excluded.sample_count),
                 payload = CASE
                   WHEN excluded.sample_count >= capsules.sample_count THEN excluded.payload
@@ -13140,7 +13157,7 @@ mod tests {
                 |r| r.get(0),
             )
             .expect("version");
-        assert!(version >= 35, "schema v35 Capsules, got {version}");
+        assert!(version >= 36, "schema v36 identity index, got {version}");
         let identity_idx: i64 = db
             .conn
             .query_row(
@@ -13151,6 +13168,61 @@ mod tests {
             )
             .expect("identity idx");
         assert_eq!(identity_idx, 1);
+    }
+
+    fn sample_capsule_record(
+        id: &str,
+        completeness: &str,
+        degraded: bool,
+        sample_count: i64,
+        payload_mark: &str,
+    ) -> CapsuleRecord {
+        CapsuleRecord {
+            id: id.into(),
+            trigger_identity_id: format!("trig_{id}"),
+            dedup_identity_id: "dedup_x".into(),
+            root_symbol: "NQ".into(),
+            event_type: "stop_run".into(),
+            event_timestamp_ms: 1_700_000_000_000.0,
+            window_start_ms: 1_700_000_000_000.0 - 30_000.0,
+            window_end_ms: 1_700_000_000_000.0 + 60_000.0,
+            observed_start_ms: Some(1_700_000_000_000.0),
+            observed_end_ms: Some(1_700_000_000_000.0),
+            start_frame_second: Some(1_699_999_970),
+            end_frame_second: Some(1_700_000_060),
+            completeness: completeness.into(),
+            degraded,
+            sample_count,
+            payload: serde_json::json!({"mark": payload_mark}),
+            created_at_ms: 1_700_000_000_000.0,
+            updated_at_ms: 1_700_000_000_000.0,
+        }
+    }
+
+    #[test]
+    fn upsert_capsule_keeps_degraded_and_complete_monotonic() {
+        let db = test_db();
+        let first = sample_capsule_record("cap_sticky", "complete", true, 20, "full");
+        db.upsert_capsule(&first).expect("insert");
+
+        let clearer = sample_capsule_record("cap_sticky", "complete", false, 40, "more");
+        db.upsert_capsule(&clearer).expect("fuller");
+        let row = &db.list_capsules().expect("list")[0];
+        assert!(
+            row.degraded,
+            "degraded must stay sticky when a fuller dump arrives"
+        );
+        assert_eq!(row.completeness, "complete");
+        assert_eq!(row.sample_count, 40);
+        assert_eq!(row.payload["mark"], "more");
+
+        let truncated = sample_capsule_record("cap_sticky", "incomplete", false, 5, "thin");
+        db.upsert_capsule(&truncated).expect("thin");
+        let row = &db.list_capsules().expect("list")[0];
+        assert_eq!(row.completeness, "complete");
+        assert!(row.degraded);
+        assert_eq!(row.sample_count, 40);
+        assert_eq!(row.payload["mark"], "more");
     }
 
     #[test]

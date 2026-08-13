@@ -380,7 +380,7 @@ impl TheDeskMcp {
             db.get_journal_frames_as_of(ts).map_err(db_error)?
         };
 
-        let note_missing = "as_of Journal Frame unavailable; domains degraded — your playbook reads should treat historical structure as incomplete";
+        let note_missing = "as_of Journal Frame unavailable; domains degraded — Your playbook indicates historical structure is incomplete";
         let mut by_root = std::collections::BTreeMap::new();
         for root in &requested_roots {
             let (snapshot, data_time, degraded, note) = match journal.as_ref() {

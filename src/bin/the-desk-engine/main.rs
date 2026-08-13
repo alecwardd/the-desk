@@ -146,6 +146,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     error = %err,
                     "the-desk-engine.journal_db_unavailable"
                 );
+                router.set_journal_enabled(false);
                 None
             }
         }
@@ -185,9 +186,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match router_bg.poll_once(&mut providers, max_ticks) {
             Ok(n) => {
                 if let Some(db) = journal_db.as_ref() {
-                    if let Ok(d) = db.lock() {
-                        if let Err(err) = router_bg.persist_journal(&d) {
-                            tracing::warn!(error = %err, "the-desk-engine.journal_persist");
+                    match db.lock() {
+                        Ok(d) => {
+                            if let Err(err) = router_bg.persist_journal(&d) {
+                                tracing::warn!(error = %err, "the-desk-engine.journal_persist");
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                error = %err,
+                                "the-desk-engine.journal_persist_lock"
+                            );
                         }
                     }
                 }

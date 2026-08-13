@@ -9,7 +9,7 @@
 //! Trust Ceiling stays **L3**. MarketRouter never places orders.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::db::{Database, DbError, JournalFrameRecord};
@@ -27,6 +27,9 @@ use super::published::{PublishedEngineState, PublishedStateStore};
 use super::root::RouterRoot;
 use super::source::{SourceError, SourceHealth, SourceProvider, SourceProviderKind, SourceTick};
 
+/// Bound in-memory transition-event queue when persist is delayed.
+const PENDING_JOURNAL_MAX_EVENTS: usize = 8_192;
+
 /// Concurrent per-symbol pipeline host (NQ + ES) sharing one market-data clock.
 pub struct MarketRouter {
     nq: EngineHost,
@@ -36,6 +39,7 @@ pub struct MarketRouter {
     provider_kind: SourceProviderKind,
     mode_label: String,
     clock_ms_bits: AtomicU64,
+    journal_enabled: AtomicBool,
     pending_journal_events: Mutex<Vec<(RouterRoot, MarketEvent)>>,
     pending_journal_frames: Mutex<BTreeMap<(i64, RouterRoot), JournalFrameRecord>>,
     journal_second_clock: Mutex<BTreeMap<i64, f64>>,
@@ -58,6 +62,7 @@ impl MarketRouter {
             provider_kind,
             mode_label: mode_label.into(),
             clock_ms_bits: AtomicU64::new(0),
+            journal_enabled: AtomicBool::new(true),
             pending_journal_events: Mutex::new(Vec::new()),
             pending_journal_frames: Mutex::new(BTreeMap::new()),
             journal_second_clock: Mutex::new(BTreeMap::new()),
@@ -97,6 +102,7 @@ impl MarketRouter {
             provider_kind,
             mode_label: mode_label.into(),
             clock_ms_bits: AtomicU64::new(0),
+            journal_enabled: AtomicBool::new(true),
             pending_journal_events: Mutex::new(Vec::new()),
             pending_journal_frames: Mutex::new(BTreeMap::new()),
             journal_second_clock: Mutex::new(BTreeMap::new()),
@@ -124,6 +130,11 @@ impl MarketRouter {
 
     pub fn es_host(&self) -> &EngineHost {
         &self.es
+    }
+
+    /// Queue Journal Frames / transition rows. Off when the host has no journal sink.
+    pub fn set_journal_enabled(&self, enabled: bool) {
+        self.journal_enabled.store(enabled, Ordering::Release);
     }
 
     pub fn set_contract_metadata(&self, root: RouterRoot, metadata: ContractMetadata) {
@@ -365,11 +376,15 @@ impl MarketRouter {
 
     /// Queue transition event rows (embedded NQ ingest that does not call `apply_tick`).
     pub fn note_transition_events(&self, root: RouterRoot, events: &[MarketEvent]) {
-        if events.is_empty() {
+        if events.is_empty() || !self.journal_enabled.load(Ordering::Acquire) {
             return;
         }
         if let Ok(mut pending) = self.pending_journal_events.lock() {
             pending.extend(events.iter().cloned().map(|event| (root, event)));
+            let excess = pending.len().saturating_sub(PENDING_JOURNAL_MAX_EVENTS);
+            if excess > 0 {
+                pending.drain(0..excess);
+            }
         }
     }
 
@@ -384,6 +399,9 @@ impl MarketRouter {
     /// Snapshots are taken without holding `pending_journal_frames` so embedded
     /// NQ ingest (`pipelines` lock) and ES `apply_tick` cannot deadlock.
     pub fn queue_journal_frames(&self) {
+        if !self.journal_enabled.load(Ordering::Acquire) {
+            return;
+        }
         let mut needed: Vec<(i64, RouterRoot, f64)> = Vec::new();
         for root in RouterRoot::ALL {
             let Some(mt) = self.lane(root).market_time_ms() else {
@@ -442,6 +460,9 @@ impl MarketRouter {
 
     /// Persist queued Journal Frames + transition events (INSERT OR IGNORE).
     pub fn persist_journal(&self, db: &Database) -> Result<JournalPersistStats, DbError> {
+        if !self.journal_enabled.load(Ordering::Acquire) {
+            return Ok(JournalPersistStats::default());
+        }
         self.queue_journal_frames();
         let frames: Vec<JournalFrameRecord> = self
             .pending_journal_frames

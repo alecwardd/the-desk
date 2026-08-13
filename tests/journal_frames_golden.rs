@@ -43,12 +43,13 @@ fn write_scid(ticks: &[(f64, f64, f64)]) -> NamedTempFile {
     file
 }
 
-fn fixture_ticks(base_price: f64) -> Vec<(f64, f64, f64)> {
+fn fixture_ticks(base_price: f64, offset_ms: f64) -> Vec<(f64, f64, f64)> {
     // 250 ms cadence across 3 seconds — must collapse to 4 Journal Frame seconds.
+    // `offset_ms` staggers ES vs NQ on the shared clock without leaving the second.
     (0..13)
         .map(|i| {
             (
-                RTH_TS + (i as f64) * 250.0,
+                RTH_TS + offset_ms + (i as f64) * 250.0,
                 base_price + i as f64 * 0.25,
                 1.0,
             )
@@ -103,8 +104,8 @@ fn persist_from_scid(nq: &NamedTempFile, es: &NamedTempFile) -> (Database, Value
 
 #[test]
 fn golden_journal_frames_rebuild_from_scid_within_strict_fields() {
-    let nq = write_scid(&fixture_ticks(20_000.0));
-    let es = write_scid(&fixture_ticks(5_000.0));
+    let nq = write_scid(&fixture_ticks(20_000.0, 0.0));
+    let es = write_scid(&fixture_ticks(5_000.0, 10.0));
     let (db_a, a) = persist_from_scid(&nq, &es);
     let (_db_b, b) = persist_from_scid(&nq, &es);
 
@@ -114,6 +115,18 @@ fn golden_journal_frames_rebuild_from_scid_within_strict_fields() {
         a, b,
         "Journal Frames must rebuild identically from the same .scid"
     );
+
+    // Staggered NQ/ES prints in the same second share the first pinned clock.
+    let nq_frames = a["nq"].as_array().expect("nq");
+    let es_frames = a["es"].as_array().expect("es");
+    assert_eq!(nq_frames.len(), es_frames.len());
+    for (nq_f, es_f) in nq_frames.iter().zip(es_frames.iter()) {
+        assert_eq!(nq_f["frameSecond"], es_f["frameSecond"]);
+        assert_eq!(
+            nq_f["clockMs"], es_f["clockMs"],
+            "NQ and ES frames in the same second must share the pinned MarketRouter clock"
+        );
+    }
 
     // 250 ms fixture must not persist 13 frames per symbol.
     assert_eq!(db_a.count_journal_frames().expect("count"), 8);

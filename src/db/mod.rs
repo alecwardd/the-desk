@@ -6785,6 +6785,7 @@ impl Database {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// Total persisted Journal Frame rows (all roots, all seconds).
     pub fn count_journal_frames(&self) -> Result<i64, DbError> {
         Ok(self
             .conn
@@ -10477,11 +10478,12 @@ impl Database {
             }
             self.upsert_session_summary(summary)?;
             if !events.is_empty() {
+                let root = Some(summary.root_symbol.as_str()).filter(|s| !s.is_empty());
                 let mut stmt = self.conn.prepare_cached(
                     "INSERT OR IGNORE INTO market_events
                      (session_date, timestamp_ms, event_type, level_name, price, direction, sequence_num, metadata_json,
-                      session_type, session_segment, trading_day, event_id)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                      session_type, session_segment, trading_day, event_id, root_symbol, journal_frame_second)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                 )?;
                 for e in events {
                     let meta = e
@@ -10501,6 +10503,8 @@ impl Database {
                         &e.session_segment,
                         &e.trading_day,
                         market_event_id(e),
+                        root,
+                        journal_frame_second_from_ts(e.timestamp_ms),
                     ])?;
                 }
             }

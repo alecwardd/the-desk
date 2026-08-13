@@ -1,3 +1,7 @@
+use crate::catalog::{
+    cheap_model_may_invoke, is_invalidation_event_type, kernel_event_from_market_event_scoped,
+    EventLifecycle,
+};
 use crate::db::{
     market_event_id, stable_hash_hex, AttentionSignalEventRecord, AttentionSignalRecord,
     SetupRuntimeStateRecord, TradeIdeaCardRecord,
@@ -6,6 +10,8 @@ use crate::pipelines::{MarketEvent, MarketState};
 use crate::risk::RiskState;
 use crate::rules::{SetupReadiness, SetupState};
 use std::collections::{BTreeMap, BTreeSet};
+
+use super::rank::{attention_kind_for_event, event_stream_signal_id, EVENT_STREAM_VIEW};
 
 const DEFAULT_SIGNAL_TTL_MS: f64 = 30.0 * 60_000.0;
 const ABSENCE_READY_MINUTE: i32 = 90;
@@ -70,14 +76,11 @@ impl SignalComposer {
     pub fn compose(&self, input: SignalComposerInput<'_>) -> AttentionComposeOutput {
         let mut output = AttentionComposeOutput::default();
         let mut grouped_events: BTreeMap<String, Vec<&MarketEvent>> = BTreeMap::new();
+        let root = Some(input.market_snapshot.root_symbol.as_str()).filter(|s| !s.is_empty());
         for event in input.events {
-            let Some((kind, _)) = classify_event_kind(&event.event_type) else {
-                continue;
-            };
-            let subject = event_subject(event);
-            let scope = signal_scope(input.market_snapshot, event);
+            let kernel = kernel_event_from_market_event_scoped(event, root, None);
             grouped_events
-                .entry(format!("{kind}:{subject}:{scope}"))
+                .entry(kernel.dedup_identity_id)
                 .or_default()
                 .push(event);
         }
@@ -103,6 +106,8 @@ impl SignalComposer {
         }
 
         if input.pulse_kind == AttentionPulseKind::Periodic {
+            // Deterministic absence overlay — not a cheap-model / LLM narrator.
+            debug_assert!(!cheap_model_may_invoke(false));
             if let Some(signal) = self.absence_signal(&input) {
                 self.push_signal(&input, &mut output, signal);
             }
@@ -167,25 +172,61 @@ impl SignalComposer {
         input: &SignalComposerInput<'_>,
         events: &[&MarketEvent],
     ) -> Option<AttentionSignalRecord> {
-        let event = *events.first()?;
-        let (kind, base_weight) = classify_event_kind(&event.event_type)?;
+        let event = events
+            .iter()
+            .max_by(|a, b| {
+                a.timestamp_ms
+                    .partial_cmp(&b.timestamp_ms)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .copied()?;
+        let root = Some(input.market_snapshot.root_symbol.as_str()).filter(|s| !s.is_empty());
+        let prior = if events.len() > 1 {
+            Some(EventLifecycle::Open)
+        } else {
+            None
+        };
+        let kernel = kernel_event_from_market_event_scoped(event, root, prior);
+        let kind = attention_kind_for_event(&event.event_type);
+        let (kind, base_weight) = match kind {
+            "dom_family" => ("dom_family", 40.0),
+            "flow_confirmation" => (
+                "flow_confirmation",
+                classify_event_kind(&event.event_type)
+                    .map(|(_, w)| w)
+                    .unwrap_or(32.0),
+            ),
+            "market_structure_change" => (
+                "market_structure_change",
+                classify_event_kind(&event.event_type)
+                    .map(|(_, w)| w)
+                    .unwrap_or(25.0),
+            ),
+            other => (other, 18.0),
+        };
         let subject = event_subject(event);
-        let scope = signal_scope(input.market_snapshot, event);
-        let dedupe_key = format!("{kind}:{subject}:{scope}");
+        let dedupe_key = format!("event_stream:{}", kernel.dedup_identity_id);
         let raw_event_ids: Vec<String> =
             events.iter().map(|event| market_event_id(event)).collect();
-        let signal_id = signal_id(&dedupe_key, &event.session_date, input.source, input.job_id);
+        let signal_id = event_stream_signal_id(
+            &kernel.dedup_identity_id,
+            &event.session_date,
+            input.source,
+            input.job_id,
+        );
         let source_event_ids = merged_source_event_ids(input, &signal_id, raw_event_ids);
         let event_bonus = events
             .iter()
             .map(|event| event_severity_bonus(event))
-            .fold(0.0, f64::max);
+            .fold(0.0, f64::max)
+            .max(kernel.severity.rank() as f64 * 4.0);
         let composite_bonus = if events.len() > 1 { 10.0 } else { 0.0 };
         let staleness_decay = staleness_decay(input, &signal_id);
         let priority_score =
             (base_weight + event_bonus + composite_bonus - staleness_decay).max(0.0);
         let priority = priority_bucket(priority_score);
         let title = match kind {
+            "dom_family" => format!("DOM-family event at {subject}"),
             "market_structure_change" if events.len() > 1 => {
                 format!("Composite structure change at {subject}")
             }
@@ -196,11 +237,21 @@ impl SignalComposer {
             "flow_confirmation" => format!("Flow changed at {subject}"),
             _ => format!("Market event: {}", event.event_type),
         };
+        let resolved = events
+            .iter()
+            .any(|event| is_invalidation_event_type(&event.event_type));
+        let lifecycle = if resolved {
+            EventLifecycle::Resolved
+        } else if events.len() > 1 {
+            EventLifecycle::Updated
+        } else {
+            kernel.lifecycle
+        };
         let summary = format!(
-            "Your playbook says this is an attention event, not an entry by itself: {} event(s) near {:.2}.",
-            events.len(), event.price
+            "Your playbook / your rules say this is an attention event, not an entry by itself: {} event(s) near {:.2} (lifecycle {}).",
+            events.len(), event.price, lifecycle.as_str()
         );
-        Some(base_signal(
+        let mut signal = base_signal(
             self.config.signal_ttl_ms,
             input,
             signal_id,
@@ -216,6 +267,14 @@ impl SignalComposer {
             None,
             suggested_tools_for_kind(kind),
             serde_json::json!({
+                "viewOf": EVENT_STREAM_VIEW,
+                "lifecycle": lifecycle.as_str(),
+                "severity": kernel.severity.as_str(),
+                "identityId": kernel.identity_id,
+                "dedupIdentityId": kernel.dedup_identity_id,
+                "frameRef": kernel.frame_ref,
+                "family": kernel.family.as_str(),
+                "requiresCapsule": kernel.requires_capsule,
                 "eventTypes": events.iter().map(|event| event.event_type.clone()).collect::<Vec<_>>(),
                 "levelName": event.level_name,
                 "direction": event.direction,
@@ -231,7 +290,9 @@ impl SignalComposer {
                 },
                 "conditionFields": events.iter().map(|event| event.event_type.clone()).collect::<Vec<_>>(),
             }),
-        ))
+        );
+        signal.status = lifecycle.attention_status().to_string();
+        Some(signal)
     }
 
     fn signal_from_setup_state(
@@ -569,6 +630,9 @@ fn base_signal(
 }
 
 fn classify_event_kind(event_type: &str) -> Option<(&'static str, f64)> {
+    if crate::catalog::is_dom_family_event_type(event_type) {
+        return Some(("dom_family", 40.0));
+    }
     match event_type {
         "dnp_cross"
         | "or5_mid_retest"
@@ -586,7 +650,7 @@ fn classify_event_kind(event_type: &str) -> Option<(&'static str, f64)> {
         | "acceleration_zone_held"
         | "large_trade_cluster" => Some(("flow_confirmation", 32.0)),
         "absorption_detected" | "acceleration_zone_created" => Some(("flow_confirmation", 22.0)),
-        _ => None,
+        _ => Some((attention_kind_for_event(event_type), 18.0)),
     }
 }
 
@@ -745,26 +809,32 @@ fn signal_id(dedupe_key: &str, session_date: &str, source: &str, job_id: Option<
     )
 }
 
-fn signal_scope(snapshot: &MarketState, event: &MarketEvent) -> String {
-    format!(
-        "{}:{}:{}:{}",
-        event.trading_day, snapshot.root_symbol, snapshot.contract_symbol, event.session_type
-    )
-}
-
 fn suggested_tools_for_kind(kind: &str) -> Vec<String> {
     match kind {
         "flow_confirmation" => vec![
+            "get_events".to_string(),
+            "get_attention_inbox".to_string(),
             "get_absorption_events".to_string(),
             "get_footprint".to_string(),
             "get_tape_pace".to_string(),
         ],
+        "dom_family" => vec![
+            "get_events".to_string(),
+            "get_attention_inbox".to_string(),
+            "get_footprint".to_string(),
+        ],
         "market_structure_change" => vec![
+            "get_events".to_string(),
+            "get_attention_inbox".to_string(),
             "get_market_snapshot".to_string(),
             "get_key_levels".to_string(),
             "get_proximity_report".to_string(),
         ],
-        _ => vec!["get_market_snapshot".to_string()],
+        _ => vec![
+            "get_events".to_string(),
+            "get_attention_inbox".to_string(),
+            "get_market_snapshot".to_string(),
+        ],
     }
 }
 

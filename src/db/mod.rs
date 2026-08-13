@@ -15,7 +15,7 @@ use crate::rules::{
 };
 use crate::tick_time_context_from_timestamp_ms;
 use crate::trading_day_from_timestamp_ms;
-use rusqlite::{params, Connection, OpenFlags, Row};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
@@ -848,6 +848,171 @@ pub fn market_event_id(event: &MarketEvent) -> String {
     format!("evt_{}", stable_hash_hex(&market_event_identity(event)))
 }
 
+/// Family stem for dedup identity (`absorption_confirmed` → `absorption`).
+pub fn market_event_family_key(event_type: &str) -> String {
+    let t = event_type
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['-', ' '], "_");
+    for suffix in [
+        "_invalidated",
+        "_confirmed",
+        "_detected",
+        "_created",
+        "_held",
+    ] {
+        if let Some(stem) = t.strip_suffix(suffix) {
+            if !stem.is_empty() {
+                return stem.to_string();
+            }
+        }
+    }
+    t
+}
+
+/// Stable condition identity (no timestamp) so a persistent condition is one
+/// canonical Event on `get_events`, while research still counts occurrences.
+pub fn market_event_dedup_identity(event: &MarketEvent, root_symbol: Option<&str>) -> String {
+    format!(
+        "{}|{}|{}|{}|{}|{}|{}|{}",
+        market_event_family_key(&event.event_type),
+        event.trading_day,
+        event.session_type,
+        event.session_segment,
+        root_symbol.unwrap_or("").trim(),
+        event.level_name.as_deref().unwrap_or(""),
+        event.direction.as_deref().unwrap_or(""),
+        event
+            .sequence_num
+            .map(|v| v.to_string())
+            .unwrap_or_default(),
+    )
+}
+
+/// Hash of [`market_event_dedup_identity`].
+pub fn market_event_dedup_id(event: &MarketEvent, root_symbol: Option<&str>) -> String {
+    format!(
+        "dedup_{}",
+        stable_hash_hex(&market_event_dedup_identity(event, root_symbol))
+    )
+}
+
+fn event_type_is_invalidation(event_type: &str) -> bool {
+    event_type
+        .trim()
+        .to_ascii_lowercase()
+        .replace('-', "_")
+        .ends_with("_invalidated")
+}
+
+fn next_stored_lifecycle(prior: Option<&str>, event_type: &str) -> &'static str {
+    let invalidated = event_type_is_invalidation(event_type);
+    match (prior, invalidated) {
+        (None, true) => "resolved",
+        (None, false) => "open",
+        (Some("resolved"), true) => "resolved",
+        (Some("expired"), true) => "expired",
+        (Some("resolved"), false) | (Some("expired"), false) => "open",
+        (Some(_), true) => "resolved",
+        (Some("open"), false) | (Some("updated"), false) => "updated",
+        _ => "open",
+    }
+}
+
+fn stored_severity_from_event(event: &MarketEvent) -> String {
+    if let Some(raw) = event
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get("severity"))
+        .and_then(|v| v.as_str())
+    {
+        let n = raw.trim().to_ascii_lowercase();
+        if matches!(n.as_str(), "low" | "normal" | "high" | "urgent") {
+            return n;
+        }
+    }
+    let t = event.event_type.to_ascii_lowercase();
+    if t.contains("absorption")
+        || t.contains("pinch")
+        || t.contains("stop_run")
+        || t.contains("iceberg")
+        || t.contains("pull_intent")
+        || t.contains("book_velocity")
+    {
+        "high".into()
+    } else {
+        "normal".into()
+    }
+}
+
+fn upsert_market_event_row(
+    conn: &rusqlite::Connection,
+    root_symbol: Option<&str>,
+    event: &MarketEvent,
+) -> Result<bool, DbError> {
+    let dedup_id = market_event_dedup_id(event, root_symbol);
+    let dedup_key = market_event_dedup_identity(event, root_symbol);
+    let occurrence_id = market_event_id(event);
+    let occurrence_key = market_event_identity(event);
+    let frame_second = journal_frame_second_from_ts(event.timestamp_ms);
+    let severity = stored_severity_from_event(event);
+    let meta = event
+        .metadata
+        .as_ref()
+        .map(|m| serde_json::to_string(m).unwrap_or_default());
+
+    // Look up the latest row for this condition only to stamp lifecycle on the
+    // *new* occurrence. Research frequency counts occurrences; `get_events`
+    // collapses to latest-per-dedup. Do not UPDATE/delete prior rows here.
+    let prior_lifecycle: Option<String> = conn
+        .query_row(
+            "SELECT COALESCE(lifecycle, 'open')
+               FROM market_events
+              WHERE dedup_identity_id = ?1
+              ORDER BY COALESCE(lifecycle_updated_at_ms, timestamp_ms) DESC,
+                       timestamp_ms DESC, id DESC
+              LIMIT 1",
+            params![dedup_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    let lifecycle = next_stored_lifecycle(prior_lifecycle.as_deref(), &event.event_type);
+    let n = conn.execute(
+        "INSERT OR IGNORE INTO market_events
+         (session_date, timestamp_ms, event_type, level_name, price, direction, sequence_num, metadata_json,
+          session_type, session_segment, trading_day, event_id, root_symbol, journal_frame_second,
+          lifecycle, severity, identity_id, identity_key, dedup_identity_id, dedup_identity_key,
+          lifecycle_updated_at_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                 ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+        params![
+            event.session_date,
+            event.timestamp_ms,
+            event.event_type,
+            event.level_name,
+            event.price,
+            event.direction,
+            event.sequence_num,
+            meta,
+            &event.session_type,
+            &event.session_segment,
+            &event.trading_day,
+            occurrence_id.clone(),
+            root_symbol,
+            frame_second,
+            lifecycle,
+            severity,
+            occurrence_id,
+            occurrence_key,
+            dedup_id,
+            dedup_key,
+            event.timestamp_ms,
+        ],
+    )?;
+    Ok(n > 0)
+}
+
 /// 1 Hz Journal Frame second on the MarketRouter clock (`floor(timestamp_ms / 1000)`).
 ///
 /// Matches [`crate::engine::journal::JOURNAL_FRAME_INTERVAL_MS`]. Invalid timestamps
@@ -1421,6 +1586,9 @@ impl Database {
         }
         if version < 32 {
             self.migrate_v32()?;
+        }
+        if version < 33 {
+            self.migrate_v33()?;
         }
 
         Ok(())
@@ -2974,6 +3142,39 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_positioning_records_day
               ON positioning_records(trading_day, captured_at_ms);
             UPDATE schema_version SET version = 32;
+            ",
+        )?;
+        Ok(())
+    }
+
+    /// V33: SIL-M4 event lifecycle columns (open → updated → resolved|expired).
+    ///
+    /// Severity, occurrence/dedup identity, and lifecycle timestamps live on
+    /// `market_events`. `frame_ref` continues to join via
+    /// `(journal_frame_second, root_symbol)` from SIL-M3a. Capsules are later.
+    fn migrate_v33(&self) -> Result<(), DbError> {
+        let columns = [
+            "ALTER TABLE market_events ADD COLUMN lifecycle TEXT NOT NULL DEFAULT 'open'",
+            "ALTER TABLE market_events ADD COLUMN severity TEXT NOT NULL DEFAULT 'unspecified'",
+            "ALTER TABLE market_events ADD COLUMN identity_id TEXT NULL",
+            "ALTER TABLE market_events ADD COLUMN identity_key TEXT NULL",
+            "ALTER TABLE market_events ADD COLUMN dedup_identity_id TEXT NULL",
+            "ALTER TABLE market_events ADD COLUMN dedup_identity_key TEXT NULL",
+            "ALTER TABLE market_events ADD COLUMN lifecycle_updated_at_ms REAL NULL",
+        ];
+        for sql in columns {
+            let _ = self.conn.execute(sql, []);
+        }
+        self.conn.execute_batch(
+            "
+            UPDATE market_events
+               SET identity_id = event_id
+             WHERE identity_id IS NULL AND event_id IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_market_events_dedup_lifecycle
+              ON market_events(dedup_identity_id, lifecycle);
+            CREATE INDEX IF NOT EXISTS idx_market_events_lifecycle_updated
+              ON market_events(lifecycle_updated_at_ms);
+            UPDATE schema_version SET version = 33;
             ",
         )?;
         Ok(())
@@ -7298,7 +7499,8 @@ impl Database {
         let limit = limit.clamp(1, 500);
         let mut sql = String::from(
             "SELECT timestamp_ms, event_type, level_name, price, direction, sequence_num, metadata_json,
-                    session_date, session_type, session_segment, trading_day
+                    session_date, session_type, session_segment, trading_day, root_symbol, journal_frame_second,
+                    lifecycle, severity, identity_id, identity_key, dedup_identity_id, dedup_identity_key, event_id
              FROM market_events WHERE 1=1",
         );
         if since_ms.is_some() {
@@ -7311,7 +7513,7 @@ impl Database {
                 sql.push_str(" AND event_type = ?1");
             }
         }
-        sql.push_str(" ORDER BY timestamp_ms DESC LIMIT ");
+        sql.push_str(" ORDER BY COALESCE(lifecycle_updated_at_ms, timestamp_ms) DESC, timestamp_ms DESC LIMIT ");
         sql.push_str(&limit.to_string());
 
         let mut stmt = self.conn.prepare(&sql)?;
@@ -7332,6 +7534,15 @@ impl Database {
                 "sessionType": row.get::<_, Option<String>>(8)?,
                 "sessionSegment": row.get::<_, Option<String>>(9)?,
                 "tradingDay": row.get::<_, Option<String>>(10)?,
+                "rootSymbol": row.get::<_, Option<String>>(11)?,
+                "journalFrameSecond": row.get::<_, Option<i64>>(12)?,
+                "lifecycle": row.get::<_, Option<String>>(13)?.unwrap_or_else(|| "open".into()),
+                "severity": row.get::<_, Option<String>>(14)?.unwrap_or_else(|| "unspecified".into()),
+                "identityId": row.get::<_, Option<String>>(15)?,
+                "identityKey": row.get::<_, Option<String>>(16)?,
+                "dedupIdentityId": row.get::<_, Option<String>>(17)?,
+                "dedupIdentityKey": row.get::<_, Option<String>>(18)?,
+                "eventId": row.get::<_, Option<String>>(19)?,
             }))
         };
 
@@ -7862,12 +8073,16 @@ impl Database {
             .map(|_| ())
     }
 
-    /// Batch-insert market events, stamping `root_symbol` and Journal Frame join key.
+    /// Batch-insert market events, stamping `root_symbol`, Journal Frame join
+    /// key, and SIL-M4 lifecycle columns.
     ///
     /// `journal_frame_second` is `floor(event.timestamp_ms / 1000)` so a
     /// transition row joins the Journal Frame for that root's print second —
     /// not the max MarketRouter clock, which may already be on a later second.
-    /// Returns the number of rows actually inserted (`INSERT OR IGNORE`).
+    /// Each distinct occurrence is appended (`INSERT OR IGNORE`). Repeats of
+    /// the same **dedup identity** stamp `open` → `updated` → `resolved` on the
+    /// new row; prior occurrence rows are left intact for research counts.
+    /// Returns rows inserted.
     pub fn insert_market_events_batch_scoped(
         &self,
         root_symbol: Option<&str>,
@@ -7878,41 +8093,54 @@ impl Database {
         }
         let tx = self.conn.unchecked_transaction()?;
         let mut written = 0usize;
-        {
-            let mut stmt = tx.prepare_cached(
-                "INSERT OR IGNORE INTO market_events
-                 (session_date, timestamp_ms, event_type, level_name, price, direction, sequence_num, metadata_json,
-                  session_type, session_segment, trading_day, event_id, root_symbol, journal_frame_second)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-            )?;
-            for e in events {
-                let meta = e
-                    .metadata
-                    .as_ref()
-                    .map(|m| serde_json::to_string(m).unwrap_or_default());
-                let event_id = market_event_id(e);
-                let frame_second = journal_frame_second_from_ts(e.timestamp_ms);
-                let n = stmt.execute(params![
-                    e.session_date,
-                    e.timestamp_ms,
-                    e.event_type,
-                    e.level_name,
-                    e.price,
-                    e.direction,
-                    e.sequence_num,
-                    meta,
-                    &e.session_type,
-                    &e.session_segment,
-                    &e.trading_day,
-                    event_id,
-                    root_symbol,
-                    frame_second,
-                ])?;
-                written += n;
+        for e in events {
+            if upsert_market_event_row(&tx, root_symbol, e)? {
+                written += 1;
             }
         }
         tx.commit()?;
         Ok(written)
+    }
+
+    /// Expire live (`open`/`updated`) events whose age on the MarketRouter clock
+    /// exceeds `ttl_ms`. Uses event time, never wall clock.
+    ///
+    /// Only the latest row per dedup identity is eligible. Historical
+    /// occurrence rows keep the lifecycle they were stamped with at insert
+    /// (research still counts them; `get_events` collapses to the latest).
+    pub fn expire_event_lifecycles(&self, clock_ms: f64, ttl_ms: f64) -> Result<usize, DbError> {
+        if !clock_ms.is_finite() || clock_ms <= 0.0 || !ttl_ms.is_finite() || ttl_ms <= 0.0 {
+            return Ok(0);
+        }
+        let cutoff = clock_ms - ttl_ms;
+        let n = self.conn.execute(
+            "UPDATE market_events
+                SET lifecycle = 'expired',
+                    lifecycle_updated_at_ms = ?1
+              WHERE id IN (
+                SELECT id FROM (
+                  SELECT id,
+                         lifecycle,
+                         timestamp_ms,
+                         ROW_NUMBER() OVER (
+                           PARTITION BY COALESCE(
+                             NULLIF(dedup_identity_id, ''),
+                             NULLIF(event_id, ''),
+                             CAST(id AS TEXT)
+                           )
+                           ORDER BY COALESCE(lifecycle_updated_at_ms, timestamp_ms) DESC,
+                                    timestamp_ms DESC,
+                                    id DESC
+                         ) AS rn
+                    FROM market_events
+                ) latest
+                WHERE rn = 1
+                  AND lifecycle IN ('open', 'updated')
+                  AND timestamp_ms < ?2
+              )",
+            params![clock_ms, cutoff],
+        )?;
+        Ok(n)
     }
 
     pub fn list_ib_extension_events_for_session(
@@ -10591,33 +10819,8 @@ impl Database {
             self.upsert_session_summary(summary)?;
             if !events.is_empty() {
                 let root = Some(summary.root_symbol.as_str()).filter(|s| !s.is_empty());
-                let mut stmt = self.conn.prepare_cached(
-                    "INSERT OR IGNORE INTO market_events
-                     (session_date, timestamp_ms, event_type, level_name, price, direction, sequence_num, metadata_json,
-                      session_type, session_segment, trading_day, event_id, root_symbol, journal_frame_second)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-                )?;
                 for e in events {
-                    let meta = e
-                        .metadata
-                        .as_ref()
-                        .map(|m| serde_json::to_string(m).unwrap_or_default());
-                    stmt.execute(params![
-                        e.session_date,
-                        e.timestamp_ms,
-                        e.event_type,
-                        e.level_name,
-                        e.price,
-                        e.direction,
-                        e.sequence_num,
-                        meta,
-                        &e.session_type,
-                        &e.session_segment,
-                        &e.trading_day,
-                        market_event_id(e),
-                        root,
-                        journal_frame_second_from_ts(e.timestamp_ms),
-                    ])?;
+                    upsert_market_event_row(&self.conn, root, e)?;
                 }
             }
             for signal in replay_signals {
@@ -12454,6 +12657,117 @@ mod tests {
         assert_eq!(joined[0]["rootSymbol"], "NQ");
         assert_eq!(joined[0]["journalFrameSecond"], frame_second);
         assert_eq!(joined[0]["frameRootSymbol"], "NQ");
+    }
+
+    #[test]
+    fn market_event_lifecycle_upserts_repeats_and_resolves() {
+        let db = test_db();
+        let ts = 1_704_207_600_250.0;
+        let detected = MarketEvent {
+            session_date: "2024-01-02".into(),
+            timestamp_ms: ts,
+            event_type: "absorption_detected".into(),
+            level_name: Some("zone".into()),
+            price: 20_000.0,
+            direction: Some("bid".into()),
+            sequence_num: None,
+            metadata: None,
+            session_type: "RTH".into(),
+            session_segment: "None".into(),
+            trading_day: "2024-01-02".into(),
+        };
+        db.insert_market_events_batch_scoped(Some("NQ"), std::slice::from_ref(&detected))
+            .expect("open");
+        let mut confirmed = detected.clone();
+        confirmed.event_type = "absorption_confirmed".into();
+        confirmed.timestamp_ms = ts + 1_000.0;
+        db.insert_market_events_batch_scoped(Some("NQ"), &[confirmed])
+            .expect("update");
+        let confirmed_rows = db
+            .list_recent_market_events(10, None, Some("absorption_confirmed"))
+            .expect("list");
+        assert_eq!(confirmed_rows.len(), 1);
+        assert_eq!(confirmed_rows[0]["lifecycle"], "updated");
+        assert_eq!(confirmed_rows[0]["severity"], "high");
+        assert!(confirmed_rows[0]["identityId"]
+            .as_str()
+            .unwrap()
+            .starts_with("evt_"));
+        assert!(confirmed_rows[0]["dedupIdentityId"]
+            .as_str()
+            .unwrap()
+            .starts_with("dedup_"));
+        assert_eq!(
+            confirmed_rows[0]["journalFrameSecond"],
+            journal_frame_second_from_ts(ts + 1_000.0).unwrap()
+        );
+        assert_eq!(confirmed_rows[0]["rootSymbol"], "NQ");
+
+        let mut invalidated = detected;
+        invalidated.event_type = "absorption_invalidated".into();
+        invalidated.timestamp_ms = ts + 2_000.0;
+        db.insert_market_events_batch_scoped(Some("NQ"), &[invalidated])
+            .expect("resolve");
+        let all = db.list_recent_market_events(10, None, None).expect("all");
+        assert_eq!(
+            all.len(),
+            3,
+            "occurrence rows stay append-only for research counts"
+        );
+        let resolved_rows = db
+            .list_recent_market_events(10, None, Some("absorption_invalidated"))
+            .expect("resolved list");
+        assert_eq!(resolved_rows.len(), 1);
+        assert_eq!(resolved_rows[0]["lifecycle"], "resolved");
+        assert_eq!(
+            confirmed_rows[0]["dedupIdentityId"],
+            resolved_rows[0]["dedupIdentityId"]
+        );
+
+        let expired = db
+            .expire_event_lifecycles(ts + 3_600_000.0, 30.0 * 60_000.0)
+            .expect("expire");
+        assert_eq!(
+            expired, 0,
+            "resolved latest rows are not expired; historical open/updated stay stamped"
+        );
+        let after_ttl = db
+            .list_recent_market_events(10, None, None)
+            .expect("after ttl");
+        assert_eq!(after_ttl[0]["lifecycle"], "resolved");
+        assert!(after_ttl.iter().any(|row| row["lifecycle"] == "open"));
+        assert!(after_ttl.iter().any(|row| row["lifecycle"] == "updated"));
+    }
+
+    #[test]
+    fn market_event_ttl_expires_on_market_clock() {
+        let db = test_db();
+        let ts = 1_704_207_600_000.0;
+        db.insert_market_events_batch_scoped(
+            Some("NQ"),
+            &[MarketEvent {
+                session_date: "2024-01-02".into(),
+                timestamp_ms: ts,
+                event_type: "dnp_cross".into(),
+                level_name: Some("dnp".into()),
+                price: 20_000.0,
+                direction: Some("from_below".into()),
+                sequence_num: None,
+                metadata: None,
+                session_type: "RTH".into(),
+                session_segment: "None".into(),
+                trading_day: "2024-01-02".into(),
+            }],
+        )
+        .expect("open");
+        let n = db
+            .expire_event_lifecycles(ts + 31.0 * 60_000.0, 30.0 * 60_000.0)
+            .expect("expire");
+        assert_eq!(n, 1);
+        let rows = db
+            .list_recent_market_events(10, None, Some("dnp_cross"))
+            .expect("list");
+        assert_eq!(rows[0]["lifecycle"], "expired");
     }
 
     #[test]

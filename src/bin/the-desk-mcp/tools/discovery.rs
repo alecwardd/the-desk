@@ -11,10 +11,11 @@ use rmcp::{
 };
 use the_desk_backend::catalog::{
     apply_positioning_slice, apply_token_budget, build_catalog, build_state_envelope,
-    describe_domain, describe_environment, kernel_event_from_db_row,
-    kernel_event_from_market_event, merge_symbol_envelopes, positioning_state_slice,
-    search_catalog, state_envelope_json, EventsEnvelope, PositioningStateSlice, ProvenanceSource,
-    StateEnvelope, StateReadRequest, StateResolution, TrustLevel, KERNEL_READ_QUERY_TOOLS,
+    coaching_kernel_events_from_db_rows, collapse_events_latest_per_dedup, describe_domain,
+    describe_environment, kernel_event_from_market_event_scoped, merge_symbol_envelopes,
+    positioning_state_slice, search_catalog, state_envelope_json, EventsEnvelope,
+    PositioningStateSlice, ProvenanceSource, StateEnvelope, StateReadRequest, StateResolution,
+    TrustLevel, COACHING_EVENT_FETCH_CAP, KERNEL_READ_QUERY_TOOLS,
 };
 use the_desk_backend::engine::{parse_requested_roots, RouterRoot, RouterRootError};
 use the_desk_backend::trading_day_from_timestamp_ms;
@@ -298,7 +299,7 @@ impl TheDeskMcp {
     }
 
     #[tool(
-        description = "SIL read kernel: recent market events with identity for later lifecycle formalization (type, time, severity placeholder, identityId). Full lifecycle (open/updated/resolved) is a later ticket — this returns identity rows only. Trust Level L0 (read/query). Enable via [sil].catalog_discovery."
+        description = "SIL read kernel: formalized market events with lifecycle (open → updated → resolved|expired), severity, dedup identity, and frame_ref joining each row to the producing Journal Frame. Trust Level L0 (read/query) — structurally incapable of mutation or order authority. Attention inbox is a ranked view over this stream (get_attention_inbox). Enable via [sil].catalog_discovery."
     )]
     pub(crate) async fn get_events(
         &self,
@@ -320,41 +321,53 @@ impl TheDeskMcp {
         };
         let _symbols = params.symbols; // reserved for MarketRouter multi-symbol
 
-        // External engine mode: prefer live published event identity rows so the
-        // read kernel stays current when MCP does not own ingest/DB event writes.
-        let events = if let Some(store) = self.engine_published.as_ref() {
-            let published = store.load();
-            let mut out = Vec::new();
-            for value in published.recent_events.iter().rev() {
-                let Ok(ev) = serde_json::from_value::<the_desk_backend::pipelines::MarketEvent>(
-                    value.clone(),
-                ) else {
-                    continue;
-                };
-                if let Some(min_ts) = since_ms {
-                    if ev.timestamp_ms < min_ts {
+        // Prefer SQLite (lifecycle + frame_ref persist without a connected agent).
+        // Published rows fill the live gap before the first journal flush.
+        // Occurrence rows stay in SQLite for research; the coaching view is
+        // latest-per-dedup identity.
+        let (db_rows, db_had_rows) = {
+            let db = self.db.lock().map_err(|_| lock_error())?;
+            let rows = db
+                .list_recent_market_events(COACHING_EVENT_FETCH_CAP, since_ms, None)
+                .map_err(db_error)?;
+            let had = !rows.is_empty();
+            (rows, had)
+        };
+        let mut events = coaching_kernel_events_from_db_rows(&db_rows, event_type, limit);
+        if events.is_empty() && !db_had_rows {
+            if let Some(store) = self.engine_published.as_ref() {
+                let published = store.load();
+                let mut out = Vec::new();
+                for value in published.recent_events.iter().rev() {
+                    let root = value
+                        .get("rootSymbol")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                    let Ok(ev) = serde_json::from_value::<the_desk_backend::pipelines::MarketEvent>(
+                        value.clone(),
+                    ) else {
                         continue;
+                    };
+                    if let Some(min_ts) = since_ms {
+                        if ev.timestamp_ms < min_ts {
+                            continue;
+                        }
                     }
+                    out.push(kernel_event_from_market_event_scoped(
+                        &ev,
+                        root.as_deref(),
+                        None,
+                    ));
                 }
+                events = collapse_events_latest_per_dedup(out);
                 if let Some(want) = event_type {
-                    if !ev.event_type.eq_ignore_ascii_case(want) {
-                        continue;
-                    }
+                    events.retain(|e| e.event_type.eq_ignore_ascii_case(want));
                 }
-                out.push(kernel_event_from_market_event(&ev));
-                if out.len() >= limit {
-                    break;
+                if events.len() > limit {
+                    events.truncate(limit);
                 }
             }
-            out
-        } else {
-            let rows = {
-                let db = self.db.lock().map_err(|_| lock_error())?;
-                db.list_recent_market_events(limit, since_ms, event_type)
-                    .map_err(db_error)?
-            };
-            rows.iter().map(kernel_event_from_db_row).collect()
-        };
+        }
         let envelope = EventsEnvelope::from_events(events);
         let mut out = serde_json::to_value(&envelope).unwrap_or_else(|_| serde_json::json!({}));
         if let Some(obj) = out.as_object_mut() {

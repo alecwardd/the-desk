@@ -1715,13 +1715,75 @@ async fn get_events_returns_identity_rows() {
             .expect("get_events"),
     );
     assert_eq!(out["trustLevel"], "L0");
-    assert_eq!(out["lifecycleFormalized"], false);
+    assert_eq!(out["lifecycleFormalized"], true);
+    assert_eq!(out["mutationAuthority"], false);
+    assert_eq!(out["orderAuthority"], false);
     assert_eq!(out["count"], 1);
     let evt = &out["events"][0];
     assert_eq!(evt["eventType"], "ib_extension_hit");
     assert_eq!(evt["timestampMs"], 1_700_000_000_000.0);
     assert_eq!(evt["severity"], "high");
+    assert_eq!(evt["lifecycle"], "open");
     assert!(evt["identityId"].as_str().unwrap().starts_with("evt_"));
+    assert!(evt["dedupIdentityId"]
+        .as_str()
+        .unwrap()
+        .starts_with("dedup_"));
+    assert!(
+        evt.get("frameRef").is_some(),
+        "frame_ref must never be omitted"
+    );
+    assert_eq!(evt["frameRef"]["journalFrameSecond"], 1_700_000_000i64);
+    assert_eq!(evt["requiresCapsule"], false);
+}
+
+#[tokio::test]
+async fn get_events_collapses_repeat_identity_to_latest_lifecycle() {
+    let server = test_server_with_sil();
+    {
+        let db = server.db.lock().expect("db");
+        let detected = MarketEvent {
+            session_date: "2026-08-11".into(),
+            timestamp_ms: 1_700_000_000_000.0,
+            event_type: "absorption_detected".into(),
+            level_name: Some("zone".into()),
+            price: 21000.0,
+            direction: Some("bid".into()),
+            sequence_num: None,
+            metadata: None,
+            session_type: "RTH".into(),
+            session_segment: "None".into(),
+            trading_day: "2026-08-11".into(),
+        };
+        let mut confirmed = detected.clone();
+        confirmed.event_type = "absorption_confirmed".into();
+        confirmed.timestamp_ms = 1_700_000_001_000.0;
+        db.insert_market_events_batch_scoped(Some("NQ"), &[detected, confirmed])
+            .expect("insert events");
+    }
+    let out = parse_text_tool_result(
+        server
+            .get_events(Parameters(GetEventsParams {
+                symbols: None,
+                event_type: None,
+                since_ms: None,
+                limit: Some(10),
+            }))
+            .await
+            .expect("get_events"),
+    );
+    assert_eq!(out["count"], 1);
+    assert_eq!(out["lifecycleFormalized"], true);
+    assert_eq!(out["trustLevel"], "L0");
+    let evt = &out["events"][0];
+    assert_eq!(evt["eventType"], "absorption_confirmed");
+    assert_eq!(evt["lifecycle"], "updated");
+    assert_eq!(evt["severity"], "high");
+    assert!(evt.get("frameRef").is_some());
+    assert!(evt["dedupIdentityId"]
+        .as_str()
+        .unwrap()
+        .starts_with("dedup_"));
 }
 
 #[tokio::test]
@@ -1774,6 +1836,59 @@ async fn get_events_rejects_invalid_since_ms() {
         .await
         .expect_err("invalid sinceMs");
     assert!(err.to_string().contains("sinceMs"));
+}
+
+#[tokio::test]
+async fn get_attention_inbox_is_ranked_view_over_event_stream() {
+    let server = test_server_with_sil();
+    {
+        let db = server.db.lock().expect("db");
+        db.insert_market_events_batch_scoped(
+            Some("NQ"),
+            &[MarketEvent {
+                session_date: "2026-08-11".into(),
+                timestamp_ms: 1_700_000_000_000.0,
+                event_type: "pinch_detected".into(),
+                level_name: Some("vwap".into()),
+                price: 21000.0,
+                direction: Some("from_below".into()),
+                sequence_num: None,
+                metadata: None,
+                session_type: "RTH".into(),
+                session_segment: "None".into(),
+                trading_day: "2026-08-11".into(),
+            }],
+        )
+        .expect("insert event");
+    }
+    let events = parse_text_tool_result(
+        server
+            .get_events(Parameters(GetEventsParams {
+                event_type: Some("pinch_detected".into()),
+                limit: Some(10),
+                ..Default::default()
+            }))
+            .await
+            .expect("get_events"),
+    );
+    assert_eq!(events["lifecycleFormalized"], true);
+    assert_eq!(events["trustLevel"], "L0");
+    let inbox = parse_text_tool_result(
+        server
+            .get_attention_inbox(Parameters(AttentionInboxParams::default()))
+            .await
+            .expect("inbox"),
+    );
+    assert_eq!(inbox["viewOf"], "eventStream");
+    assert_eq!(inbox["lifecycleFormalized"], true);
+    assert_eq!(inbox["sourceOperator"], "get_events");
+    let signals = inbox["signals"].as_array().expect("signals");
+    assert!(!signals.is_empty());
+    assert_eq!(signals[0]["payload"]["viewOf"], "eventStream");
+    assert_eq!(signals[0]["status"], "active");
+    let summary = signals[0]["summary"].as_str().unwrap_or("");
+    assert!(summary.contains("Your playbook") || summary.contains("your rules"));
+    assert!(!summary.to_ascii_lowercase().contains("you should buy"));
 }
 
 #[tokio::test]

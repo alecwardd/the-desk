@@ -666,9 +666,30 @@ This note does not introduce Journal Frames, Capsules, Feature-IR, Positioning p
 4. **MFE/MAE / R-result** remain tick-driven (ADR-019). The journal writer persists already-computed state and does not sample outcome extremes from frames.
 5. **Embedded-engine fallback** still writes Journal Frames for both symbols (NQ shared coaching pipelines + ES lane). External `the-desk-engine` writes the same tables on the same clock. Journal snapshot must not hold the pending-frame mutex across pipeline locks (embedded NQ ingest and ES poll are concurrent). Trust Ceiling stays **L3**; read/query stays Trust Level **L0**.
 
-This note does not introduce Capsules, event lifecycle formalization, the research query kernel, DuckDB, Positioning providers, Feature-IR, or ACSIL.
+This note does not introduce Capsules, the research query kernel, DuckDB, Positioning providers, Feature-IR, or ACSIL.
 
 **Consequences:** Historical `as_of` reads are co-recorded NQ↔ES frames. Rebuild from `.scid`/`.depth` through MarketRouter reproduces frames within the existing golden strict/derived tolerance model.
+
+---
+
+### Decision note: SIL-M4 event lifecycle + attention view + DOM-family taxonomy
+
+**Date:** 2026-08-13
+**Status:** Decided (implements [alecwardd/the-desk#9](https://github.com/alecwardd/the-desk/issues/9); Part of #2)
+
+**Context:** After Journal Frames, `get_events` still returned identity placeholders (`lifecycleFormalized=false`, severity `"unspecified"`). Attention (`SignalComposer` / `get_attention_inbox`) could disagree with event identity. Overnight completeness required events + attention to persist in the engine + SQLite while MCP/agent is disconnected. Capsules (#10) need an explicit DOM-family taxonomy to key off — without emitting Capsules here.
+
+**Decision:**
+
+1. **Lifecycle on the existing stream:** detector rows are formalized, not rebuilt. Canonical lifecycle is `open → updated → resolved|expired`. Each distinct occurrence is appended in SQLite (research frequency still counts rows). Repeats of the same **dedup identity** stamp the next lifecycle on the new row; `get_events` / `get_attention_inbox` collapse to latest-per-dedup so a persistent condition is not a stream of new Events. `_invalidated` types resolve; TTL on the MarketRouter clock expires only the latest live row per identity. Occurrence `identityId` is per row; **dedup identity** is the canonical condition key. Severity is always present (`low|normal|high|urgent|unspecified`).
+2. **`frame_ref`:** every `get_events` row carries `{ journalFrameSecond, rootSymbol }` using the SIL-M3a join (`floor(event.timestamp_ms / 1000)`, printing root). Keys are never silently omitted.
+3. **Attention inbox is a ranked view** over that event stream (`viewOf: eventStream`). Event-linked signals inherit lifecycle from `get_events`; missing live events are synthesized into the view so SignalComposer cannot be a silent second source of truth. `acknowledge_attention_signal` remains a typed workflow mutation (not a Trust Ceiling change, not order authority). Setup/risk/absence overlays may follow event-stream rows.
+4. **Overnight completeness:** `the-desk-engine` persist_journal writes lifecycle-stamped events and event-stream attention to SQLite with no MCP/agent attached. No push vendor and no standing LLM session. Cheap-model invocation is **event-triggered only** — the periodic absence pulse is deterministic, not a narrator.
+5. **DOM-family taxonomy** (Capsule-mandatory later, not emitted here): `stop_run`, `iceberg_reload`, `pull_intent`, `book_velocity_regime_shift`. Reads stay on `get_events` / `get_attention_inbox` — no new specialty event getters. Trust Level **L0** on `get_events`; Trust Ceiling stays **L3**.
+
+This note does not introduce Capsules / 250 ms dumps, Episode Query, DuckDB, Vs3dProvider, Feature-IR, or ACSIL.
+
+**Consequences:** Agents can distinguish a new condition from one already discussed. Capsule policy (#10) keys off the named DOM-family types. Embedded-engine fallback and external engine remain behavior-parity for the live coaching path.
 
 ---
 

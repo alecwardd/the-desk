@@ -847,6 +847,38 @@ pub fn market_event_id(event: &MarketEvent) -> String {
     format!("evt_{}", stable_hash_hex(&market_event_identity(event)))
 }
 
+/// 1 Hz Journal Frame second on the MarketRouter clock (`floor(timestamp_ms / 1000)`).
+///
+/// Matches [`crate::engine::journal::JOURNAL_FRAME_INTERVAL_MS`]. Invalid timestamps
+/// yield `None` so they cannot join a frame.
+pub fn journal_frame_second_from_ts(timestamp_ms: f64) -> Option<i64> {
+    if timestamp_ms.is_finite() && timestamp_ms > 0.0 {
+        Some((timestamp_ms / 1000.0).floor() as i64)
+    } else {
+        None
+    }
+}
+
+/// One persisted Journal Frame row (NQ or ES) on the shared MarketRouter clock.
+#[derive(Debug, Clone)]
+pub struct JournalFrameRecord {
+    pub clock_ms: f64,
+    pub frame_second: i64,
+    pub root_symbol: String,
+    pub session_type: String,
+    pub session_segment: String,
+    pub trading_day: String,
+    pub payload: serde_json::Value,
+}
+
+/// `get_state(as_of=…)` lookup: co-recorded frames at one clock second.
+#[derive(Debug, Clone)]
+pub struct JournalAsOfSnapshot {
+    pub frame_second: i64,
+    pub clock_ms: f64,
+    pub by_root: BTreeMap<String, serde_json::Value>,
+}
+
 fn min_priority_score(priority: Option<&str>) -> f64 {
     match priority {
         Some("urgent") => 80.0,
@@ -1382,6 +1414,9 @@ impl Database {
         }
         if version < 30 {
             self.migrate_v30()?;
+        }
+        if version < 31 {
+            self.migrate_v31()?;
         }
 
         Ok(())
@@ -2860,6 +2895,55 @@ impl Database {
         }
         self.conn
             .execute_batch("UPDATE schema_version SET version = 30;")?;
+        Ok(())
+    }
+
+    /// V31: Market State Journal Frames (SIL-M3a) — 1 Hz on the MarketRouter clock.
+    ///
+    /// Persist NQ+ES frames plus transition event join keys. Never persist the
+    /// ~250 ms analysis publish as a frame (Capsules are a later ticket).
+    fn migrate_v31(&self) -> Result<(), DbError> {
+        let _ = self.conn.execute(
+            "ALTER TABLE market_events ADD COLUMN journal_frame_second INTEGER NULL",
+            [],
+        );
+        self.conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS journal_frames (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              clock_ms REAL NOT NULL,
+              frame_second INTEGER NOT NULL,
+              root_symbol TEXT NOT NULL,
+              session_type TEXT NOT NULL DEFAULT 'Unknown',
+              session_segment TEXT NOT NULL DEFAULT 'None',
+              trading_day TEXT NOT NULL DEFAULT '',
+              payload TEXT NOT NULL,
+              UNIQUE(frame_second, root_symbol)
+            );
+            CREATE INDEX IF NOT EXISTS idx_journal_frames_clock
+              ON journal_frames(clock_ms, root_symbol);
+            CREATE INDEX IF NOT EXISTS idx_journal_frames_root_second
+              ON journal_frames(root_symbol, frame_second);
+            CREATE INDEX IF NOT EXISTS idx_market_events_journal_frame
+              ON market_events(journal_frame_second, root_symbol);
+
+            DROP INDEX IF EXISTS ux_market_events_identity;
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_market_events_identity
+              ON market_events(
+                session_date,
+                timestamp_ms,
+                event_type,
+                COALESCE(level_name, ''),
+                price,
+                COALESCE(direction, ''),
+                COALESCE(sequence_num, -1),
+                COALESCE(contract_symbol, ''),
+                COALESCE(root_symbol, '')
+              );
+
+            UPDATE schema_version SET version = 31;
+            ",
+        )?;
         Ok(())
     }
 
@@ -6589,6 +6673,154 @@ impl Database {
         })
     }
 
+    /// Insert Journal Frames at 1 Hz. Duplicate `(frame_second, root_symbol)` rows are ignored.
+    ///
+    /// Returns the number of rows actually inserted (not ignored). Callers must not
+    /// persist the ~250 ms analysis publish as a frame — uniqueness enforces 1 Hz.
+    pub fn insert_journal_frames(&self, frames: &[JournalFrameRecord]) -> Result<usize, DbError> {
+        if frames.is_empty() {
+            return Ok(0);
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        let mut written = 0usize;
+        {
+            let mut stmt = tx.prepare_cached(
+                "INSERT OR IGNORE INTO journal_frames
+                 (clock_ms, frame_second, root_symbol, session_type, session_segment, trading_day, payload)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )?;
+            for frame in frames {
+                let n = stmt.execute(params![
+                    frame.clock_ms,
+                    frame.frame_second,
+                    frame.root_symbol.as_str(),
+                    frame.session_type.as_str(),
+                    frame.session_segment.as_str(),
+                    frame.trading_day.as_str(),
+                    serde_json::to_string(&frame.payload)?,
+                ])?;
+                written += n;
+            }
+        }
+        tx.commit()?;
+        Ok(written)
+    }
+
+    /// Latest co-recorded Journal Frames with `clock_ms <= as_of_ms` (never pipeline snapshots).
+    pub fn get_journal_frames_as_of(
+        &self,
+        as_of_ms: f64,
+    ) -> Result<Option<JournalAsOfSnapshot>, DbError> {
+        if !as_of_ms.is_finite() || as_of_ms <= 0.0 {
+            return Ok(None);
+        }
+        let frame_second: Option<i64> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT frame_second FROM journal_frames
+                 WHERE clock_ms <= ?1
+                 ORDER BY clock_ms DESC, frame_second DESC
+                 LIMIT 1",
+            )?;
+            let mut rows = stmt.query(params![as_of_ms])?;
+            match rows.next()? {
+                Some(row) => Some(row.get(0)?),
+                None => None,
+            }
+        };
+        let Some(frame_second) = frame_second else {
+            return Ok(None);
+        };
+        let mut stmt = self.conn.prepare(
+            "SELECT clock_ms, root_symbol, payload FROM journal_frames
+             WHERE frame_second = ?1",
+        )?;
+        let rows = stmt.query_map(params![frame_second], |row| {
+            let clock_ms: f64 = row.get(0)?;
+            let root: String = row.get(1)?;
+            let payload: String = row.get(2)?;
+            let value = serde_json::from_str::<serde_json::Value>(&payload)
+                .unwrap_or_else(|_| serde_json::json!({}));
+            Ok((clock_ms, root, value))
+        })?;
+        let mut by_root = BTreeMap::new();
+        let mut clock_ms = 0.0_f64;
+        for row in rows {
+            let (clock, root, payload) = row?;
+            if clock.is_finite() {
+                clock_ms = clock_ms.max(clock);
+            }
+            by_root.insert(root, payload);
+        }
+        if by_root.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(JournalAsOfSnapshot {
+            frame_second,
+            clock_ms,
+            by_root,
+        }))
+    }
+
+    /// All Journal Frames ordered by clock (tests / rebuild comparison).
+    pub fn list_journal_frames(&self) -> Result<Vec<JournalFrameRecord>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT clock_ms, frame_second, root_symbol, session_type, session_segment, trading_day, payload
+             FROM journal_frames
+             ORDER BY clock_ms ASC, root_symbol ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let payload: String = row.get(6)?;
+            let value = serde_json::from_str::<serde_json::Value>(&payload)
+                .unwrap_or_else(|_| serde_json::json!({}));
+            Ok(JournalFrameRecord {
+                clock_ms: row.get(0)?,
+                frame_second: row.get(1)?,
+                root_symbol: row.get(2)?,
+                session_type: row.get(3)?,
+                session_segment: row.get(4)?,
+                trading_day: row.get(5)?,
+                payload: value,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Total persisted Journal Frame rows (all roots, all seconds).
+    pub fn count_journal_frames(&self) -> Result<i64, DbError> {
+        Ok(self
+            .conn
+            .query_row("SELECT COUNT(1) FROM journal_frames", [], |r| r.get(0))?)
+    }
+
+    /// Transition event rows joinable to a Journal Frame second (same root + frame_second).
+    pub fn list_events_joined_to_journal_frame(
+        &self,
+        frame_second: i64,
+    ) -> Result<Vec<serde_json::Value>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT e.event_type, e.timestamp_ms, e.root_symbol, e.journal_frame_second,
+                    e.event_id, f.clock_ms, f.root_symbol
+             FROM market_events e
+             INNER JOIN journal_frames f
+               ON e.journal_frame_second = f.frame_second
+              AND COALESCE(e.root_symbol, '') = f.root_symbol
+             WHERE f.frame_second = ?1
+             ORDER BY e.timestamp_ms ASC, e.root_symbol ASC",
+        )?;
+        let rows = stmt.query_map(params![frame_second], |row| {
+            Ok(serde_json::json!({
+                "eventType": row.get::<_, String>(0)?,
+                "timestampMs": row.get::<_, f64>(1)?,
+                "rootSymbol": row.get::<_, Option<String>>(2)?,
+                "journalFrameSecond": row.get::<_, Option<i64>>(3)?,
+                "eventId": row.get::<_, Option<String>>(4)?,
+                "frameClockMs": row.get::<_, f64>(5)?,
+                "frameRootSymbol": row.get::<_, String>(6)?,
+            }))
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     pub fn raw_tick_count(&self) -> Result<i64, DbError> {
         Ok(self
             .conn
@@ -7514,16 +7746,32 @@ impl Database {
 
     /// Batch-insert market events in a single transaction.
     pub fn insert_market_events_batch(&self, events: &[MarketEvent]) -> Result<(), DbError> {
+        self.insert_market_events_batch_scoped(None, events)
+            .map(|_| ())
+    }
+
+    /// Batch-insert market events, stamping `root_symbol` and Journal Frame join key.
+    ///
+    /// `journal_frame_second` is `floor(event.timestamp_ms / 1000)` so a
+    /// transition row joins the Journal Frame for that root's print second —
+    /// not the max MarketRouter clock, which may already be on a later second.
+    /// Returns the number of rows actually inserted (`INSERT OR IGNORE`).
+    pub fn insert_market_events_batch_scoped(
+        &self,
+        root_symbol: Option<&str>,
+        events: &[MarketEvent],
+    ) -> Result<usize, DbError> {
         if events.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
         let tx = self.conn.unchecked_transaction()?;
+        let mut written = 0usize;
         {
             let mut stmt = tx.prepare_cached(
                 "INSERT OR IGNORE INTO market_events
                  (session_date, timestamp_ms, event_type, level_name, price, direction, sequence_num, metadata_json,
-                  session_type, session_segment, trading_day, event_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                  session_type, session_segment, trading_day, event_id, root_symbol, journal_frame_second)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             )?;
             for e in events {
                 let meta = e
@@ -7531,7 +7779,8 @@ impl Database {
                     .as_ref()
                     .map(|m| serde_json::to_string(m).unwrap_or_default());
                 let event_id = market_event_id(e);
-                stmt.execute(params![
+                let frame_second = journal_frame_second_from_ts(e.timestamp_ms);
+                let n = stmt.execute(params![
                     e.session_date,
                     e.timestamp_ms,
                     e.event_type,
@@ -7544,11 +7793,14 @@ impl Database {
                     &e.session_segment,
                     &e.trading_day,
                     event_id,
+                    root_symbol,
+                    frame_second,
                 ])?;
+                written += n;
             }
         }
         tx.commit()?;
-        Ok(())
+        Ok(written)
     }
 
     pub fn list_ib_extension_events_for_session(
@@ -10226,11 +10478,12 @@ impl Database {
             }
             self.upsert_session_summary(summary)?;
             if !events.is_empty() {
+                let root = Some(summary.root_symbol.as_str()).filter(|s| !s.is_empty());
                 let mut stmt = self.conn.prepare_cached(
                     "INSERT OR IGNORE INTO market_events
                      (session_date, timestamp_ms, event_type, level_name, price, direction, sequence_num, metadata_json,
-                      session_type, session_segment, trading_day, event_id)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                      session_type, session_segment, trading_day, event_id, root_symbol, journal_frame_second)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                 )?;
                 for e in events {
                     let meta = e
@@ -10250,6 +10503,8 @@ impl Database {
                         &e.session_segment,
                         &e.trading_day,
                         market_event_id(e),
+                        root,
+                        journal_frame_second_from_ts(e.timestamp_ms),
                     ])?;
                 }
             }
@@ -11930,6 +12185,99 @@ mod tests {
         // Query past the end → c (last snapshot).
         let (ts, _) = db.get_snapshot_near(99_000.0).expect("q4").expect("some");
         assert_eq!(ts, 9_000.0);
+    }
+
+    #[test]
+    fn journal_frames_one_hz_unique_and_as_of_ignores_pipeline_snapshots() {
+        let db = test_db();
+        let clock = 1_704_207_600_000.0;
+        let frame_second = journal_frame_second_from_ts(clock).expect("second");
+        let nq = JournalFrameRecord {
+            clock_ms: clock,
+            frame_second,
+            root_symbol: "NQ".into(),
+            session_type: "RTH".into(),
+            session_segment: "None".into(),
+            trading_day: "2024-01-02".into(),
+            payload: serde_json::json!({"lastPrice": 20_000.0, "rootSymbol": "NQ"}),
+        };
+        let es = JournalFrameRecord {
+            clock_ms: clock,
+            frame_second,
+            root_symbol: "ES".into(),
+            session_type: "RTH".into(),
+            session_segment: "None".into(),
+            trading_day: "2024-01-02".into(),
+            payload: serde_json::json!({"lastPrice": 5_000.0, "rootSymbol": "ES"}),
+        };
+        assert_eq!(
+            db.insert_journal_frames(&[nq.clone(), es.clone()])
+                .expect("insert"),
+            2
+        );
+        // Same second must not persist a second 250 ms publish as another frame.
+        let duplicate = JournalFrameRecord {
+            clock_ms: clock + 250.0,
+            ..nq.clone()
+        };
+        assert_eq!(db.insert_journal_frames(&[duplicate]).expect("dup"), 0);
+        assert_eq!(db.count_journal_frames().expect("count"), 2);
+
+        db.insert_pipeline_snapshot(
+            clock + 100.0,
+            &serde_json::json!({"lastPrice": 99_999.0, "rootSymbol": "NQ"}),
+        )
+        .expect("pipeline decoy");
+        let as_of = db
+            .get_journal_frames_as_of(clock + 100.0)
+            .expect("as_of")
+            .expect("frames");
+        assert_eq!(as_of.frame_second, frame_second);
+        assert_eq!(as_of.by_root["NQ"]["lastPrice"], 20_000.0);
+        assert_eq!(as_of.by_root["ES"]["lastPrice"], 5_000.0);
+        assert_ne!(as_of.by_root["NQ"]["lastPrice"], 99_999.0);
+    }
+
+    #[test]
+    fn journal_transition_events_join_to_frames() {
+        let db = test_db();
+        let ts = 1_704_207_600_250.0;
+        let frame_second = journal_frame_second_from_ts(ts).expect("second");
+        db.insert_journal_frames(&[JournalFrameRecord {
+            clock_ms: 1_704_207_600_000.0,
+            frame_second,
+            root_symbol: "NQ".into(),
+            session_type: "RTH".into(),
+            session_segment: "None".into(),
+            trading_day: "2024-01-02".into(),
+            payload: serde_json::json!({"lastPrice": 20_000.0}),
+        }])
+        .expect("frame");
+        db.insert_market_events_batch_scoped(
+            Some("NQ"),
+            &[MarketEvent {
+                session_date: "2024-01-02".into(),
+                timestamp_ms: ts,
+                event_type: "new_session_high".into(),
+                level_name: None,
+                price: 20_000.25,
+                direction: Some("up".into()),
+                sequence_num: Some(1),
+                metadata: None,
+                session_type: "RTH".into(),
+                session_segment: "None".into(),
+                trading_day: "2024-01-02".into(),
+            }],
+        )
+        .expect("event");
+        let joined = db
+            .list_events_joined_to_journal_frame(frame_second)
+            .expect("join");
+        assert_eq!(joined.len(), 1);
+        assert_eq!(joined[0]["eventType"], "new_session_high");
+        assert_eq!(joined[0]["rootSymbol"], "NQ");
+        assert_eq!(joined[0]["journalFrameSecond"], frame_second);
+        assert_eq!(joined[0]["frameRootSymbol"], "NQ");
     }
 
     #[test]

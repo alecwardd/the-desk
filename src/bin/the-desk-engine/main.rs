@@ -11,12 +11,13 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use the_desk_backend::db::Database;
 use the_desk_backend::engine::{
-    load_engine_bind_addr, EngineSocketServer, FileProvider, MarketRouter, RouterRoot,
-    SourceProvider, SourceProviderKind, ENGINE_DEFAULT_BIND,
+    default_engine_database_path, load_engine_bind_addr, EngineSocketServer, FileProvider,
+    MarketRouter, RouterRoot, SourceProvider, SourceProviderKind, ENGINE_DEFAULT_BIND,
 };
 use the_desk_backend::feed::{load_feed_config, resolve_contract_metadata};
 use the_desk_backend::observability::{init_logging, load_logging_config};
@@ -54,9 +55,10 @@ fn print_help() {
     eprintln!(
         "the-desk-engine — headless Desk intelligence host (SIL-M2b MarketRouter)\n\n\
          Usage:\n\
-           the-desk-engine [--bind ADDR] [--scid PATH] [--scid-es PATH]\n\n\
+           the-desk-engine [--bind ADDR] [--scid PATH] [--scid-es PATH] [--db PATH]\n\n\
          Defaults:\n\
            --bind {ENGINE_DEFAULT_BIND} (or [sil].engine_bind in config.toml)\n\
+           --db ~/.the-desk/data.db (Journal Frames at 1 Hz on the MarketRouter clock)\n\
            NQ/ES SCID paths from feed config / FileProvider (MarketRouter v0)\n\n\
          Ops: register via Task Scheduler on Sierra hours; keep running through\n\
          Globex overnight whenever Sierra Chart is recording. MCP adapters connect\n\
@@ -128,6 +130,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let store = router.published_store();
 
+    let journal_db = {
+        let db_path = parse_path_flag("--db").unwrap_or_else(default_engine_database_path);
+        if let Some(parent) = db_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match Database::open(&db_path.to_string_lossy()) {
+            Ok(db) => {
+                tracing::info!(path = %db_path.display(), "the-desk-engine.journal_db");
+                Some(Arc::new(Mutex::new(db)))
+            }
+            Err(err) => {
+                tracing::warn!(
+                    path = %db_path.display(),
+                    error = %err,
+                    "the-desk-engine.journal_db_unavailable"
+                );
+                router.set_journal_enabled(false);
+                None
+            }
+        }
+    };
+
     // Initial publish so clients see health even before first tick.
     let mut boot_health = BTreeMap::new();
     for (root, provider) in providers.iter() {
@@ -160,10 +184,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     while !stop_bg.load(Ordering::Acquire) {
         match router_bg.poll_once(&mut providers, max_ticks) {
-            Ok(n) if n > 0 => {
-                continue;
+            Ok(n) => {
+                if let Some(db) = journal_db.as_ref() {
+                    match db.lock() {
+                        Ok(d) => {
+                            if let Err(err) = router_bg.persist_journal(&d) {
+                                tracing::warn!(error = %err, "the-desk-engine.journal_persist");
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                error = %err,
+                                "the-desk-engine.journal_persist_lock"
+                            );
+                        }
+                    }
+                }
+                if n > 0 {
+                    continue;
+                }
             }
-            Ok(_) => {}
             Err(err) => {
                 tracing::warn!(error = %err, "the-desk-engine.poll_error");
                 let mut health = BTreeMap::new();

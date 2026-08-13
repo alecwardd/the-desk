@@ -39,7 +39,8 @@ pub(crate) struct GetStateParams {
     pub(crate) fields: Option<Vec<String>>,
     /// Resolution band: `R0` (orientation) or `R1` (state). R2/R3 rejected.
     pub(crate) resolution: Option<String>,
-    /// Optional as-of timestamp (epoch ms). Served from persisted snapshots until Journal Frames land.
+    /// Optional as-of timestamp (epoch ms). Served from 1 Hz Journal Frames
+    /// (provenance source = Journal). Live reads omit as_of.
     pub(crate) as_of: Option<f64>,
     /// Soft token budget; envelope may truncate values and set `truncated: true`.
     pub(crate) budget_tokens: Option<u64>,

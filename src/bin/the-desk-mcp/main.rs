@@ -10,6 +10,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use the_desk_backend::attention::AttentionPulseKind;
 use the_desk_backend::db::{Database, RawTickBatchRow};
+use the_desk_backend::engine::RouterRoot;
 use the_desk_backend::feed::monotonic::{MonotonicTickGuard, MonotonicTimestampDecision};
 use the_desk_backend::feed::scid_reader::ScidReader;
 use the_desk_backend::feed::{load_feed_config, resolve_contract_metadata, TradeSide};
@@ -296,8 +297,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
             loop {
                 match router.poll_once(&mut providers, max_ticks) {
-                    Ok(n) if n > 0 => continue,
-                    Ok(_) => {}
+                    Ok(n) => {
+                        match db_es.lock() {
+                            Ok(db) => {
+                                if let Err(err) = router.persist_journal(&db) {
+                                    tracing::warn!(error = %err, "market_router.journal_persist");
+                                }
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    error = %err,
+                                    "market_router.journal_persist_lock"
+                                );
+                            }
+                        }
+                        if n > 0 {
+                            continue;
+                        }
+                    }
                     Err(err) => {
                         tracing::debug!(error = %err, "market_router.es_poll_error");
                     }
@@ -437,6 +454,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let contract_metadata = contract_metadata.clone();
         let feed_rt_bg = Arc::clone(&server.feed_runtime);
         let boundary_cache_bg = Arc::clone(&server.boundary_cache);
+        let market_router_bg = Arc::clone(&server.market_router);
         {
             let feed_rt_watchdog = Arc::clone(&server.feed_runtime);
             let runtime_events_watchdog = Arc::clone(&server.runtime_events);
@@ -591,6 +609,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         tokio::spawn(async move {
             use tokio::time::{sleep, Duration};
+
+            let coaching_root =
+                RouterRoot::parse(&contract_metadata.root_symbol).unwrap_or(RouterRoot::Nq);
 
             let poll = Duration::from_millis(poll_ms.max(250));
             let mut caught_up = true;
@@ -980,6 +1001,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     } else {
                         Vec::new()
                     };
+                    if !new_events.is_empty() {
+                        market_router_bg.note_transition_events(coaching_root, &new_events);
+                    }
+                    market_router_bg.queue_journal_frames();
                     let should_run_analysis = latest_analysis_snapshot.is_some()
                         && (ticks_since_analysis >= analysis_max_ticks
                             || last_analysis_market_ts <= 0.0
@@ -1212,9 +1237,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .scid_worker_phase
                         .store(SCID_WORKER_DB, Ordering::Release);
                     if let Ok(db) = db_bg.lock() {
-                        let _ = db.insert_market_events_batch(&event_buffer);
+                        let _ = db.insert_market_events_batch_scoped(
+                            Some(coaching_root.as_str()),
+                            &event_buffer,
+                        );
                     }
                     event_buffer.clear();
+                }
+
+                if ticks_this_poll > 0 {
+                    match db_bg.lock() {
+                        Ok(db) => {
+                            if let Err(err) = market_router_bg.persist_journal(&db) {
+                                tracing::warn!(error = %err, "scid.journal_persist");
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!(error = %err, "scid.journal_persist_lock");
+                        }
+                    }
                 }
 
                 // Flush remaining raw ticks

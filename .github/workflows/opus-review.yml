@@ -1,6 +1,13 @@
 # Claude Opus deep PR review. Canonical implementation lives in
 # alecwardd/agent-infrastructure — do not fork the reviewer logic here.
 #
+# Prerequisites in this repo:
+#   1. Actions secret `CLAUDE_CODE_OAUTH_TOKEN` — set per repository with
+#      `gh secret set CLAUDE_CODE_OAUTH_TOKEN --repo <owner>/<repo>`.
+#      Personal accounts have no organization-level Actions secrets, so this
+#      secret exists once per participating repository.
+#   2. Labels: review:opus, review:passed, review:changes-requested, review:opus-error
+#
 # Trigger: apply the `review:opus` label to a non-draft, same-repo pull request.
 
 name: Opus Review
@@ -11,19 +18,33 @@ on:
 
 jobs:
   opus-review:
+    # Guards evaluated before any Opus cost is incurred:
+    #   - only the review:opus label triggers a run (any other label is a no-op)
+    #   - drafts are excluded: Opus is a completion checkpoint, not a running commentary
+    #   - fork PRs are excluded: they receive no secrets, and pull_request_target
+    #     is deliberately not used
     if: >-
       github.event.label.name == 'review:opus' &&
       github.event.pull_request.draft == false &&
       github.event.pull_request.head.repo.full_name == github.repository
 
+    # This is the CEILING for the whole pipeline. A called workflow can only
+    # reduce these, never escalate, so the caller must declare the union of what
+    # the reusable workflow's jobs need. Individual jobs downgrade from here:
+    # only the publisher gets `pull-requests: write`, and the job that runs
+    # Claude is read-only.
     permissions:
       contents: read
       pull-requests: write
       issues: read
       actions: read
+      checks: read
+      statuses: read
 
     uses: alecwardd/agent-infrastructure/.github/workflows/reusable-opus-pr-review.yml@v1
     with:
       pr_number: ${{ github.event.pull_request.number }}
     secrets:
+      # Explicitly named, not `secrets: inherit` — this workflow receives the
+      # single credential it needs and no other repository secret.
       CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}

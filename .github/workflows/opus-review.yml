@@ -1,0 +1,29 @@
+# Claude Opus deep PR review. Canonical implementation lives in
+# alecwardd/agent-infrastructure — do not fork the reviewer logic here.
+#
+# Trigger: apply the `review:opus` label to a non-draft, same-repo pull request.
+
+name: Opus Review
+
+on:
+  pull_request:
+    types: [labeled]
+
+jobs:
+  opus-review:
+    if: >-
+      github.event.label.name == 'review:opus' &&
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.full_name == github.repository
+
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: read
+      actions: read
+
+    uses: alecwardd/agent-infrastructure/.github/workflows/reusable-opus-pr-review.yml@v1
+    with:
+      pr_number: ${{ github.event.pull_request.number }}
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}

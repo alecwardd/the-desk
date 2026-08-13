@@ -60,8 +60,14 @@ pub struct PositioningRecord {
     pub record_kind: String,
     pub completeness: String,
     pub trading_day: String,
+    /// Desk annotation timestamp (epoch ms). Wire name matches the Catalog field.
+    #[serde(rename = "capturedAt", alias = "capturedAtMs")]
     pub captured_at_ms: f64,
+    /// Explicit manual/as-of timestamp (epoch ms). Wire name matches the Catalog field.
+    #[serde(rename = "asOf", alias = "asOfMs")]
     pub as_of_ms: f64,
+    /// Vendor data time when a provider exists; null on Levels-Only Records.
+    #[serde(rename = "dataTime", alias = "dataTimeMs")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data_time_ms: Option<f64>,
     pub freshness_ok: bool,
@@ -589,6 +595,12 @@ mod tests {
         assert_eq!(rec.provenance.source, MANUAL_PROVENANCE_SOURCE);
         assert!(rec.provenance.vendor.is_none());
         assert!(rec.data_time_ms.is_none());
+        let wire = serde_json::to_value(&rec).expect("wire");
+        assert!(wire.get("capturedAt").is_some());
+        assert!(wire.get("asOf").is_some());
+        assert!(wire.get("capturedAtMs").is_none());
+        assert!(wire.get("asOfMs").is_none());
+        assert!(wire.get("dataTimeMs").is_none());
         let slice = positioning_state_slice(Some(&rec), Some("2026-02-18"));
         assert!(!slice.degraded, "fresh Levels-Only must not be degraded");
         assert_eq!(slice.provenance.source, ProvenanceSource::Manual);

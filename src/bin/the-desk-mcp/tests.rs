@@ -1227,7 +1227,9 @@ async fn positioning_entry_round_trips_into_get_state_as_first_class_levels_only
     assert!(written["record"]["provenance"]["firstClass"]
         .as_bool()
         .unwrap());
-    assert!(written["record"]["dataTimeMs"].is_null());
+    assert!(written["record"]["dataTime"].is_null());
+    assert!(written["record"].get("capturedAt").is_some());
+    assert!(written["record"].get("asOf").is_some());
     let note = written["note"].as_str().unwrap_or("").to_lowercase();
     assert!(note.contains("your annotated sessions") || note.contains("your methodology"));
     assert!(!note.contains("you should buy"));

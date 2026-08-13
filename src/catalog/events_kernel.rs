@@ -16,7 +16,7 @@ use std::collections::HashSet;
 use super::envelope::TrustLevel;
 use super::event_lifecycle::{
     classify_event_family, detection_kind_for_event_type, event_dedup_identity_id,
-    event_dedup_identity_key, is_dom_family_event_type, next_lifecycle_for_detection,
+    event_dedup_identity_key, next_lifecycle_for_detection, requires_capsule,
     resolve_event_severity, DetectionKind, EventFamily, EventLifecycle, EventSeverity, FrameRef,
     CAPSULE_AFTER_MS, CAPSULE_LOOKBACK_MS,
 };
@@ -188,7 +188,7 @@ fn assemble_kernel_event(
     identity_key: String,
 ) -> KernelEvent {
     let family = classify_event_family(&event.event_type);
-    let requires = is_dom_family_event_type(&event.event_type);
+    let requires = requires_capsule(&event.event_type);
     KernelEvent {
         identity_id,
         identity_key,
@@ -766,5 +766,38 @@ mod tests {
             "ES Capsule must not attach to an NQ event that shares occurrence identity"
         );
         assert_eq!(cap.completeness.as_deref(), Some("pending"));
+    }
+
+    #[test]
+    fn dom_invalidation_keeps_capsule_ref_on_coaching_row() {
+        let open = MarketEvent {
+            event_type: "stop_run".into(),
+            ..sample()
+        };
+        let mut invalidated = open.clone();
+        invalidated.event_type = "stop_run_invalidated".into();
+        invalidated.timestamp_ms += 5_000.0;
+        let open_row = kernel_event_from_market_event_scoped(&open, Some("NQ"), None);
+        let inv_row = kernel_event_from_market_event_scoped(
+            &invalidated,
+            Some("NQ"),
+            Some(EventLifecycle::Open),
+        );
+        assert_eq!(inv_row.family, EventFamily::Dom);
+        assert!(inv_row.requires_capsule);
+        assert_eq!(inv_row.lifecycle, EventLifecycle::Resolved);
+        assert_eq!(open_row.dedup_identity_id, inv_row.dedup_identity_id);
+        let mut cap = sample_capsule("cap_nq", &open_row.identity_id, "NQ");
+        cap.dedup_identity_id = open_row.dedup_identity_id.clone();
+        cap.event_timestamp_ms = open_row.timestamp_ms;
+        let collapsed = collapse_events_latest_per_dedup(vec![open_row, inv_row]);
+        assert_eq!(collapsed.len(), 1);
+        assert_eq!(collapsed[0].event_type, "stop_run_invalidated");
+        let mut events = collapsed;
+        attach_capsule_refs(&mut events, &[cap]);
+        assert_eq!(
+            events[0].capsule_ref.as_ref().and_then(|c| c.id.as_deref()),
+            Some("cap_nq")
+        );
     }
 }

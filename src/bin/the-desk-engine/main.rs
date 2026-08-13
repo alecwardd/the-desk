@@ -220,7 +220,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(db) = journal_db.as_ref() {
         match db.lock() {
             Ok(d) => {
-                if let Err(err) = router.persist_journal(&d) {
+                if let Err(err) = router.flush_journal_on_stop(&d) {
                     tracing::warn!(error = %err, "the-desk-engine.journal_persist_on_stop");
                 }
             }

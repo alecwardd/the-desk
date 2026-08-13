@@ -243,9 +243,21 @@ pub fn is_dom_family_event_type(event_type: &str) -> bool {
         .any(|name| *name == normalized)
 }
 
+/// True when this type is a DOM-family stem, including `*_invalidated` rows.
+pub fn is_dom_family_stem(event_type: &str) -> bool {
+    if is_dom_family_event_type(event_type) {
+        return true;
+    }
+    let family = event_family_key(event_type);
+    DOM_FAMILY_EVENT_TYPES.iter().any(|name| *name == family)
+}
+
 /// Capsule dump is mandatory for this event type (DOM-family only in M3b).
+///
+/// Invalidation rows of a DOM stem also require `capsuleRef` so the coaching
+/// view still joins the dump after collapse-to-latest-per-dedup.
 pub fn requires_capsule(event_type: &str) -> bool {
-    is_dom_family_event_type(event_type)
+    is_dom_family_stem(event_type)
 }
 
 /// Lookback before the triggering Event (ADR-024 / #10).
@@ -304,7 +316,7 @@ pub fn event_dedup_identity_id(event: &MarketEvent, root_symbol: Option<&str>) -
 
 /// Classify an event type into an operator family.
 pub fn classify_event_family(event_type: &str) -> EventFamily {
-    if is_dom_family_event_type(event_type) {
+    if is_dom_family_stem(event_type) {
         return EventFamily::Dom;
     }
     let family = event_family_key(event_type);
@@ -476,6 +488,12 @@ mod tests {
             assert_eq!(classify_event_family(name), EventFamily::Dom);
             assert!(requires_capsule(name), "{name}");
         }
+        assert!(requires_capsule("stop_run_invalidated"));
+        assert_eq!(
+            classify_event_family("stop_run_invalidated"),
+            EventFamily::Dom
+        );
+        assert!(!is_dom_family_event_type("stop_run_invalidated"));
         assert!(!is_dom_family_event_type("ib_extension_hit"));
         assert!(!is_dom_family_event_type("absorption_confirmed"));
         assert_eq!(DOM_FAMILY_EVENT_TYPES.len(), 4);

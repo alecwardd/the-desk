@@ -1115,10 +1115,18 @@ pub struct JournalAsOfSnapshot {
     pub by_root: BTreeMap<String, serde_json::Value>,
 }
 
-/// Wire completeness for a Capsule row (not trader-memory markdown capsules).
+/// Capsule dump still filling the after-window.
 pub const CAPSULE_COMPLETENESS_PENDING: &str = "pending";
+/// After-window closed on the Capsule's own lane clock.
 pub const CAPSULE_COMPLETENESS_COMPLETE: &str = "complete";
+/// Session/feed ended (or mix/coverage gap) before the after-window closed.
 pub const CAPSULE_COMPLETENESS_INCOMPLETE: &str = "incomplete";
+
+const CAPSULE_SELECT_COLUMNS: &str =
+    "id, trigger_identity_id, dedup_identity_id, root_symbol, event_type,
+                    event_timestamp_ms, window_start_ms, window_end_ms,
+                    observed_start_ms, observed_end_ms, start_frame_second, end_frame_second,
+                    completeness, degraded, sample_count, payload, created_at_ms, updated_at_ms";
 
 /// One persisted Capsule dump (SIL-M3b). Joinable to the triggering Event and
 /// surrounding Journal Frames. This is **not** a 250 ms frame store.
@@ -7234,14 +7242,37 @@ impl Database {
                 completeness, degraded, sample_count, payload, created_at_ms, updated_at_ms
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
              ON CONFLICT(id) DO UPDATE SET
-                completeness = excluded.completeness,
-                degraded = excluded.degraded,
-                sample_count = excluded.sample_count,
-                payload = excluded.payload,
-                observed_start_ms = excluded.observed_start_ms,
-                observed_end_ms = excluded.observed_end_ms,
-                start_frame_second = excluded.start_frame_second,
-                end_frame_second = excluded.end_frame_second,
+                completeness = CASE
+                  WHEN capsules.completeness IN ('complete', 'incomplete')
+                       AND excluded.completeness = 'pending'
+                  THEN capsules.completeness
+                  ELSE excluded.completeness
+                END,
+                degraded = CASE
+                  WHEN excluded.sample_count >= capsules.sample_count THEN excluded.degraded
+                  ELSE capsules.degraded OR excluded.degraded
+                END,
+                sample_count = MAX(capsules.sample_count, excluded.sample_count),
+                payload = CASE
+                  WHEN excluded.sample_count >= capsules.sample_count THEN excluded.payload
+                  ELSE capsules.payload
+                END,
+                observed_start_ms = CASE
+                  WHEN excluded.sample_count >= capsules.sample_count THEN excluded.observed_start_ms
+                  ELSE capsules.observed_start_ms
+                END,
+                observed_end_ms = CASE
+                  WHEN excluded.sample_count >= capsules.sample_count THEN excluded.observed_end_ms
+                  ELSE capsules.observed_end_ms
+                END,
+                start_frame_second = CASE
+                  WHEN excluded.sample_count >= capsules.sample_count THEN excluded.start_frame_second
+                  ELSE capsules.start_frame_second
+                END,
+                end_frame_second = CASE
+                  WHEN excluded.sample_count >= capsules.sample_count THEN excluded.end_frame_second
+                  ELSE capsules.end_frame_second
+                END,
                 updated_at_ms = excluded.updated_at_ms",
             params![
                 record.id,
@@ -7296,16 +7327,39 @@ impl Database {
 
     /// All Capsules (tests / overnight asserts).
     pub fn list_capsules(&self) -> Result<Vec<CapsuleRecord>, DbError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, trigger_identity_id, dedup_identity_id, root_symbol, event_type,
-                    event_timestamp_ms, window_start_ms, window_end_ms,
-                    observed_start_ms, observed_end_ms, start_frame_second, end_frame_second,
-                    completeness, degraded, sample_count, payload, created_at_ms, updated_at_ms
+        let sql = format!(
+            "SELECT {CAPSULE_SELECT_COLUMNS}
                FROM capsules
-              ORDER BY event_timestamp_ms ASC, id ASC",
-        )?;
+              ORDER BY event_timestamp_ms ASC, id ASC"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map([], Self::map_capsule_row)?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    fn capsules_where_in(
+        &self,
+        column: &str,
+        ids: &[String],
+        out: &mut Vec<CapsuleRecord>,
+    ) -> Result<(), DbError> {
+        for chunk in ids.chunks(400) {
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+            let sql = format!(
+                "SELECT {CAPSULE_SELECT_COLUMNS}
+                   FROM capsules
+                  WHERE {column} IN ({placeholders})"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(
+                rusqlite::params_from_iter(chunk.iter()),
+                Self::map_capsule_row,
+            )?;
+            for row in rows {
+                out.push(row?);
+            }
+        }
+        Ok(())
     }
 
     /// Capsules matching occurrence and/or dedup identities (coaching join).
@@ -7319,46 +7373,10 @@ impl Database {
         }
         let mut out = Vec::new();
         if !trigger_ids.is_empty() {
-            for chunk in trigger_ids.chunks(400) {
-                let placeholders = vec!["?"; chunk.len()].join(", ");
-                let sql = format!(
-                    "SELECT id, trigger_identity_id, dedup_identity_id, root_symbol, event_type,
-                            event_timestamp_ms, window_start_ms, window_end_ms,
-                            observed_start_ms, observed_end_ms, start_frame_second, end_frame_second,
-                            completeness, degraded, sample_count, payload, created_at_ms, updated_at_ms
-                       FROM capsules
-                      WHERE trigger_identity_id IN ({placeholders})"
-                );
-                let mut stmt = self.conn.prepare(&sql)?;
-                let rows = stmt.query_map(
-                    rusqlite::params_from_iter(chunk.iter()),
-                    Self::map_capsule_row,
-                )?;
-                for row in rows {
-                    out.push(row?);
-                }
-            }
+            self.capsules_where_in("trigger_identity_id", trigger_ids, &mut out)?;
         }
         if !dedup_ids.is_empty() {
-            for chunk in dedup_ids.chunks(400) {
-                let placeholders = vec!["?"; chunk.len()].join(", ");
-                let sql = format!(
-                    "SELECT id, trigger_identity_id, dedup_identity_id, root_symbol, event_type,
-                            event_timestamp_ms, window_start_ms, window_end_ms,
-                            observed_start_ms, observed_end_ms, start_frame_second, end_frame_second,
-                            completeness, degraded, sample_count, payload, created_at_ms, updated_at_ms
-                       FROM capsules
-                      WHERE dedup_identity_id IN ({placeholders})"
-                );
-                let mut stmt = self.conn.prepare(&sql)?;
-                let rows = stmt.query_map(
-                    rusqlite::params_from_iter(chunk.iter()),
-                    Self::map_capsule_row,
-                )?;
-                for row in rows {
-                    out.push(row?);
-                }
-            }
+            self.capsules_where_in("dedup_identity_id", dedup_ids, &mut out)?;
         }
         out.sort_by(|a, b| {
             a.event_timestamp_ms
@@ -7391,6 +7409,7 @@ impl Database {
             .optional()?)
     }
 
+    /// Number of persisted Capsule rows.
     pub fn count_capsules(&self) -> Result<i64, DbError> {
         Ok(self
             .conn

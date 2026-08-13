@@ -1371,8 +1371,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    let journal_router = std::sync::Arc::clone(&server.market_router);
+    let journal_db = std::sync::Arc::clone(&server.db);
     let service = server.serve(stdio()).await?;
     service.waiting().await?;
+    match journal_db.lock() {
+        Ok(d) => {
+            if let Err(err) = journal_router.flush_journal_on_stop(&d) {
+                tracing::warn!(error = %err, "mcp.journal_persist_on_stop");
+            }
+        }
+        Err(err) => tracing::warn!(error = %err, "mcp.journal_persist_lock_on_stop"),
+    }
     Ok(())
 }
 

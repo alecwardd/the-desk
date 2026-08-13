@@ -351,13 +351,23 @@ impl TheDeskMcp {
             );
         }
         {
-            let trigger_ids: Vec<String> = events.iter().map(|e| e.identity_id.clone()).collect();
-            let dedup_ids: Vec<String> =
-                events.iter().map(|e| e.dedup_identity_id.clone()).collect();
-            let db = self.db.lock().map_err(|_| lock_error())?;
-            let capsules = db
-                .list_capsules_matching(&trigger_ids, &dedup_ids)
-                .map_err(db_error)?;
+            let capsules = if events.iter().any(|e| e.requires_capsule) {
+                let trigger_ids: Vec<String> = events
+                    .iter()
+                    .filter(|e| e.requires_capsule)
+                    .map(|e| e.identity_id.clone())
+                    .collect();
+                let dedup_ids: Vec<String> = events
+                    .iter()
+                    .filter(|e| e.requires_capsule)
+                    .map(|e| e.dedup_identity_id.clone())
+                    .collect();
+                let db = self.db.lock().map_err(|_| lock_error())?;
+                db.list_capsules_matching(&trigger_ids, &dedup_ids)
+                    .map_err(db_error)?
+            } else {
+                Vec::new()
+            };
             attach_capsule_refs(&mut events, &capsules);
         }
         let envelope = EventsEnvelope::from_events(events);

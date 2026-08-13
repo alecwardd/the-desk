@@ -83,8 +83,21 @@ impl CapsuleRing {
         if self.last_bucket == Some(bucket) {
             return false;
         }
-        if self.last_bucket.is_some_and(|prev| bucket < prev) {
-            return false;
+        if let Some(prev) = self.last_bucket {
+            let max_jump = Self::capacity() as i64;
+            if bucket < prev {
+                if prev - bucket > max_jump {
+                    // Large backward jump: a latched glitch; rebuild from here.
+                    self.samples.clear();
+                    self.last_bucket = None;
+                } else {
+                    return false;
+                }
+            } else if bucket > prev + max_jump {
+                // Session gap or future glitch: drop stale lookback, accept this tick.
+                self.samples.clear();
+                self.last_bucket = None;
+            }
         }
         self.samples.push_back(CapsuleRingSample {
             clock_ms,
@@ -180,9 +193,17 @@ impl PendingCapsule {
             .last()
             .map(|s| s.clock_ms)
             .unwrap_or(event.timestamp_ms);
+        let mut session_truncated = false;
         let samples: Vec<Value> = lookback
             .into_iter()
-            .filter(|s| s.session_type == event.session_type)
+            .filter(|s| {
+                if s.session_type == event.session_type {
+                    true
+                } else {
+                    session_truncated = true;
+                    false
+                }
+            })
             .map(|s| s.payload)
             .collect();
         Self {
@@ -198,7 +219,7 @@ impl PendingCapsule {
             trading_day: event.trading_day.clone(),
             samples,
             completeness: CAPSULE_COMPLETENESS_PENDING.to_string(),
-            degraded: false,
+            degraded: session_truncated,
             created_at_ms: event.timestamp_ms,
             last_sample_ms,
         }
@@ -529,11 +550,48 @@ mod tests {
         );
         assert!(!pending.samples.is_empty());
         assert!(pending.is_pending());
-        assert!(!pending.degraded);
+        assert!(
+            pending.degraded,
+            "dropping other-session lookback must mark degraded"
+        );
         for sample in &pending.samples {
             assert_eq!(sample["sessionType"], "RTH");
             assert_eq!(sample["lastPrice"].as_f64(), Some(20_000.0));
         }
+    }
+
+    #[test]
+    fn ring_resets_on_discontinuity_instead_of_latching() {
+        let mut ring = CapsuleRing::default();
+        let start = 1_704_207_600_000.0;
+        fill_ring(&mut ring, start, 8);
+        let before = ring.len();
+        assert!(before > 0);
+        let glitch = start + 2.0 * 3_600_000.0;
+        assert!(ring.push(
+            glitch,
+            "RTH",
+            compact_capsule_sample(glitch, RouterRoot::Nq, &json!({"sessionType": "RTH"})),
+        ));
+        assert_eq!(ring.len(), 1, "large forward jump must drop stale lookback");
+        let resume = start + 9.0 * CAPSULE_RING_STEP_MS;
+        assert!(ring.push(
+            resume,
+            "RTH",
+            compact_capsule_sample(resume, RouterRoot::Nq, &json!({"sessionType": "RTH"})),
+        ));
+        assert_eq!(
+            ring.len(),
+            1,
+            "large backward jump after a glitch must rebuild"
+        );
+        let next = resume + CAPSULE_RING_STEP_MS;
+        assert!(ring.push(
+            next,
+            "RTH",
+            compact_capsule_sample(next, RouterRoot::Nq, &json!({"sessionType": "RTH"})),
+        ));
+        assert_eq!(ring.len(), 2);
     }
 
     #[test]

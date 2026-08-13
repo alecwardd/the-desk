@@ -38,6 +38,8 @@ use super::source::{SourceError, SourceHealth, SourceProvider, SourceProviderKin
 
 /// Bound in-memory transition-event queue when persist is delayed.
 const PENDING_JOURNAL_MAX_EVENTS: usize = 8_192;
+/// Bound in-memory Capsules waiting for an after-window or a trigger row.
+const PENDING_CAPSULES_MAX: usize = 256;
 
 /// Concurrent per-symbol pipeline host (NQ + ES) sharing one market-data clock.
 pub struct MarketRouter {
@@ -159,6 +161,12 @@ impl MarketRouter {
     pub fn mark_stopped(&self) {
         self.nq.mark_stopped();
         self.es.mark_stopped();
+    }
+
+    /// Mark lanes stopped and persist Journal Frames + Capsules (session/feed end).
+    pub fn flush_journal_on_stop(&self, db: &Database) -> Result<JournalPersistStats, DbError> {
+        self.mark_stopped();
+        self.persist_journal(db)
     }
 
     /// Aligned clock: max market timestamp across lanes (epoch ms).
@@ -525,6 +533,7 @@ impl MarketRouter {
         if !self.journal_enabled.load(Ordering::Acquire) {
             return;
         }
+        let mut pushed = false;
         for root in RouterRoot::ALL {
             let Some(mt) = self.lane(root).market_time_ms() else {
                 continue;
@@ -545,10 +554,14 @@ impl MarketRouter {
             let session = snapshot_session_type(&snap);
             let compact = compact_capsule_sample(mt, root, &snap);
             if let Ok(mut rings) = self.capsule_rings.lock() {
-                rings.entry(root).or_default().push(mt, &session, compact);
+                if rings.entry(root).or_default().push(mt, &session, compact) {
+                    pushed = true;
+                }
             }
         }
-        self.ingest_pending_capsules_from_rings();
+        if pushed {
+            self.ingest_pending_capsules_from_rings();
+        }
     }
 
     fn ingest_pending_capsules_from_rings(&self) {
@@ -569,12 +582,14 @@ impl MarketRouter {
         if events.is_empty() || !self.journal_enabled.load(Ordering::Acquire) {
             return;
         }
-        let ring = {
-            let Ok(rings) = self.capsule_rings.lock() else {
-                return;
-            };
-            rings.get(&root).cloned().unwrap_or_default()
+        if !events.iter().any(event_may_open_capsule) {
+            return;
+        }
+        let Ok(rings) = self.capsule_rings.lock() else {
+            return;
         };
+        let empty = CapsuleRing::default();
+        let ring = rings.get(&root).unwrap_or(&empty);
         let Ok(mut pending) = self.pending_capsules.lock() else {
             return;
         };
@@ -593,12 +608,13 @@ impl MarketRouter {
             {
                 continue;
             }
-            pending.push(PendingCapsule::open_from_ring(root, event, &ring));
+            pending.push(PendingCapsule::open_from_ring(root, event, ring));
         }
     }
 
     fn persist_capsules(&self, db: &Database, clock_ms: f64) -> Result<(usize, usize), DbError> {
         self.sample_capsule_rings();
+        self.ingest_pending_capsules_from_rings();
         let stopped = !self.nq.is_running() && !self.es.is_running();
         let pending = match self.pending_capsules.lock() {
             Ok(mut g) => std::mem::take(&mut *g),
@@ -610,7 +626,12 @@ impl MarketRouter {
         let mut persist_err: Option<DbError> = None;
         let mut remaining = pending.into_iter();
         for mut cap in remaining.by_ref() {
-            let finalize_clock = clock_ms.max(cap.observed_clock_ms());
+            let lane_clock = self.lane(cap.root).market_time_ms().unwrap_or(0.0);
+            let finalize_clock = if lane_clock > 0.0 {
+                lane_clock.max(cap.observed_clock_ms())
+            } else {
+                clock_ms.max(cap.observed_clock_ms())
+            };
             cap.finalize(finalize_clock, stopped);
             let lifecycle = match db.market_event_lifecycle_for_identity(&cap.trigger_identity_id) {
                 Ok(v) => v,
@@ -620,40 +641,53 @@ impl MarketRouter {
                     break;
                 }
             };
-            match lifecycle.as_deref() {
-                Some(state) if should_open_capsule(&cap.event_type, state) => {
-                    let existed = match db.capsule_exists(&cap.id) {
-                        Ok(v) => v,
-                        Err(err) => {
-                            keep.push(cap);
-                            persist_err = Some(err);
-                            break;
-                        }
-                    };
-                    let rec = cap.to_record(finalize_clock.max(cap.event_timestamp_ms));
-                    if let Err(err) = db.upsert_capsule(&rec) {
-                        keep.push(cap);
-                        persist_err = Some(err);
-                        break;
-                    }
-                    if !existed {
-                        opened += 1;
-                    }
-                    if cap.is_terminal() {
-                        finalized += 1;
-                    } else {
-                        keep.push(cap);
-                    }
+            let existed = match db.capsule_exists(&cap.id) {
+                Ok(v) => v,
+                Err(err) => {
+                    keep.push(cap);
+                    persist_err = Some(err);
+                    break;
                 }
-                None => keep.push(cap),
-                Some(_) => {}
+            };
+            let should_write = match lifecycle.as_deref() {
+                Some(state) if should_open_capsule(&cap.event_type, state) => true,
+                Some("updated") if !existed => false,
+                None if !existed => {
+                    keep.push(cap);
+                    continue;
+                }
+                _ => true,
+            };
+            if !should_write {
+                tracing::warn!(
+                    trigger = %cap.trigger_identity_id,
+                    lifecycle = lifecycle.as_deref().unwrap_or(""),
+                    "market_router.capsule_skipped_not_open"
+                );
+                continue;
+            }
+            if !existed || cap.is_terminal() {
+                let rec = cap.to_record(finalize_clock.max(cap.event_timestamp_ms));
+                if let Err(err) = db.upsert_capsule(&rec) {
+                    keep.push(cap);
+                    persist_err = Some(err);
+                    break;
+                }
+                if !existed {
+                    opened += 1;
+                }
+            }
+            if cap.is_terminal() {
+                finalized += 1;
+            } else {
+                keep.push(cap);
             }
         }
         // Drain+break would drop unyielded Capsules; keep them for the next persist.
         keep.extend(remaining);
         if let Ok(mut g) = self.pending_capsules.lock() {
             keep.append(&mut *g);
-            *g = keep;
+            *g = merge_pending_capsules(keep);
         }
         match persist_err {
             Some(err) => Err(err),
@@ -783,6 +817,31 @@ fn persist_router_event_attention(
             );
         }
     }
+}
+
+/// Keep the fuller Capsule when persist raced an open of the same trigger.
+fn merge_pending_capsules(mut caps: Vec<PendingCapsule>) -> Vec<PendingCapsule> {
+    caps.sort_by(|a, b| a.trigger_identity_id.cmp(&b.trigger_identity_id));
+    let mut out: Vec<PendingCapsule> = Vec::with_capacity(caps.len());
+    for cap in caps {
+        if let Some(prev) = out.last_mut() {
+            if prev.trigger_identity_id == cap.trigger_identity_id {
+                if cap.samples.len() > prev.samples.len()
+                    || (cap.samples.len() == prev.samples.len()
+                        && cap.observed_clock_ms() > prev.observed_clock_ms())
+                {
+                    *prev = cap;
+                }
+                continue;
+            }
+        }
+        out.push(cap);
+    }
+    if out.len() > PENDING_CAPSULES_MAX {
+        let excess = out.len() - PENDING_CAPSULES_MAX;
+        out.drain(0..excess);
+    }
+    out
 }
 
 /// Stable one-clock order: market time, then NQ before ES on a timestamp tie.

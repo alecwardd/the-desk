@@ -511,6 +511,35 @@ mod tests {
     }
 
     #[test]
+    fn persist_keeps_capsule_when_es_clock_expires_nq_trigger() {
+        use crate::engine::{CAPSULE_LOOKBACK_MS, CAPSULE_RING_STEP_MS};
+        let db = Database::open(":memory:").expect("db");
+        let router = MarketRouter::new(RouterRoot::Nq, SourceProviderKind::File, "expire-cap");
+        let event_ts = RTH_TS + CAPSULE_LOOKBACK_MS;
+        let lookback_n = (CAPSULE_LOOKBACK_MS / CAPSULE_RING_STEP_MS) as i32;
+        for i in 0..=lookback_n {
+            let ts = RTH_TS + i as f64 * CAPSULE_RING_STEP_MS;
+            router.apply_tick(RouterRoot::Nq, &tick(ts, 20_000.0));
+        }
+        router.note_transition_events(RouterRoot::Nq, &[stop_run_at(event_ts)]);
+        router.persist_journal(&db).expect("open");
+        assert_eq!(db.count_capsules().expect("opened"), 1);
+        router.apply_tick(RouterRoot::Es, &tick(event_ts + 40.0 * 60_000.0, 5_000.0));
+        router.persist_journal(&db).expect("after es jump");
+        assert_eq!(
+            db.count_capsules().expect("kept"),
+            1,
+            "expired trigger must not drop an in-flight Capsule"
+        );
+        let cap = &db.list_capsules().expect("list")[0];
+        assert_eq!(cap.event_type, "stop_run");
+        assert_ne!(
+            cap.completeness, "complete",
+            "NQ Capsule must not complete off the ES lane clock"
+        );
+    }
+
+    #[test]
     fn non_dom_events_do_not_open_capsules() {
         let db = Database::open(":memory:").expect("db");
         let router = MarketRouter::new(RouterRoot::Nq, SourceProviderKind::File, "no-cap");

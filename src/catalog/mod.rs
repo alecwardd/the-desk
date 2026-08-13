@@ -19,7 +19,7 @@ mod search;
 mod trust;
 mod types;
 
-pub use config::{load_sil_config, SilConfig};
+pub use config::{load_sil_config, EngineMode, SilConfig};
 pub use envelope::{
     build_state_envelope, state_envelope_json, DomainProvenance, EnvelopeError, ProvenanceSource,
     StateEnvelope, StateReadRequest, StateResolution, TrustLevel,

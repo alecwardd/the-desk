@@ -607,3 +607,23 @@ This note does not raise the Trust Ceiling and does not introduce Catalog v0.
 4. **M0 baseline immutable:** do not re-bless `docs/mcp/sil-m0-tool-telemetry-baseline.json`; shim deltas are attributable against that frozen before-figure.
 
 **Consequences:** Agents can migrate orientation to `get_state` from inside shim responses. Positioning remains a fail-closed stub domain inside every envelope until a provider lands.
+
+---
+
+### Decision note: SIL-M2a engine extract + embedded fallback + SourceProvider stub
+
+**Date:** 2026-08-12
+**Status:** Decided (implements [alecwardd/the-desk#6](https://github.com/alecwardd/the-desk/issues/6); Part of #2)
+
+**Context:** After M1b, intelligence still dies when the MCP/agent session ends because ingest, pipelines, and event detection live inside the stdio-bound MCP process. Contended pipeline mutexes remain a known stdio-stall failure mode (ADR-014). ACSIL is later and must not block the file-spine path.
+
+**Decision:**
+
+1. **`the-desk-engine` host:** headless binary owns ingest, pipelines, and event detection. Lifecycle expectation is Task Scheduler on Sierra hours with **Globex overnight coverage** — the engine runs whenever Sierra records. Closing an MCP/agent session must not stop ingest.
+2. **Embedded-engine fallback:** `[sil].engine_mode = "embedded"` (default) keeps today's MCP-owns-ingest topology as a true rollback. `"external"` makes MCP a thin adapter over a read-only localhost state socket (`[sil].engine_bind`, default `127.0.0.1:17843`).
+3. **Published state:** engine publishes coaching snapshots behind a lock-free swap (`arc_swap`); socket readers never take the pipeline mutex. Kill-the-engine must degrade cleanly (explicit degraded published state + adapter error) and recover on reconnect — never silent stale success.
+4. **`SourceProvider` seam:** `FileProvider` covers `.scid`/`.depth`; `SierraProvider` is stubbed for ACSIL (#23). MarketRouter NQ+ES (#7), Journal Frames / Capsules, and Feature-IR stay out of scope.
+5. **Observability:** ingest gaps (`get_raw_tick_ingest_gaps`), feed health (`get_feed_health` + engine stall/behind fields), and runtime events (`engine.adapter_degraded` / `engine.adapter_recovered`) remain the ops/agent surface.
+6. **Trust Ceiling stays L3:** no path from this work reaches order placement; read/query kernel operators remain Trust Level L0.
+
+**Consequences:** Continuity becomes a property of the engine process. Embedded mode preserves the live coaching path without requiring an external engine. Socket/embedded coaching-path parity and kill/recover are enforced by process + in-crate tests.

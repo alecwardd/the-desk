@@ -422,6 +422,11 @@ pub struct TheDeskMcp {
     pub(crate) tool_telemetry: Arc<crate::tool_telemetry::ToolTelemetry>,
     /// SIL feature flags (`[sil]` in config.toml); discovery tools omit when off.
     pub(crate) sil_config: the_desk_backend::catalog::SilConfig,
+    /// When `[sil].engine_mode = "external"`, lock-free cache of published engine
+    /// state refreshed by a background socket client. `None` in embedded mode.
+    pub(crate) engine_published: Option<the_desk_backend::engine::PublishedStateStore>,
+    /// Last engine-adapter error (kill-the-engine / connect failures).
+    pub(crate) engine_adapter_error: Arc<Mutex<Option<String>>>,
 }
 
 #[derive(Debug)]

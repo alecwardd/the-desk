@@ -32,6 +32,7 @@ All tasks are registered under `\TheDesk\` by `scripts\ops\Register-DeskTasks.ps
 | Task | Trigger local (CT) | Trigger ET | Account | Behavior |
 | --- | --- | --- | --- | --- |
 | `Sierra Watchdog` | Logon and every 4 minutes | same | Interactive user | During Sun 18:00 ET through Fri 17:00 ET, starts Sierra if `SierraChart_64` is not running. It does not close Sierra during the daily 17:00-18:00 ET maintenance halt. |
+| `Engine Watchdog` | Logon and every 4 minutes | same | Interactive user | SIL-M2a: starts `the-desk-engine` if down so ingest covers Globex overnight when `[sil].engine_mode=external`. See `docs/ops/engine-lifecycle.md`. |
 | `Sierra Weekend Close` | Friday 16:10 | Friday 17:10 | Interactive user | Calls `CloseMainWindow()`, waits up to 60 seconds, then force-kills Sierra if it has not exited. |
 | `Friday Data Readiness` | Friday 16:20 | Friday 17:20 | `SYSTEM` | Runs `Invoke-FridayDataReadiness.ps1`: Sierra/SCID idle check, `the-desk-storage --status`, prints operator-gated catch-up MCP/CLI commands, writes `weekend-readiness-YYYYMMDD.json`. Does **not** ingest/backfill unless the operator runs those commands. |
 | `Weekly Storage Archive` | Saturday 09:00 + hourly for 10h | Saturday 10:00 + hourly | `SYSTEM`, highest privileges | Saturday storage maintenance (name retained). Runs `the-desk-storage --maintain`: archives old `raw_ticks` + prunes `depth_events`. **Exit 2** if MCP is up (deferred marker). Success marker on completion. Passes `--abort-if-mcp` when the binary advertises it. |

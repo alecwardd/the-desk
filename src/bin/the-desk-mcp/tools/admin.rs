@@ -266,6 +266,53 @@ impl TheDeskMcp {
                 "recentRuntimeEventNameCounts".to_string(),
                 serde_json::json!(&runtime_event_stats.recent_event_name_counts),
             );
+            obj.insert(
+                "engineMode".to_string(),
+                serde_json::json!(self.sil_config.engine_mode.as_str()),
+            );
+            obj.insert(
+                "engineBind".to_string(),
+                serde_json::json!(self.engine_bind_addr()),
+            );
+            if let Some(store) = self.engine_published.as_ref() {
+                let published = store.load();
+                obj.insert(
+                    "engineAlive".to_string(),
+                    serde_json::json!(published.health.engine_alive),
+                );
+                obj.insert(
+                    "engineGeneration".to_string(),
+                    serde_json::json!(published.generation),
+                );
+                obj.insert(
+                    "engineStallState".to_string(),
+                    serde_json::json!(published.health.stall_state),
+                );
+                obj.insert(
+                    "engineScidBacklogBytes".to_string(),
+                    serde_json::json!(published.health.scid_backlog_bytes),
+                );
+                obj.insert(
+                    "engineTicksIngested".to_string(),
+                    serde_json::json!(published.health.ticks_ingested),
+                );
+                obj.insert(
+                    "engineDegraded".to_string(),
+                    serde_json::json!(published.degraded),
+                );
+                obj.insert(
+                    "engineAdapterError".to_string(),
+                    serde_json::json!(self
+                        .engine_adapter_error
+                        .lock()
+                        .ok()
+                        .and_then(|g| g.clone())),
+                );
+                obj.insert(
+                    "engineSourceHealth".to_string(),
+                    serde_json::json!(&published.health.source),
+                );
+            }
         }
 
         Ok(text_result(payload))

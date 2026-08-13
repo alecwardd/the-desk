@@ -11,8 +11,9 @@ use rmcp::{
 };
 use the_desk_backend::catalog::{
     build_catalog, build_state_envelope, describe_domain, describe_environment,
-    kernel_event_from_db_row, search_catalog, state_envelope_json, EventsEnvelope,
-    ProvenanceSource, StateReadRequest, StateResolution, TrustLevel, KERNEL_READ_QUERY_TOOLS,
+    kernel_event_from_db_row, kernel_event_from_market_event, search_catalog, state_envelope_json,
+    EventsEnvelope, ProvenanceSource, StateReadRequest, StateResolution, TrustLevel,
+    KERNEL_READ_QUERY_TOOLS,
 };
 
 #[allow(unused_imports)]
@@ -195,12 +196,41 @@ impl TheDeskMcp {
         };
         let _symbols = params.symbols; // reserved for MarketRouter multi-symbol
 
-        let rows = {
-            let db = self.db.lock().map_err(|_| lock_error())?;
-            db.list_recent_market_events(limit, since_ms, event_type)
-                .map_err(db_error)?
+        // External engine mode: prefer live published event identity rows so the
+        // read kernel stays current when MCP does not own ingest/DB event writes.
+        let events = if let Some(store) = self.engine_published.as_ref() {
+            let published = store.load();
+            let mut out = Vec::new();
+            for value in published.recent_events.iter().rev() {
+                let Ok(ev) = serde_json::from_value::<the_desk_backend::pipelines::MarketEvent>(
+                    value.clone(),
+                ) else {
+                    continue;
+                };
+                if let Some(min_ts) = since_ms {
+                    if ev.timestamp_ms < min_ts {
+                        continue;
+                    }
+                }
+                if let Some(want) = event_type {
+                    if !ev.event_type.eq_ignore_ascii_case(want) {
+                        continue;
+                    }
+                }
+                out.push(kernel_event_from_market_event(&ev));
+                if out.len() >= limit {
+                    break;
+                }
+            }
+            out
+        } else {
+            let rows = {
+                let db = self.db.lock().map_err(|_| lock_error())?;
+                db.list_recent_market_events(limit, since_ms, event_type)
+                    .map_err(db_error)?
+            };
+            rows.iter().map(kernel_event_from_db_row).collect()
         };
-        let events = rows.iter().map(kernel_event_from_db_row).collect();
         let envelope = EventsEnvelope::from_events(events);
         let mut out = serde_json::to_value(&envelope).unwrap_or_else(|_| serde_json::json!({}));
         if let Some(obj) = out.as_object_mut() {

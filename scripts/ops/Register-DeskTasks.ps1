@@ -106,6 +106,14 @@ function Get-ExpectedTaskSpecs {
             Description = "Interactive-session watchdog: launches Sierra during Sun 18:00 ET through Fri 17:00 ET if it is not running. Triggers are local wall-clock."
         },
         [pscustomobject]@{
+            Name = "Engine Watchdog"
+            ScriptPath = $engineScript
+            Arguments = "-Action Watchdog"
+            PrincipalKind = "Interactive"
+            ExpectEnabled = $true
+            Description = "SIL-M2a: keep the-desk-engine running for Globex overnight coverage when [sil].engine_mode=external. MCP disconnect must not stop ingest."
+        },
+        [pscustomobject]@{
             Name = "Sierra Weekend Close"
             ScriptPath = $sierraScript
             Arguments = "-Action Close"
@@ -273,6 +281,7 @@ if ([string]::IsNullOrWhiteSpace($UserProfilePath)) {
 }
 
 $sierraScript = Join-Path $RepoRoot "scripts\ops\Sierra-Lifecycle.ps1"
+$engineScript = Join-Path $RepoRoot "scripts\ops\Engine-Lifecycle.ps1"
 $weeklyScript = Join-Path $RepoRoot "scripts\ops\Run-Weekly-Archive.ps1"
 $diskScript = Join-Path $RepoRoot "scripts\ops\Check-Disk-Space.ps1"
 $reclaimScript = Join-Path $RepoRoot "scripts\ops\Reclaim-Storage.ps1"
@@ -320,6 +329,14 @@ Register-DeskTask `
     -Principal $sierraPrincipal `
     -Settings $sierraSettings `
     -Description "Interactive-session watchdog: launches Sierra during Sun 18:00 ET through Fri 17:00 ET if it is not running. Triggers are local wall-clock (Central on this box)."
+
+Register-DeskTask `
+    -Name "Engine Watchdog" `
+    -Action (New-PowerShellAction -ScriptPath $engineScript -Arguments "-Action Watchdog") `
+    -Triggers @($watchdogLogon, $watchdogRepeat) `
+    -Principal $sierraPrincipal `
+    -Settings $sierraSettings `
+    -Description "SIL-M2a: keep the-desk-engine running whenever Sierra records (including Globex overnight). Use with [sil].engine_mode=external; embedded MCP mode remains the rollback."
 
 Register-DeskTask `
     -Name "Sierra Weekend Close" `

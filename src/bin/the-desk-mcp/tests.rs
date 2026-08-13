@@ -33,7 +33,7 @@ use the_desk_backend::observability::RuntimeEventLevel;
 use the_desk_backend::pipelines::event_detector::MarketEvent;
 use the_desk_backend::pipelines::PriorSessionData;
 #[allow(unused_imports)]
-use the_desk_backend::pipelines::{EventDetector, FlowEventEmitter, PipelineEngine};
+use the_desk_backend::pipelines::{EventDetector, FlowEventEmitter, MarketState, PipelineEngine};
 #[allow(unused_imports)]
 use the_desk_backend::research;
 #[allow(unused_imports)]
@@ -130,6 +130,7 @@ fn test_server_with_sil() -> TheDeskMcp {
         )),
         the_desk_backend::catalog::SilConfig {
             catalog_discovery: true,
+            ..Default::default()
         },
     );
     server
@@ -913,6 +914,7 @@ fn discovery_tools_absent_from_default_router() {
 fn discovery_tools_present_when_sil_flag_on() {
     let sil = the_desk_backend::catalog::SilConfig {
         catalog_discovery: true,
+        ..Default::default()
     };
     let names: std::collections::BTreeSet<_> = TheDeskMcp::tool_router_with_sil(&sil)
         .list_all()
@@ -956,6 +958,7 @@ fn kernel_read_query_tools_are_trust_level_l0_without_mutation_authority() {
     // Router surface: every kernel tool present under SIL must remain non-mutating.
     let sil = the_desk_backend::catalog::SilConfig {
         catalog_discovery: true,
+        ..Default::default()
     };
     let names: Vec<String> = TheDeskMcp::tool_router_with_sil(&sil)
         .list_all()
@@ -2487,6 +2490,70 @@ fn startup_warm_replay_persists_setup_runtime_without_live_signals() {
         .pending_signal_outcomes()
         .expect("pending outcomes")
         .is_empty());
+}
+
+#[tokio::test]
+async fn evaluate_playbook_uses_external_engine_published_market_state() {
+    let db = Database::open(":memory:").expect("db");
+    let logging_config = the_desk_backend::observability::LoggingConfig {
+        destination: "none".to_string(),
+        runtime_event_suppression_window_ms: 0,
+        ..the_desk_backend::observability::LoggingConfig::default()
+    };
+    let server = TheDeskMcp::with_runtime_events_and_sil(
+        db,
+        PipelineEngine::new(),
+        ":memory:".into(),
+        std::sync::Arc::new(the_desk_backend::observability::RuntimeEventStore::new(
+            &logging_config,
+        )),
+        the_desk_backend::catalog::SilConfig {
+            catalog_discovery: true,
+            engine_mode: the_desk_backend::catalog::EngineMode::External,
+            ..Default::default()
+        },
+    );
+    let store = server
+        .engine_published
+        .as_ref()
+        .expect("external mode publishes store")
+        .clone();
+    store.store(the_desk_backend::engine::PublishedEngineState {
+        generation: 3,
+        engine_pid: 1,
+        published_at_ms: 1.0,
+        data_time_ms: Some(1_704_207_600_000.0),
+        source_provider: the_desk_backend::engine::SourceProviderKind::File,
+        market_state: serde_json::to_value(MarketState {
+            last_price: 20_500.0,
+            bid: 20_499.75,
+            ask: 20_500.25,
+            vwap: 20_490.0,
+            ..Default::default()
+        })
+        .expect("market state json"),
+        recent_events: vec![],
+        health: the_desk_backend::engine::EngineHealth::unavailable("test"),
+        degraded: false,
+        degraded_note: None,
+    });
+    server
+        .playbook_cache
+        .replace_active_setups(vec![SetupDefinition {
+            id: "engine_pub_setup".to_string(),
+            name: "Engine Pub Setup".to_string(),
+            active: true,
+            min_delta: 0.0,
+            conditions: Vec::new(),
+            ..Default::default()
+        }]);
+    let result = server.evaluate_playbook().await.expect("evaluate");
+    let rendered = format!("{result:?}");
+    assert!(
+        rendered.contains("engine_pub_setup"),
+        "evaluate_playbook must use published MarketState in external mode: {rendered}"
+    );
+    assert!(!rendered.contains("\"state\": \"unknown\""));
 }
 
 #[tokio::test]

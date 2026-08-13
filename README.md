@@ -123,7 +123,9 @@ the-desk/
 ├── Cargo.toml                  # Rust package (default-run: the-desk-mcp)
 ├── src/
 │   ├── bin/the-desk-mcp/       # MCP server binary (9 tool domain modules)
+│   ├── bin/the-desk-engine/    # Headless engine host (SIL-M2a; survives MCP disconnect)
 │   ├── lib.rs                  # Module exports
+│   ├── engine/                 # Engine host, SourceProvider, published-state socket
 │   ├── backfill.rs             # Historical .scid backfill engine
 │   ├── research/mod.rs         # Query engine (frequency, conditional, distribution)
 │   ├── pipelines/              # 14 pipeline modules + event detector

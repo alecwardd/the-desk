@@ -4,6 +4,7 @@ pub mod backup;
 pub mod catalog;
 pub mod db;
 pub mod depth;
+pub mod engine;
 pub mod feed;
 pub mod mcp;
 pub mod memory;

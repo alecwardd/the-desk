@@ -96,6 +96,17 @@ pub fn parse_requested_roots(raw: Option<&[String]>) -> Result<Vec<RouterRoot>, 
     }
 }
 
+/// Coaching-path primary root from feed `base_symbol`.
+///
+/// Empty / unknown labels default to NQ. Micros (`MES` / `MNQ`) are rejected.
+pub fn primary_root_from_config(base_symbol: &str) -> Result<RouterRoot, RouterRootError> {
+    match RouterRoot::parse(base_symbol) {
+        Ok(root) => Ok(root),
+        Err(RouterRootError::Empty) | Err(RouterRootError::Unsupported(_)) => Ok(RouterRoot::Nq),
+        Err(err @ RouterRootError::MicroNotInScope(_)) => Err(err),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -128,5 +139,21 @@ mod tests {
             parse_requested_roots(Some(&[])).unwrap(),
             vec![RouterRoot::Nq, RouterRoot::Es]
         );
+    }
+
+    #[test]
+    fn primary_root_rejects_micros_and_defaults_nq() {
+        assert_eq!(primary_root_from_config("ES").unwrap(), RouterRoot::Es);
+        assert_eq!(primary_root_from_config("NQ").unwrap(), RouterRoot::Nq);
+        assert_eq!(primary_root_from_config("").unwrap(), RouterRoot::Nq);
+        assert_eq!(primary_root_from_config("NQU26").unwrap(), RouterRoot::Nq);
+        assert!(matches!(
+            primary_root_from_config("MES"),
+            Err(RouterRootError::MicroNotInScope(_))
+        ));
+        assert!(matches!(
+            primary_root_from_config("MNQ"),
+            Err(RouterRootError::MicroNotInScope(_))
+        ));
     }
 }

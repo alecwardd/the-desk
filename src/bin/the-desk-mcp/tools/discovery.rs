@@ -181,7 +181,7 @@ impl TheDeskMcp {
                     fields: params.fields.clone(),
                     resolution,
                     as_of,
-                    budget_tokens: params.budget_tokens,
+                    budget_tokens: None,
                     snapshot,
                     snapshot_source,
                     data_time,
@@ -195,6 +195,11 @@ impl TheDeskMcp {
                     other => invalid_params_error(other.to_string()),
                 })?;
                 by_root.insert(root.as_str().to_string(), env);
+            }
+            if let Some(budget) = params.budget_tokens {
+                if let Some(env) = by_root.values_mut().next() {
+                    env.budget_tokens = Some(budget);
+                }
             }
             let mut clock_ms = self.market_router.clock_ms().or(data_time);
             for piece in live_by_symbol.values() {

@@ -23,7 +23,7 @@ pub use config::{load_engine_bind_addr, ENGINE_DEFAULT_BIND};
 pub use health::{EngineHealth, FeedStallState};
 pub use host::{coaching_parity_fingerprint, EngineHost, IngestOutcome};
 pub use published::{PublishedEngineState, PublishedStateStore};
-pub use root::{parse_requested_roots, RouterRoot, RouterRootError};
+pub use root::{parse_requested_roots, primary_root_from_config, RouterRoot, RouterRootError};
 pub use router::{sort_ticks_one_clock, MarketRouter};
 pub use socket::{EngineClient, EngineSocketServer, SocketRequest, SocketResponse};
 pub use source::{

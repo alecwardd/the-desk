@@ -211,6 +211,7 @@ impl MarketRouter {
                 recent_events.push(ev);
             }
         }
+        sort_recent_events_one_clock(&mut recent_events);
         let primary_state = by_symbol
             .get(self.primary.as_str())
             .cloned()
@@ -373,6 +374,27 @@ pub fn sort_ticks_one_clock(ticks: &mut [(RouterRoot, SourceTick)]) {
             .partial_cmp(&b.1.timestamp_ms)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.0.cmp(&b.0))
+    });
+}
+
+/// Published event identity rows: ascending `timestampMs`, NQ before ES on a tie.
+fn sort_recent_events_one_clock(events: &mut [Value]) {
+    events.sort_by(|a, b| {
+        let ta = a.get("timestampMs").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let tb = b.get("timestampMs").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        ta.partial_cmp(&tb)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                let ra = a
+                    .get("rootSymbol")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| RouterRoot::parse(s).ok());
+                let rb = b
+                    .get("rootSymbol")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| RouterRoot::parse(s).ok());
+                ra.cmp(&rb)
+            })
     });
 }
 
@@ -555,5 +577,21 @@ mod tests {
         let nq = router.nq_host().snapshot_market_state();
         assert_eq!(nq["sessionType"], "RTH");
         assert_eq!(nq["lastPrice"], 20_000.0);
+    }
+
+    #[test]
+    fn published_events_sort_by_one_clock() {
+        let mut events = vec![
+            serde_json::json!({"timestampMs": 200.0, "rootSymbol": "NQ", "eventType": "b"}),
+            serde_json::json!({"timestampMs": 100.0, "rootSymbol": "ES", "eventType": "a"}),
+            serde_json::json!({"timestampMs": 200.0, "rootSymbol": "ES", "eventType": "c"}),
+        ];
+        sort_recent_events_one_clock(&mut events);
+        assert_eq!(events[0]["rootSymbol"], "ES");
+        assert_eq!(events[0]["timestampMs"], 100.0);
+        assert_eq!(events[1]["rootSymbol"], "NQ");
+        assert_eq!(events[1]["timestampMs"], 200.0);
+        assert_eq!(events[2]["rootSymbol"], "ES");
+        assert_eq!(events[2]["timestampMs"], 200.0);
     }
 }

@@ -327,8 +327,18 @@ fn apply_token_budget(envelope: &mut StateEnvelope, budget_tokens: u64) {
         return;
     }
     // Drop highest-cost (R1) values first, then trim alphabetically.
+    // Multi-symbol envelopes prefix `{ROOT}.…`; drop non-primary (ES) before NQ
+    // so the coaching-path primary is retained under budget pressure.
     let mut ids: Vec<String> = envelope.values.keys().cloned().collect();
-    ids.sort_by(|a, b| b.cmp(a));
+    ids.sort_by(|a, b| {
+        let a_nq = a.starts_with("NQ.");
+        let b_nq = b.starts_with("NQ.");
+        match (a_nq, b_nq) {
+            (true, false) => std::cmp::Ordering::Greater,
+            (false, true) => std::cmp::Ordering::Less,
+            _ => b.cmp(a),
+        }
+    });
     for id in ids {
         if approx(envelope) <= budget_tokens {
             break;

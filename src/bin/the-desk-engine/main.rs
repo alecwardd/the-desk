@@ -80,8 +80,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let bind = parse_bind_arg();
     let feed = load_feed_config();
-    let primary =
-        the_desk_backend::engine::RouterRoot::parse(&feed.base_symbol).unwrap_or(RouterRoot::Nq);
+    let primary = the_desk_backend::engine::primary_root_from_config(&feed.base_symbol)?;
 
     let mut providers: BTreeMap<RouterRoot, Box<dyn SourceProvider>> = BTreeMap::new();
     let nq_provider: Box<dyn SourceProvider> = if let Some(scid) = parse_path_flag("--scid") {

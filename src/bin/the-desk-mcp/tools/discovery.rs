@@ -299,7 +299,7 @@ impl TheDeskMcp {
     }
 
     #[tool(
-        description = "SIL read kernel: formalized market events with lifecycle (open → updated → resolved|expired), severity, dedup identity, frame_ref to the producing Journal Frame, and capsuleRef on DOM-family rows (stop_run, iceberg_reload, pull_intent, book_velocity_regime_shift). Trust Level L0 (read/query) — structurally incapable of mutation or order authority. Attention inbox is a ranked view over this stream (get_attention_inbox). Enable via [sil].catalog_discovery."
+        description = "SIL read kernel: formalized market events with lifecycle (open → updated → resolved|expired), severity, dedup identity, frameRef to the producing Journal Frame, and capsuleRef on DOM-family rows (stop_run, iceberg_reload, pull_intent, book_velocity_regime_shift). Trust Level L0 (read/query) — structurally incapable of mutation or order authority. Attention inbox is a ranked view over this stream (get_attention_inbox). Enable via [sil].catalog_discovery."
     )]
     pub(crate) async fn get_events(
         &self,

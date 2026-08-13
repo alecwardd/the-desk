@@ -276,7 +276,7 @@ fn base_domain_shells() -> Vec<DomainDescriptor> {
         DomainDescriptor {
             id: "events".into(),
             name: "Events".into(),
-            summary: "Formalized event stream: lifecycle (open → updated → resolved|expired), severity, dedup identity, frame_ref to the producing Journal Frame, and capsuleRef on DOM-family rows (stop_run, iceberg_reload, pull_intent, book_velocity_regime_shift). Reads ride get_events; the attention inbox is a ranked view over this stream.".into(),
+            summary: "Formalized event stream: lifecycle (open → updated → resolved|expired), severity, dedup identity, frameRef to the producing Journal Frame, and capsuleRef on DOM-family rows (stop_run, iceberg_reload, pull_intent, book_velocity_regime_shift). Reads ride get_events; the attention inbox is a ranked view over this stream.".into(),
             field_ids: vec![],
             record_kinds: vec![],
         },

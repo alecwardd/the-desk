@@ -466,7 +466,8 @@ mod tests {
         }
         let stats = router.persist_journal(&db).expect("persist");
         assert!(stats.events_written >= 1);
-        assert!(stats.capsules_opened >= 1 || db.count_capsules().expect("count") == 1);
+        assert!(stats.capsules_opened >= 1);
+        assert!(stats.capsules_finalized >= 1);
         let capsules = db.list_capsules().expect("capsules");
         assert_eq!(capsules.len(), 1);
         let cap = &capsules[0];

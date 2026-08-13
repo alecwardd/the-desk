@@ -600,7 +600,7 @@ impl MarketRouter {
     fn persist_capsules(&self, db: &Database, clock_ms: f64) -> Result<(usize, usize), DbError> {
         self.sample_capsule_rings();
         let stopped = !self.nq.is_running() && !self.es.is_running();
-        let mut pending = match self.pending_capsules.lock() {
+        let pending = match self.pending_capsules.lock() {
             Ok(mut g) => std::mem::take(&mut *g),
             Err(_) => return Ok((0, 0)),
         };
@@ -608,8 +608,10 @@ impl MarketRouter {
         let mut finalized = 0usize;
         let mut keep = Vec::new();
         let mut persist_err: Option<DbError> = None;
-        for mut cap in pending.drain(..) {
-            cap.finalize(clock_ms, stopped);
+        let mut remaining = pending.into_iter();
+        for mut cap in remaining.by_ref() {
+            let finalize_clock = clock_ms.max(cap.observed_clock_ms());
+            cap.finalize(finalize_clock, stopped);
             let lifecycle = match db.market_event_lifecycle_for_identity(&cap.trigger_identity_id) {
                 Ok(v) => v,
                 Err(err) => {
@@ -628,7 +630,7 @@ impl MarketRouter {
                             break;
                         }
                     };
-                    let rec = cap.to_record(clock_ms.max(cap.event_timestamp_ms));
+                    let rec = cap.to_record(finalize_clock.max(cap.event_timestamp_ms));
                     if let Err(err) = db.upsert_capsule(&rec) {
                         keep.push(cap);
                         persist_err = Some(err);
@@ -647,6 +649,8 @@ impl MarketRouter {
                 Some(_) => {}
             }
         }
+        // Drain+break would drop unyielded Capsules; keep them for the next persist.
+        keep.extend(remaining);
         if let Ok(mut g) = self.pending_capsules.lock() {
             keep.append(&mut *g);
             *g = keep;

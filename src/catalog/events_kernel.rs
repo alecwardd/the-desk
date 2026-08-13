@@ -444,19 +444,32 @@ pub fn attach_capsule_refs(events: &mut [KernelEvent], capsules: &[CapsuleRecord
     }
 }
 
+fn event_root_symbol(event: &KernelEvent) -> Option<&str> {
+    event
+        .root_symbol
+        .as_deref()
+        .or(event.frame_ref.root_symbol.as_deref())
+}
+
+fn capsule_matches_event_root(capsule: &CapsuleRecord, event: &KernelEvent) -> bool {
+    event_root_symbol(event).is_some_and(|root| capsule.root_symbol == root)
+}
+
 fn pick_capsule_for_event<'a>(
     event: &KernelEvent,
     capsules: &'a [CapsuleRecord],
 ) -> Option<&'a CapsuleRecord> {
-    if let Some(hit) = capsules
-        .iter()
-        .find(|c| c.trigger_identity_id == event.identity_id)
-    {
+    // Occurrence identity is not namespaced by root (pre-existing M4). Match
+    // the persisted Capsule root instead of rewriting `market_event_id`.
+    if let Some(hit) = capsules.iter().find(|c| {
+        c.trigger_identity_id == event.identity_id && capsule_matches_event_root(c, event)
+    }) {
         return Some(hit);
     }
     capsules
         .iter()
         .filter(|c| c.dedup_identity_id == event.dedup_identity_id)
+        .filter(|c| capsule_matches_event_root(c, event))
         .filter(|c| c.event_timestamp_ms <= event.timestamp_ms + 0.5)
         .max_by(|a, b| {
             a.event_timestamp_ms
@@ -703,5 +716,55 @@ mod tests {
         let wire = serde_json::to_value(&row).expect("wire");
         assert!(wire.get("capsuleRef").is_some());
         assert!(wire["capsuleRef"]["id"].is_null());
+    }
+
+    fn sample_capsule(id: &str, trigger: &str, root: &str) -> CapsuleRecord {
+        CapsuleRecord {
+            id: id.into(),
+            trigger_identity_id: trigger.into(),
+            dedup_identity_id: "dedup_x".into(),
+            root_symbol: root.into(),
+            event_type: "stop_run".into(),
+            event_timestamp_ms: 1_700_000_000_000.0,
+            window_start_ms: 1_700_000_000_000.0 - 30_000.0,
+            window_end_ms: 1_700_000_000_000.0 + 60_000.0,
+            observed_start_ms: None,
+            observed_end_ms: None,
+            start_frame_second: Some(1_699_999_970),
+            end_frame_second: Some(1_700_000_060),
+            completeness: "complete".into(),
+            degraded: false,
+            sample_count: 1,
+            payload: json!({}),
+            created_at_ms: 1_700_000_000_000.0,
+            updated_at_ms: 1_700_000_000_000.0,
+        }
+    }
+
+    #[test]
+    fn attach_capsule_refs_requires_matching_root() {
+        let event = MarketEvent {
+            event_type: "stop_run".into(),
+            ..sample()
+        };
+        let row = kernel_event_from_market_event_scoped(&event, Some("NQ"), None);
+        let nq = sample_capsule("cap_nq", &row.identity_id, "NQ");
+        let es = sample_capsule("cap_es", &row.identity_id, "ES");
+
+        let mut events = [row.clone()];
+        attach_capsule_refs(&mut events, &[es.clone(), nq.clone()]);
+        assert_eq!(
+            events[0].capsule_ref.as_ref().and_then(|c| c.id.as_deref()),
+            Some("cap_nq")
+        );
+
+        let mut events = [row];
+        attach_capsule_refs(&mut events, &[es]);
+        let cap = events[0].capsule_ref.as_ref().expect("capsuleRef required");
+        assert!(
+            cap.id.is_none(),
+            "ES Capsule must not attach to an NQ event that shares occurrence identity"
+        );
+        assert_eq!(cap.completeness.as_deref(), Some("pending"));
     }
 }

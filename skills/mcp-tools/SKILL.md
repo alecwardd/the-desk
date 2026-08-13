@@ -38,7 +38,7 @@ operators appear (Trust Level L0 — read/query, no mutation/order authority):
 2. `describe_domain` — one domain's field descriptors (unit, session scope, freshness, cost hint).
 3. `search_catalog` — text search over field ids / names / descriptions.
 4. `get_state` — StateEnvelope (`values` + per-domain `provenance` + `degraded`; resolution R0|R1 only). MarketRouter v0: `symbols=["NQ","ES"]` returns both roots in one envelope.
-5. `get_events` — formalized event rows (lifecycle, severity, dedup identity, `frame_ref` to the producing Journal Frame, `capsuleRef` on DOM-family rows). Trust Level L0.
+5. `get_events` — formalized event rows (lifecycle, severity, dedup identity, `frameRef` to the producing Journal Frame, `capsuleRef` on DOM-family rows). Trust Level L0.
 
 Default off keeps the **122 MCP tools** surface unchanged. Artifacts:
 [docs/mcp/desk-catalog-v0.json](../../docs/mcp/desk-catalog-v0.json).

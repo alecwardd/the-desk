@@ -128,10 +128,12 @@ impl CapsuleRing {
             .collect()
     }
 
+    /// Number of ring samples currently retained.
     pub fn len(&self) -> usize {
         self.samples.len()
     }
 
+    /// True when the ring holds no samples.
     pub fn is_empty(&self) -> bool {
         self.samples.is_empty()
     }
@@ -171,15 +173,18 @@ impl PendingCapsule {
     pub fn open_from_ring(root: RouterRoot, event: &MarketEvent, ring: &CapsuleRing) -> Self {
         let trigger_identity_id = market_event_id(event);
         let (window_start_ms, window_end_ms) = capsule_window_bounds(event.timestamp_ms);
-        let samples: Vec<Value> = ring
-            .lookback(event.timestamp_ms)
+        let lookback = ring.lookback(event.timestamp_ms);
+        // Advance the after-window cursor across the full lookback span so
+        // filtered other-session samples are not re-ingested and mixed.
+        let last_sample_ms = lookback
+            .last()
+            .map(|s| s.clock_ms)
+            .unwrap_or(event.timestamp_ms);
+        let samples: Vec<Value> = lookback
             .into_iter()
+            .filter(|s| s.session_type == event.session_type)
             .map(|s| s.payload)
             .collect();
-        let last_sample_ms = samples
-            .last()
-            .and_then(|s| s.get("clockMs").and_then(|v| v.as_f64()))
-            .unwrap_or(event.timestamp_ms);
         Self {
             id: capsule_id_for_trigger(&trigger_identity_id),
             trigger_identity_id,
@@ -230,13 +235,20 @@ impl PendingCapsule {
         }
     }
 
+    /// True when the Capsule reached `complete` or `incomplete`.
     pub fn is_terminal(&self) -> bool {
         self.completeness == CAPSULE_COMPLETENESS_COMPLETE
             || self.completeness == CAPSULE_COMPLETENESS_INCOMPLETE
     }
 
+    /// True while the after-window is still open.
     pub fn is_pending(&self) -> bool {
         self.completeness == CAPSULE_COMPLETENESS_PENDING
+    }
+
+    /// Latest ring sample on the MarketRouter clock (lookback or after-window).
+    pub fn observed_clock_ms(&self) -> f64 {
+        self.last_sample_ms
     }
 
     /// SQLite row (payload is the dump, not a 250 ms frame store).
@@ -480,6 +492,48 @@ mod tests {
                 < journal_frame_second_from_ts(event_ts + CAPSULE_AFTER_MS).unwrap()
                 || rec.observed_end_ms.unwrap() < event_ts + CAPSULE_AFTER_MS
         );
+    }
+
+    #[test]
+    fn lookback_excludes_other_session_samples() {
+        let mut ring = CapsuleRing::default();
+        let event_ts = 1_704_207_630_000.0;
+        for i in 0..4 {
+            let ts = event_ts - 2_000.0 + i as f64 * CAPSULE_RING_STEP_MS;
+            ring.push(
+                ts,
+                "Globex",
+                compact_capsule_sample(
+                    ts,
+                    RouterRoot::Nq,
+                    &json!({"sessionType": "Globex", "lastPrice": 19_999.0}),
+                ),
+            );
+        }
+        for i in 0..4 {
+            let ts = event_ts - 750.0 + i as f64 * CAPSULE_RING_STEP_MS;
+            ring.push(
+                ts,
+                "RTH",
+                compact_capsule_sample(
+                    ts,
+                    RouterRoot::Nq,
+                    &json!({"sessionType": "RTH", "lastPrice": 20_000.0}),
+                ),
+            );
+        }
+        let pending = PendingCapsule::open_from_ring(
+            RouterRoot::Nq,
+            &sample_event("stop_run", event_ts),
+            &ring,
+        );
+        assert!(!pending.samples.is_empty());
+        assert!(pending.is_pending());
+        assert!(!pending.degraded);
+        for sample in &pending.samples {
+            assert_eq!(sample["sessionType"], "RTH");
+            assert_eq!(sample["lastPrice"].as_f64(), Some(20_000.0));
+        }
     }
 
     #[test]

@@ -3341,6 +3341,8 @@ impl Database {
               ON capsules(dedup_identity_id, event_timestamp_ms);
             CREATE INDEX IF NOT EXISTS idx_capsules_root_frames
               ON capsules(root_symbol, start_frame_second, end_frame_second);
+            CREATE INDEX IF NOT EXISTS idx_market_events_identity
+              ON market_events(identity_id);
             UPDATE schema_version SET version = 35;
             ",
         )?;
@@ -7374,8 +7376,13 @@ impl Database {
         identity_id: &str,
     ) -> Result<Option<String>, DbError> {
         let mut stmt = self.conn.prepare(
-            "SELECT lifecycle FROM market_events
-              WHERE identity_id = ?1 OR event_id = ?1
+            "SELECT lifecycle FROM (
+                 SELECT lifecycle, lifecycle_updated_at_ms, timestamp_ms, id
+                   FROM market_events WHERE identity_id = ?1
+                 UNION ALL
+                 SELECT lifecycle, lifecycle_updated_at_ms, timestamp_ms, id
+                   FROM market_events WHERE event_id = ?1
+               )
               ORDER BY COALESCE(lifecycle_updated_at_ms, timestamp_ms) DESC, id DESC
               LIMIT 1",
         )?;
@@ -13115,6 +13122,49 @@ mod tests {
             )
             .expect("version");
         assert!(version >= 35, "schema v35 Capsules, got {version}");
+        let identity_idx: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(1) FROM sqlite_master
+                  WHERE type='index' AND name='idx_market_events_identity'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("identity idx");
+        assert_eq!(identity_idx, 1);
+    }
+
+    #[test]
+    fn market_event_lifecycle_for_identity_hits_identity_or_event_id() {
+        let db = test_db();
+        let event = MarketEvent {
+            session_date: "2024-01-02".into(),
+            timestamp_ms: 1_704_207_600_250.0,
+            event_type: "stop_run".into(),
+            level_name: None,
+            price: 20_000.0,
+            direction: Some("up".into()),
+            sequence_num: Some(1),
+            metadata: None,
+            session_type: "RTH".into(),
+            session_segment: "None".into(),
+            trading_day: "2024-01-02".into(),
+        };
+        db.insert_market_events_batch_scoped(Some("NQ"), std::slice::from_ref(&event))
+            .expect("insert");
+        let identity = market_event_id(&event);
+        assert_eq!(
+            db.market_event_lifecycle_for_identity(&identity)
+                .expect("lookup")
+                .as_deref(),
+            Some("open")
+        );
+        assert_eq!(
+            db.market_event_lifecycle_for_identity("missing")
+                .expect("missing")
+                .as_deref(),
+            None
+        );
     }
 
     #[test]

@@ -248,9 +248,11 @@ pub fn requires_capsule(event_type: &str) -> bool {
     is_dom_family_event_type(event_type)
 }
 
-/// Lookback before the triggering Event (ADR-024 / #2).
+/// Lookback before the triggering Event (ADR-024 / #10).
+/// Named constants — tests must not require `config.toml`.
 pub const CAPSULE_LOOKBACK_MS: f64 = 30_000.0;
-/// After-window following the triggering Event (ADR-024 / #2).
+/// After-window following the triggering Event (ADR-024 / #10).
+/// Named constants — tests must not require `config.toml`.
 pub const CAPSULE_AFTER_MS: f64 = 60_000.0;
 
 fn normalize_event_type_key(event_type: &str) -> String {

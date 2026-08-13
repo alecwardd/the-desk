@@ -151,14 +151,30 @@ async fn kill_the_engine_degrades_and_recovers() {
     let serve = tokio::spawn(async move { server.serve(store_bg, rx).await });
 
     let client = EngineClient::new(bind.clone());
-    for _ in 0..50 {
+    for _ in 0..100 {
         if client.ping().await.is_ok() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    let live = client.get_published().await;
-    assert!(!live.degraded);
+    assert!(
+        client.ping().await.is_ok(),
+        "engine socket must accept connections before kill/recover"
+    );
+    let mut live = client.get_published().await;
+    for _ in 0..100 {
+        if !live.degraded && live.generation > 0 && !live.market_state.is_null() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        live = client.get_published().await;
+    }
+    assert!(
+        !live.degraded && live.generation > 0,
+        "socket path must publish non-degraded coaching state before kill (gen={}, err={:?})",
+        live.generation,
+        client.last_error()
+    );
 
     // Kill the engine socket.
     let _ = tx.send(true);
@@ -178,8 +194,8 @@ async fn kill_the_engine_degrades_and_recovers() {
     let server = EngineSocketServer::new(bind.clone());
     let serve2 = tokio::spawn(async move { server.serve(store_bg, rx2).await });
     let mut recovered = client.get_published().await;
-    for _ in 0..50 {
-        if !recovered.degraded {
+    for _ in 0..100 {
+        if !recovered.degraded && recovered.generation > 0 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;

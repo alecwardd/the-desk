@@ -861,11 +861,14 @@ pub(crate) struct PositioningEntryParams {
     pub(crate) completeness: Option<String>,
     /// Trading day YYYY-MM-DD. Derived from asOf/capturedAt when omitted.
     pub(crate) trading_day: Option<String>,
-    /// Desk annotation timestamp (epoch ms). Defaults to now.
+    /// Desk annotation timestamp (epoch ms). Catalog name `capturedAt`; `capturedAtMs` also accepted.
+    #[serde(rename = "capturedAt", alias = "capturedAtMs")]
     pub(crate) captured_at_ms: Option<f64>,
-    /// Explicit manual/as-of timestamp (epoch ms). Defaults to capturedAt.
+    /// Explicit manual/as-of timestamp (epoch ms). Catalog name `asOf`; `asOfMs` also accepted.
+    #[serde(rename = "asOf", alias = "asOfMs")]
     pub(crate) as_of_ms: Option<f64>,
-    /// Vendor dataTime — rejected on the Levels-Only path.
+    /// Vendor dataTime — rejected on the Levels-Only path. Catalog name `dataTime`.
+    #[serde(rename = "dataTime", alias = "dataTimeMs")]
     pub(crate) data_time_ms: Option<f64>,
     /// Desk-derived levels (flip, walls, BALANCE / UPSIDE / DOWNSIDE TEST).
     pub(crate) derived_levels: Option<DerivedLevelsParams>,

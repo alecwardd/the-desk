@@ -10,11 +10,11 @@ use rmcp::{
     handler::server::wrapper::Parameters, model::*, tool, tool_router, ErrorData as McpError,
 };
 use the_desk_backend::catalog::{
-    apply_positioning_slice, build_catalog, build_state_envelope, describe_domain,
-    describe_environment, kernel_event_from_db_row, kernel_event_from_market_event,
-    merge_symbol_envelopes, positioning_state_slice, search_catalog, state_envelope_json,
-    EventsEnvelope, PositioningStateSlice, ProvenanceSource, StateEnvelope, StateReadRequest,
-    StateResolution, TrustLevel, KERNEL_READ_QUERY_TOOLS,
+    apply_positioning_slice, apply_token_budget, build_catalog, build_state_envelope,
+    describe_domain, describe_environment, kernel_event_from_db_row,
+    kernel_event_from_market_event, merge_symbol_envelopes, positioning_state_slice,
+    search_catalog, state_envelope_json, EventsEnvelope, PositioningStateSlice, ProvenanceSource,
+    StateEnvelope, StateReadRequest, StateResolution, TrustLevel, KERNEL_READ_QUERY_TOOLS,
 };
 use the_desk_backend::engine::{parse_requested_roots, RouterRoot, RouterRootError};
 use the_desk_backend::trading_day_from_timestamp_ms;
@@ -376,6 +376,9 @@ impl TheDeskMcp {
     ) -> Result<CallToolResult, McpError> {
         let slice = self.load_positioning_slice(as_of);
         apply_positioning_slice(&mut envelope, catalog, &slice, fields);
+        if let Some(budget) = envelope.budget_tokens {
+            apply_token_budget(&mut envelope, budget);
+        }
         Ok(text_result(finish_state_envelope_json(&envelope)?))
     }
 
@@ -391,13 +394,9 @@ impl TheDeskMcp {
             }
             Err(_) => None,
         };
-        let live_day = if as_of.is_none() {
-            let now = chrono::Utc::now().timestamp_millis() as f64;
-            Some(trading_day_from_timestamp_ms(now))
-        } else {
-            None
-        };
-        positioning_state_slice(record.as_ref(), live_day.as_deref())
+        let reference_ms = as_of.unwrap_or_else(|| chrono::Utc::now().timestamp_millis() as f64);
+        let reference_day = trading_day_from_timestamp_ms(reference_ms);
+        positioning_state_slice(record.as_ref(), Some(reference_day.as_str()))
     }
 
     /// Serve `get_state(as_of=…)` from 1 Hz Journal Frames (never `pipeline_snapshots`).

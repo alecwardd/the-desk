@@ -386,7 +386,7 @@ Typed trader memory context fit. Separates executed-trade memory, setup opportun
 
 ### `positioning_entry`
 
-Typed workflow verb: write a first-class Levels-Only Record into Positioning (same schema a later capture adapter will use). Manual/as-of provenance — not live vendor data, no VolSignals scrape, no ToS. Completeness is levels_only (first-class, not a fallback). Reads ride get_state (domain=positioning); do not use this as a getter. Mutation of Positioning records only — Trust Ceiling stays L3, no order authority. Frame coaching as your annotated sessions / your methodology say…
+Typed workflow verb: write a first-class Levels-Only Record into Positioning (same schema a later capture adapter will use). Manual/as-of provenance — not live vendor data, no VolSignals scrape, no ToS. Completeness is levels_only (first-class, not a fallback). Reads ride get_state (domain=positioning) which requires [sil].catalog_discovery = true; do not use this as a getter. Mutation of Positioning records only — Trust Ceiling stays L3, no order authority. Frame coaching as your annotated sessions / your methodology say…
 
 ### `recall_agent_insights`
 

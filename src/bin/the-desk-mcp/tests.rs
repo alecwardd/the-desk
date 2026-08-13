@@ -1290,15 +1290,14 @@ async fn positioning_entry_rejects_slice_and_vendor_pretence() {
     );
     let err = server
         .positioning_entry(Parameters(PositioningEntryParams {
-            vendor: Some("VolSignals".into()),
+            vendor: Some("Menthor Q".into()),
             derived_levels: Some(levels.clone()),
             ..Default::default()
         }))
         .await
-        .expect_err("vendor stamp rejected");
+        .expect_err("unrecognized vendor stamp rejected");
     assert!(
         err.to_string().to_lowercase().contains("vendor")
-            || err.to_string().contains("VolSignals")
             || err.to_string().contains("Levels-Only"),
         "unexpected: {err}"
     );
@@ -1401,7 +1400,76 @@ async fn get_state_as_of_serves_dated_levels_only_without_staling_or_vendor() {
     assert_eq!(out["values"]["positioning.completeness"], "levels_only");
     assert_eq!(out["provenance"]["positioning"]["source"], "manual");
     assert!(out["provenance"]["positioning"]["vendor"].is_null());
-    assert_eq!(out["provenance"]["positioning"]["dataTime"], as_of);
+    assert!(out["provenance"]["positioning"]["dataTime"].is_null());
+    assert_eq!(out["values"]["positioning.asOf"], as_of);
+}
+
+#[tokio::test]
+async fn get_state_as_of_other_day_fails_closed_not_vendor() {
+    let server = test_server_with_sil();
+    let card_as_of = 1_771_372_800_000.0;
+    server
+        .positioning_entry(Parameters(PositioningEntryParams {
+            trading_day: Some("2026-02-18".into()),
+            captured_at_ms: Some(card_as_of),
+            as_of_ms: Some(card_as_of),
+            derived_levels: Some(DerivedLevelsParams {
+                flip: Some(5750.0),
+                walls: Some(vec![PositioningWallParams {
+                    strike: Some(5800.0),
+                    role: Some("call_wall".into()),
+                }]),
+                balance: Some(5745.0),
+                upside_test: Some(5825.0),
+                downside_test: Some(5680.0),
+            }),
+            ..Default::default()
+        }))
+        .await
+        .expect("write february card");
+    let later = 1_786_629_600_000.0; // 2026-08-13 14:00 UTC
+    let out = parse_text_tool_result(
+        server
+            .get_state(Parameters(GetStateParams {
+                domains: Some(vec!["positioning".into()]),
+                resolution: Some("R1".into()),
+                as_of: Some(later),
+                ..Default::default()
+            }))
+            .await
+            .expect("get_state as_of later day"),
+    );
+    assert_eq!(out["degraded"]["positioning"], true);
+    assert_eq!(out["values"]["positioning.freshnessOk"], false);
+    assert_eq!(out["values"]["positioning.completeness"], "levels_only");
+    assert_eq!(out["provenance"]["positioning"]["source"], "manual");
+    assert!(out["provenance"]["positioning"]["vendor"].is_null());
+}
+
+#[test]
+fn positioning_entry_params_accept_catalog_and_ms_timestamp_names() {
+    let catalog_names = serde_json::json!({
+        "capturedAt": 1_771_372_800_000.0,
+        "asOf": 1_771_372_800_000.0,
+        "derivedLevels": {
+            "flip": 5750.0,
+            "balance": 5745.0,
+            "upsideTest": 5825.0,
+            "downsideTest": 5680.0
+        }
+    });
+    let from_catalog: PositioningEntryParams =
+        serde_json::from_value(catalog_names).expect("catalog names");
+    assert_eq!(from_catalog.captured_at_ms, Some(1_771_372_800_000.0));
+    assert_eq!(from_catalog.as_of_ms, Some(1_771_372_800_000.0));
+
+    let ms_names = serde_json::json!({
+        "capturedAtMs": 1_771_372_800_000.0,
+        "asOfMs": 1_771_372_800_000.0
+    });
+    let from_ms: PositioningEntryParams = serde_json::from_value(ms_names).expect("ms names");
+    assert_eq!(from_ms.captured_at_ms, Some(1_771_372_800_000.0));
+    assert_eq!(from_ms.as_of_ms, Some(1_771_372_800_000.0));
 }
 
 #[tokio::test]

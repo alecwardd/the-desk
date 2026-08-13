@@ -319,7 +319,9 @@ fn extract_field_value(snapshot: Option<&Value>, field: &FieldDescriptor) -> Opt
     })
 }
 
-fn apply_token_budget(envelope: &mut StateEnvelope, budget_tokens: u64) {
+/// Re-apply a token budget after late overlays (e.g. Positioning) so
+/// `truncated` matches the envelope that is actually returned.
+pub fn apply_token_budget(envelope: &mut StateEnvelope, budget_tokens: u64) {
     // Approximate tokens as ceil(bytes/4), matching tool telemetry.
     let approx = |v: &StateEnvelope| -> u64 {
         let bytes = serde_json::to_vec(v).map(|b| b.len()).unwrap_or(0) as u64;

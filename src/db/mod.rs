@@ -2965,11 +2965,6 @@ impl Database {
               trading_day TEXT NOT NULL,
               captured_at_ms REAL NOT NULL,
               as_of_ms REAL NOT NULL,
-              data_time_ms REAL NULL,
-              freshness_ok INTEGER NOT NULL,
-              provenance_source TEXT NOT NULL,
-              first_class INTEGER NOT NULL,
-              derived_levels TEXT NOT NULL,
               payload TEXT NOT NULL,
               created_at_ms REAL NOT NULL,
               updated_at_ms REAL NOT NULL
@@ -6865,33 +6860,17 @@ impl Database {
         now_ms: f64,
     ) -> Result<(), DbError> {
         let payload = serde_json::to_string(record)?;
-        let derived = serde_json::to_string(&record.derived_levels)?;
-        let existing: Option<f64> = self
-            .conn
-            .query_row(
-                "SELECT created_at_ms FROM positioning_records WHERE id = ?1",
-                params![record.id],
-                |r| r.get(0),
-            )
-            .ok();
-        let created_at = existing.unwrap_or(now_ms);
         self.conn.execute(
             "INSERT INTO positioning_records (
                 id, record_kind, completeness, trading_day, captured_at_ms, as_of_ms,
-                data_time_ms, freshness_ok, provenance_source, first_class,
-                derived_levels, payload, created_at_ms, updated_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                payload, created_at_ms, updated_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(id) DO UPDATE SET
                 record_kind = excluded.record_kind,
                 completeness = excluded.completeness,
                 trading_day = excluded.trading_day,
                 captured_at_ms = excluded.captured_at_ms,
                 as_of_ms = excluded.as_of_ms,
-                data_time_ms = excluded.data_time_ms,
-                freshness_ok = excluded.freshness_ok,
-                provenance_source = excluded.provenance_source,
-                first_class = excluded.first_class,
-                derived_levels = excluded.derived_levels,
                 payload = excluded.payload,
                 updated_at_ms = excluded.updated_at_ms",
             params![
@@ -6901,13 +6880,8 @@ impl Database {
                 record.trading_day,
                 record.captured_at_ms,
                 record.as_of_ms,
-                record.data_time_ms,
-                i64::from(record.freshness_ok),
-                record.provenance.source,
-                i64::from(record.provenance.first_class),
-                derived,
                 payload,
-                created_at,
+                now_ms,
                 now_ms,
             ],
         )?;

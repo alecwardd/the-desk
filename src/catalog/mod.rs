@@ -22,8 +22,9 @@ mod types;
 
 pub use config::{load_sil_config, EngineMode, SilConfig};
 pub use envelope::{
-    build_state_envelope, merge_symbol_envelopes, state_envelope_json, DomainProvenance,
-    EnvelopeError, ProvenanceSource, StateEnvelope, StateReadRequest, StateResolution, TrustLevel,
+    apply_token_budget, build_state_envelope, merge_symbol_envelopes, state_envelope_json,
+    DomainProvenance, EnvelopeError, ProvenanceSource, StateEnvelope, StateReadRequest,
+    StateResolution, TrustLevel,
 };
 pub use events_kernel::{
     kernel_event_from_db_row, kernel_event_from_market_event, EventsEnvelope, KernelEvent,

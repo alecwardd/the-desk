@@ -72,6 +72,9 @@ pub enum FreshnessSemantics {
     /// Optional delayed DOM/depth summary when available.
     DelayedDepthOptional,
     /// Schema present; live provider not wired.
+    ///
+    /// Reserved for future unwired provider domains (Slice / grid until
+    /// Vs3dProvider). Positioning Levels-Only uses [`Self::ManualAsOfFailClosed`].
     StubUnavailable,
     /// Vendor timestamp must fail closed when present (future provider).
     VendorTimestampFailClosed,

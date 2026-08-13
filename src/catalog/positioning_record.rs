@@ -70,7 +70,6 @@ pub struct PositioningRecord {
     #[serde(rename = "dataTime", alias = "dataTimeMs")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data_time_ms: Option<f64>,
-    pub freshness_ok: bool,
     pub derived_levels: DerivedLevels,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub transitions: Vec<String>,
@@ -164,14 +163,23 @@ pub fn accept_levels_only_entry(
     let captured_at_ms =
         required_timestamp(input.captured_at_ms.or(Some(input.now_ms)), "capturedAt")?;
     let as_of_ms = required_timestamp(input.as_of_ms.or(Some(captured_at_ms)), "asOf")?;
+    let derived_day = trading_day_from_timestamp_ms(as_of_ms);
     let trading_day = match input
         .trading_day
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        Some(day) => validate_trading_day(day)?,
-        None => trading_day_from_timestamp_ms(as_of_ms),
+        Some(day) => {
+            let day = validate_trading_day(day)?;
+            if day != derived_day {
+                return Err(PositioningError::Invalid(format!(
+                    "tradingDay `{day}` does not match asOf trading day `{derived_day}`"
+                )));
+            }
+            day
+        }
+        None => derived_day,
     };
 
     let derived_levels = input.derived_levels.ok_or_else(|| {
@@ -212,7 +220,6 @@ pub fn accept_levels_only_entry(
         captured_at_ms,
         as_of_ms,
         data_time_ms: None,
-        freshness_ok: true,
         derived_levels,
         transitions: input.transitions,
         mid_day_reads: input.mid_day_reads,
@@ -306,7 +313,8 @@ fn slice_from_record(
     record: &PositioningRecord,
     live_trading_day: Option<&str>,
 ) -> PositioningStateSlice {
-    let (freshness_ok, degraded, note) = evaluate_freshness(record, live_trading_day);
+    let (freshness_ok, note) = evaluate_freshness(record, live_trading_day);
+    let degraded = !freshness_ok;
     let mut values = BTreeMap::new();
     values.insert(
         "positioning.recordKind".into(),
@@ -334,7 +342,9 @@ fn slice_from_record(
         values,
         provenance: DomainProvenance {
             source: ProvenanceSource::Manual,
-            data_time: Some(record.as_of_ms),
+            // Vendor `dataTime` stays null on the Levels-Only path. Manual as-of
+            // is `values["positioning.asOf"]`.
+            data_time: None,
             vendor: None,
             note: Some(note),
         },
@@ -343,26 +353,24 @@ fn slice_from_record(
 }
 
 /// Recompute fail-closed freshness at read time (never silent live-vendor).
+///
+/// `live_trading_day` is the day the envelope is being asked about (today on
+/// the live path, the as-of timestamp's trading day on historical reads).
+/// A card whose `trading_day` disagrees is stale — first-class, but not fresh.
 pub fn evaluate_freshness(
     record: &PositioningRecord,
     live_trading_day: Option<&str>,
-) -> (bool, bool, String) {
+) -> (bool, String) {
     if !timestamp_ok(record.captured_at_ms) || !timestamp_ok(record.as_of_ms) {
         return (
             false,
-            true,
             "Levels-Only Record missing capturedAt/as-of; freshness fails closed. Not live vendor data."
                 .into(),
         );
     }
-    if record.provenance.vendor.is_some()
-        || record.provenance.source.eq_ignore_ascii_case("provider")
-        || is_vendor_label(record.provenance.vendor.as_deref())
-        || is_vendor_label(Some(&record.provenance.source))
-    {
+    if record.provenance.vendor.is_some() || is_vendor_label(Some(&record.provenance.source)) {
         return (
             false,
-            true,
             "Positioning freshness fails closed: vendor/provider stamp is not valid on the \
              Levels-Only Record path. Not live vendor data."
                 .into(),
@@ -372,7 +380,6 @@ pub fn evaluate_freshness(
         if record.trading_day != day {
             return (
                 false,
-                true,
                 format!(
                     "Levels-Only Record as-of {} from your annotated sessions is first-class \
                      Positioning; freshnessOk=false (not live vendor data).",
@@ -383,7 +390,6 @@ pub fn evaluate_freshness(
     }
     (
         true,
-        false,
         "Levels-Only Record from your annotated sessions / your methodology (manual/as-of). \
          Completeness levels_only is first-class. Not vendor scrape."
             .into(),
@@ -424,20 +430,9 @@ fn timestamp_ok(ms: f64) -> bool {
 }
 
 fn validate_trading_day(day: &str) -> Result<String, PositioningError> {
-    let bytes = day.as_bytes();
-    let ok = bytes.len() == 10
-        && bytes[4] == b'-'
-        && bytes[7] == b'-'
-        && bytes.iter().enumerate().all(|(i, b)| {
-            if i == 4 || i == 7 {
-                true
-            } else {
-                b.is_ascii_digit()
-            }
-        });
-    if !ok {
+    if chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d").is_err() {
         return Err(PositioningError::Invalid(format!(
-            "tradingDay must be YYYY-MM-DD (got `{day}`)"
+            "tradingDay must be a real YYYY-MM-DD calendar date (got `{day}`)"
         )));
     }
     Ok(day.to_string())
@@ -481,21 +476,19 @@ fn reject_vendor_pretence(
     vendor: Option<&str>,
     data_time_ms: Option<f64>,
 ) -> Result<(), PositioningError> {
-    if is_vendor_label(vendor) {
+    if vendor.map(str::trim).is_some_and(|s| !s.is_empty()) {
         return Err(PositioningError::Invalid(
             "Levels-Only Records are the manual/as-of path; do not stamp a vendor \
              (VolSignals / Vs3dProvider is a later ticket)"
                 .into(),
         ));
     }
-    if let Some(ms) = data_time_ms {
-        if timestamp_ok(ms) {
-            return Err(PositioningError::Invalid(
-                "Levels-Only Records must not carry vendor dataTime; use capturedAt/asOf \
-                 for explicit manual as-of"
-                    .into(),
-            ));
-        }
+    if data_time_ms.is_some() {
+        return Err(PositioningError::Invalid(
+            "Levels-Only Records must not carry vendor dataTime; use capturedAt/asOf \
+             for explicit manual as-of"
+                .into(),
+        ));
     }
     Ok(())
 }
@@ -523,21 +516,7 @@ fn reject_banned_copy(text: Option<&str>) -> Result<(), PositioningError> {
         return Ok(());
     };
     let l = text.to_lowercase();
-    for banned in [
-        "you should buy",
-        "you should sell",
-        "i recommend",
-        "this is a good trade",
-        "fallback",
-        "second-class",
-        "second class",
-        "partial record",
-        "degraded record",
-        "degraded mode",
-        "degraded path",
-        "fallback path",
-        "fallback record",
-    ] {
+    for banned in ["you should buy", "you should sell", "this is a good trade"] {
         if l.contains(banned) {
             return Err(PositioningError::Invalid(format!(
                 "Positioning copy must not use `{banned}` — Levels-Only Records are first-class; \
@@ -577,7 +556,7 @@ mod tests {
         PositioningEntryInput {
             record_kind: Some(LEVELS_ONLY_RECORD_KIND.into()),
             completeness: Some(LEVELS_ONLY_RECORD_KIND.into()),
-            trading_day: Some("2026-02-18".into()),
+            trading_day: None,
             captured_at_ms: Some(now_ms),
             as_of_ms: Some(now_ms),
             derived_levels: Some(sample_levels()),
@@ -661,12 +640,27 @@ mod tests {
     }
 
     #[test]
-    fn as_of_path_does_not_stale_a_dated_card() {
+    fn as_of_path_does_not_stale_a_same_day_card() {
         let rec = accept_levels_only_entry(sample_input(1_771_372_800_000.0)).unwrap();
-        let slice = positioning_state_slice(Some(&rec), None);
+        let slice = positioning_state_slice(Some(&rec), Some("2026-02-18"));
         assert!(!slice.degraded);
         assert_eq!(slice.values["positioning.freshnessOk"], Value::Bool(true));
-        assert_eq!(slice.provenance.data_time, Some(rec.as_of_ms));
+        assert!(slice.provenance.data_time.is_none());
+        assert_eq!(slice.values["positioning.asOf"], json_ms(rec.as_of_ms));
+    }
+
+    #[test]
+    fn as_of_other_day_fails_closed_not_vendor() {
+        let rec = accept_levels_only_entry(sample_input(1_771_372_800_000.0)).unwrap();
+        let slice = positioning_state_slice(Some(&rec), Some("2026-08-13"));
+        assert!(slice.degraded);
+        assert_eq!(slice.values["positioning.freshnessOk"], Value::Bool(false));
+        assert_eq!(slice.provenance.source, ProvenanceSource::Manual);
+        assert!(slice.provenance.data_time.is_none());
+        assert_eq!(
+            slice.values["positioning.completeness"],
+            Value::String(LEVELS_ONLY_RECORD_KIND.into())
+        );
     }
 
     #[test]
@@ -693,17 +687,36 @@ mod tests {
         let mut input = sample_input(1.0);
         input.data_time_ms = Some(1.0);
         assert!(accept_levels_only_entry(input).is_err());
+
+        let mut input = sample_input(1.0);
+        input.vendor = Some("Menthor Q".into());
+        assert!(accept_levels_only_entry(input).is_err());
+
+        let mut input = sample_input(1.0);
+        input.data_time_ms = Some(0.0);
+        assert!(accept_levels_only_entry(input).is_err());
     }
 
     #[test]
-    fn rejects_advisory_and_fallback_copy() {
+    fn rejects_trading_day_mismatch_and_impossible_dates() {
+        let mut input = sample_input(1_771_372_800_000.0);
+        input.trading_day = Some("2026-08-13".into());
+        assert!(accept_levels_only_entry(input).is_err());
+
+        let mut input = sample_input(1_771_372_800_000.0);
+        input.trading_day = Some("2026-02-81".into());
+        assert!(accept_levels_only_entry(input).is_err());
+    }
+
+    #[test]
+    fn rejects_advisory_copy_but_keeps_trader_notes() {
         let mut input = sample_input(1.0);
         input.note = Some("You should buy the call wall".into());
         assert!(accept_levels_only_entry(input).is_err());
 
         let mut input = sample_input(1.0);
-        input.note = Some("fallback record for the backlog".into());
-        assert!(accept_levels_only_entry(input).is_err());
+        input.note = Some("no fallback plan needed here, flip held".into());
+        accept_levels_only_entry(input).expect("trader note may use fallback in ordinary language");
     }
 
     #[test]
@@ -748,6 +761,36 @@ mod tests {
             Some(&Value::String(LEVELS_ONLY_RECORD_KIND.into()))
         );
         assert!(!env.values.keys().any(|k| k.starts_with("NQ.positioning")));
+        assert!(env.provenance["positioning"].data_time.is_none());
+    }
+
+    #[test]
+    fn overlay_then_budget_reapply_does_not_claim_under_budget() {
+        use crate::catalog::apply_token_budget;
+        let catalog = build_catalog();
+        let mut env = build_state_envelope(
+            &catalog,
+            StateReadRequest {
+                symbols: None,
+                domains: Some(vec!["positioning".into()]),
+                fields: None,
+                resolution: StateResolution::R1,
+                as_of: None,
+                budget_tokens: Some(1),
+                snapshot: None,
+                snapshot_source: ProvenanceSource::Live,
+                data_time: None,
+                source_degraded: true,
+                source_degraded_note: None,
+            },
+        )
+        .unwrap();
+        let rec = accept_levels_only_entry(sample_input(1_771_372_800_000.0)).unwrap();
+        let slice = positioning_state_slice(Some(&rec), Some("2026-02-18"));
+        apply_positioning_slice(&mut env, &catalog, &slice, None);
+        apply_token_budget(&mut env, 1);
+        assert_eq!(env.truncated, Some(true));
+        assert!(env.provenance.contains_key("positioning"));
     }
 
     #[test]

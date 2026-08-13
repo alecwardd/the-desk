@@ -907,7 +907,7 @@ fn discovery_tools_absent_from_default_router() {
             "{tool} must be omitted from the default router when SIL discovery is off"
         );
     }
-    assert_eq!(names.len(), 121);
+    assert_eq!(names.len(), 122);
 }
 
 #[test]
@@ -927,7 +927,7 @@ fn discovery_tools_present_when_sil_flag_on() {
             "{tool} must appear when [sil].catalog_discovery = true"
         );
     }
-    assert_eq!(names.len(), 126);
+    assert_eq!(names.len(), 127);
 }
 
 #[test]
@@ -1082,9 +1082,11 @@ async fn get_state_returns_provenance_and_degraded_flags() {
             "missing degraded for {domain}"
         );
     }
-    // Positioning stub always degraded + present (never silently omitted).
+    // Positioning stub always fail-closed + present (never silently omitted, never vendor).
     assert_eq!(degraded["positioning"], true);
-    assert_eq!(provenance["positioning"]["source"], "provider");
+    assert_eq!(provenance["positioning"]["source"], "manual");
+    assert!(provenance["positioning"]["vendor"].is_null());
+    assert_eq!(out["values"]["positioning.freshnessOk"], false);
     // No live snapshot in empty test server → market domains degraded, not a hard fail.
     assert_eq!(degraded["location_structure"], true);
     assert_eq!(degraded["identity"], true);
@@ -1177,6 +1179,297 @@ async fn get_state_returns_nq_and_es_in_one_envelope() {
     assert!(provenance.contains_key("ES.identity"));
     assert!(provenance.contains_key("NQ.location_structure"));
     assert!(provenance.contains_key("ES.location_structure"));
+}
+
+#[tokio::test]
+async fn positioning_entry_round_trips_into_get_state_as_first_class_levels_only() {
+    let server = test_server_with_sil();
+    let now_ms = Utc::now().timestamp_millis() as f64;
+    let trading_day = trading_day_from_timestamp_ms(now_ms);
+    let written = parse_text_tool_result(
+        server
+            .positioning_entry(Parameters(PositioningEntryParams {
+                trading_day: Some(trading_day.clone()),
+                captured_at_ms: Some(now_ms),
+                as_of_ms: Some(now_ms),
+                derived_levels: Some(DerivedLevelsParams {
+                    flip: Some(5750.0),
+                    walls: Some(vec![
+                        PositioningWallParams {
+                            strike: Some(5800.0),
+                            role: Some("call_wall".into()),
+                        },
+                        PositioningWallParams {
+                            strike: Some(5700.0),
+                            role: Some("put_wall".into()),
+                        },
+                    ]),
+                    balance: Some(5745.0),
+                    upside_test: Some(5825.0),
+                    downside_test: Some(5680.0),
+                }),
+                note: Some(
+                    "Your annotated sessions / your methodology say this is the morning card."
+                        .into(),
+                ),
+                ..Default::default()
+            }))
+            .await
+            .expect("positioning_entry"),
+    );
+    assert_eq!(written["completeness"], "levels_only");
+    assert_eq!(written["firstClass"], true);
+    assert_eq!(written["mutationAuthority"], true);
+    assert_eq!(written["orderAuthority"], false);
+    assert_eq!(written["trustCeiling"], "L3");
+    assert_eq!(written["readOperator"], "get_state");
+    assert_eq!(written["record"]["recordKind"], "levels_only");
+    assert!(written["record"]["provenance"]["firstClass"]
+        .as_bool()
+        .unwrap());
+    assert!(written["record"]["dataTime"].is_null());
+    assert!(written["record"].get("capturedAt").is_some());
+    assert!(written["record"].get("asOf").is_some());
+    let note = written["note"].as_str().unwrap_or("").to_lowercase();
+    assert!(note.contains("your annotated sessions") || note.contains("your methodology"));
+    assert!(!note.contains("you should buy"));
+    assert!(!note.contains("fallback"));
+
+    let out = parse_text_tool_result(
+        server
+            .get_state(Parameters(GetStateParams {
+                domains: Some(vec!["positioning".into()]),
+                resolution: Some("R1".into()),
+                ..Default::default()
+            }))
+            .await
+            .expect("get_state"),
+    );
+    assert_eq!(out["trustLevel"], "L0");
+    assert_eq!(out["mutationAuthority"], false);
+    assert_eq!(out["orderAuthority"], false);
+    assert_eq!(out["degraded"]["positioning"], false);
+    assert_eq!(out["provenance"]["positioning"]["source"], "manual");
+    assert!(out["provenance"]["positioning"]["vendor"].is_null());
+    assert_eq!(out["values"]["positioning.completeness"], "levels_only");
+    assert_eq!(out["values"]["positioning.recordKind"], "levels_only");
+    assert_eq!(out["values"]["positioning.freshnessOk"], true);
+    assert_eq!(out["values"]["positioning.derivedLevels"]["flip"], 5750.0);
+    assert!(out["values"]["positioning.dataTime"].is_null());
+    assert!(!out["values"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .any(|k| k.starts_with("NQ.positioning") || k.starts_with("ES.positioning")));
+}
+
+#[tokio::test]
+async fn positioning_entry_rejects_slice_and_vendor_pretence() {
+    let server = test_server_with_sil();
+    let levels = DerivedLevelsParams {
+        flip: Some(5750.0),
+        walls: Some(vec![PositioningWallParams {
+            strike: Some(5800.0),
+            role: Some("call_wall".into()),
+        }]),
+        balance: Some(5745.0),
+        upside_test: Some(5825.0),
+        downside_test: Some(5680.0),
+    };
+    let err = server
+        .positioning_entry(Parameters(PositioningEntryParams {
+            record_kind: Some("slice".into()),
+            derived_levels: Some(levels.clone()),
+            ..Default::default()
+        }))
+        .await
+        .expect_err("slice writes are later");
+    assert!(
+        err.to_string().contains("levels_only") || err.to_string().contains("Levels-Only"),
+        "unexpected: {err}"
+    );
+    let err = server
+        .positioning_entry(Parameters(PositioningEntryParams {
+            vendor: Some("Menthor Q".into()),
+            derived_levels: Some(levels.clone()),
+            ..Default::default()
+        }))
+        .await
+        .expect_err("unrecognized vendor stamp rejected");
+    assert!(
+        err.to_string().to_lowercase().contains("vendor")
+            || err.to_string().contains("Levels-Only"),
+        "unexpected: {err}"
+    );
+}
+
+#[tokio::test]
+async fn get_state_positioning_prior_day_fails_closed_not_vendor() {
+    let server = test_server_with_sil();
+    server
+        .positioning_entry(Parameters(PositioningEntryParams {
+            trading_day: Some("2026-02-18".into()),
+            captured_at_ms: Some(1_771_372_800_000.0),
+            as_of_ms: Some(1_771_372_800_000.0),
+            derived_levels: Some(DerivedLevelsParams {
+                flip: Some(5750.0),
+                walls: Some(vec![PositioningWallParams {
+                    strike: Some(5800.0),
+                    role: Some("call_wall".into()),
+                }]),
+                balance: Some(5745.0),
+                upside_test: Some(5825.0),
+                downside_test: Some(5680.0),
+            }),
+            ..Default::default()
+        }))
+        .await
+        .expect("write backlog card");
+    let out = parse_text_tool_result(
+        server
+            .get_state(Parameters(GetStateParams {
+                symbols: Some(vec!["NQ".into(), "ES".into()]),
+                domains: Some(vec!["positioning".into(), "identity".into()]),
+                resolution: Some("R1".into()),
+                ..Default::default()
+            }))
+            .await
+            .expect("get_state"),
+    );
+    assert_eq!(out["degraded"]["positioning"], true);
+    assert_eq!(out["values"]["positioning.freshnessOk"], false);
+    assert_eq!(out["values"]["positioning.completeness"], "levels_only");
+    assert_eq!(out["provenance"]["positioning"]["source"], "manual");
+    assert!(out["provenance"]["positioning"]["vendor"].is_null());
+    assert!(!out["provenance"]
+        .as_object()
+        .unwrap()
+        .contains_key("NQ.positioning"));
+    assert!(!out["provenance"]
+        .as_object()
+        .unwrap()
+        .contains_key("ES.positioning"));
+    let note = out["provenance"]["positioning"]["note"]
+        .as_str()
+        .unwrap_or("")
+        .to_lowercase();
+    assert!(note.contains("first-class"));
+    assert!(!note.contains("fallback"));
+    assert!(!note.contains("volsignal"));
+}
+
+#[tokio::test]
+async fn get_state_as_of_serves_dated_levels_only_without_staling_or_vendor() {
+    let server = test_server_with_sil();
+    let as_of = 1_771_372_800_000.0;
+    server
+        .positioning_entry(Parameters(PositioningEntryParams {
+            trading_day: Some("2026-02-18".into()),
+            captured_at_ms: Some(as_of),
+            as_of_ms: Some(as_of),
+            derived_levels: Some(DerivedLevelsParams {
+                flip: Some(5750.0),
+                walls: Some(vec![PositioningWallParams {
+                    strike: Some(5800.0),
+                    role: Some("call_wall".into()),
+                }]),
+                balance: Some(5745.0),
+                upside_test: Some(5825.0),
+                downside_test: Some(5680.0),
+            }),
+            ..Default::default()
+        }))
+        .await
+        .expect("write dated card");
+    let out = parse_text_tool_result(
+        server
+            .get_state(Parameters(GetStateParams {
+                domains: Some(vec!["positioning".into()]),
+                resolution: Some("R1".into()),
+                as_of: Some(as_of),
+                ..Default::default()
+            }))
+            .await
+            .expect("get_state as_of"),
+    );
+    assert_eq!(out["trustLevel"], "L0");
+    assert_eq!(out["mutationAuthority"], false);
+    assert_eq!(out["orderAuthority"], false);
+    assert_eq!(out["degraded"]["positioning"], false);
+    assert_eq!(out["values"]["positioning.freshnessOk"], true);
+    assert_eq!(out["values"]["positioning.completeness"], "levels_only");
+    assert_eq!(out["provenance"]["positioning"]["source"], "manual");
+    assert!(out["provenance"]["positioning"]["vendor"].is_null());
+    assert!(out["provenance"]["positioning"]["dataTime"].is_null());
+    assert_eq!(out["values"]["positioning.asOf"], as_of);
+}
+
+#[tokio::test]
+async fn get_state_as_of_other_day_fails_closed_not_vendor() {
+    let server = test_server_with_sil();
+    let card_as_of = 1_771_372_800_000.0;
+    server
+        .positioning_entry(Parameters(PositioningEntryParams {
+            trading_day: Some("2026-02-18".into()),
+            captured_at_ms: Some(card_as_of),
+            as_of_ms: Some(card_as_of),
+            derived_levels: Some(DerivedLevelsParams {
+                flip: Some(5750.0),
+                walls: Some(vec![PositioningWallParams {
+                    strike: Some(5800.0),
+                    role: Some("call_wall".into()),
+                }]),
+                balance: Some(5745.0),
+                upside_test: Some(5825.0),
+                downside_test: Some(5680.0),
+            }),
+            ..Default::default()
+        }))
+        .await
+        .expect("write february card");
+    let later = 1_786_629_600_000.0; // 2026-08-13 14:00 UTC
+    let out = parse_text_tool_result(
+        server
+            .get_state(Parameters(GetStateParams {
+                domains: Some(vec!["positioning".into()]),
+                resolution: Some("R1".into()),
+                as_of: Some(later),
+                ..Default::default()
+            }))
+            .await
+            .expect("get_state as_of later day"),
+    );
+    assert_eq!(out["degraded"]["positioning"], true);
+    assert_eq!(out["values"]["positioning.freshnessOk"], false);
+    assert_eq!(out["values"]["positioning.completeness"], "levels_only");
+    assert_eq!(out["provenance"]["positioning"]["source"], "manual");
+    assert!(out["provenance"]["positioning"]["vendor"].is_null());
+}
+
+#[test]
+fn positioning_entry_params_accept_catalog_and_ms_timestamp_names() {
+    let catalog_names = serde_json::json!({
+        "capturedAt": 1_771_372_800_000.0,
+        "asOf": 1_771_372_800_000.0,
+        "derivedLevels": {
+            "flip": 5750.0,
+            "balance": 5745.0,
+            "upsideTest": 5825.0,
+            "downsideTest": 5680.0
+        }
+    });
+    let from_catalog: PositioningEntryParams =
+        serde_json::from_value(catalog_names).expect("catalog names");
+    assert_eq!(from_catalog.captured_at_ms, Some(1_771_372_800_000.0));
+    assert_eq!(from_catalog.as_of_ms, Some(1_771_372_800_000.0));
+
+    let ms_names = serde_json::json!({
+        "capturedAtMs": 1_771_372_800_000.0,
+        "asOfMs": 1_771_372_800_000.0
+    });
+    let from_ms: PositioningEntryParams = serde_json::from_value(ms_names).expect("ms names");
+    assert_eq!(from_ms.captured_at_ms, Some(1_771_372_800_000.0));
+    assert_eq!(from_ms.as_of_ms, Some(1_771_372_800_000.0));
 }
 
 #[tokio::test]

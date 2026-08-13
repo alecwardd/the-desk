@@ -86,7 +86,11 @@ pub fn tool_name_implies_mutation(name: &str) -> bool {
         "seed_",
     ];
     // Explicit mutation verbs that don't match prefixes cleanly.
-    const MUTATION_EXACT: &[&str] = &["record_trade_result", "update_attention_signal_status"];
+    const MUTATION_EXACT: &[&str] = &[
+        "record_trade_result",
+        "update_attention_signal_status",
+        "positioning_entry",
+    ];
     if MUTATION_EXACT.contains(&name) {
         return true;
     }
@@ -118,6 +122,7 @@ mod tests {
         assert!(tool_name_implies_mutation("save_journal_entry"));
         assert!(tool_name_implies_mutation("mark_trade_idea_confirmed"));
         assert!(tool_name_implies_mutation("backfill_history"));
+        assert!(tool_name_implies_mutation("positioning_entry"));
         assert!(!tool_name_implies_mutation("get_state"));
         assert!(!tool_name_implies_mutation("get_events"));
         assert!(!tool_name_implies_mutation("describe_environment"));

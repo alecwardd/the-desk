@@ -5,7 +5,7 @@ description: MCP tool routing for The Desk. USE WHEN any agent needs to decide w
 
 # MCP Tool Routing
 
-The Desk MCP server exposes **121 MCP tools in 9 domains**. This skill tells you *which* tool to call *when*. For the full catalog with every description, read [docs/mcp/tool-reference.md](../../docs/mcp/tool-reference.md) — it is generated from the compiled server and guarded by a test, so it is never stale.
+The Desk MCP server exposes **122 MCP tools in 9 domains**. This skill tells you *which* tool to call *when*. For the full catalog with every description, read [docs/mcp/tool-reference.md](../../docs/mcp/tool-reference.md) — it is generated from the compiled server and guarded by a test, so it is never stale.
 
 **Source layout:** each domain is a module in `src/bin/the-desk-mcp/tools/` (market, dom, options, playbook, risk, journal, memory, research, admin).
 
@@ -40,7 +40,7 @@ operators appear (Trust Level L0 — read/query, no mutation/order authority):
 4. `get_state` — StateEnvelope (`values` + per-domain `provenance` + `degraded`; resolution R0|R1 only). MarketRouter v0: `symbols=["NQ","ES"]` returns both roots in one envelope.
 5. `get_events` — event identity rows (type, time, severity placeholder, identityId); lifecycle formalization is later.
 
-Default off keeps the **121 MCP tools** surface unchanged. Artifacts:
+Default off keeps the **122 MCP tools** surface unchanged. Artifacts:
 [docs/mcp/desk-catalog-v0.json](../../docs/mcp/desk-catalog-v0.json).
 Vocabulary: [CONTEXT.md](../../CONTEXT.md).
 
@@ -109,7 +109,7 @@ This is the canonical "potential trade" flow — keep state in the system, not i
 
 - Read: `get_memory_brief` (by intent: session_start, setup_check, trade_review, weekly_review), `get_trader_context_fit` (typed envelope when the answer depends on trader memory), `recall_agent_insights`, `get_behavioral_patterns`.
 - Write: `save_agent_insight` (candidate/validated lifecycle), `create_memory_followup` / `resolve_memory_followup`, `acknowledge_agent_insight`.
-- Positioning interpretation corpus (SIL-P-VS-c): seed with `the-desk-mcp --seed-positioning-corpus`; recall via `recall_agent_insights(category="positioning_annotation", tag="positioning")` or `get_memory_brief`. Category `positioning_annotation` stores Slice / Levels-Only Record co-annotations. Methodology: `docs/research/odte-mm-level-map-from-vs3d.md`.
+- Positioning Levels-Only Record (SIL-P-VS-a): write with `positioning_entry` (first-class completeness `levels_only`, manual/as-of provenance — not live vendor data). Reads ride `get_state` (domain=`positioning`); do not add specialty getters. Interpretation corpus (SIL-P-VS-c) remains: seed with `the-desk-mcp --seed-positioning-corpus`; recall via `recall_agent_insights(category="positioning_annotation", tag="positioning")` or `get_memory_brief`. Methodology: `docs/research/odte-mm-level-map-from-vs3d.md`.
 - Maintenance: `refresh_memory_state` when `memoryMaintenance.refreshSuggested` is true or after memory-affecting writes in the same flow; `detect_behavioral_patterns` for explicit pattern sweeps.
 - Memory reports context only — it must never adjust sizing by itself.
 

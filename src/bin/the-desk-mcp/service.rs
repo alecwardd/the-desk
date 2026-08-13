@@ -27,7 +27,7 @@ use tokio::time::{sleep, Duration};
 use crate::{helpers::*, lifecycle::*, params::*, state::*};
 
 impl TheDeskMcp {
-    /// Combined router across all always-on tool domain modules (121 tools).
+    /// Combined router across all always-on tool domain modules (122 tools).
     ///
     /// Discovery / read-kernel operators are **not** included here so the default
     /// surface stays unchanged when `[sil].catalog_discovery` is off. Use

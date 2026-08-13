@@ -193,10 +193,12 @@
     {
       "id": "positioning",
       "name": "Positioning",
-      "summary": "Dealer/options Positioning — grid aggregations, by-strike positions, greek Slices, and Levels-Only Records. Schema stub only in Catalog v0 (no live provider).",
+      "summary": "Dealer/options Positioning — grid aggregations, by-strike positions, greek Slices, and first-class Levels-Only Records. Manual write via positioning_entry; no live Vs3dProvider.",
       "fieldIds": [
         "positioning.recordKind",
+        "positioning.completeness",
         "positioning.capturedAt",
+        "positioning.asOf",
         "positioning.dataTime",
         "positioning.freshnessOk",
         "positioning.derivedLevels"
@@ -1778,21 +1780,43 @@
       "costHint": "R1"
     },
     {
-      "id": "positioning.capturedAt",
-      "name": "capturedAt",
+      "id": "positioning.asOf",
+      "name": "asOf",
       "domainId": "positioning",
-      "description": "Desk capture timestamp for a Positioning record (schema stub; no live provider).",
+      "description": "Explicit manual/as-of timestamp for a Positioning record. Missing/stale as-of fails closed and is never live vendor data.",
       "rustField": "",
       "unit": "milliseconds",
       "sessionScope": "session",
-      "freshness": "stubUnavailable",
+      "freshness": "manualAsOfFailClosed",
       "costHint": "R1"
+    },
+    {
+      "id": "positioning.capturedAt",
+      "name": "capturedAt",
+      "domainId": "positioning",
+      "description": "Desk capture / annotation timestamp for a Positioning record (manual as-of on the Levels-Only path).",
+      "rustField": "",
+      "unit": "milliseconds",
+      "sessionScope": "session",
+      "freshness": "manualAsOfFailClosed",
+      "costHint": "R1"
+    },
+    {
+      "id": "positioning.completeness",
+      "name": "completeness",
+      "domainId": "positioning",
+      "description": "First-class completeness of the current Positioning record. levels_only is a first-class kind — the ToS-denial steady state and historical backlog path.",
+      "rustField": "",
+      "unit": "enumLabel",
+      "sessionScope": "session",
+      "freshness": "manualAsOfFailClosed",
+      "costHint": "R0"
     },
     {
       "id": "positioning.dataTime",
       "name": "dataTime",
       "domainId": "positioning",
-      "description": "Vendor data time for a Positioning record when a provider exists; fail-closed freshness later.",
+      "description": "Vendor data time when a provider exists; null on the Levels-Only Record path. Fail-closed — never silent live vendor.",
       "rustField": "",
       "unit": "milliseconds",
       "sessionScope": "session",
@@ -1807,18 +1831,18 @@
       "rustField": "",
       "unit": "structuredBlob",
       "sessionScope": "session",
-      "freshness": "stubUnavailable",
+      "freshness": "manualAsOfFailClosed",
       "costHint": "R1"
     },
     {
       "id": "positioning.freshnessOk",
       "name": "freshnessOk",
       "domainId": "positioning",
-      "description": "Vendor freshness gate for Positioning; stubbed unavailable until a provider lands.",
+      "description": "Fail-closed freshness gate for Positioning. False when capturedAt/as-of is missing or the live card is from a prior trading day. Never presents as live vendor data.",
       "rustField": "",
       "unit": "bool",
       "sessionScope": "session",
-      "freshness": "stubUnavailable",
+      "freshness": "manualAsOfFailClosed",
       "costHint": "R0"
     },
     {
@@ -1829,7 +1853,7 @@
       "rustField": "",
       "unit": "enumLabel",
       "sessionScope": "session",
-      "freshness": "stubUnavailable",
+      "freshness": "manualAsOfFailClosed",
       "costHint": "R1"
     }
   ],
@@ -1852,7 +1876,7 @@
     {
       "id": "levels_only",
       "name": "Levels-Only Record",
-      "summary": "First-class positioning record carrying only derived levels (flip, walls, BALANCE / UPSIDE / DOWNSIDE TEST) — manual-entry unit and ToS-denial steady state (ADR-025)."
+      "summary": "First-class Positioning record carrying only derived levels (flip, walls, BALANCE / UPSIDE / DOWNSIDE TEST) — manual-entry unit, ToS-denial steady state, and historical backlog path (ADR-025). Written via positioning_entry."
     }
   ],
   "positioningProvider": null

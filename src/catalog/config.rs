@@ -38,7 +38,7 @@ impl EngineMode {
 /// SIL (Sierra Intelligence Layer) configuration.
 ///
 /// Default-off: when `catalog_discovery` is false, discovery / read-kernel tools
-/// are omitted from the MCP router and today's 121-tool surface is unchanged.
+/// are omitted from the MCP router and today's 122-tool surface is unchanged.
 ///
 /// `engine_mode` defaults to [`EngineMode::Embedded`] — MCP owns ingest (today's
 /// topology / true rollback). Set `external` to attach MCP as a thin adapter over

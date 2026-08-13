@@ -10,12 +10,14 @@ use rmcp::{
     handler::server::wrapper::Parameters, model::*, tool, tool_router, ErrorData as McpError,
 };
 use the_desk_backend::catalog::{
-    build_catalog, build_state_envelope, describe_domain, describe_environment,
-    kernel_event_from_db_row, kernel_event_from_market_event, merge_symbol_envelopes,
-    search_catalog, state_envelope_json, EventsEnvelope, ProvenanceSource, StateEnvelope,
-    StateReadRequest, StateResolution, TrustLevel, KERNEL_READ_QUERY_TOOLS,
+    apply_positioning_slice, apply_token_budget, build_catalog, build_state_envelope,
+    describe_domain, describe_environment, kernel_event_from_db_row,
+    kernel_event_from_market_event, merge_symbol_envelopes, positioning_state_slice,
+    search_catalog, state_envelope_json, EventsEnvelope, PositioningStateSlice, ProvenanceSource,
+    StateEnvelope, StateReadRequest, StateResolution, TrustLevel, KERNEL_READ_QUERY_TOOLS,
 };
 use the_desk_backend::engine::{parse_requested_roots, RouterRoot, RouterRootError};
+use the_desk_backend::trading_day_from_timestamp_ms;
 
 #[allow(unused_imports)]
 use crate::{helpers::*, lifecycle::*, params::*, state::*};
@@ -217,7 +219,7 @@ impl TheDeskMcp {
             }
             let envelope = merge_symbol_envelopes(by_root, clock_ms)
                 .map_err(|e| McpError::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?;
-            return Ok(text_result(finish_state_envelope_json(&envelope)?));
+            return self.finish_get_state(&catalog, envelope, params.fields.as_deref(), None);
         }
 
         // Single-symbol (M1b shape): requested root must match the snapshot when known.
@@ -255,7 +257,12 @@ impl TheDeskMcp {
                                     ),
                                     other => invalid_params_error(other.to_string()),
                                 })?;
-                            return Ok(text_result(finish_state_envelope_json(&envelope)?));
+                            return self.finish_get_state(
+                                &catalog,
+                                envelope,
+                                params.fields.as_deref(),
+                                None,
+                            );
                         }
                         return Err(invalid_params_error(format!(
                             "get_state symbol `{}` does not match resolved rootSymbol `{root}` \
@@ -267,10 +274,11 @@ impl TheDeskMcp {
             }
         }
 
+        let fields = params.fields.clone();
         let req = StateReadRequest {
             symbols: params.symbols,
             domains: params.domains,
-            fields: params.fields,
+            fields: fields.clone(),
             resolution,
             as_of,
             budget_tokens: params.budget_tokens,
@@ -286,7 +294,7 @@ impl TheDeskMcp {
             }
             other => invalid_params_error(other.to_string()),
         })?;
-        Ok(text_result(finish_state_envelope_json(&envelope)?))
+        self.finish_get_state(&catalog, envelope, fields.as_deref(), None)
     }
 
     #[tool(
@@ -358,6 +366,39 @@ impl TheDeskMcp {
 }
 
 impl TheDeskMcp {
+    /// Overlay Positioning onto a StateEnvelope, then serialize (Trust Level L0).
+    fn finish_get_state(
+        &self,
+        catalog: &the_desk_backend::catalog::DeskCatalog,
+        mut envelope: StateEnvelope,
+        fields: Option<&[String]>,
+        as_of: Option<f64>,
+    ) -> Result<CallToolResult, McpError> {
+        let slice = self.load_positioning_slice(as_of);
+        apply_positioning_slice(&mut envelope, catalog, &slice, fields);
+        if let Some(budget) = envelope.budget_tokens {
+            apply_token_budget(&mut envelope, budget);
+        }
+        Ok(text_result(finish_state_envelope_json(&envelope)?))
+    }
+
+    /// Load the durable Positioning record for live (`None`) or as-of reads.
+    fn load_positioning_slice(&self, as_of: Option<f64>) -> PositioningStateSlice {
+        let record = match self.db.lock() {
+            Ok(db) => {
+                if let Some(ts) = as_of {
+                    db.get_positioning_record_as_of(ts).ok().flatten()
+                } else {
+                    db.latest_positioning_record().ok().flatten()
+                }
+            }
+            Err(_) => None,
+        };
+        let reference_ms = as_of.unwrap_or_else(|| chrono::Utc::now().timestamp_millis() as f64);
+        let reference_day = trading_day_from_timestamp_ms(reference_ms);
+        positioning_state_slice(record.as_ref(), Some(reference_day.as_str()))
+    }
+
     /// Serve `get_state(as_of=…)` from 1 Hz Journal Frames (never `pipeline_snapshots`).
     async fn get_state_from_journal_frames(
         &self,
@@ -450,7 +491,7 @@ impl TheDeskMcp {
         if include_multi {
             let envelope = merge_symbol_envelopes(by_root, clock_ms)
                 .map_err(|e| McpError::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?;
-            return Ok(text_result(finish_state_envelope_json(&envelope)?));
+            return self.finish_get_state(catalog, envelope, params.fields.as_deref(), Some(ts));
         }
 
         let mut envelope = if requested_roots.len() == 1 {
@@ -476,7 +517,7 @@ impl TheDeskMcp {
                 })?
         };
         envelope.clock_ms = clock_ms;
-        Ok(text_result(finish_state_envelope_json(&envelope)?))
+        self.finish_get_state(catalog, envelope, params.fields.as_deref(), Some(ts))
     }
 
     /// Resolve a live market snapshot for `get_state` (no `as_of`).

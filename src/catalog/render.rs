@@ -37,7 +37,7 @@ pub fn render_catalog_markdown(catalog: &DeskCatalog) -> String {
         catalog.fields.len()
     ));
     out.push_str(
-        "- **Positioning provider:** none (schema stub — grid / by-strike / Slice / Levels-Only Record)\n\n",
+        "- **Positioning provider:** none (no Vs3dProvider). Levels-Only Records are first-class via `positioning_entry` (manual/as-of).\n\n",
     );
 
     out.push_str("## Domains\n\n");

@@ -34,7 +34,7 @@ impl StateResolution {
         }
     }
 
-    fn allows(self, cost: CostHint) -> bool {
+    pub(crate) fn allows(self, cost: CostHint) -> bool {
         match self {
             Self::R0 => matches!(cost, CostHint::R0),
             Self::R1 => matches!(cost, CostHint::R0 | CostHint::R1),
@@ -50,8 +50,10 @@ pub enum ProvenanceSource {
     Live,
     /// Historical Journal Frame / persisted feature snapshot (`as_of` path).
     Journal,
-    /// External provider record (e.g. Positioning) with optional vendor stamp.
+    /// External provider record (e.g. later Vs3dProvider) with optional vendor stamp.
     Provider,
+    /// Manual / as-of Positioning path (Levels-Only Record). Never live vendor data.
+    Manual,
 }
 
 /// Per-domain provenance — required for every domain present in an envelope.
@@ -242,16 +244,17 @@ fn domain_provenance(
     req: &StateReadRequest<'_>,
 ) -> (DomainProvenance, bool) {
     if domain_id == "positioning" {
-        // Schema stub — no live provider. Fail closed: always degraded, always
-        // present in provenance (never silently omitted).
-        let _ = catalog; // catalog pins version elsewhere
+        // Fail closed until `apply_positioning_slice` overlays a durable record.
+        // Manual/as-of — never presented as live vendor / Provider data.
+        let _ = catalog;
         return (
             DomainProvenance {
-                source: ProvenanceSource::Provider,
+                source: ProvenanceSource::Manual,
                 data_time: None,
                 vendor: None,
                 note: Some(
-                    "Positioning provider not wired (Catalog v0 stub); freshness fails closed"
+                    "No Positioning record. Levels-Only Record path is first-class — write via \
+                     positioning_entry (manual/as-of). Not live vendor data."
                         .into(),
                 ),
             },
@@ -316,7 +319,9 @@ fn extract_field_value(snapshot: Option<&Value>, field: &FieldDescriptor) -> Opt
     })
 }
 
-fn apply_token_budget(envelope: &mut StateEnvelope, budget_tokens: u64) {
+/// Re-apply a token budget after late overlays (e.g. Positioning) so
+/// `truncated` matches the envelope that is actually returned.
+pub fn apply_token_budget(envelope: &mut StateEnvelope, budget_tokens: u64) {
     // Approximate tokens as ceil(bytes/4), matching tool telemetry.
     let approx = |v: &StateEnvelope| -> u64 {
         let bytes = serde_json::to_vec(v).map(|b| b.len()).unwrap_or(0) as u64;
@@ -569,8 +574,9 @@ mod tests {
         assert!(env.provenance["positioning"].data_time.is_none());
         assert_eq!(
             env.provenance["positioning"].source,
-            ProvenanceSource::Provider
+            ProvenanceSource::Manual
         );
+        assert!(env.provenance["positioning"].vendor.is_none());
     }
 
     #[test]

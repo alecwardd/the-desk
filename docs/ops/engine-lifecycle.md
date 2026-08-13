@@ -1,9 +1,11 @@
-# Engine lifecycle (SIL-M2a)
+# Engine lifecycle (SIL-M2a / MarketRouter v0)
 
 `the-desk-engine` is the headless **Engine host**: it owns ingest, pipelines, and
 event detection so market intelligence survives MCP/agent disconnect.
 
-Trust Ceiling stays **L3**. This binary never places or manages orders.
+**MarketRouter** v0 runs **NQ** and **ES** concurrently on one clock (isolated
+session scopes per root). Trust Ceiling stays **L3**. This binary never places
+or manages orders.
 
 ## Topology
 
@@ -36,8 +38,8 @@ overnight. Pair this with the existing Sierra Watchdog / Sunday Open tasks in
 # Foreground (debug)
 cargo run --release --bin the-desk-engine
 
-# Or with explicit bind / fixture SCID
-the-desk-engine --bind 127.0.0.1:17843 --scid T:\SierraChart\Data\NQU26.scid
+# Or with explicit bind / fixture SCIDs (NQ primary; optional ES)
+the-desk-engine --bind 127.0.0.1:17843 --scid T:\SierraChart\Data\NQU26.scid --scid-es T:\SierraChart\Data\ESU26.scid
 ```
 
 ## Observability (ops / agents)

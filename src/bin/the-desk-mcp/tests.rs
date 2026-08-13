@@ -1091,6 +1091,95 @@ async fn get_state_returns_provenance_and_degraded_flags() {
 }
 
 #[tokio::test]
+async fn get_state_rejects_mes_and_mnq() {
+    let server = test_server_with_sil();
+    let err = server
+        .get_state(Parameters(GetStateParams {
+            symbols: Some(vec!["MES".into()]),
+            resolution: Some("R0".into()),
+            ..Default::default()
+        }))
+        .await
+        .expect_err("MES is out of MarketRouter v0 scope");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("MES") || msg.contains("micros") || msg.contains("NQ and ES"),
+        "unexpected error: {msg}"
+    );
+
+    let err = server
+        .get_state(Parameters(GetStateParams {
+            symbols: Some(vec!["MNQ".into()]),
+            resolution: Some("R0".into()),
+            ..Default::default()
+        }))
+        .await
+        .expect_err("MNQ is out of MarketRouter v0 scope");
+    assert!(err.to_string().contains("MNQ") || err.to_string().contains("micros"));
+}
+
+#[tokio::test]
+async fn get_state_returns_nq_and_es_in_one_envelope() {
+    let server = test_server_with_sil();
+    let ts = 1_704_207_600_000.0;
+    server.market_router.apply_tick(
+        the_desk_backend::engine::RouterRoot::Nq,
+        &the_desk_backend::engine::SourceTick {
+            timestamp_ms: ts,
+            price: 20_000.0,
+            volume: 1.0,
+            bid: 19_999.75,
+            ask: 20_000.25,
+            side: TradeSide::Buy,
+            root_symbol: Some("NQ".into()),
+        },
+    );
+    server.market_router.apply_tick(
+        the_desk_backend::engine::RouterRoot::Es,
+        &the_desk_backend::engine::SourceTick {
+            timestamp_ms: ts + 100.0,
+            price: 5_000.0,
+            volume: 1.0,
+            bid: 4_999.75,
+            ask: 5_000.25,
+            side: TradeSide::Buy,
+            root_symbol: Some("ES".into()),
+        },
+    );
+    let out = parse_text_tool_result(
+        server
+            .get_state(Parameters(GetStateParams {
+                symbols: Some(vec!["NQ".into(), "ES".into()]),
+                domains: Some(vec!["identity".into(), "location_structure".into()]),
+                fields: None,
+                resolution: Some("R0".into()),
+                as_of: None,
+                budget_tokens: None,
+            }))
+            .await
+            .expect("get_state"),
+    );
+    assert_eq!(out["trustLevel"], "L0");
+    assert_eq!(out["mutationAuthority"], false);
+    assert_eq!(out["orderAuthority"], false);
+    assert_eq!(out["clockMs"], ts + 100.0);
+    let values = out["values"].as_object().expect("values");
+    assert_eq!(
+        values.get("NQ.market.location_structure.lastPrice"),
+        Some(&serde_json::json!(20_000.0))
+    );
+    assert_eq!(
+        values.get("ES.market.location_structure.lastPrice"),
+        Some(&serde_json::json!(5_000.0))
+    );
+    let provenance = out["provenance"].as_object().expect("provenance");
+    assert!(provenance.contains_key("NQ.identity"));
+    assert!(provenance.contains_key("ES.identity"));
+    assert!(provenance.contains_key("NQ.location_structure"));
+    assert!(provenance.contains_key("ES.location_structure"));
+}
+
+#[tokio::test]
 async fn get_state_rejects_r2_r3() {
     let server = test_server_with_sil();
     let err = server
@@ -2536,6 +2625,9 @@ async fn evaluate_playbook_uses_external_engine_published_market_state() {
         health: the_desk_backend::engine::EngineHealth::unavailable("test"),
         degraded: false,
         degraded_note: None,
+        by_symbol: Default::default(),
+        clock_ms: Some(1_704_207_600_000.0),
+        primary_root: "NQ".into(),
     });
     server
         .playbook_cache

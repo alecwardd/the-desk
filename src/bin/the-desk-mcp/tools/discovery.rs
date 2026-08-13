@@ -11,10 +11,11 @@ use rmcp::{
 };
 use the_desk_backend::catalog::{
     build_catalog, build_state_envelope, describe_domain, describe_environment,
-    kernel_event_from_db_row, kernel_event_from_market_event, search_catalog, state_envelope_json,
-    EventsEnvelope, ProvenanceSource, StateReadRequest, StateResolution, TrustLevel,
-    KERNEL_READ_QUERY_TOOLS,
+    kernel_event_from_db_row, kernel_event_from_market_event, merge_symbol_envelopes,
+    search_catalog, state_envelope_json, EventsEnvelope, ProvenanceSource, StateEnvelope,
+    StateReadRequest, StateResolution, TrustLevel, KERNEL_READ_QUERY_TOOLS,
 };
+use the_desk_backend::engine::{parse_requested_roots, RouterRoot, RouterRootError};
 
 #[allow(unused_imports)]
 use crate::{helpers::*, lifecycle::*, params::*, state::*};
@@ -100,7 +101,7 @@ impl TheDeskMcp {
     }
 
     #[tool(
-        description = "SIL read kernel: parameterized state read returning a StateEnvelope with per-domain provenance and degraded flags. Params: symbols?, domains?, fields?, resolution (R0|R1 required), as_of?, budget_tokens?. Absence of provenance is a failure; a degraded domain sets its flag rather than failing the whole call. Trust Level L0 — read/query only, no mutation or order authority. Enable via [sil].catalog_discovery."
+        description = "SIL read kernel: parameterized state read returning a StateEnvelope with per-domain provenance and degraded flags. Params: symbols? (NQ and/or ES; MarketRouter v0), domains?, fields?, resolution (R0|R1 required), as_of?, budget_tokens?. When both symbols are requested, values are keyed {ROOT}.{catalogFieldId} in one envelope on the aligned clock. Absence of provenance is a failure; a degraded domain sets its flag rather than failing the whole call. Trust Level L0 — read/query only, no mutation or order authority. Enable via [sil].catalog_discovery."
     )]
     pub(crate) async fn get_state(
         &self,
@@ -116,29 +117,132 @@ impl TheDeskMcp {
             .map_err(|e| invalid_params_error(e.to_string()))?;
 
         let catalog = build_catalog();
+        let requested_roots = parse_requested_roots(params.symbols.as_deref()).map_err(|e| {
+            invalid_params_error(match e {
+                RouterRootError::MicroNotInScope(s) => format!(
+                    "get_state symbols include `{s}` — MarketRouter v0 hosts NQ and ES only (micros are out of scope)"
+                ),
+                other => other.to_string(),
+            })
+        })?;
+
         let (snapshot_owned, snapshot_source, data_time, source_degraded, source_note, as_of) =
             self.resolve_state_snapshot(params.as_of).await?;
 
-        // MarketRouter multi-symbol is later work (#7). Until then, reject
-        // requests that ask for a symbol other than the resolved snapshot root.
-        if let Some(ref requested) = params.symbols {
-            let requested: Vec<&str> = requested
-                .iter()
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty())
-                .collect();
-            if !requested.is_empty() {
-                if let Some(root) = snapshot_owned
-                    .as_ref()
-                    .and_then(|s| s.get("rootSymbol"))
-                    .and_then(|v| v.as_str())
-                {
-                    let ok = requested.iter().any(|s| s.eq_ignore_ascii_case(root));
-                    if !ok {
+        // as_of is still a single persisted snapshot until Journal Frames (#8).
+        // Live path can return both MarketRouter roots in one StateEnvelope.
+        let live_by_symbol = if as_of.is_none() {
+            self.collect_live_snapshots_by_root()
+        } else {
+            std::collections::BTreeMap::new()
+        };
+
+        let caller_listed_both = params
+            .symbols
+            .as_ref()
+            .map(|list| {
+                parse_requested_roots(Some(list))
+                    .map(|v| v.len() > 1)
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+        let both_live = requested_roots
+            .iter()
+            .filter(|r| live_by_symbol.contains_key(r))
+            .count()
+            >= 2;
+        let include_multi =
+            as_of.is_none() && requested_roots.len() > 1 && (caller_listed_both || both_live);
+
+        if include_multi {
+            let mut by_root = std::collections::BTreeMap::new();
+            for root in &requested_roots {
+                let snap = live_by_symbol.get(root);
+                let (snapshot, data_time, degraded, note) = match snap {
+                    Some(piece) => (
+                        Some(&piece.snapshot),
+                        piece.data_time,
+                        piece.degraded,
+                        piece.note.clone(),
+                    ),
+                    None => (
+                        None,
+                        data_time,
+                        true,
+                        Some(format!(
+                            "MarketRouter has no live snapshot for {}",
+                            root.as_str()
+                        )),
+                    ),
+                };
+                let req = StateReadRequest {
+                    symbols: Some(vec![root.as_str().to_string()]),
+                    domains: params.domains.clone(),
+                    fields: params.fields.clone(),
+                    resolution,
+                    as_of,
+                    budget_tokens: params.budget_tokens,
+                    snapshot,
+                    snapshot_source,
+                    data_time,
+                    source_degraded: degraded,
+                    source_degraded_note: note,
+                };
+                let env = build_state_envelope(&catalog, req).map_err(|e| match e {
+                    the_desk_backend::catalog::EnvelopeError::MissingProvenance(_) => {
+                        McpError::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None)
+                    }
+                    other => invalid_params_error(other.to_string()),
+                })?;
+                by_root.insert(root.as_str().to_string(), env);
+            }
+            let clock_ms = self.market_router.clock_ms().or(data_time);
+            let envelope = merge_symbol_envelopes(by_root, clock_ms)
+                .map_err(|e| McpError::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?;
+            return Ok(text_result(finish_state_envelope_json(&envelope)?));
+        }
+
+        // Single-symbol (M1b shape): requested root must match the snapshot when known.
+        if requested_roots.len() == 1 {
+            let want = requested_roots[0];
+            if let Some(root) = snapshot_owned
+                .as_ref()
+                .and_then(|s| s.get("rootSymbol"))
+                .and_then(|v| v.as_str())
+            {
+                if let Ok(have) = RouterRoot::parse(root) {
+                    if have != want {
+                        if let Some(piece) = live_by_symbol.get(&want) {
+                            let req = StateReadRequest {
+                                symbols: Some(vec![want.as_str().to_string()]),
+                                domains: params.domains.clone(),
+                                fields: params.fields.clone(),
+                                resolution,
+                                as_of,
+                                budget_tokens: params.budget_tokens,
+                                snapshot: Some(&piece.snapshot),
+                                snapshot_source,
+                                data_time: piece.data_time,
+                                source_degraded: piece.degraded,
+                                source_degraded_note: piece.note.clone(),
+                            };
+                            let envelope =
+                                build_state_envelope(&catalog, req).map_err(|e| match e {
+                                    the_desk_backend::catalog::EnvelopeError::MissingProvenance(
+                                        _,
+                                    ) => McpError::new(
+                                        ErrorCode::INTERNAL_ERROR,
+                                        e.to_string(),
+                                        None,
+                                    ),
+                                    other => invalid_params_error(other.to_string()),
+                                })?;
+                            return Ok(text_result(finish_state_envelope_json(&envelope)?));
+                        }
                         return Err(invalid_params_error(format!(
-                            "get_state symbols {:?} do not match resolved rootSymbol `{root}` \
-                             (MarketRouter multi-symbol is not shipped yet)",
-                            requested
+                            "get_state symbol `{}` does not match resolved rootSymbol `{root}` \
+                             and MarketRouter has no live snapshot for that root",
+                            want.as_str()
                         )));
                     }
                 }
@@ -164,13 +268,7 @@ impl TheDeskMcp {
             }
             other => invalid_params_error(other.to_string()),
         })?;
-        let mut out = state_envelope_json(&envelope)
-            .map_err(|e| McpError::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?;
-        if let Some(obj) = out.as_object_mut() {
-            obj.insert("mutationAuthority".into(), serde_json::json!(false));
-            obj.insert("orderAuthority".into(), serde_json::json!(false));
-        }
-        Ok(text_result(out))
+        Ok(text_result(finish_state_envelope_json(&envelope)?))
     }
 
     #[tool(
@@ -321,4 +419,95 @@ impl TheDeskMcp {
             ))
         }
     }
+
+    /// Live MarketRouter snapshots keyed by root (embedded lanes + external published).
+    fn collect_live_snapshots_by_root(
+        &self,
+    ) -> std::collections::BTreeMap<RouterRoot, LiveRootSnapshot> {
+        let mut out = std::collections::BTreeMap::new();
+        if let Some(store) = self.engine_published.as_ref() {
+            let published = store.load();
+            for root in RouterRoot::ALL {
+                if let Some(snap) = published.snapshot_for_root(root.as_str()) {
+                    if snap.is_null() {
+                        continue;
+                    }
+                    let data_time = snap
+                        .get("tapeLastTradeTimestampMs")
+                        .and_then(|v| v.as_f64())
+                        .or(published.clock_ms)
+                        .or(published.data_time_ms);
+                    out.insert(
+                        root,
+                        LiveRootSnapshot {
+                            snapshot: snap.clone(),
+                            data_time,
+                            degraded: published.degraded
+                                && root.as_str().eq_ignore_ascii_case(&published.primary_root),
+                            note: published.degraded_note.clone(),
+                        },
+                    );
+                }
+            }
+            if !out.is_empty() {
+                return out;
+            }
+        }
+
+        if let Some(r) = self.resolve_live_market_view() {
+            if !r.snapshot.is_null() {
+                let root = r
+                    .snapshot
+                    .get("rootSymbol")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| RouterRoot::parse(s).ok())
+                    .unwrap_or(RouterRoot::Nq);
+                let degraded = r.degradation_reason.is_some();
+                out.insert(
+                    root,
+                    LiveRootSnapshot {
+                        snapshot: r.snapshot,
+                        data_time: Some(r.as_of_timestamp_ms),
+                        degraded,
+                        note: r.degradation_reason,
+                    },
+                );
+            }
+        }
+
+        let es = self.market_router.es_host().snapshot_market_state();
+        if !es.is_null() {
+            let data_time = es
+                .get("tapeLastTradeTimestampMs")
+                .and_then(|v| v.as_f64())
+                .or_else(|| self.market_router.clock_ms());
+            out.insert(
+                RouterRoot::Es,
+                LiveRootSnapshot {
+                    snapshot: es,
+                    data_time,
+                    degraded: false,
+                    note: None,
+                },
+            );
+        }
+        out
+    }
+}
+
+struct LiveRootSnapshot {
+    snapshot: serde_json::Value,
+    data_time: Option<f64>,
+    degraded: bool,
+    note: Option<String>,
+}
+
+fn finish_state_envelope_json(envelope: &StateEnvelope) -> Result<serde_json::Value, McpError> {
+    let mut out = state_envelope_json(envelope)
+        .map_err(|e| McpError::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?;
+    if let Some(obj) = out.as_object_mut() {
+        obj.insert("mutationAuthority".into(), serde_json::json!(false));
+        obj.insert("orderAuthority".into(), serde_json::json!(false));
+    }
+    Ok(out)
 }

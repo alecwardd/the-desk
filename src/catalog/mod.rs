@@ -21,8 +21,8 @@ mod types;
 
 pub use config::{load_sil_config, EngineMode, SilConfig};
 pub use envelope::{
-    build_state_envelope, state_envelope_json, DomainProvenance, EnvelopeError, ProvenanceSource,
-    StateEnvelope, StateReadRequest, StateResolution, TrustLevel,
+    build_state_envelope, merge_symbol_envelopes, state_envelope_json, DomainProvenance,
+    EnvelopeError, ProvenanceSource, StateEnvelope, StateReadRequest, StateResolution, TrustLevel,
 };
 pub use events_kernel::{
     kernel_event_from_db_row, kernel_event_from_market_event, EventsEnvelope, KernelEvent,
@@ -109,6 +109,11 @@ pub fn describe_environment(catalog: &DeskCatalog, discovery_enabled: bool) -> s
         },
         "specialtyMarketToolsPolicy": "no_catalog_entry_no_new_market_tool",
         "specialtyMarketToolCount": catalog.specialty_market_tools.len(),
+        "marketRouter": {
+            "roots": ["NQ", "ES"],
+            "oneClock": true,
+            "microsInScope": false,
+        },
         "metadataOnly": true,
     })
 }

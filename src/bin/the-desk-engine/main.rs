@@ -1,22 +1,24 @@
-//! `the-desk-engine` — headless SIL engine host (SIL-M2a).
+//! `the-desk-engine` — headless SIL engine host (SIL-M2a + MarketRouter v0).
 //!
 //! Owns ingest (SourceProvider / FileProvider), pipelines, and event detection
-//! so intelligence survives MCP/agent disconnect. Publishes lock-free state on a
-//! read-only localhost TCP socket for the MCP adapter.
+//! so intelligence survives MCP/agent disconnect. **MarketRouter** runs NQ and
+//! ES concurrently on one clock. Publishes lock-free state on a read-only
+//! localhost TCP socket for the MCP adapter.
 //!
 //! Lifecycle: launch on Sierra hours (Task Scheduler) with Globex overnight
 //! coverage — the engine runs whenever Sierra records. Trust Ceiling stays L3.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use the_desk_backend::engine::{
-    load_engine_bind_addr, EngineHost, EngineSocketServer, FileProvider, SourceProvider,
-    SourceProviderKind, ENGINE_DEFAULT_BIND,
+    load_engine_bind_addr, EngineSocketServer, FileProvider, MarketRouter, RouterRoot,
+    SourceProvider, SourceProviderKind, ENGINE_DEFAULT_BIND,
 };
-use the_desk_backend::feed::load_feed_config;
+use the_desk_backend::feed::{load_feed_config, resolve_contract_metadata};
 use the_desk_backend::observability::{init_logging, load_logging_config};
 use tokio::sync::watch;
 
@@ -34,13 +36,14 @@ fn parse_bind_arg() -> String {
     load_engine_bind_addr()
 }
 
-fn parse_scid_override() -> Option<PathBuf> {
+fn parse_path_flag(flag: &str) -> Option<PathBuf> {
+    let eq = format!("{flag}=");
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
-        if arg == "--scid" {
+        if arg == flag {
             return args.next().map(PathBuf::from);
         }
-        if let Some(path) = arg.strip_prefix("--scid=") {
+        if let Some(path) = arg.strip_prefix(&eq) {
             return Some(PathBuf::from(path));
         }
     }
@@ -49,12 +52,12 @@ fn parse_scid_override() -> Option<PathBuf> {
 
 fn print_help() {
     eprintln!(
-        "the-desk-engine — headless Desk intelligence host (SIL-M2a)\n\n\
+        "the-desk-engine — headless Desk intelligence host (SIL-M2b MarketRouter)\n\n\
          Usage:\n\
-           the-desk-engine [--bind ADDR] [--scid PATH]\n\n\
+           the-desk-engine [--bind ADDR] [--scid PATH] [--scid-es PATH]\n\n\
          Defaults:\n\
            --bind {ENGINE_DEFAULT_BIND} (or [sil].engine_bind in config.toml)\n\
-           SCID path from feed config / FileProvider\n\n\
+           NQ/ES SCID paths from feed config / FileProvider (MarketRouter v0)\n\n\
          Ops: register via Task Scheduler on Sierra hours; keep running through\n\
          Globex overnight whenever Sierra Chart is recording. MCP adapters connect\n\
          read-only; closing an agent session must not stop this process.\n\
@@ -77,17 +80,61 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let bind = parse_bind_arg();
     let feed = load_feed_config();
-    let mut provider: Box<dyn SourceProvider> = if let Some(scid) = parse_scid_override() {
+    let primary =
+        the_desk_backend::engine::RouterRoot::parse(&feed.base_symbol).unwrap_or(RouterRoot::Nq);
+
+    let mut providers: BTreeMap<RouterRoot, Box<dyn SourceProvider>> = BTreeMap::new();
+    let nq_provider: Box<dyn SourceProvider> = if let Some(scid) = parse_path_flag("--scid") {
         Box::new(FileProvider::from_paths(scid, vec![], feed.price_scale))
     } else {
-        Box::new(FileProvider::from_feed_config(&feed))
+        Box::new(FileProvider::from_feed_config_for_root(
+            &feed,
+            RouterRoot::Nq,
+        ))
     };
+    providers.insert(RouterRoot::Nq, nq_provider);
 
-    let host = Arc::new(EngineHost::new(SourceProviderKind::File, "external"));
-    let store = host.published_store();
+    let es_provider: Box<dyn SourceProvider> = if let Some(scid) = parse_path_flag("--scid-es") {
+        Box::new(FileProvider::from_paths(scid, vec![], feed.price_scale))
+    } else {
+        Box::new(FileProvider::from_feed_config_for_root(
+            &feed,
+            RouterRoot::Es,
+        ))
+    };
+    providers.insert(RouterRoot::Es, es_provider);
+
+    let router = Arc::new(MarketRouter::new(
+        primary,
+        SourceProviderKind::File,
+        "external",
+    ));
+    router.set_contract_metadata(
+        RouterRoot::Nq,
+        resolve_contract_metadata(&{
+            let mut cfg = feed.clone();
+            cfg.base_symbol = "NQ".into();
+            cfg.symbol = "NQ".into();
+            cfg
+        }),
+    );
+    router.set_contract_metadata(
+        RouterRoot::Es,
+        resolve_contract_metadata(&{
+            let mut cfg = feed.clone();
+            cfg.base_symbol = "ES".into();
+            cfg.symbol = "ES".into();
+            cfg
+        }),
+    );
+    let store = router.published_store();
 
     // Initial publish so clients see health even before first tick.
-    host.publish(None, &provider.health());
+    let mut boot_health = BTreeMap::new();
+    for (root, provider) in providers.iter() {
+        boot_health.insert(*root, provider.health());
+    }
+    router.publish(&boot_health);
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let stop_flag = Arc::new(AtomicBool::new(false));
@@ -102,39 +149,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let poll_ms = feed.flush_poll_ms.max(250);
     let max_ticks = feed.max_ticks_per_poll.max(1);
-    let host_bg = Arc::clone(&host);
+    let router_bg = Arc::clone(&router);
     let stop_bg = Arc::clone(&stop_flag);
 
     tracing::info!(
         %bind,
         pid = std::process::id(),
+        primary = primary.as_str(),
         "the-desk-engine.started"
     );
 
     while !stop_bg.load(Ordering::Acquire) {
-        match host_bg.poll_once(provider.as_mut(), max_ticks) {
+        match router_bg.poll_once(&mut providers, max_ticks) {
             Ok(n) if n > 0 => {
-                // Drain without sleeping while catching up.
                 continue;
             }
             Ok(_) => {}
             Err(err) => {
                 tracing::warn!(error = %err, "the-desk-engine.poll_error");
-                host_bg.publish(None, &provider.health());
+                let mut health = BTreeMap::new();
+                for (root, provider) in providers.iter() {
+                    health.insert(*root, provider.health());
+                }
+                router_bg.publish(&health);
             }
         }
         tokio::time::sleep(Duration::from_millis(poll_ms)).await;
     }
 
-    host.mark_stopped();
+    router.mark_stopped();
     let _ = shutdown_tx.send(true);
     let _ = server_handle.await;
     Ok(())
 }
 
 fn ctrlc_shim(stop_flag: Arc<AtomicBool>, shutdown_tx: watch::Sender<bool>) {
-    // Avoid pulling signal-hook; use a simple background watcher on Unix via
-    // tokio ctrl_c when available.
     tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
             stop_flag.store(true, Ordering::Release);

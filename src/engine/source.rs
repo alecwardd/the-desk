@@ -32,6 +32,9 @@ pub struct SourceTick {
     pub bid: f64,
     pub ask: f64,
     pub side: TradeSide,
+    /// MarketRouter root when known (`NQ` / `ES`). Optional for single-host paths.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_symbol: Option<String>,
 }
 
 impl From<ScidTick> for SourceTick {
@@ -43,6 +46,7 @@ impl From<ScidTick> for SourceTick {
             bid: t.bid,
             ask: t.ask,
             side: t.side,
+            root_symbol: None,
         }
     }
 }
@@ -103,6 +107,18 @@ pub struct FileProvider {
 }
 
 impl FileProvider {
+    /// Build from feed config for one MarketRouter root (exact NQ or ES).
+    ///
+    /// Uses the same Sierra data dir as the live feed, with `base_symbol` pinned
+    /// to the requested root so ES resolution cannot pick NQ (and vice versa).
+    pub fn from_feed_config_for_root(config: &FeedConfig, root: super::root::RouterRoot) -> Self {
+        let mut cfg = config.clone();
+        cfg.base_symbol = root.as_str().to_string();
+        cfg.symbol = root.as_str().to_string();
+        cfg.active_symbol_override = None;
+        Self::from_feed_config(&cfg)
+    }
+
     /// Build from feed config (resolves contract SCID path + depth files).
     pub fn from_feed_config(config: &FeedConfig) -> Self {
         let contract = resolve_contract_metadata(config);

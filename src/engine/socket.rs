@@ -254,6 +254,9 @@ mod tests {
             health: EngineHealth::unavailable("boot"),
             degraded: false,
             degraded_note: None,
+            by_symbol: Default::default(),
+            clock_ms: Some(1.0),
+            primary_root: "NQ".into(),
         });
         let (tx, rx) = watch::channel(false);
         // Pick a free port, then re-bind inside serve().
@@ -297,6 +300,9 @@ mod tests {
             health: EngineHealth::unavailable("recovered"),
             degraded: false,
             degraded_note: None,
+            by_symbol: Default::default(),
+            clock_ms: Some(2.0),
+            primary_root: "NQ".into(),
         });
         let store_bg = store.clone();
         let server = EngineSocketServer::new(bind.clone());

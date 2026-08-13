@@ -60,3 +60,72 @@ pub fn persist_event_stream_attention(
     }
     Ok(written)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::kernel_event_from_market_event_scoped;
+    use crate::pipelines::MarketEvent;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn persist_writes_event_stream_row_for_detail_and_ack() {
+        let file = NamedTempFile::new().expect("temp");
+        let db = Database::open(file.path().to_string_lossy().as_ref()).expect("open");
+        let event = MarketEvent {
+            session_date: "2026-08-13".into(),
+            timestamp_ms: 1_700_000_000_000.0,
+            event_type: "pinch_detected".into(),
+            level_name: Some("vwap".into()),
+            price: 21000.0,
+            direction: Some("from_below".into()),
+            sequence_num: None,
+            metadata: None,
+            session_type: "RTH".into(),
+            session_segment: "None".into(),
+            trading_day: "2026-08-13".into(),
+        };
+        let kernel = kernel_event_from_market_event_scoped(&event, Some("NQ"), None);
+        let written = persist_event_stream_attention(
+            &db,
+            std::slice::from_ref(&kernel),
+            None,
+            event.timestamp_ms,
+            "live",
+            None,
+        )
+        .expect("persist");
+        assert_eq!(written, 1);
+        let signal_id = crate::attention::event_stream_signal_id(
+            &kernel.dedup_identity_id,
+            &event.session_date,
+            "live",
+            None,
+        );
+        let loaded = db
+            .get_attention_signal(&signal_id)
+            .expect("load")
+            .expect("row");
+        assert_eq!(loaded.status, "active");
+        assert_eq!(loaded.payload["viewOf"], "eventStream");
+        assert_eq!(loaded.priority, "high");
+        db.acknowledge_attention_signal(&signal_id, "trader", None, event.timestamp_ms)
+            .expect("ack");
+        let again = persist_event_stream_attention(
+            &db,
+            std::slice::from_ref(&kernel),
+            None,
+            event.timestamp_ms + 1.0,
+            "live",
+            None,
+        )
+        .expect("repersist");
+        assert_eq!(again, 1);
+        let kept = db
+            .get_attention_signal(&signal_id)
+            .expect("reload")
+            .expect("row");
+        assert_eq!(kept.status, "acknowledged");
+        assert_eq!(kept.acknowledged_by.as_deref(), Some("trader"));
+    }
+}

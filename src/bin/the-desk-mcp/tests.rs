@@ -1889,6 +1889,31 @@ async fn get_attention_inbox_is_ranked_view_over_event_stream() {
     let summary = signals[0]["summary"].as_str().unwrap_or("");
     assert!(summary.contains("Your playbook") || summary.contains("your rules"));
     assert!(!summary.to_ascii_lowercase().contains("you should buy"));
+    let signal_id = signals[0]["signalId"]
+        .as_str()
+        .expect("signalId")
+        .to_string();
+    let detail = parse_text_tool_result(
+        server
+            .get_signal_detail(Parameters(AttentionSignalDetailParams {
+                signal_id: signal_id.clone(),
+            }))
+            .await
+            .expect("detail"),
+    );
+    assert_eq!(detail["signal"]["signalId"], signal_id);
+    assert_eq!(detail["signal"]["payload"]["viewOf"], "eventStream");
+    let ack = parse_text_tool_result(
+        server
+            .acknowledge_attention_signal(Parameters(AttentionSignalAcknowledgeParams {
+                signal_id: signal_id.clone(),
+                acknowledged_by: "trader".into(),
+                note: Some("reviewed".into()),
+            }))
+            .await
+            .expect("ack"),
+    );
+    assert_eq!(ack["acknowledged"], true);
 }
 
 #[tokio::test]

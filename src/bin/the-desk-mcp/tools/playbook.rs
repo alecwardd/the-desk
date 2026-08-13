@@ -4,8 +4,13 @@ use rmcp::{
     handler::server::wrapper::Parameters, model::*, tool, tool_router, ErrorData as McpError,
 };
 use std::sync::atomic::Ordering;
-use the_desk_backend::attention::{rank_attention_inbox, EVENT_STREAM_VIEW};
-use the_desk_backend::catalog::{kernel_event_from_db_row, COACHING_EVENT_FETCH_CAP};
+use the_desk_backend::attention::{
+    apply_inbox_cursor, persist_event_stream_attention, rank_attention_inbox,
+    signal_matches_inbox_filters, EVENT_STREAM_VIEW,
+};
+use the_desk_backend::catalog::{
+    kernel_event_from_db_row, COACHING_EVENT_FETCH_CAP, EVENT_LIFECYCLE_TTL_MS,
+};
 use the_desk_backend::db::{AttentionChangelogQuery, AttentionSignalQuery, TradeIdeaQuery};
 use the_desk_backend::observability::RuntimeEventLevel;
 use the_desk_backend::pipelines::MarketState;
@@ -244,12 +249,28 @@ impl TheDeskMcp {
         let limit = params.limit.unwrap_or(25).clamp(1, 100);
         let cursor = params.cursor.unwrap_or_default();
         let include_expired = params.include_expired.unwrap_or(false);
-        let (mut signals, event_rows, data_age_ms) = {
+        let clock_ms = self
+            .market_router
+            .clock_ms()
+            .filter(|clock| clock.is_finite() && *clock > 0.0);
+        let now_ms = clock_ms.unwrap_or_else(|| chrono::Utc::now().timestamp_millis() as f64);
+        let since_ms = clock_ms.map(|clock| (clock - EVENT_LIFECYCLE_TTL_MS).max(0.0));
+        let (mut signals, kernel_events, data_age_ms) = {
             let db = self.db.lock().map_err(|_| lock_error())?;
+            if let Some(clock) = clock_ms {
+                db.expire_event_lifecycles(clock, EVENT_LIFECYCLE_TTL_MS)
+                    .map_err(db_error)?;
+            }
+            let event_rows = db
+                .list_coaching_market_events(COACHING_EVENT_FETCH_CAP, since_ms, None)
+                .map_err(db_error)?;
+            let kernel_events: Vec<_> = event_rows.iter().map(kernel_event_from_db_row).collect();
+            persist_event_stream_attention(&db, &kernel_events, None, now_ms, "live", None)
+                .map_err(db_error)?;
             let signals = db
                 .query_attention_signals(&AttentionSignalQuery {
-                    status: params.status,
-                    min_priority: params.min_priority,
+                    status: None,
+                    min_priority: None,
                     include_expired,
                     cursor_signal_id: None,
                     since_ms: None,
@@ -257,26 +278,18 @@ impl TheDeskMcp {
                     ..AttentionSignalQuery::default()
                 })
                 .map_err(db_error)?;
-            let event_rows = db
-                .list_coaching_market_events(COACHING_EVENT_FETCH_CAP, None, None)
-                .map_err(db_error)?;
             let data_age_ms = compute_data_age(&db);
-            (signals, event_rows, data_age_ms)
+            (signals, kernel_events, data_age_ms)
         };
-        let kernel_events: Vec<_> = event_rows.iter().map(kernel_event_from_db_row).collect();
-        let now_ms = chrono::Utc::now().timestamp_millis() as f64;
         signals = rank_attention_inbox(signals, &kernel_events, include_expired, now_ms, "live");
-        if let Some(last_id) = cursor.last_signal_id.as_deref() {
-            if let Some(pos) = signals
-                .iter()
-                .position(|signal| signal.signal_id == last_id)
-            {
-                signals = signals.split_off(pos.saturating_add(1));
-            }
-        }
-        if signals.len() > limit {
-            signals.truncate(limit);
-        }
+        signals.retain(|signal| {
+            signal_matches_inbox_filters(
+                signal,
+                params.status.as_deref(),
+                params.min_priority.as_deref(),
+            )
+        });
+        signals = apply_inbox_cursor(signals, cursor.last_signal_id.as_deref(), limit);
         let next_cursor = signals.last().map(|signal| {
             serde_json::json!({
                 "lastSignalId": signal.signal_id,

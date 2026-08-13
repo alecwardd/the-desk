@@ -5,7 +5,7 @@
 
 use crate::catalog::{
     collapse_events_latest_per_dedup, event_dedup_identity_id, is_dom_family_event_type,
-    EventLifecycle, KernelEvent,
+    EventLifecycle, EventSeverity, KernelEvent,
 };
 use crate::db::{stable_hash_hex, AttentionSignalRecord};
 use crate::pipelines::MarketEvent;
@@ -58,16 +58,7 @@ pub fn attention_signal_from_kernel_event(
         "Your playbook / your rules say this is an attention event, not an entry by itself: {} near {:.2} (lifecycle {}).",
         event.event_type, price, event.lifecycle.as_str()
     );
-    let priority_score = 20.0 + (event.severity.rank() as f64) * 15.0;
-    let priority = if priority_score >= 80.0 {
-        "urgent"
-    } else if priority_score >= 60.0 {
-        "high"
-    } else if priority_score >= 35.0 {
-        "normal"
-    } else {
-        "low"
-    };
+    let (priority, priority_score) = priority_for_severity(event.severity);
     AttentionSignalRecord {
         signal_id,
         dedupe_key: format!("event_stream:{}", event.dedup_identity_id),
@@ -129,6 +120,73 @@ pub fn attention_kind_for_event(event_type: &str) -> &'static str {
         crate::catalog::EventFamily::Dom => "dom_family",
         crate::catalog::EventFamily::Other => "market_event",
     }
+}
+
+/// Map event severity onto the inbox priority label and score.
+///
+/// Label is derived from severity so `low` cannot land in the `normal` bucket
+/// via the old `20 + rank*15` off-by-one (Low rank 1 → 35.0 ≥ 35).
+fn priority_for_severity(severity: EventSeverity) -> (&'static str, f64) {
+    match severity {
+        EventSeverity::Urgent => ("urgent", 80.0),
+        EventSeverity::High => ("high", 60.0),
+        EventSeverity::Normal => ("normal", 40.0),
+        EventSeverity::Low => ("low", 20.0),
+        EventSeverity::Unspecified => ("low", 10.0),
+    }
+}
+
+fn priority_label_rank(label: &str) -> i32 {
+    match label.trim().to_ascii_lowercase().as_str() {
+        "urgent" => 4,
+        "high" => 3,
+        "normal" => 2,
+        "low" => 1,
+        _ => 0,
+    }
+}
+
+/// True when a ranked inbox row matches the caller’s status / minPriority filters.
+pub fn signal_matches_inbox_filters(
+    signal: &AttentionSignalRecord,
+    status: Option<&str>,
+    min_priority: Option<&str>,
+) -> bool {
+    if let Some(want) = status.map(str::trim).filter(|s| !s.is_empty()) {
+        if signal.status != want {
+            return false;
+        }
+    }
+    if let Some(min) = min_priority.map(str::trim).filter(|s| !s.is_empty()) {
+        if priority_label_rank(&signal.priority) < priority_label_rank(min) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Apply a last-signal cursor after ranking. A missing cursor id is treated as
+/// stale (empty page) so clients cannot loop on page 1.
+pub fn apply_inbox_cursor(
+    mut signals: Vec<AttentionSignalRecord>,
+    last_signal_id: Option<&str>,
+    limit: usize,
+) -> Vec<AttentionSignalRecord> {
+    if let Some(last_id) = last_signal_id.map(str::trim).filter(|s| !s.is_empty()) {
+        match signals
+            .iter()
+            .position(|signal| signal.signal_id == last_id)
+        {
+            Some(pos) => {
+                signals = signals.split_off(pos.saturating_add(1));
+            }
+            None => return Vec::new(),
+        }
+    }
+    if signals.len() > limit {
+        signals.truncate(limit);
+    }
+    signals
 }
 
 fn suggested_tools_for_event_kind(kind: &str) -> Vec<String> {
@@ -430,5 +488,46 @@ mod tests {
         resolved.lifecycle = EventLifecycle::Resolved;
         let ranked = rank_attention_inbox(vec![], &[resolved], false, 1.0, "live");
         assert!(ranked.is_empty());
+    }
+
+    #[test]
+    fn low_severity_maps_to_low_priority_not_normal() {
+        let mut open = event("dnp_cross", 1_700_000_000_000.0);
+        open.severity = EventSeverity::Low;
+        let signal = attention_signal_from_kernel_event(&open, open.timestamp_ms, "live", None);
+        assert_eq!(signal.priority, "low");
+        assert!(signal.priority_score < 35.0);
+        assert!(signal_matches_inbox_filters(&signal, None, Some("low")));
+        assert!(!signal_matches_inbox_filters(&signal, None, Some("normal")));
+    }
+
+    #[test]
+    fn stale_inbox_cursor_returns_empty_instead_of_replaying_page_one() {
+        let open = event("ib_extension_hit", 1_700_000_000_000.0);
+        let ranked = rank_attention_inbox(vec![], &[open], false, 1.0, "live");
+        assert_eq!(ranked.len(), 1);
+        let page = apply_inbox_cursor(ranked, Some("sig_missing"), 25);
+        assert!(page.is_empty());
+    }
+
+    #[test]
+    fn inbox_filters_apply_after_event_stream_synthesis() {
+        let open = event("pinch_detected", 1_700_000_000_000.0);
+        let overlay = overlay_signal("setup_lifecycle_change", "active");
+        let ranked = rank_attention_inbox(
+            vec![overlay],
+            std::slice::from_ref(&open),
+            false,
+            open.timestamp_ms,
+            "live",
+        );
+        let high_only: Vec<_> = ranked
+            .iter()
+            .filter(|s| signal_matches_inbox_filters(s, None, Some("high")))
+            .collect();
+        assert!(high_only
+            .iter()
+            .all(|s| s.payload["viewOf"] == EVENT_STREAM_VIEW));
+        assert!(high_only.iter().all(|s| s.priority == "high"));
     }
 }

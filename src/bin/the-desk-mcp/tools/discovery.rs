@@ -13,7 +13,7 @@ use the_desk_backend::catalog::{
     apply_positioning_slice, apply_token_budget, build_catalog, build_state_envelope,
     collapse_events_latest_per_dedup, describe_domain, describe_environment,
     kernel_event_from_db_row, kernel_event_from_market_event_scoped, merge_symbol_envelopes,
-    positioning_state_slice, search_catalog, state_envelope_json, EventsEnvelope,
+    positioning_state_slice, search_catalog, state_envelope_json, EventsEnvelope, KernelEvent,
     PositioningStateSlice, ProvenanceSource, StateEnvelope, StateReadRequest, StateResolution,
     TrustLevel, KERNEL_READ_QUERY_TOOLS,
 };
@@ -340,39 +340,15 @@ impl TheDeskMcp {
             (rows, had)
         };
         let mut events: Vec<_> = db_rows.iter().map(kernel_event_from_db_row).collect();
-        if events.is_empty() && !db_had_rows {
-            if let Some(store) = self.engine_published.as_ref() {
-                let published = store.load();
-                let mut out = Vec::new();
-                for value in published.recent_events.iter().rev() {
-                    let root = value
-                        .get("rootSymbol")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string);
-                    let Ok(ev) = serde_json::from_value::<the_desk_backend::pipelines::MarketEvent>(
-                        value.clone(),
-                    ) else {
-                        continue;
-                    };
-                    if let Some(min_ts) = since_ms {
-                        if ev.timestamp_ms < min_ts {
-                            continue;
-                        }
-                    }
-                    out.push(kernel_event_from_market_event_scoped(
-                        &ev,
-                        root.as_deref(),
-                        None,
-                    ));
-                }
-                events = collapse_events_latest_per_dedup(out);
-                if let Some(want) = event_type {
-                    events.retain(|e| e.event_type.eq_ignore_ascii_case(want));
-                }
-                if events.len() > limit {
-                    events.truncate(limit);
-                }
-            }
+        if let Some(store) = self.engine_published.as_ref() {
+            events = merge_published_live_events(
+                events,
+                db_had_rows,
+                &store.load().recent_events,
+                since_ms,
+                event_type,
+                limit,
+            );
         }
         let envelope = EventsEnvelope::from_events(events);
         let mut out = serde_json::to_value(&envelope).unwrap_or_else(|_| serde_json::json!({}));
@@ -689,4 +665,64 @@ fn journal_root_present(
     journal
         .and_then(|snap| snap.by_root.get(root.as_str()))
         .is_some_and(|payload| !payload.is_null())
+}
+
+/// Fold published engine rows that are ahead of SQLite into the coaching view.
+///
+/// SQLite stays the overnight source of truth. Published rows fill the live gap
+/// before the first journal flush, and any events newer than the newest DB row
+/// after a flush. When SQLite has rows but the type filter emptied the page,
+/// published rows are not used as a replacement.
+fn merge_published_live_events(
+    mut events: Vec<KernelEvent>,
+    db_had_rows: bool,
+    published_events: &[serde_json::Value],
+    since_ms: Option<f64>,
+    event_type: Option<&str>,
+    limit: usize,
+) -> Vec<KernelEvent> {
+    if events.is_empty() && db_had_rows {
+        return events;
+    }
+    let newest_db_ts = events
+        .iter()
+        .map(|event| event.timestamp_ms)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let mut extra = Vec::new();
+    for value in published_events.iter().rev() {
+        let root = value
+            .get("rootSymbol")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let Ok(ev) =
+            serde_json::from_value::<the_desk_backend::pipelines::MarketEvent>(value.clone())
+        else {
+            continue;
+        };
+        if !ev.timestamp_ms.is_finite() || ev.timestamp_ms <= newest_db_ts {
+            continue;
+        }
+        if let Some(min_ts) = since_ms {
+            if ev.timestamp_ms < min_ts {
+                continue;
+            }
+        }
+        extra.push(kernel_event_from_market_event_scoped(
+            &ev,
+            root.as_deref(),
+            None,
+        ));
+    }
+    if extra.is_empty() {
+        return events;
+    }
+    events.extend(extra);
+    events = collapse_events_latest_per_dedup(events);
+    if let Some(want) = event_type {
+        events.retain(|event| event.event_type.eq_ignore_ascii_case(want));
+    }
+    if events.len() > limit {
+        events.truncate(limit);
+    }
+    events
 }

@@ -520,6 +520,13 @@ mod tests {
         let mut with_meta = sample_event("dnp_cross");
         with_meta.metadata = Some(serde_json::json!({ "severity": "urgent" }));
         assert_eq!(resolve_event_severity(&with_meta), EventSeverity::Urgent);
+        let mut numeric = sample_event("ib_extension_hit");
+        numeric.metadata = Some(serde_json::json!({ "severity": 1.0 }));
+        assert_eq!(resolve_event_severity(&numeric), EventSeverity::Low);
+        assert_eq!(
+            resolve_event_severity(&sample_event("large_trade_cluster")),
+            EventSeverity::High
+        );
         assert_eq!(EventSeverity::parse("nope").as_str(), SEVERITY_UNSPECIFIED);
     }
 

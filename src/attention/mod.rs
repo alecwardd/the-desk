@@ -10,6 +10,6 @@ pub use composer::{
 pub use notifier::{AttentionNotifierConfig, AttentionNotifierDecision};
 pub use persist::persist_event_stream_attention;
 pub use rank::{
-    attention_signal_from_kernel_event, event_stream_signal_id, rank_attention_inbox,
-    EVENT_STREAM_VIEW,
+    apply_inbox_cursor, attention_signal_from_kernel_event, event_stream_signal_id,
+    rank_attention_inbox, signal_matches_inbox_filters, EVENT_STREAM_VIEW,
 };

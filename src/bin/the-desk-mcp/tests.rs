@@ -1326,6 +1326,49 @@ async fn get_state_as_of_omitted_symbols_keeps_unprefixed_when_only_nq_frame() {
 }
 
 #[tokio::test]
+async fn get_state_as_of_omitted_symbols_serves_es_when_only_es_frame() {
+    let server = test_server_with_sil();
+    let ts = 1_704_207_600_000.0;
+    server.market_router.apply_tick(
+        the_desk_backend::engine::RouterRoot::Es,
+        &the_desk_backend::engine::SourceTick {
+            timestamp_ms: ts,
+            price: 5_000.0,
+            volume: 1.0,
+            bid: 4_999.75,
+            ask: 5_000.25,
+            side: TradeSide::Buy,
+            root_symbol: Some("ES".into()),
+        },
+    );
+    {
+        let db = server.db.lock().expect("db");
+        server.market_router.persist_journal(&db).expect("es frame");
+    }
+    let out = parse_text_tool_result(
+        server
+            .get_state(Parameters(GetStateParams {
+                symbols: None,
+                domains: Some(vec!["location_structure".into()]),
+                resolution: Some("R0".into()),
+                as_of: Some(ts + 100.0),
+                ..Default::default()
+            }))
+            .await
+            .expect("as_of ES-only"),
+    );
+    assert_eq!(out["trustLevel"], "L0");
+    assert_eq!(out["provenance"]["location_structure"]["source"], "journal");
+    assert_eq!(out["degraded"]["location_structure"], false);
+    let values = out["values"].as_object().expect("values");
+    assert_eq!(
+        values.get("market.location_structure.lastPrice"),
+        Some(&serde_json::json!(5_000.0)),
+        "omitted symbols with only ES present must serve the ES frame, not a degraded NQ placeholder: {values:?}"
+    );
+}
+
+#[tokio::test]
 async fn get_state_rejects_r2_r3() {
     let server = test_server_with_sil();
     let err = server

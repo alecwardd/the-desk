@@ -458,8 +458,18 @@ impl TheDeskMcp {
                 invalid_params_error("get_state as_of required a MarketRouter root")
             })?
         } else {
+            // Omitted symbols: unprefixed envelope of a present frame. Prefer NQ
+            // (live primary). If only ES printed this second, serve ES — do not
+            // return the degraded NQ placeholder and drop the real frame.
+            let preferred = if journal_root_present(journal.as_ref(), RouterRoot::Nq) {
+                RouterRoot::Nq
+            } else if journal_root_present(journal.as_ref(), RouterRoot::Es) {
+                RouterRoot::Es
+            } else {
+                RouterRoot::Nq
+            };
             by_root
-                .remove(RouterRoot::Nq.as_str())
+                .remove(preferred.as_str())
                 .or_else(|| by_root.into_values().next())
                 .ok_or_else(|| {
                     invalid_params_error("get_state as_of required a MarketRouter root")
@@ -610,4 +620,13 @@ fn finish_state_envelope_json(envelope: &StateEnvelope) -> Result<serde_json::Va
         obj.insert("orderAuthority".into(), serde_json::json!(false));
     }
     Ok(out)
+}
+
+fn journal_root_present(
+    journal: Option<&the_desk_backend::db::JournalAsOfSnapshot>,
+    root: RouterRoot,
+) -> bool {
+    journal
+        .and_then(|snap| snap.by_root.get(root.as_str()))
+        .is_some_and(|payload| !payload.is_null())
 }

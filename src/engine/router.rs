@@ -122,14 +122,21 @@ impl MarketRouter {
         self.es.mark_stopped();
     }
 
-    /// Aligned clock: max market timestamp applied on any lane (epoch ms).
+    /// Aligned clock: max market timestamp across lanes (epoch ms).
+    ///
+    /// Prefers the merge-sorted apply clock, then each lane's last tick / tape
+    /// last trade so the embedded shared-NQ path still contributes.
     pub fn clock_ms(&self) -> Option<f64> {
         let bits = self.clock_ms_bits.load(Ordering::Acquire);
-        if bits == 0 {
+        let stored = if bits == 0 {
             None
         } else {
             Some(f64::from_bits(bits))
-        }
+        };
+        max_opt_ts(
+            max_opt_ts(stored, self.nq.market_time_ms()),
+            self.es.market_time_ms(),
+        )
     }
 
     /// Apply one tick to the owning symbol's host only (no cross-lane session mix).
@@ -350,6 +357,15 @@ impl MarketRouter {
     }
 }
 
+fn max_opt_ts(a: Option<f64>, b: Option<f64>) -> Option<f64> {
+    match (a, b) {
+        (Some(x), Some(y)) if x.is_finite() && y.is_finite() => Some(x.max(y)),
+        (Some(x), _) if x.is_finite() => Some(x),
+        (_, Some(y)) if y.is_finite() => Some(y),
+        _ => None,
+    }
+}
+
 /// Stable one-clock order: market time, then NQ before ES on a timestamp tie.
 pub fn sort_ticks_one_clock(ticks: &mut [(RouterRoot, SourceTick)]) {
     ticks.sort_by(|a, b| {
@@ -515,5 +531,29 @@ mod tests {
         assert!(!published.degraded);
         assert_eq!(published.market_state["lastPrice"], 20_000.0);
         assert!(!published.by_symbol.contains_key("ES"));
+    }
+
+    #[test]
+    fn shared_nq_tape_contributes_to_aligned_clock() {
+        let nq_pipelines = Arc::new(Mutex::new(PipelineEngine::new()));
+        let router = MarketRouter::with_shared_nq(
+            Arc::clone(&nq_pipelines),
+            Arc::new(Mutex::new(EventDetector::new())),
+            Arc::new(Mutex::new(FlowEventEmitter::new())),
+            Arc::new(Mutex::new(20_000.0)),
+            Arc::new(Mutex::new(20_000.25)),
+            RouterRoot::Nq,
+            SourceProviderKind::File,
+            "embedded",
+        );
+        {
+            let mut p = nq_pipelines.lock().unwrap();
+            p.on_trade_with_timestamp(20_000.0, 1.0, true, 30, RTH_TS + 800.0);
+        }
+        router.apply_tick(RouterRoot::Es, &tick(RTH_TS + 100.0, 5_000.0));
+        assert_eq!(router.clock_ms(), Some(RTH_TS + 800.0));
+        let nq = router.nq_host().snapshot_market_state();
+        assert_eq!(nq["sessionType"], "RTH");
+        assert_eq!(nq["lastPrice"], 20_000.0);
     }
 }

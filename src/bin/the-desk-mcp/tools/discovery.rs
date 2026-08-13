@@ -196,7 +196,15 @@ impl TheDeskMcp {
                 })?;
                 by_root.insert(root.as_str().to_string(), env);
             }
-            let clock_ms = self.market_router.clock_ms().or(data_time);
+            let mut clock_ms = self.market_router.clock_ms().or(data_time);
+            for piece in live_by_symbol.values() {
+                clock_ms = match (clock_ms, piece.data_time) {
+                    (Some(a), Some(b)) if a.is_finite() && b.is_finite() => Some(a.max(b)),
+                    (Some(a), _) if a.is_finite() => Some(a),
+                    (_, Some(b)) if b.is_finite() => Some(b),
+                    (other, _) => other,
+                };
+            }
             let envelope = merge_symbol_envelopes(by_root, clock_ms)
                 .map_err(|e| McpError::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?;
             return Ok(text_result(finish_state_envelope_json(&envelope)?));

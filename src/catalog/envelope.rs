@@ -369,6 +369,18 @@ fn is_symbol_scoped_domain(domain_id: &str) -> bool {
     !matches!(domain_id, "positioning" | "events" | "meta")
 }
 
+/// Catalog field id → domain id (`market.location_structure.lastPrice` → `location_structure`).
+fn field_domain_id(field_id: &str) -> Option<&str> {
+    if let Some(rest) = field_id.strip_prefix("market.") {
+        return rest.split('.').next();
+    }
+    field_id.split('.').next()
+}
+
+fn field_is_symbol_scoped(field_id: &str) -> bool {
+    field_domain_id(field_id).is_none_or(is_symbol_scoped_domain)
+}
+
 /// Merge per-root StateEnvelopes into one multi-symbol envelope.
 ///
 /// Values and symbol-scoped provenance/degraded keys are prefixed
@@ -411,7 +423,12 @@ pub fn merge_symbol_envelopes(
             truncated = Some(true);
         }
         for (field_id, value) in &env.values {
-            values.insert(format!("{root}.{field_id}"), value.clone());
+            let key = if field_is_symbol_scoped(field_id) {
+                format!("{root}.{field_id}")
+            } else {
+                field_id.clone()
+            };
+            values.entry(key).or_insert_with(|| value.clone());
         }
         for (domain, prov) in &env.provenance {
             if is_symbol_scoped_domain(domain) {
@@ -717,5 +734,77 @@ mod tests {
         assert!(merged.provenance.contains_key("ES.identity"));
         assert!(merged.degraded.contains_key("NQ.location_structure"));
         assert!(merged.degraded.contains_key("ES.location_structure"));
+    }
+
+    #[test]
+    fn multi_symbol_keeps_meta_and_positioning_unprefixed() {
+        let catalog = build_catalog();
+        let nq = serde_json::json!({
+            "lastPrice": 21000.25,
+            "rootSymbol": "NQ",
+            "sessionType": "RTH",
+        });
+        let es = serde_json::json!({
+            "lastPrice": 5000.0,
+            "rootSymbol": "ES",
+            "sessionType": "Globex",
+        });
+        let domains = Some(vec![
+            "identity".into(),
+            "location_structure".into(),
+            "meta".into(),
+            "positioning".into(),
+        ]);
+        let nq_env = build_state_envelope(
+            &catalog,
+            StateReadRequest {
+                symbols: Some(vec!["NQ".into()]),
+                domains: domains.clone(),
+                fields: None,
+                resolution: StateResolution::R0,
+                as_of: None,
+                budget_tokens: None,
+                snapshot: Some(&nq),
+                snapshot_source: ProvenanceSource::Live,
+                data_time: Some(1.0),
+                source_degraded: false,
+                source_degraded_note: None,
+            },
+        )
+        .unwrap();
+        let es_env = build_state_envelope(
+            &catalog,
+            StateReadRequest {
+                symbols: Some(vec!["ES".into()]),
+                domains: domains.clone(),
+                fields: None,
+                resolution: StateResolution::R0,
+                as_of: None,
+                budget_tokens: None,
+                snapshot: Some(&es),
+                snapshot_source: ProvenanceSource::Live,
+                data_time: Some(2.0),
+                source_degraded: false,
+                source_degraded_note: None,
+            },
+        )
+        .unwrap();
+        let mut by_root = BTreeMap::new();
+        by_root.insert("ES".into(), es_env);
+        by_root.insert("NQ".into(), nq_env);
+        let merged = merge_symbol_envelopes(by_root, Some(2.0)).unwrap();
+        assert!(merged.values.contains_key("meta.catalogVersion"));
+        assert!(merged.provenance.contains_key("meta"));
+        assert!(merged.provenance.contains_key("positioning"));
+        assert!(merged.degraded.contains_key("positioning"));
+        assert_eq!(merged.degraded.get("positioning"), Some(&true));
+        assert!(!merged
+            .values
+            .keys()
+            .any(|k| k.starts_with("NQ.meta.") || k.starts_with("ES.meta.")));
+        assert!(!merged.provenance.contains_key("NQ.meta"));
+        assert!(!merged.provenance.contains_key("ES.positioning"));
+        assert!(merged.provenance.contains_key("NQ.identity"));
+        assert!(merged.provenance.contains_key("ES.identity"));
     }
 }

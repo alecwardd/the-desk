@@ -127,10 +127,24 @@ impl EngineHost {
         }
     }
 
+    /// Market-data time for this lane: last `apply_tick`, else tape last trade.
+    ///
+    /// The tape fallback covers the embedded-engine path where MCP ingest
+    /// updates the shared NQ `PipelineEngine` without calling `apply_tick`.
+    pub fn market_time_ms(&self) -> Option<f64> {
+        if let Some(ts) = self.last_tick_timestamp_ms() {
+            return Some(ts);
+        }
+        self.pipelines
+            .try_lock()
+            .ok()
+            .and_then(|p| p.tape_pace.last_trade_timestamp_ms())
+    }
+
     /// Current MarketState JSON from this lane (Null when no quotes yet).
     ///
-    /// Uses the last applied tick timestamp so session scope (RTH/Globex) is
-    /// classified from market time, not the wall clock.
+    /// Uses the last applied tick timestamp (or tape last trade) so session
+    /// scope (RTH/Globex) is classified from market time, not the wall clock.
     pub fn snapshot_market_state(&self) -> Value {
         let bid = self.last_bid.lock().ok().map(|g| *g).unwrap_or(0.0);
         let ask = self.last_ask.lock().ok().map(|g| *g).unwrap_or(0.0);
@@ -139,7 +153,10 @@ impl EngineHost {
         }
         match self.pipelines.lock() {
             Ok(p) => {
-                let snap = if let Some(ts) = self.last_tick_timestamp_ms() {
+                let ts = self
+                    .last_tick_timestamp_ms()
+                    .or_else(|| p.tape_pace.last_trade_timestamp_ms());
+                let snap = if let Some(ts) = ts {
                     p.snapshot_at(bid.max(1e-9), ask.max(1e-9), ts)
                 } else {
                     p.snapshot(bid.max(1e-9), ask.max(1e-9))

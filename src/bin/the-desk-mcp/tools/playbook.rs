@@ -4,6 +4,13 @@ use rmcp::{
     handler::server::wrapper::Parameters, model::*, tool, tool_router, ErrorData as McpError,
 };
 use std::sync::atomic::Ordering;
+use the_desk_backend::attention::{
+    apply_inbox_cursor, persist_event_stream_attention, rank_attention_inbox,
+    signal_matches_inbox_filters, EVENT_STREAM_VIEW,
+};
+use the_desk_backend::catalog::{
+    kernel_event_from_db_row, COACHING_EVENT_FETCH_CAP, EVENT_LIFECYCLE_TTL_MS,
+};
 use the_desk_backend::db::{AttentionChangelogQuery, AttentionSignalQuery, TradeIdeaQuery};
 use the_desk_backend::observability::RuntimeEventLevel;
 use the_desk_backend::pipelines::MarketState;
@@ -233,7 +240,7 @@ impl TheDeskMcp {
     }
 
     #[tool(
-        description = "Ranked proactive attention inbox. Call this first when asking what deserves attention now; returns durable playbook-grounded signals, never raw ticks."
+        description = "Ranked view over the formalized event stream (get_events lifecycle). Call this first when asking what deserves attention now; returns durable playbook-grounded signals, never raw ticks, never a parallel source of truth. Your playbook indicates / your rules say what deserves attention — this tool does not advise entries."
     )]
     pub(crate) async fn get_attention_inbox(
         &self,
@@ -241,18 +248,48 @@ impl TheDeskMcp {
     ) -> Result<CallToolResult, McpError> {
         let limit = params.limit.unwrap_or(25).clamp(1, 100);
         let cursor = params.cursor.unwrap_or_default();
-        let db = self.db.lock().map_err(|_| lock_error())?;
-        let signals = db
-            .query_attention_signals(&AttentionSignalQuery {
-                status: params.status,
-                min_priority: params.min_priority,
-                include_expired: params.include_expired.unwrap_or(false),
-                cursor_signal_id: cursor.last_signal_id,
-                since_ms: cursor.since_ms,
-                limit,
-                ..AttentionSignalQuery::default()
-            })
-            .map_err(db_error)?;
+        let include_expired = params.include_expired.unwrap_or(false);
+        let clock_ms = self
+            .market_router
+            .clock_ms()
+            .filter(|clock| clock.is_finite() && *clock > 0.0);
+        let now_ms = clock_ms.unwrap_or_else(|| chrono::Utc::now().timestamp_millis() as f64);
+        let since_ms = clock_ms.map(|clock| (clock - EVENT_LIFECYCLE_TTL_MS).max(0.0));
+        let (mut signals, kernel_events, data_age_ms) = {
+            let db = self.db.lock().map_err(|_| lock_error())?;
+            if let Some(clock) = clock_ms {
+                db.expire_event_lifecycles(clock, EVENT_LIFECYCLE_TTL_MS)
+                    .map_err(db_error)?;
+            }
+            let event_rows = db
+                .list_coaching_market_events(COACHING_EVENT_FETCH_CAP, since_ms, None)
+                .map_err(db_error)?;
+            let kernel_events: Vec<_> = event_rows.iter().map(kernel_event_from_db_row).collect();
+            persist_event_stream_attention(&db, &kernel_events, None, now_ms, "live", None)
+                .map_err(db_error)?;
+            let signals = db
+                .query_attention_signals(&AttentionSignalQuery {
+                    status: None,
+                    min_priority: None,
+                    include_expired,
+                    cursor_signal_id: None,
+                    since_ms: None,
+                    limit: COACHING_EVENT_FETCH_CAP,
+                    ..AttentionSignalQuery::default()
+                })
+                .map_err(db_error)?;
+            let data_age_ms = compute_data_age(&db);
+            (signals, kernel_events, data_age_ms)
+        };
+        signals = rank_attention_inbox(signals, &kernel_events, include_expired, now_ms, "live");
+        signals.retain(|signal| {
+            signal_matches_inbox_filters(
+                signal,
+                params.status.as_deref(),
+                params.min_priority.as_deref(),
+            )
+        });
+        signals = apply_inbox_cursor(signals, cursor.last_signal_id.as_deref(), limit);
         let next_cursor = signals.last().map(|signal| {
             serde_json::json!({
                 "lastSignalId": signal.signal_id,
@@ -263,7 +300,10 @@ impl TheDeskMcp {
             "signals": signals,
             "count": signals.len(),
             "nextCursor": next_cursor,
-            "dataAgeMs": compute_data_age(&db)
+            "dataAgeMs": data_age_ms,
+            "viewOf": EVENT_STREAM_VIEW,
+            "lifecycleFormalized": true,
+            "sourceOperator": "get_events",
         })))
     }
 

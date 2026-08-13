@@ -376,4 +376,55 @@ mod tests {
             "NQ RTH must not appear co-recorded on the Globex second"
         );
     }
+
+    #[test]
+    fn persist_journal_writes_lifecycle_and_attention_without_mcp() {
+        let db = Database::open(":memory:").expect("db");
+        let router = MarketRouter::new(RouterRoot::Nq, SourceProviderKind::File, "overnight");
+        router.apply_tick(RouterRoot::Nq, &tick(RTH_TS, 20_000.0));
+        let event = MarketEvent {
+            session_date: "2024-01-02".into(),
+            timestamp_ms: RTH_TS + 100.0,
+            event_type: "ib_extension_hit".into(),
+            level_name: Some("ib_high".into()),
+            price: 20_000.25,
+            direction: Some("from_below".into()),
+            sequence_num: Some(1),
+            metadata: None,
+            session_type: "RTH".into(),
+            session_segment: "None".into(),
+            trading_day: "2024-01-02".into(),
+        };
+        router.note_transition_events(RouterRoot::Nq, &[event]);
+        router.persist_journal(&db).expect("persist");
+        let rows = db
+            .list_recent_market_events(10, None, Some("ib_extension_hit"))
+            .expect("events");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["lifecycle"], "open");
+        assert!(rows[0].get("frameRef").is_none());
+        assert!(rows[0]["journalFrameSecond"].as_i64().is_some());
+        assert!(rows[0]["identityId"].as_str().unwrap().starts_with("evt_"));
+        assert!(rows[0]["dedupIdentityId"]
+            .as_str()
+            .unwrap()
+            .starts_with("dedup_"));
+        let signals = db
+            .query_attention_signals(&crate::db::AttentionSignalQuery {
+                include_expired: true,
+                limit: 50,
+                ..crate::db::AttentionSignalQuery::default()
+            })
+            .expect("attention");
+        assert!(
+            !signals.is_empty(),
+            "engine persist must write attention without MCP attached"
+        );
+        assert_eq!(signals[0].payload["viewOf"], "eventStream");
+        assert!(signals[0].summary.contains("Your playbook"));
+        assert!(!signals[0]
+            .summary
+            .to_ascii_lowercase()
+            .contains("you should buy"));
+    }
 }

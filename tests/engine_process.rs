@@ -189,32 +189,28 @@ async fn kill_the_engine_degrades_and_recovers() {
     );
     assert!(client.last_error().is_some());
 
-    // Recover: new engine on same bind.
+    // Recover on a fresh bind. Windows can return WSAEACCES (10013) / TIME_WAIT
+    // if we reuse the killed listen port; the contract is degrade then recover,
+    // not exclusive reuse of the same TCP port.
     let (tx2, rx2) = watch::channel(false);
     host.poll_once(&mut provider, 100).unwrap();
     let store_bg = store.clone();
-    let mut listener2 = None;
-    for _ in 0..80 {
-        match tokio::net::TcpListener::bind(&bind).await {
-            Ok(l) => {
-                listener2 = Some(l);
-                break;
-            }
-            Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
-        }
-    }
-    let listener2 = listener2.expect("recover bind after kill");
+    let listener2 = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("recover bind");
+    let bind2 = listener2.local_addr().unwrap().to_string();
     let serve2 =
         tokio::spawn(
             async move { EngineSocketServer::serve_listener(listener2, store_bg, rx2).await },
         );
-    let mut recovered = client.get_published().await;
+    let client2 = EngineClient::new(bind2);
+    let mut recovered = client2.get_published().await;
     for _ in 0..100 {
         if !recovered.degraded && recovered.generation > 0 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
-        recovered = client.get_published().await;
+        recovered = client2.get_published().await;
     }
     assert!(
         !recovered.degraded,

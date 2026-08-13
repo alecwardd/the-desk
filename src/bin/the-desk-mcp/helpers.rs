@@ -388,6 +388,8 @@ pub(crate) fn spawn_attention_periodic_pulse(
     last_bid: Arc<Mutex<f64>>,
     last_ask: Arc<Mutex<f64>>,
 ) {
+    // Deterministic absence overlay on a timer — not cheap-model / LLM narration.
+    // SIL-M4: cheap-model invocation is event-triggered only.
     tokio::spawn(async move {
         let interval = Duration::from_secs(5);
         loop {

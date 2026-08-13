@@ -6,9 +6,11 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use the_desk_backend::attention::{
-    AttentionNotifierConfig, AttentionPulseKind, SignalComposer, SignalComposerInput,
+    persist_event_stream_attention, AttentionNotifierConfig, AttentionPulseKind, SignalComposer,
+    SignalComposerInput,
 };
 use the_desk_backend::backfill;
+use the_desk_backend::catalog::kernel_event_from_market_event_scoped;
 use the_desk_backend::db::{
     AttentionSignalQuery, AttentionSignalRecord, Database, ReplaySignalRecord, SessionScopeFilter,
     SetupRuntimeStateRecord, SignalOutcome,
@@ -600,6 +602,21 @@ pub(crate) fn compose_and_persist_attention(
     }
     for idea in &output.idea_cards {
         let _ = db.upsert_trade_idea_card(idea);
+    }
+    if source == "live" && !new_events.is_empty() {
+        let root = Some(snapshot.root_symbol.as_str()).filter(|s| !s.is_empty());
+        let kernel: Vec<_> = new_events
+            .iter()
+            .map(|event| kernel_event_from_market_event_scoped(event, root, None))
+            .collect();
+        let _ = persist_event_stream_attention(
+            db,
+            &kernel,
+            Some(snapshot),
+            timestamp_ms,
+            source,
+            job_id,
+        );
     }
     if source == "live" {
         dispatch_attention_runtime_notifications(db, runtime_events, timestamp_ms);

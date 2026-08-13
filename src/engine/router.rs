@@ -8,13 +8,17 @@
 //!
 //! Trust Ceiling stays **L3**. MarketRouter never places orders.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::attention::persist_event_stream_attention;
+use crate::catalog::{
+    collapse_events_latest_per_dedup, kernel_event_from_db_row, EVENT_LIFECYCLE_TTL_MS,
+};
 use crate::db::{Database, DbError, JournalFrameRecord};
 use crate::feed::ContractMetadata;
-use crate::pipelines::{EventDetector, FlowEventEmitter, MarketEvent, PipelineEngine};
+use crate::pipelines::{EventDetector, FlowEventEmitter, MarketEvent, MarketState, PipelineEngine};
 use serde_json::Value;
 
 use super::health::{EngineHealth, FeedStallState};
@@ -475,7 +479,18 @@ impl MarketRouter {
             .map(|mut g| std::mem::take(&mut *g))
             .unwrap_or_default();
         match persist_journal_observation(db, &frames, &events) {
-            Ok(stats) => Ok(stats),
+            Ok(stats) => {
+                let clock = self.clock_ms().unwrap_or(0.0);
+                if clock > 0.0 {
+                    if let Err(err) = db.expire_event_lifecycles(clock, EVENT_LIFECYCLE_TTL_MS) {
+                        tracing::warn!(error = %err, "market_router.event_lifecycle_expire");
+                    }
+                }
+                if !events.is_empty() {
+                    persist_router_event_attention(db, self, &events, clock);
+                }
+                Ok(stats)
+            }
             Err(err) => {
                 self.restore_pending_journal(frames, events);
                 Err(err)
@@ -532,6 +547,78 @@ fn max_opt_ts(a: Option<f64>, b: Option<f64>) -> Option<f64> {
         (Some(x), _) if x.is_finite() => Some(x),
         (_, Some(y)) if y.is_finite() => Some(y),
         _ => None,
+    }
+}
+
+fn persist_router_event_attention(
+    db: &Database,
+    router: &MarketRouter,
+    events: &[(RouterRoot, MarketEvent)],
+    clock_ms: f64,
+) {
+    if events.is_empty() {
+        return;
+    }
+    let timestamp_ms = if clock_ms > 0.0 {
+        clock_ms
+    } else {
+        events
+            .iter()
+            .map(|(_, e)| e.timestamp_ms)
+            .fold(0.0_f64, f64::max)
+    };
+    let pending_ids: Vec<String> = events
+        .iter()
+        .map(|(root, event)| crate::db::market_event_dedup_id(event, Some(root.as_str())))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let rows = match db.list_market_events_by_dedup_ids(&pending_ids) {
+        Ok(rows) => rows,
+        Err(err) => {
+            tracing::warn!(error = %err, "market_router.attention_event_read");
+            return;
+        }
+    };
+    let kernel_events =
+        collapse_events_latest_per_dedup(rows.iter().map(kernel_event_from_db_row).collect());
+    let mut by_root: BTreeMap<Option<RouterRoot>, Vec<crate::catalog::KernelEvent>> =
+        BTreeMap::new();
+    for event in kernel_events {
+        let root = event
+            .root_symbol
+            .as_deref()
+            .or(event.frame_ref.root_symbol.as_deref())
+            .and_then(|s| match RouterRoot::parse(s) {
+                Ok(root) => Some(root),
+                Err(_) => {
+                    tracing::warn!(root = s, "market_router.attention_unknown_root");
+                    None
+                }
+            });
+        by_root.entry(root).or_default().push(event);
+    }
+    if by_root.is_empty() {
+        return;
+    }
+    for (root, kernel_events) in by_root {
+        let snapshot = root.and_then(|root| {
+            serde_json::from_value::<MarketState>(router.lane(root).snapshot_market_state()).ok()
+        });
+        if let Err(err) = persist_event_stream_attention(
+            db,
+            &kernel_events,
+            snapshot.as_ref(),
+            timestamp_ms,
+            "live",
+            None,
+        ) {
+            tracing::warn!(
+                root = root.map(RouterRoot::as_str).unwrap_or("unknown"),
+                error = %err,
+                "market_router.attention_upsert"
+            );
+        }
     }
 }
 

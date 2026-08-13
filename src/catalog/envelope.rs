@@ -263,14 +263,16 @@ fn domain_provenance(
     }
 
     if domain_id == "events" {
-        // Event taxonomy is reserved; identity for get_events lands separately.
+        // Event rows live on get_events (lifecycle + frame_ref). Capsules later.
         return (
             DomainProvenance {
                 source: req.snapshot_source,
                 data_time: req.data_time,
                 vendor: None,
                 note: Some(
-                    "events domain descriptors reserved; use get_events for event rows".into(),
+                    "events domain descriptors: lifecycle formalized on get_events; \
+                     DOM-family taxonomy named for later Capsule policy"
+                        .into(),
                 ),
             },
             true,

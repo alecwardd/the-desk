@@ -427,6 +427,9 @@ pub struct TheDeskMcp {
     pub(crate) engine_published: Option<the_desk_backend::engine::PublishedStateStore>,
     /// Last engine-adapter error (kill-the-engine / connect failures).
     pub(crate) engine_adapter_error: Arc<Mutex<Option<String>>>,
+    /// MarketRouter v0: concurrent NQ + ES lanes on one clock (embedded ES lane;
+    /// NQ shares the live coaching pipelines).
+    pub(crate) market_router: std::sync::Arc<the_desk_backend::engine::MarketRouter>,
 }
 
 #[derive(Debug)]

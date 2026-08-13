@@ -92,16 +92,34 @@ impl TheDeskMcp {
             db_path.clone(),
             crate::read_pool::DEFAULT_READ_POOL_SIZE,
         );
+        let pipelines = Arc::new(Mutex::new(pipelines));
+        let detector = Arc::new(Mutex::new(EventDetector::new()));
+        let flow_emitter = Arc::new(Mutex::new(FlowEventEmitter::new()));
+        let last_bid = Arc::new(Mutex::new(0.0));
+        let last_ask = Arc::new(Mutex::new(0.0));
+        let market_router = Arc::new(the_desk_backend::engine::MarketRouter::with_shared_nq(
+            Arc::clone(&pipelines),
+            Arc::clone(&detector),
+            Arc::clone(&flow_emitter),
+            Arc::clone(&last_bid),
+            Arc::clone(&last_ask),
+            the_desk_backend::engine::RouterRoot::Nq,
+            the_desk_backend::engine::SourceProviderKind::File,
+            match sil_config.engine_mode {
+                the_desk_backend::catalog::EngineMode::External => "external",
+                the_desk_backend::catalog::EngineMode::Embedded => "embedded",
+            },
+        ));
         Self {
             db: Arc::new(Mutex::new(db)),
             db_path: Arc::new(db_path),
             read_pool,
-            pipelines: Arc::new(Mutex::new(pipelines)),
-            detector: Arc::new(Mutex::new(EventDetector::new())),
-            flow_emitter: Arc::new(Mutex::new(FlowEventEmitter::new())),
+            pipelines,
+            detector,
+            flow_emitter,
             rules: Arc::new(Mutex::new(RulesEngine::default())),
-            last_bid: Arc::new(Mutex::new(0.0)),
-            last_ask: Arc::new(Mutex::new(0.0)),
+            last_bid,
+            last_ask,
             feed_runtime: Arc::new(McpFeedRuntimeState::default()),
             runtime_events,
             playbook_cache: Arc::new(PlaybookRuntimeCache::default()),
@@ -120,6 +138,7 @@ impl TheDeskMcp {
             },
             engine_adapter_error: Arc::new(Mutex::new(None)),
             sil_config,
+            market_router,
         }
     }
 

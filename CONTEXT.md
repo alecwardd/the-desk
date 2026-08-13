@@ -17,8 +17,8 @@ exactly in code, docs, ADRs, and agent copy. Do not invent synonyms.
 | **Positioning** | Dealer/options domain with four record kinds: position-grid, by-strike, Slice, Levels-Only Record. Catalog stub first; providers later. |
 | **Slice** | Price-indexed greek values plus Desk-derived levels at capture time (Positioning record kind). |
 | **Levels-Only Record** | First-class manual Positioning path when capture is unavailable. |
-| **MarketRouter** | Concurrent per-symbol pipeline host (NQ+ES) on one clock — later milestone; not implemented in M1b. |
-| **StateEnvelope** | `get_state` response: `values`, per-domain `provenance`, per-domain `degraded`, `catalogVersion`. Absence of provenance is a failure. |
+| **MarketRouter** | Concurrent per-symbol pipeline host (NQ+ES) on one clock. Each root owns an isolated pipeline set; ticks are merge-sorted by `(timestamp_ms, root)` so cross-market predicates are co-recorded from the first row. Session scope (RTH/Globex) is classified per tick on the owning lane — never mixed across symbols. MES/MNQ are out of scope. |
+| **StateEnvelope** | `get_state` response: `values`, per-domain `provenance`, per-domain `degraded`, `catalogVersion`. Absence of provenance is a failure. Multi-symbol reads (NQ+ES) live in one envelope: values keyed `{ROOT}.{catalogFieldId}`, symbol-scoped provenance keyed `{ROOT}.{domain}`, plus `clockMs` for the aligned MarketRouter clock. |
 | **Desk Catalog** | Versioned schema waist over annotated runtime fields + Positioning stub. Discovery is metadata-only. |
 | **SourceProvider** | Market-data provider seam for the engine host. **FileProvider** covers Sierra `.scid`/`.depth`; **SierraProvider** is stubbed until ACSIL (#23). |
 | **FileProvider** | Real SourceProvider adapter over on-disk `.scid` + discovered `.depth` paths. |

@@ -81,10 +81,22 @@ impl EngineSocketServer {
     pub async fn serve(
         self,
         store: PublishedStateStore,
-        mut shutdown: watch::Receiver<bool>,
+        shutdown: watch::Receiver<bool>,
     ) -> std::io::Result<()> {
         let listener = TcpListener::bind(&self.bind).await?;
-        tracing::info!(bind = %self.bind, "engine.state_socket.listening");
+        Self::serve_listener(listener, store, shutdown).await
+    }
+
+    /// Serve on an already-bound listener (tests: avoid probe-drop-rebind TIME_WAIT).
+    pub async fn serve_listener(
+        listener: TcpListener,
+        store: PublishedStateStore,
+        mut shutdown: watch::Receiver<bool>,
+    ) -> std::io::Result<()> {
+        tracing::info!(
+            bind = %listener.local_addr()?.to_string(),
+            "engine.state_socket.listening"
+        );
         loop {
             tokio::select! {
                 _ = shutdown.changed() => {
@@ -158,17 +170,21 @@ impl EngineClient {
     }
 
     async fn call(&self, req: SocketRequest) -> Result<SocketResponse, String> {
-        let connect = TcpStream::connect(&self.addr);
-        let mut stream = tokio::time::timeout(Duration::from_secs(2), connect)
+        let addr = self.addr.clone();
+        let fut = async {
+            let mut stream = TcpStream::connect(&addr)
+                .await
+                .map_err(|e| format!("engine socket connect failed: {e}"))?;
+            write_msg(&mut stream, &req)
+                .await
+                .map_err(|e| format!("engine socket write failed: {e}"))?;
+            read_msg(&mut stream)
+                .await
+                .map_err(|e| format!("engine socket read failed: {e}"))
+        };
+        let resp = tokio::time::timeout(Duration::from_secs(2), fut)
             .await
-            .map_err(|_| "engine socket connect timed out".to_string())?
-            .map_err(|e| format!("engine socket connect failed: {e}"))?;
-        write_msg(&mut stream, &req)
-            .await
-            .map_err(|e| format!("engine socket write failed: {e}"))?;
-        let resp: SocketResponse = read_msg(&mut stream)
-            .await
-            .map_err(|e| format!("engine socket read failed: {e}"))?;
+            .map_err(|_| "engine socket call timed out".to_string())??;
         if let Ok(mut g) = self.last_error.lock() {
             *g = None;
         }
@@ -254,15 +270,17 @@ mod tests {
             health: EngineHealth::unavailable("boot"),
             degraded: false,
             degraded_note: None,
+            by_symbol: Default::default(),
+            clock_ms: Some(1.0),
+            primary_root: "NQ".into(),
         });
         let (tx, rx) = watch::channel(false);
-        // Pick a free port, then re-bind inside serve().
-        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let bind = probe.local_addr().unwrap().to_string();
-        drop(probe);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bind = listener.local_addr().unwrap().to_string();
         let store_bg = store.clone();
-        let server = EngineSocketServer::new(bind.clone());
-        let handle = tokio::spawn(async move { server.serve(store_bg, rx).await });
+        let handle = tokio::spawn(async move {
+            EngineSocketServer::serve_listener(listener, store_bg, rx).await
+        });
 
         let client = EngineClient::new(bind.clone());
         // Wait briefly for listen
@@ -297,10 +315,25 @@ mod tests {
             health: EngineHealth::unavailable("recovered"),
             degraded: false,
             degraded_note: None,
+            by_symbol: Default::default(),
+            clock_ms: Some(2.0),
+            primary_root: "NQ".into(),
         });
         let store_bg = store.clone();
-        let server = EngineSocketServer::new(bind.clone());
-        let handle2 = tokio::spawn(async move { server.serve(store_bg, rx2).await });
+        let mut listener2 = None;
+        for _ in 0..80 {
+            match TcpListener::bind(&bind).await {
+                Ok(l) => {
+                    listener2 = Some(l);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
+        }
+        let listener2 = listener2.expect("recover bind");
+        let handle2 = tokio::spawn(async move {
+            EngineSocketServer::serve_listener(listener2, store_bg, rx2).await
+        });
         for _ in 0..50 {
             if client.ping().await.is_ok() {
                 break;

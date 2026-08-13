@@ -37,7 +37,7 @@ operators appear (Trust Level L0 — read/query, no mutation/order authority):
 1. `describe_environment` — catalogVersion, Trust Ceiling (L3), domain list, Positioning stub status.
 2. `describe_domain` — one domain's field descriptors (unit, session scope, freshness, cost hint).
 3. `search_catalog` — text search over field ids / names / descriptions.
-4. `get_state` — StateEnvelope (`values` + per-domain `provenance` + `degraded`; resolution R0|R1 only).
+4. `get_state` — StateEnvelope (`values` + per-domain `provenance` + `degraded`; resolution R0|R1 only). MarketRouter v0: `symbols=["NQ","ES"]` returns both roots in one envelope.
 5. `get_events` — event identity rows (type, time, severity placeholder, identityId); lifecycle formalization is later.
 
 Default off keeps the **121 MCP tools** surface unchanged. Artifacts:

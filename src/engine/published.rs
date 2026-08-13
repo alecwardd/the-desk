@@ -3,6 +3,7 @@
 //! Readers (MCP adapter / socket) never take the pipeline mutex. Writers swap
 //! a complete snapshot after each ingest/publish cycle.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -34,6 +35,15 @@ pub struct PublishedEngineState {
     pub degraded: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub degraded_note: Option<String>,
+    /// Per-root MarketState JSON (NQ and/or ES). Empty on pre-M2b placeholders.
+    #[serde(default)]
+    pub by_symbol: BTreeMap<String, Value>,
+    /// Aligned MarketRouter clock (max applied market timestamp across lanes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clock_ms: Option<f64>,
+    /// Coaching-path primary root (`NQ` unless configured otherwise).
+    #[serde(default)]
+    pub primary_root: String,
 }
 
 impl PublishedEngineState {
@@ -54,6 +64,28 @@ impl PublishedEngineState {
                 "engine published state unavailable — your playbook reads should treat live structure as degraded"
                     .into(),
             ),
+            by_symbol: BTreeMap::new(),
+            clock_ms: None,
+            primary_root: "NQ".into(),
+        }
+    }
+
+    /// Snapshot for one MarketRouter root, falling back to primary `market_state`.
+    pub fn snapshot_for_root(&self, root: &str) -> Option<&Value> {
+        if let Some(v) = self.by_symbol.get(root) {
+            if !v.is_null() {
+                return Some(v);
+            }
+        }
+        let primary = if self.primary_root.is_empty() {
+            "NQ"
+        } else {
+            self.primary_root.as_str()
+        };
+        if root.eq_ignore_ascii_case(primary) && !self.market_state.is_null() {
+            Some(&self.market_state)
+        } else {
+            None
         }
     }
 }
@@ -110,6 +142,9 @@ mod tests {
             health: EngineHealth::unavailable("ok"),
             degraded: false,
             degraded_note: None,
+            by_symbol: BTreeMap::new(),
+            clock_ms: Some(1.0),
+            primary_root: "NQ".into(),
         });
         let second = store.load();
         assert_eq!(second.generation, 1);

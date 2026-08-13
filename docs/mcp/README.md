@@ -171,6 +171,9 @@ With `[sil].catalog_discovery = true`:
 - Published coaching state uses a lock-free swap; kill-the-engine degrades
   cleanly (`engine.adapter_degraded`) and recovers on reconnect.
 - `SourceProvider`: FileProvider (`.scid`/`.depth`) real; SierraProvider stubbed.
+- **MarketRouter v0:** concurrent NQ + ES on one clock. `get_state` can return both
+  symbols in one StateEnvelope (`{ROOT}.{catalogFieldId}` values). Micros (MES/MNQ)
+  are out of scope. Missing ES does not degrade the NQ coaching path.
 - Trust Ceiling stays L3; read/query kernel remains Trust Level L0.
 
 ## Runtime Model

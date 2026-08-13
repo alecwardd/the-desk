@@ -5,12 +5,13 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 
-use crate::feed::TradeSide;
+use crate::feed::{ContractMetadata, TradeSide};
 use crate::minute_of_session_from_timestamp;
 use crate::pipelines::{EventDetector, FlowEventEmitter, MarketEvent, MarketState, PipelineEngine};
 
 use super::health::{EngineHealth, FeedStallState};
 use super::published::{PublishedEngineState, PublishedStateStore};
+use super::root::RouterRoot;
 use super::source::{SourceProvider, SourceProviderKind, SourceTick};
 
 const STALL_THRESHOLD_MS: u64 = 10_000;
@@ -35,8 +36,9 @@ pub struct EngineHost {
     events_detected: AtomicU64,
     last_ingest_wall_ms: AtomicU64,
     last_publish_wall_ms: AtomicU64,
-    last_bid: Mutex<f64>,
-    last_ask: Mutex<f64>,
+    last_tick_timestamp_bits: AtomicU64,
+    last_bid: Arc<Mutex<f64>>,
+    last_ask: Arc<Mutex<f64>>,
     recent_events: Mutex<Vec<Value>>,
     running: AtomicBool,
     mode_label: String,
@@ -45,10 +47,42 @@ pub struct EngineHost {
 impl EngineHost {
     /// Create a host with empty pipelines (tests / embedded publish path).
     pub fn new(provider_kind: SourceProviderKind, mode_label: impl Into<String>) -> Self {
+        Self::from_shared(
+            Arc::new(Mutex::new(PipelineEngine::new())),
+            Arc::new(Mutex::new(EventDetector::new())),
+            Arc::new(Mutex::new(FlowEventEmitter::new())),
+            Arc::new(Mutex::new(0.0)),
+            Arc::new(Mutex::new(0.0)),
+            provider_kind,
+            mode_label,
+        )
+    }
+
+    /// Lane constructor: empty pipelines with `rootSymbol` already bound.
+    pub fn new_for_root(
+        root: RouterRoot,
+        provider_kind: SourceProviderKind,
+        mode_label: impl Into<String>,
+    ) -> Self {
+        let host = Self::new(provider_kind, mode_label);
+        host.set_contract_metadata(root.placeholder_metadata());
+        host
+    }
+
+    /// Share existing NQ pipelines / quotes (embedded-engine fallback).
+    pub fn from_shared(
+        pipelines: Arc<Mutex<PipelineEngine>>,
+        detector: Arc<Mutex<EventDetector>>,
+        flow_emitter: Arc<Mutex<FlowEventEmitter>>,
+        last_bid: Arc<Mutex<f64>>,
+        last_ask: Arc<Mutex<f64>>,
+        provider_kind: SourceProviderKind,
+        mode_label: impl Into<String>,
+    ) -> Self {
         Self {
-            pipelines: Arc::new(Mutex::new(PipelineEngine::new())),
-            detector: Arc::new(Mutex::new(EventDetector::new())),
-            flow_emitter: Arc::new(Mutex::new(FlowEventEmitter::new())),
+            pipelines,
+            detector,
+            flow_emitter,
             published: PublishedStateStore::new(),
             provider_kind,
             generation: AtomicU64::new(0),
@@ -56,12 +90,93 @@ impl EngineHost {
             events_detected: AtomicU64::new(0),
             last_ingest_wall_ms: AtomicU64::new(0),
             last_publish_wall_ms: AtomicU64::new(0),
-            last_bid: Mutex::new(0.0),
-            last_ask: Mutex::new(0.0),
+            last_tick_timestamp_bits: AtomicU64::new(0),
+            last_bid,
+            last_ask,
             recent_events: Mutex::new(Vec::new()),
             running: AtomicBool::new(true),
             mode_label: mode_label.into(),
         }
+    }
+
+    /// Bind contract identity so snapshots carry `rootSymbol`.
+    pub fn set_contract_metadata(&self, metadata: ContractMetadata) {
+        if let Ok(mut p) = self.pipelines.lock() {
+            p.set_contract_metadata(metadata);
+        }
+    }
+
+    pub fn ticks_ingested(&self) -> u64 {
+        self.ticks_ingested.load(Ordering::Acquire)
+    }
+
+    pub fn events_detected(&self) -> u64 {
+        self.events_detected.load(Ordering::Acquire)
+    }
+
+    pub fn last_ingest_wall_ms(&self) -> u64 {
+        self.last_ingest_wall_ms.load(Ordering::Acquire)
+    }
+
+    fn last_tick_timestamp_ms(&self) -> Option<f64> {
+        let bits = self.last_tick_timestamp_bits.load(Ordering::Acquire);
+        if bits == 0 {
+            None
+        } else {
+            Some(f64::from_bits(bits))
+        }
+    }
+
+    /// Market-data time for this lane: last `apply_tick`, else tape last trade.
+    ///
+    /// The tape fallback covers the embedded-engine path where MCP ingest
+    /// updates the shared NQ `PipelineEngine` without calling `apply_tick`.
+    pub fn market_time_ms(&self) -> Option<f64> {
+        if let Some(ts) = self.last_tick_timestamp_ms() {
+            return Some(ts);
+        }
+        self.pipelines
+            .try_lock()
+            .ok()
+            .and_then(|p| p.tape_pace.last_trade_timestamp_ms())
+    }
+
+    /// Current MarketState JSON from this lane (Null when no quotes yet).
+    ///
+    /// Uses the last applied tick timestamp (or tape last trade) so session
+    /// scope (RTH/Globex) is classified from market time, not the wall clock.
+    pub fn snapshot_market_state(&self) -> Value {
+        let bid = self.last_bid.lock().ok().map(|g| *g).unwrap_or(0.0);
+        let ask = self.last_ask.lock().ok().map(|g| *g).unwrap_or(0.0);
+        if bid <= 0.0 && ask <= 0.0 {
+            return Value::Null;
+        }
+        match self.pipelines.lock() {
+            Ok(p) => {
+                let ts = self
+                    .last_tick_timestamp_ms()
+                    .or_else(|| p.tape_pace.last_trade_timestamp_ms());
+                let snap = if let Some(ts) = ts {
+                    p.snapshot_at(bid.max(1e-9), ask.max(1e-9), ts)
+                } else {
+                    p.snapshot(bid.max(1e-9), ask.max(1e-9))
+                };
+                serde_json::to_value(snap).unwrap_or(Value::Null)
+            }
+            Err(_) => Value::Null,
+        }
+    }
+
+    /// Bump the host generation (used by MarketRouter combined publish).
+    pub fn next_generation(&self) -> u64 {
+        self.generation.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    pub fn recent_events_json(&self) -> Vec<Value> {
+        self.recent_events
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default()
     }
 
     pub fn published_store(&self) -> PublishedStateStore {
@@ -128,6 +243,10 @@ impl EngineHost {
         };
         let new_events = event_buffer;
         self.ticks_ingested.fetch_add(1, Ordering::Release);
+        if tick.timestamp_ms.is_finite() && tick.timestamp_ms > 0.0 {
+            self.last_tick_timestamp_bits
+                .store(tick.timestamp_ms.to_bits(), Ordering::Release);
+        }
         self.events_detected
             .fetch_add(new_events.len() as u64, Ordering::Release);
         self.last_ingest_wall_ms.store(
@@ -185,8 +304,12 @@ impl EngineHost {
             serde_json::to_value(snap).unwrap_or(Value::Null)
         } else if let Ok(p) = self.pipelines.lock() {
             if bid > 0.0 || ask > 0.0 {
-                serde_json::to_value(p.snapshot(bid.max(1e-9), ask.max(1e-9)))
-                    .unwrap_or(Value::Null)
+                let snap = if let Some(ts) = self.last_tick_timestamp_ms() {
+                    p.snapshot_at(bid.max(1e-9), ask.max(1e-9), ts)
+                } else {
+                    p.snapshot(bid.max(1e-9), ask.max(1e-9))
+                };
+                serde_json::to_value(snap).unwrap_or(Value::Null)
             } else {
                 Value::Null
             }
@@ -245,6 +368,16 @@ impl EngineHost {
                 FeedStallState::Ok => None,
             },
         };
+        let primary_root = market_state
+            .get("rootSymbol")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("NQ")
+            .to_string();
+        let mut by_symbol = std::collections::BTreeMap::new();
+        if !market_state.is_null() {
+            by_symbol.insert(primary_root.clone(), market_state.clone());
+        }
         let state = PublishedEngineState {
             generation,
             engine_pid: std::process::id(),
@@ -263,6 +396,9 @@ impl EngineHost {
             } else {
                 None
             },
+            by_symbol,
+            clock_ms: data_time_ms,
+            primary_root,
         };
         self.last_publish_wall_ms.store(now_ms, Ordering::Release);
         self.published.store(state);
@@ -366,6 +502,7 @@ mod tests {
                 bid: 19_999.75,
                 ask: 20_000.25,
                 side: TradeSide::Buy,
+                root_symbol: None,
             },
             SourceTick {
                 timestamp_ms: ts + 250.0,
@@ -374,6 +511,7 @@ mod tests {
                 bid: 20_000.0,
                 ask: 20_000.50,
                 side: TradeSide::Sell,
+                root_symbol: None,
             },
         ];
         let a = EngineHost::new(SourceProviderKind::File, "embedded");

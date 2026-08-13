@@ -29,8 +29,9 @@ pub(crate) struct SearchCatalogParams {
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct GetStateParams {
-    /// Optional symbol roots (e.g. `["NQ"]`). Until MarketRouter multi-symbol
-    /// ships, requests must match the resolved snapshot `rootSymbol` when known.
+    /// Optional symbol roots (`["NQ"]`, `["ES"]`, or `["NQ","ES"]`). MarketRouter v0
+    /// hosts NQ and ES only; MES/MNQ are rejected. Both roots may be returned in
+    /// one StateEnvelope (values keyed `{ROOT}.{catalogFieldId}`).
     pub(crate) symbols: Option<Vec<String>>,
     /// Optional catalog domain ids (e.g. `location_structure`, `flow`, `positioning`).
     pub(crate) domains: Option<Vec<String>>,
@@ -47,7 +48,7 @@ pub(crate) struct GetStateParams {
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct GetEventsParams {
-    /// Optional symbol roots (informational until MarketRouter multi-symbol lands).
+    /// Optional symbol roots (NQ/ES; informational until event rows are per-root).
     pub(crate) symbols: Option<Vec<String>>,
     /// Optional event type filter (exact match).
     pub(crate) event_type: Option<String>,

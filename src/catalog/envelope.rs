@@ -85,6 +85,9 @@ pub struct StateEnvelope {
     pub resolution: StateResolution,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub symbols: Option<Vec<String>>,
+    /// Aligned MarketRouter clock (max applied market timestamp) when multi-symbol.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clock_ms: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub as_of: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -187,6 +190,7 @@ pub fn build_state_envelope(
         trust_level: TrustLevel::L0,
         resolution: req.resolution,
         symbols: req.symbols,
+        clock_ms: None,
         as_of: req.as_of,
         budget_tokens: req.budget_tokens,
         truncated: None,
@@ -323,8 +327,18 @@ fn apply_token_budget(envelope: &mut StateEnvelope, budget_tokens: u64) {
         return;
     }
     // Drop highest-cost (R1) values first, then trim alphabetically.
+    // Multi-symbol envelopes prefix `{ROOT}.…`; drop non-primary (ES) before NQ
+    // so the coaching-path primary is retained under budget pressure.
     let mut ids: Vec<String> = envelope.values.keys().cloned().collect();
-    ids.sort_by(|a, b| b.cmp(a));
+    ids.sort_by(|a, b| {
+        let a_nq = a.starts_with("NQ.");
+        let b_nq = b.starts_with("NQ.");
+        match (a_nq, b_nq) {
+            (true, false) => std::cmp::Ordering::Greater,
+            (false, true) => std::cmp::Ordering::Less,
+            _ => b.cmp(a),
+        }
+    });
     for id in ids {
         if approx(envelope) <= budget_tokens {
             break;
@@ -358,6 +372,116 @@ fn validate_provenance_complete(envelope: &StateEnvelope) -> Result<(), Envelope
 pub fn state_envelope_json(envelope: &StateEnvelope) -> Result<Value, EnvelopeError> {
     validate_provenance_complete(envelope)?;
     Ok(serde_json::to_value(envelope).unwrap_or(Value::Null))
+}
+
+/// Domains whose values are per-symbol (MarketRouter lanes).
+fn is_symbol_scoped_domain(domain_id: &str) -> bool {
+    !matches!(domain_id, "positioning" | "events" | "meta")
+}
+
+/// Catalog field id → domain id (`market.location_structure.lastPrice` → `location_structure`).
+fn field_domain_id(field_id: &str) -> Option<&str> {
+    if let Some(rest) = field_id.strip_prefix("market.") {
+        return rest.split('.').next();
+    }
+    field_id.split('.').next()
+}
+
+fn field_is_symbol_scoped(field_id: &str) -> bool {
+    field_domain_id(field_id).is_none_or(is_symbol_scoped_domain)
+}
+
+/// Merge per-root StateEnvelopes into one multi-symbol envelope.
+///
+/// Values and symbol-scoped provenance/degraded keys are prefixed
+/// `{ROOT}.{catalogFieldId}` / `{ROOT}.{domain}` so NQ and ES coexist.
+/// Positioning / events / meta stay unprefixed (not symbol-scoped).
+/// Trust Level remains L0; Trust Ceiling remains L3.
+pub fn merge_symbol_envelopes(
+    by_root: BTreeMap<String, StateEnvelope>,
+    clock_ms: Option<f64>,
+) -> Result<StateEnvelope, EnvelopeError> {
+    if by_root.len() <= 1 {
+        let mut env = by_root
+            .into_iter()
+            .next()
+            .map(|(_, e)| e)
+            .ok_or_else(|| EnvelopeError::MissingProvenance("<empty>".into()))?;
+        env.clock_ms = clock_ms;
+        validate_provenance_complete(&env)?;
+        return Ok(env);
+    }
+
+    let roots: Vec<String> = by_root.keys().cloned().collect();
+    let mut values = BTreeMap::new();
+    let mut provenance = BTreeMap::new();
+    let mut degraded = BTreeMap::new();
+    let mut catalog_version = String::new();
+    let mut trust_ceiling = TrustCeiling::L3;
+    let mut resolution = StateResolution::R0;
+    let mut as_of = None;
+    let mut budget_tokens = None;
+    let mut truncated = None;
+
+    for (root, env) in &by_root {
+        catalog_version = env.catalog_version.clone();
+        trust_ceiling = env.trust_ceiling;
+        resolution = env.resolution;
+        as_of = env.as_of.or(as_of);
+        budget_tokens = env.budget_tokens.or(budget_tokens);
+        if env.truncated == Some(true) {
+            truncated = Some(true);
+        }
+        for (field_id, value) in &env.values {
+            let key = if field_is_symbol_scoped(field_id) {
+                format!("{root}.{field_id}")
+            } else {
+                field_id.clone()
+            };
+            values.entry(key).or_insert_with(|| value.clone());
+        }
+        for (domain, prov) in &env.provenance {
+            if is_symbol_scoped_domain(domain) {
+                provenance.insert(format!("{root}.{domain}"), prov.clone());
+            } else {
+                provenance
+                    .entry(domain.clone())
+                    .or_insert_with(|| prov.clone());
+            }
+        }
+        for (domain, flag) in &env.degraded {
+            if is_symbol_scoped_domain(domain) {
+                degraded.insert(format!("{root}.{domain}"), *flag);
+            } else {
+                let entry = degraded.entry(domain.clone()).or_insert(false);
+                *entry = *entry || *flag;
+            }
+        }
+    }
+
+    if truncated.is_none() && by_root.values().any(|e| e.truncated == Some(false)) {
+        truncated = Some(false);
+    }
+
+    let mut envelope = StateEnvelope {
+        values,
+        provenance,
+        degraded,
+        catalog_version,
+        trust_ceiling,
+        trust_level: TrustLevel::L0,
+        resolution,
+        symbols: Some(roots),
+        clock_ms,
+        as_of,
+        budget_tokens,
+        truncated,
+    };
+    if let Some(budget) = budget_tokens {
+        apply_token_budget(&mut envelope, budget);
+    }
+    validate_provenance_complete(&envelope)?;
+    Ok(envelope)
 }
 
 #[cfg(test)]
@@ -460,6 +584,7 @@ mod tests {
             trust_level: TrustLevel::L0,
             resolution: StateResolution::R0,
             symbols: None,
+            clock_ms: None,
             as_of: None,
             budget_tokens: None,
             truncated: None,
@@ -547,5 +672,149 @@ mod tests {
         .unwrap();
         assert_eq!(env.provenance["identity"].source, ProvenanceSource::Journal);
         assert_eq!(env.as_of, Some(1_700_000_000_000.0));
+    }
+
+    #[test]
+    fn multi_symbol_envelope_prefixes_values_and_keeps_l0() {
+        let catalog = build_catalog();
+        let nq = serde_json::json!({
+            "lastPrice": 21000.25,
+            "rootSymbol": "NQ",
+            "sessionType": "RTH",
+        });
+        let es = serde_json::json!({
+            "lastPrice": 5000.0,
+            "rootSymbol": "ES",
+            "sessionType": "Globex",
+        });
+        let nq_env = build_state_envelope(
+            &catalog,
+            StateReadRequest {
+                symbols: Some(vec!["NQ".into()]),
+                domains: Some(vec!["identity".into(), "location_structure".into()]),
+                fields: None,
+                resolution: StateResolution::R0,
+                as_of: None,
+                budget_tokens: None,
+                snapshot: Some(&nq),
+                snapshot_source: ProvenanceSource::Live,
+                data_time: Some(1.0),
+                source_degraded: false,
+                source_degraded_note: None,
+            },
+        )
+        .unwrap();
+        let es_env = build_state_envelope(
+            &catalog,
+            StateReadRequest {
+                symbols: Some(vec!["ES".into()]),
+                domains: Some(vec!["identity".into(), "location_structure".into()]),
+                fields: None,
+                resolution: StateResolution::R0,
+                as_of: None,
+                budget_tokens: None,
+                snapshot: Some(&es),
+                snapshot_source: ProvenanceSource::Live,
+                data_time: Some(2.0),
+                source_degraded: false,
+                source_degraded_note: None,
+            },
+        )
+        .unwrap();
+        let mut by_root = BTreeMap::new();
+        by_root.insert("ES".into(), es_env);
+        by_root.insert("NQ".into(), nq_env);
+        let merged = merge_symbol_envelopes(by_root, Some(2.0)).unwrap();
+        assert_eq!(merged.trust_level, TrustLevel::L0);
+        assert_eq!(merged.trust_ceiling, TrustCeiling::L3);
+        assert_eq!(merged.clock_ms, Some(2.0));
+        assert_eq!(
+            merged.symbols.as_deref(),
+            Some(&["ES".into(), "NQ".into()][..])
+        );
+        assert_eq!(
+            merged.values.get("NQ.market.location_structure.lastPrice"),
+            Some(&serde_json::json!(21000.25))
+        );
+        assert_eq!(
+            merged.values.get("ES.market.location_structure.lastPrice"),
+            Some(&serde_json::json!(5000.0))
+        );
+        assert!(merged.provenance.contains_key("NQ.identity"));
+        assert!(merged.provenance.contains_key("ES.identity"));
+        assert!(merged.degraded.contains_key("NQ.location_structure"));
+        assert!(merged.degraded.contains_key("ES.location_structure"));
+    }
+
+    #[test]
+    fn multi_symbol_keeps_meta_and_positioning_unprefixed() {
+        let catalog = build_catalog();
+        let nq = serde_json::json!({
+            "lastPrice": 21000.25,
+            "rootSymbol": "NQ",
+            "sessionType": "RTH",
+        });
+        let es = serde_json::json!({
+            "lastPrice": 5000.0,
+            "rootSymbol": "ES",
+            "sessionType": "Globex",
+        });
+        let domains = Some(vec![
+            "identity".into(),
+            "location_structure".into(),
+            "meta".into(),
+            "positioning".into(),
+        ]);
+        let nq_env = build_state_envelope(
+            &catalog,
+            StateReadRequest {
+                symbols: Some(vec!["NQ".into()]),
+                domains: domains.clone(),
+                fields: None,
+                resolution: StateResolution::R0,
+                as_of: None,
+                budget_tokens: None,
+                snapshot: Some(&nq),
+                snapshot_source: ProvenanceSource::Live,
+                data_time: Some(1.0),
+                source_degraded: false,
+                source_degraded_note: None,
+            },
+        )
+        .unwrap();
+        let es_env = build_state_envelope(
+            &catalog,
+            StateReadRequest {
+                symbols: Some(vec!["ES".into()]),
+                domains: domains.clone(),
+                fields: None,
+                resolution: StateResolution::R0,
+                as_of: None,
+                budget_tokens: None,
+                snapshot: Some(&es),
+                snapshot_source: ProvenanceSource::Live,
+                data_time: Some(2.0),
+                source_degraded: false,
+                source_degraded_note: None,
+            },
+        )
+        .unwrap();
+        let mut by_root = BTreeMap::new();
+        by_root.insert("ES".into(), es_env);
+        by_root.insert("NQ".into(), nq_env);
+        let merged = merge_symbol_envelopes(by_root, Some(2.0)).unwrap();
+        assert!(merged.values.contains_key("meta.catalogVersion"));
+        assert!(merged.provenance.contains_key("meta"));
+        assert!(merged.provenance.contains_key("positioning"));
+        assert!(merged.degraded.contains_key("positioning"));
+        assert_eq!(merged.degraded.get("positioning"), Some(&true));
+        assert!(!merged
+            .values
+            .keys()
+            .any(|k| k.starts_with("NQ.meta.") || k.starts_with("ES.meta.")));
+        assert!(!merged.provenance.contains_key("NQ.meta"));
+        assert!(!merged.provenance.contains_key("ES.positioning"));
+        assert!(merged.provenance.contains_key("NQ.identity"));
+        assert!(merged.provenance.contains_key("ES.identity"));
     }
 }

@@ -250,6 +250,63 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    // MarketRouter v0: embedded ES lane on the same clock as NQ coaching ingest.
+    // Isolated PipelineEngine — session scope cannot mix with NQ. Missing ES SCID
+    // degrades only the ES slice of get_state; NQ coaching path is unchanged.
+    if !external_engine {
+        let router = Arc::clone(&server.market_router);
+        let feed = config.clone();
+        let poll_ms = config.flush_poll_ms.max(250);
+        let max_ticks = config.max_ticks_per_poll.max(1);
+        let runtime_events_es = Arc::clone(&server.runtime_events);
+        let db_es = Arc::clone(&server.db);
+        tokio::spawn(async move {
+            use the_desk_backend::engine::{FileProvider, RouterRoot, SourceProvider};
+            use tokio::time::{sleep, Duration};
+
+            let mut cfg = feed.clone();
+            cfg.base_symbol = "ES".into();
+            cfg.symbol = "ES".into();
+            cfg.active_symbol_override = None;
+            let es_meta = resolve_contract_metadata(&cfg);
+            router.set_contract_metadata(RouterRoot::Es, es_meta.clone());
+            if !es_meta.scid_file_exists {
+                record_runtime_event(
+                    &runtime_events_es,
+                    Some(&db_es),
+                    RuntimeEventLevel::Info,
+                    "market_router.es_scid_missing",
+                    "engine",
+                    "MarketRouter ES FileProvider has no .scid yet; ES get_state slice stays degraded. NQ coaching path is unchanged.",
+                    serde_json::json!({
+                        "scidPath": es_meta.scid_path,
+                        "rootSymbol": "ES",
+                    }),
+                );
+            }
+            let mut provider = FileProvider::from_feed_config_for_root(&feed, RouterRoot::Es);
+            // Live tail: start at EOF so we do not replay the whole ES history on boot.
+            if let Ok(end) = std::fs::metadata(provider.scid_path()).map(|m| m.len()) {
+                provider.seek(end);
+            }
+            let mut providers = std::collections::BTreeMap::new();
+            providers.insert(
+                RouterRoot::Es,
+                Box::new(provider) as Box<dyn SourceProvider>,
+            );
+            loop {
+                match router.poll_once(&mut providers, max_ticks) {
+                    Ok(n) if n > 0 => continue,
+                    Ok(_) => {}
+                    Err(err) => {
+                        tracing::debug!(error = %err, "market_router.es_poll_error");
+                    }
+                }
+                sleep(Duration::from_millis(poll_ms)).await;
+            }
+        });
+    }
+
     if !external_engine && scid_available {
         let (startup_cutover_tx, rx) = tokio::sync::oneshot::channel::<u64>();
         startup_cutover_rx = Some(rx);

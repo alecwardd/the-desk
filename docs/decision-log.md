@@ -627,3 +627,24 @@ This note does not raise the Trust Ceiling and does not introduce Catalog v0.
 6. **Trust Ceiling stays L3:** no path from this work reaches order placement; read/query kernel operators remain Trust Level L0.
 
 **Consequences:** Continuity becomes a property of the engine process. Embedded mode preserves the live coaching path without requiring an external engine. Socket/embedded coaching-path parity and kill/recover are enforced by process + in-crate tests.
+
+---
+
+### Decision note: SIL-M2b MarketRouter v0 — concurrent NQ + ES
+
+**Date:** 2026-08-13
+**Status:** Decided (implements [alecwardd/the-desk#7](https://github.com/alecwardd/the-desk/issues/7); Part of #2)
+
+**Context:** After M2a the engine host is single-symbol. Cross-market predicates that are not co-recorded from the first row are historically unanswerable. Journal Frames (#8) must inherit an aligned NQ+ES clock.
+
+**Decision:**
+
+1. **MarketRouter v0** hosts exactly two roots — **NQ** and **ES** — each with an isolated `EngineHost` / `PipelineEngine`. MES/MNQ and other roots are rejected at the `RouterRoot` parse boundary.
+2. **One clock:** ticks from both FileProviders are merge-sorted by `(timestamp_ms, root)` (NQ before ES on a tie) and applied in that order. `clockMs` is the max applied market timestamp across lanes. Session classification (RTH / Globex) is per-tick on the owning lane — NQ Globex never contaminates ES RTH (and vice versa).
+3. **StateEnvelope:** `get_state(symbols=["NQ","ES"])` returns both roots in one envelope. Values are keyed `{ROOT}.{catalogFieldId}`; symbol-scoped provenance/degraded are keyed `{ROOT}.{domain}`. Positioning / events / meta stay unprefixed. Single-symbol reads keep the M1b unprefixed shape. Trust Level stays **L0**; Trust Ceiling stays **L3**.
+4. **Coaching-path parity:** published `market_state` remains the primary root (configured `base_symbol`, default NQ) so embedded-engine fallback and external-engine live coaching (`get_market_snapshot`, `evaluate_playbook`) do not regress SIL-M2a. A missing ES SCID degrades only the ES slice.
+5. **Embedded-engine fallback:** MCP-alone still runs MarketRouter. NQ shares the live coaching pipelines; ES is an isolated FileProvider lane. External `the-desk-engine` uses MarketRouter for both roots.
+
+This note does not introduce Journal Frames, Capsules, Feature-IR, Positioning providers, or ACSIL.
+
+**Consequences:** Cross-market live `get_state` is one call. Later Journal Frames can persist both symbols on the same clock without a backfill gap for NQ↔ES conjunctions.

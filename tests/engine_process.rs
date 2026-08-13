@@ -76,6 +76,16 @@ fn rth_ticks() -> Vec<(f64, f64, f64)> {
     ]
 }
 
+async fn bind_reuse(addr: &str) -> std::io::Result<tokio::net::TcpListener> {
+    let addr: std::net::SocketAddr = addr.parse().map_err(|err| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("{addr}: {err}"))
+    })?;
+    let socket = tokio::net::TcpSocket::new_v4()?;
+    socket.set_reuseaddr(true)?;
+    socket.bind(addr)?;
+    socket.listen(1024)
+}
+
 #[tokio::test]
 async fn embedded_and_socket_paths_are_coaching_parity() {
     let tmp = NamedTempFile::new().unwrap();
@@ -193,17 +203,22 @@ async fn kill_the_engine_degrades_and_recovers() {
     let (tx2, rx2) = watch::channel(false);
     host.poll_once(&mut provider, 100).unwrap();
     let store_bg = store.clone();
+    let mut last_err = None;
     let mut listener2 = None;
     for _ in 0..80 {
-        match tokio::net::TcpListener::bind(&bind).await {
-            Ok(l) => {
-                listener2 = Some(l);
+        match bind_reuse(&bind).await {
+            Ok(listener) => {
+                listener2 = Some(listener);
                 break;
             }
-            Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+            Err(err) => {
+                last_err = Some(err);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
         }
     }
-    let listener2 = listener2.expect("recover bind after kill");
+    let listener2 =
+        listener2.unwrap_or_else(|| panic!("recover bind after kill on {bind}: {last_err:?}"));
     let serve2 =
         tokio::spawn(
             async move { EngineSocketServer::serve_listener(listener2, store_bg, rx2).await },

@@ -16,10 +16,15 @@ use crate::attention::persist_event_stream_attention;
 use crate::catalog::{
     collapse_events_latest_per_dedup, kernel_event_from_db_row, EVENT_LIFECYCLE_TTL_MS,
 };
-use crate::db::{Database, DbError, JournalFrameRecord};
+use crate::db::{market_event_dedup_id, market_event_id, Database, DbError, JournalFrameRecord};
 use crate::feed::ContractMetadata;
 use crate::pipelines::{EventDetector, FlowEventEmitter, MarketEvent, MarketState, PipelineEngine};
 use serde_json::Value;
+
+use super::capsule::{
+    compact_capsule_sample, event_may_open_capsule, should_open_capsule, snapshot_session_type,
+    CapsuleRing, PendingCapsule,
+};
 
 use super::health::{EngineHealth, FeedStallState};
 use super::host::{EngineHost, IngestOutcome};
@@ -47,6 +52,8 @@ pub struct MarketRouter {
     pending_journal_events: Mutex<Vec<(RouterRoot, MarketEvent)>>,
     pending_journal_frames: Mutex<BTreeMap<(i64, RouterRoot), JournalFrameRecord>>,
     journal_second_clock: Mutex<BTreeMap<i64, f64>>,
+    capsule_rings: Mutex<BTreeMap<RouterRoot, CapsuleRing>>,
+    pending_capsules: Mutex<Vec<PendingCapsule>>,
 }
 
 impl MarketRouter {
@@ -70,6 +77,8 @@ impl MarketRouter {
             pending_journal_events: Mutex::new(Vec::new()),
             pending_journal_frames: Mutex::new(BTreeMap::new()),
             journal_second_clock: Mutex::new(BTreeMap::new()),
+            capsule_rings: Mutex::new(BTreeMap::new()),
+            pending_capsules: Mutex::new(Vec::new()),
         }
     }
 
@@ -110,6 +119,8 @@ impl MarketRouter {
             pending_journal_events: Mutex::new(Vec::new()),
             pending_journal_frames: Mutex::new(BTreeMap::new()),
             journal_second_clock: Mutex::new(BTreeMap::new()),
+            capsule_rings: Mutex::new(BTreeMap::new()),
+            pending_capsules: Mutex::new(Vec::new()),
         }
     }
 
@@ -383,6 +394,7 @@ impl MarketRouter {
         if events.is_empty() || !self.journal_enabled.load(Ordering::Acquire) {
             return;
         }
+        self.sample_capsule_rings();
         if let Ok(mut pending) = self.pending_journal_events.lock() {
             pending.extend(events.iter().cloned().map(|event| (root, event)));
             let excess = pending.len().saturating_sub(PENDING_JOURNAL_MAX_EVENTS);
@@ -390,6 +402,7 @@ impl MarketRouter {
                 pending.drain(0..excess);
             }
         }
+        self.maybe_open_pending_capsules(root, events);
     }
 
     /// Capture 1 Hz Journal Frames for every root that printed in its lane second.
@@ -406,6 +419,7 @@ impl MarketRouter {
         if !self.journal_enabled.load(Ordering::Acquire) {
             return;
         }
+        self.sample_capsule_rings();
         let mut needed: Vec<(i64, RouterRoot, f64)> = Vec::new();
         for root in RouterRoot::ALL {
             let Some(mt) = self.lane(root).market_time_ms() else {
@@ -479,7 +493,7 @@ impl MarketRouter {
             .map(|mut g| std::mem::take(&mut *g))
             .unwrap_or_default();
         match persist_journal_observation(db, &frames, &events) {
-            Ok(stats) => {
+            Ok(mut stats) => {
                 let clock = self.clock_ms().unwrap_or(0.0);
                 if clock > 0.0 {
                     if let Err(err) = db.expire_event_lifecycles(clock, EVENT_LIFECYCLE_TTL_MS) {
@@ -489,12 +503,157 @@ impl MarketRouter {
                 if !events.is_empty() {
                     persist_router_event_attention(db, self, &events, clock);
                 }
+                match self.persist_capsules(db, clock) {
+                    Ok((opened, finalized)) => {
+                        stats.capsules_opened = opened;
+                        stats.capsules_finalized = finalized;
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = %err, "market_router.capsule_persist");
+                    }
+                }
                 Ok(stats)
             }
             Err(err) => {
                 self.restore_pending_journal(frames, events);
                 Err(err)
             }
+        }
+    }
+
+    fn sample_capsule_rings(&self) {
+        if !self.journal_enabled.load(Ordering::Acquire) {
+            return;
+        }
+        for root in RouterRoot::ALL {
+            let Some(mt) = self.lane(root).market_time_ms() else {
+                continue;
+            };
+            let need = {
+                let Ok(rings) = self.capsule_rings.lock() else {
+                    continue;
+                };
+                rings.get(&root).map(|r| r.needs_sample(mt)).unwrap_or(true)
+            };
+            if !need {
+                continue;
+            }
+            let snap = self.lane(root).snapshot_market_state();
+            if snap.is_null() {
+                continue;
+            }
+            let session = snapshot_session_type(&snap);
+            let compact = compact_capsule_sample(mt, root, &snap);
+            if let Ok(mut rings) = self.capsule_rings.lock() {
+                rings.entry(root).or_default().push(mt, &session, compact);
+            }
+        }
+        self.ingest_pending_capsules_from_rings();
+    }
+
+    fn ingest_pending_capsules_from_rings(&self) {
+        let Ok(rings) = self.capsule_rings.lock() else {
+            return;
+        };
+        let Ok(mut pending) = self.pending_capsules.lock() else {
+            return;
+        };
+        for cap in pending.iter_mut() {
+            if let Some(ring) = rings.get(&cap.root) {
+                cap.ingest_ring(ring);
+            }
+        }
+    }
+
+    fn maybe_open_pending_capsules(&self, root: RouterRoot, events: &[MarketEvent]) {
+        if events.is_empty() || !self.journal_enabled.load(Ordering::Acquire) {
+            return;
+        }
+        let ring = {
+            let Ok(rings) = self.capsule_rings.lock() else {
+                return;
+            };
+            rings.get(&root).cloned().unwrap_or_default()
+        };
+        let Ok(mut pending) = self.pending_capsules.lock() else {
+            return;
+        };
+        for event in events {
+            if !event_may_open_capsule(event) {
+                continue;
+            }
+            let trigger = market_event_id(event);
+            if pending.iter().any(|p| p.trigger_identity_id == trigger) {
+                continue;
+            }
+            let dedup = market_event_dedup_id(event, Some(root.as_str()));
+            if pending
+                .iter()
+                .any(|p| p.dedup_identity_id == dedup && p.is_pending())
+            {
+                continue;
+            }
+            pending.push(PendingCapsule::open_from_ring(root, event, &ring));
+        }
+    }
+
+    fn persist_capsules(&self, db: &Database, clock_ms: f64) -> Result<(usize, usize), DbError> {
+        self.sample_capsule_rings();
+        let stopped = !self.nq.is_running() && !self.es.is_running();
+        let mut pending = match self.pending_capsules.lock() {
+            Ok(mut g) => std::mem::take(&mut *g),
+            Err(_) => return Ok((0, 0)),
+        };
+        let mut opened = 0usize;
+        let mut finalized = 0usize;
+        let mut keep = Vec::new();
+        let mut persist_err: Option<DbError> = None;
+        for mut cap in pending.drain(..) {
+            cap.finalize(clock_ms, stopped);
+            let lifecycle = match db.market_event_lifecycle_for_identity(&cap.trigger_identity_id) {
+                Ok(v) => v,
+                Err(err) => {
+                    keep.push(cap);
+                    persist_err = Some(err);
+                    break;
+                }
+            };
+            match lifecycle.as_deref() {
+                Some(state) if should_open_capsule(&cap.event_type, state) => {
+                    let existed = match db.capsule_exists(&cap.id) {
+                        Ok(v) => v,
+                        Err(err) => {
+                            keep.push(cap);
+                            persist_err = Some(err);
+                            break;
+                        }
+                    };
+                    let rec = cap.to_record(clock_ms.max(cap.event_timestamp_ms));
+                    if let Err(err) = db.upsert_capsule(&rec) {
+                        keep.push(cap);
+                        persist_err = Some(err);
+                        break;
+                    }
+                    if !existed {
+                        opened += 1;
+                    }
+                    if cap.is_terminal() {
+                        finalized += 1;
+                    } else {
+                        keep.push(cap);
+                    }
+                }
+                None => keep.push(cap),
+                Some(_) => {}
+            }
+        }
+        if let Ok(mut g) = self.pending_capsules.lock() {
+            keep.append(&mut *g);
+            *g = keep;
+        }
+        match persist_err {
+            Some(err) => Err(err),
+            None => Ok((opened, finalized)),
         }
     }
 

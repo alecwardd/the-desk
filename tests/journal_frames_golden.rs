@@ -2,7 +2,7 @@
 //! strict field equality (lastPrice / rootSymbol / sessionType / clock).
 //!
 //! 1 Hz frames are captured on the shared MarketRouter clock. 250 ms publishes
-//! are not persisted. Capsules are out of scope.
+//! are not persisted. Capsules live in a separate table (see `capsules_golden`).
 
 use std::io::Write;
 

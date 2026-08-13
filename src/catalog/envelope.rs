@@ -263,7 +263,7 @@ fn domain_provenance(
     }
 
     if domain_id == "events" {
-        // Event rows live on get_events (lifecycle + frame_ref). Capsules later.
+        // Event rows live on get_events (lifecycle + frame_ref + Capsule refs).
         return (
             DomainProvenance {
                 source: req.snapshot_source,
@@ -271,7 +271,7 @@ fn domain_provenance(
                 vendor: None,
                 note: Some(
                     "events domain descriptors: lifecycle formalized on get_events; \
-                     DOM-family taxonomy named for later Capsule policy"
+                     DOM-family Capsules join via capsuleRef"
                         .into(),
                 ),
             },

@@ -693,6 +693,27 @@ This note does not introduce Capsules / 250 ms dumps, Episode Query, DuckDB, Vs3
 
 ---
 
+### Decision note: SIL-M3b Capsules mandatory for DOM-family events
+
+**Date:** 2026-08-13
+**Status:** Decided (implements [alecwardd/the-desk#10](https://github.com/alecwardd/the-desk/issues/10); Part of #2)
+
+**Context:** After Journal Frames (1 Hz) and M4 lifecycle + DOM-family taxonomy, forensic sub-second DOM behavior had no persist path. A permanent 250 ms frame store would densify the forever journal. M4 named `stop_run`, `iceberg_reload`, `pull_intent`, `book_velocity_regime_shift` and set `requires_capsule` but did not emit Capsules. Detectors still do not emit those types (#22).
+
+**Decision:**
+
+1. **In-memory ~250 ms ring** per MarketRouter root (session scope per-lane). Depth covers 30 s lookback plus a small margin. Ring samples are never a SQLite/Parquet table. Compute/publish may stay ~250 ms (ADR-019); only 1 Hz Journal Frames stay in the forever journal.
+2. **Capsule window** is ~30 s before → ~60 s after the triggering Event on the MarketRouter clock (defaults 30_000 / 60_000 / 250 ms). Lookback is copied from the ring at trigger. The after-window fills until `clock_ms >= event.timestamp_ms + 60s`. If the session/feed ends earlier, persist what exists as `incomplete` + `degraded` — never silently truncated as a full window. RTH and Globex are not mixed in one Capsule.
+3. **Trigger policy:** open one Capsule per triggering occurrence (`lifecycle=open`) when `is_dom_family_event_type`. Repeats of the same dedup identity do not spawn unbounded Capsules. Non-DOM types (pinch, absorption, ib_extension, …) are out of scope here.
+4. **Persistence / joins:** schema v35 `capsules` table keyed to `trigger_identity_id`, joinable to Journal Frames via `[start_frame_second, end_frame_second] × root_symbol`. `the-desk-engine` `persist_journal` writes Capsules with no MCP/agent attached. `get_events` (Trust Level L0) carries `capsuleRef` on every DOM-family row (nulls OK while pending). No `get_capsule` specialty tool. Trust Ceiling stays **L3**.
+5. **Embedded-engine fallback** and external engine remain coaching-path parity. MFE/MAE stay tick-driven. Trader-memory markdown capsules are unrelated and unchanged.
+
+This note does not introduce DOM cluster Base Detectors, Episode Query, DuckDB, cold Parquet, Vs3dProvider, Feature-IR, ACSIL, or a 250 ms forever-store.
+
+**Consequences:** Sub-second DOM dumps exist around injected/future DOM-family Events without densifying the 1 Hz journal. Coaching reads stay on `get_events`.
+
+---
+
 ### Decision note: SIL-P-VS-a Levels-Only Record path
 
 **Date:** 2026-08-13

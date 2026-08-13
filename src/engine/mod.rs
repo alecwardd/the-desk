@@ -9,6 +9,7 @@
 //! Published state uses a lock-free swap. Trust Ceiling stays **L3** — no path
 //! here reaches order placement.
 
+pub mod capsule;
 pub mod config;
 pub mod health;
 pub mod host;
@@ -20,6 +21,9 @@ pub mod socket;
 pub mod source;
 
 pub use crate::catalog::EngineMode;
+pub use capsule::{
+    capsule_window_bounds, CAPSULE_AFTER_MS, CAPSULE_LOOKBACK_MS, CAPSULE_RING_STEP_MS,
+};
 pub use config::{default_engine_database_path, load_engine_bind_addr, ENGINE_DEFAULT_BIND};
 pub use health::{EngineHealth, FeedStallState};
 pub use host::{coaching_parity_fingerprint, EngineHost, IngestOutcome};

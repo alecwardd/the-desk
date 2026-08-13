@@ -2,7 +2,8 @@
 //!
 //! Every row carries lifecycle (`open` → `updated` → `resolved`|`expired`),
 //! severity, occurrence + dedup identity, and `frame_ref` joining the event
-//! to the Journal Frame that produced it. Fields are never silently omitted.
+//! to the Journal Frame that produced it. DOM-family rows also carry
+//! `capsuleRef` (never silently omitted; nulls OK while pending).
 //!
 //! SQLite stores every occurrence. `get_events` / `get_attention_inbox` collapse
 //! to the latest row per **dedup identity** so a persistent condition is not a
@@ -17,13 +18,67 @@ use super::event_lifecycle::{
     classify_event_family, detection_kind_for_event_type, event_dedup_identity_id,
     event_dedup_identity_key, is_dom_family_event_type, next_lifecycle_for_detection,
     resolve_event_severity, DetectionKind, EventFamily, EventLifecycle, EventSeverity, FrameRef,
+    CAPSULE_AFTER_MS, CAPSULE_LOOKBACK_MS,
 };
 use super::types::{TrustCeiling, CATALOG_VERSION};
-use crate::db::{market_event_id, market_event_identity};
+use crate::db::{
+    journal_frame_second_from_ts, market_event_id, market_event_identity, CapsuleRecord,
+};
 use crate::pipelines::MarketEvent;
 
 /// Legacy alias — severity is now a real field; unspecified is the fallback.
 pub const SEVERITY_PLACEHOLDER: &str = super::event_lifecycle::SEVERITY_UNSPECIFIED;
+
+/// Join from a DOM-family Event to its Capsule dump.
+///
+/// Present on every `requires_capsule` row (nulls OK while pending). Omitted
+/// for non-DOM rows so they do not pretend to have Capsules.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CapsuleRef {
+    pub id: Option<String>,
+    pub window_start_ms: Option<f64>,
+    pub window_end_ms: Option<f64>,
+    pub start_frame_second: Option<i64>,
+    pub end_frame_second: Option<i64>,
+    pub completeness: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub degraded: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sample_count: Option<i64>,
+}
+
+impl CapsuleRef {
+    /// Placeholder while the dump has not been persisted yet.
+    pub fn pending_for_event(timestamp_ms: f64) -> Self {
+        let start = timestamp_ms - CAPSULE_LOOKBACK_MS;
+        let end = timestamp_ms + CAPSULE_AFTER_MS;
+        Self {
+            id: None,
+            window_start_ms: Some(start),
+            window_end_ms: Some(end),
+            start_frame_second: journal_frame_second_from_ts(start),
+            end_frame_second: journal_frame_second_from_ts(end),
+            completeness: Some("pending".into()),
+            degraded: None,
+            sample_count: None,
+        }
+    }
+
+    /// Lift a persisted Capsule row.
+    pub fn from_record(record: &CapsuleRecord) -> Self {
+        Self {
+            id: Some(record.id.clone()),
+            window_start_ms: Some(record.window_start_ms),
+            window_end_ms: Some(record.window_end_ms),
+            start_frame_second: record.start_frame_second,
+            end_frame_second: record.end_frame_second,
+            completeness: Some(record.completeness.clone()),
+            degraded: Some(record.degraded),
+            sample_count: Some(record.sample_count),
+        }
+    }
+}
 
 /// One event row returned by `get_events`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -44,8 +99,11 @@ pub struct KernelEvent {
     /// Journal Frame join: `(journalFrameSecond, rootSymbol)`.
     pub frame_ref: FrameRef,
     pub family: EventFamily,
-    /// Capsule dump is later (#10). True only for DOM-family types.
+    /// True only for DOM-family types (SIL-M3b Capsules are mandatory).
     pub requires_capsule: bool,
+    /// Capsule join. Never silently omitted for DOM-family rows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capsule_ref: Option<CapsuleRef>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub level_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -130,6 +188,7 @@ fn assemble_kernel_event(
     identity_key: String,
 ) -> KernelEvent {
     let family = classify_event_family(&event.event_type);
+    let requires = is_dom_family_event_type(&event.event_type);
     KernelEvent {
         identity_id,
         identity_key,
@@ -141,7 +200,12 @@ fn assemble_kernel_event(
         severity: resolve_event_severity(event),
         frame_ref: FrameRef::from_event(event.timestamp_ms, root_symbol),
         family,
-        requires_capsule: is_dom_family_event_type(&event.event_type),
+        requires_capsule: requires,
+        capsule_ref: if requires {
+            Some(CapsuleRef::pending_for_event(event.timestamp_ms))
+        } else {
+            None
+        },
         level_name: event.level_name.clone(),
         price: Some(event.price),
         direction: event.direction.clone(),
@@ -362,14 +426,62 @@ pub fn coaching_kernel_events_from_db_rows(
     events
 }
 
+/// Overlay persisted Capsule rows onto coaching events.
+///
+/// DOM-family rows always keep a `capsuleRef` (pending placeholder if no row).
+/// Non-DOM rows stay without one.
+pub fn attach_capsule_refs(events: &mut [KernelEvent], capsules: &[CapsuleRecord]) {
+    for event in events.iter_mut() {
+        if !event.requires_capsule {
+            event.capsule_ref = None;
+            continue;
+        }
+        let picked = pick_capsule_for_event(event, capsules);
+        event.capsule_ref = Some(picked.map_or_else(
+            || CapsuleRef::pending_for_event(event.timestamp_ms),
+            CapsuleRef::from_record,
+        ));
+    }
+}
+
+fn pick_capsule_for_event<'a>(
+    event: &KernelEvent,
+    capsules: &'a [CapsuleRecord],
+) -> Option<&'a CapsuleRecord> {
+    if let Some(hit) = capsules
+        .iter()
+        .find(|c| c.trigger_identity_id == event.identity_id)
+    {
+        return Some(hit);
+    }
+    capsules
+        .iter()
+        .filter(|c| c.dedup_identity_id == event.dedup_identity_id)
+        .filter(|c| c.event_timestamp_ms <= event.timestamp_ms + 0.5)
+        .max_by(|a, b| {
+            a.event_timestamp_ms
+                .partial_cmp(&b.event_timestamp_ms)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.id.cmp(&b.id))
+        })
+}
+
 /// Assert envelope contract: lifecycle, severity, identities, and frame_ref
-/// are always present on every row.
+/// are always present on every row. DOM-family rows must carry capsuleRef.
 pub fn kernel_event_envelope_fields_present(event: &KernelEvent) -> bool {
-    !event.identity_id.is_empty()
+    let ids_ok = !event.identity_id.is_empty()
         && !event.identity_key.is_empty()
         && !event.dedup_identity_id.is_empty()
         && !event.dedup_identity_key.is_empty()
-        && !event.event_type.is_empty()
+        && !event.event_type.is_empty();
+    if !ids_ok {
+        return false;
+    }
+    if event.requires_capsule {
+        event.capsule_ref.is_some()
+    } else {
+        true
+    }
 }
 
 #[cfg(test)]
@@ -406,6 +518,7 @@ mod tests {
         assert_eq!(row.frame_ref.journal_frame_second, Some(1_700_000_000));
         assert_eq!(row.frame_ref.root_symbol.as_deref(), Some("NQ"));
         assert!(!row.requires_capsule);
+        assert!(row.capsule_ref.is_none());
         assert!(kernel_event_envelope_fields_present(&row));
 
         let envelope = EventsEnvelope::from_events(vec![row.clone()]);
@@ -567,7 +680,7 @@ mod tests {
     }
 
     #[test]
-    fn dom_family_row_flags_capsule_later_without_emitting() {
+    fn dom_family_row_flags_capsule_and_never_omits_ref() {
         let event = MarketEvent {
             event_type: "stop_run".into(),
             ..sample()
@@ -576,5 +689,19 @@ mod tests {
         assert!(row.requires_capsule);
         assert_eq!(row.family, EventFamily::Dom);
         assert_eq!(row.severity, EventSeverity::High);
+        let cap = row.capsule_ref.as_ref().expect("capsuleRef required");
+        assert!(cap.id.is_none());
+        assert_eq!(cap.completeness.as_deref(), Some("pending"));
+        assert_eq!(
+            cap.window_start_ms,
+            Some(event.timestamp_ms - CAPSULE_LOOKBACK_MS)
+        );
+        assert_eq!(
+            cap.window_end_ms,
+            Some(event.timestamp_ms + CAPSULE_AFTER_MS)
+        );
+        let wire = serde_json::to_value(&row).expect("wire");
+        assert!(wire.get("capsuleRef").is_some());
+        assert!(wire["capsuleRef"]["id"].is_null());
     }
 }

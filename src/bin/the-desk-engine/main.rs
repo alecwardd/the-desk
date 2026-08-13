@@ -217,6 +217,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     router.mark_stopped();
+    if let Some(db) = journal_db.as_ref() {
+        match db.lock() {
+            Ok(d) => {
+                if let Err(err) = router.persist_journal(&d) {
+                    tracing::warn!(error = %err, "the-desk-engine.journal_persist_on_stop");
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "the-desk-engine.journal_persist_lock_on_stop"
+                );
+            }
+        }
+    }
     let _ = shutdown_tx.send(true);
     let _ = server_handle.await;
     Ok(())

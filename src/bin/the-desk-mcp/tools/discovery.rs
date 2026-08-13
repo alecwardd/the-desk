@@ -11,11 +11,11 @@ use rmcp::{
 };
 use the_desk_backend::catalog::{
     apply_positioning_slice, apply_token_budget, build_catalog, build_state_envelope,
-    coaching_kernel_events_from_db_rows, collapse_events_latest_per_dedup, describe_domain,
-    describe_environment, kernel_event_from_market_event_scoped, merge_symbol_envelopes,
+    collapse_events_latest_per_dedup, describe_domain, describe_environment,
+    kernel_event_from_db_row, kernel_event_from_market_event_scoped, merge_symbol_envelopes,
     positioning_state_slice, search_catalog, state_envelope_json, EventsEnvelope,
     PositioningStateSlice, ProvenanceSource, StateEnvelope, StateReadRequest, StateResolution,
-    TrustLevel, COACHING_EVENT_FETCH_CAP, KERNEL_READ_QUERY_TOOLS,
+    TrustLevel, KERNEL_READ_QUERY_TOOLS,
 };
 use the_desk_backend::engine::{parse_requested_roots, RouterRoot, RouterRootError};
 use the_desk_backend::trading_day_from_timestamp_ms;
@@ -328,12 +328,18 @@ impl TheDeskMcp {
         let (db_rows, db_had_rows) = {
             let db = self.db.lock().map_err(|_| lock_error())?;
             let rows = db
-                .list_recent_market_events(COACHING_EVENT_FETCH_CAP, since_ms, None)
+                .list_coaching_market_events(limit, since_ms, event_type)
                 .map_err(db_error)?;
-            let had = !rows.is_empty();
+            let had = if rows.is_empty() {
+                !db.list_recent_market_events(1, since_ms, None)
+                    .map_err(db_error)?
+                    .is_empty()
+            } else {
+                true
+            };
             (rows, had)
         };
-        let mut events = coaching_kernel_events_from_db_rows(&db_rows, event_type, limit);
+        let mut events: Vec<_> = db_rows.iter().map(kernel_event_from_db_row).collect();
         if events.is_empty() && !db_had_rows {
             if let Some(store) = self.engine_published.as_ref() {
                 let published = store.load();

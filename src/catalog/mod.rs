@@ -33,7 +33,7 @@ pub use event_lifecycle::{
     event_family_key, is_dom_family_event_type, is_invalidation_event_type,
     next_lifecycle_for_detection, resolve_event_severity, DetectionKind, EventFamily,
     EventLifecycle, EventSeverity, FrameRef, LifecycleError, DOM_FAMILY_EVENT_TYPES,
-    EVENT_LIFECYCLE_TTL_MS, SEVERITY_UNSPECIFIED,
+    EVENT_LIFECYCLE_STATES, EVENT_LIFECYCLE_TTL_MS, SEVERITY_UNSPECIFIED,
 };
 pub use events_kernel::{
     coaching_kernel_events_from_db_rows, collapse_events_latest_per_dedup,
@@ -139,7 +139,7 @@ pub fn describe_environment(catalog: &DeskCatalog, discovery_enabled: bool) -> s
             "lifecycleFormalized": true,
             "operator": "get_events",
             "attentionView": "get_attention_inbox",
-            "lifecycle": ["open", "updated", "resolved", "expired"],
+            "lifecycle": crate::catalog::EVENT_LIFECYCLE_STATES,
             "domFamilyEventTypes": crate::catalog::DOM_FAMILY_EVENT_TYPES,
             "capsules": "later",
             "cheapModel": "event_triggered_only",
@@ -183,7 +183,7 @@ pub fn describe_domain(catalog: &DeskCatalog, domain_id: &str) -> Option<serde_j
             obj.insert("lifecycleFormalized".into(), serde_json::Value::Bool(true));
             obj.insert(
                 "lifecycle".into(),
-                serde_json::json!(["open", "updated", "resolved", "expired"]),
+                serde_json::json!(crate::catalog::EVENT_LIFECYCLE_STATES),
             );
             obj.insert(
                 "readOperator".into(),

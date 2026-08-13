@@ -16,6 +16,9 @@ use crate::pipelines::MarketEvent;
 /// Wire value when severity cannot be classified (legacy rows only).
 pub const SEVERITY_UNSPECIFIED: &str = "unspecified";
 
+/// Wire lifecycle labels in transition order (`open` → `updated` → `resolved`|`expired`).
+pub const EVENT_LIFECYCLE_STATES: &[&str] = &["open", "updated", "resolved", "expired"];
+
 /// Default time-to-live for `open`/`updated` events before they **expire**.
 ///
 /// Measured on the MarketRouter clock (event time), never wall clock, so
@@ -157,6 +160,7 @@ pub enum EventSeverity {
 }
 
 impl EventSeverity {
+    /// Wire label used in `get_events` / SQLite.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Low => "low",
@@ -167,6 +171,7 @@ impl EventSeverity {
         }
     }
 
+    /// Parse a stored/wire severity label. Unknown values map to `Unspecified`.
     pub fn parse(raw: &str) -> Self {
         match raw.trim().to_ascii_lowercase().as_str() {
             "low" => Self::Low,
@@ -208,6 +213,7 @@ pub enum EventFamily {
 }
 
 impl EventFamily {
+    /// Wire label used in `get_events` (`dom` / `flow` / `structure` / `other`).
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Dom => "dom",

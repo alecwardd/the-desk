@@ -216,7 +216,7 @@ Replay attention signal lifecycle deltas such as created, priority_changed, ackn
 
 ### `get_attention_inbox`
 
-Ranked view over the formalized event stream (get_events lifecycle). Call this first when asking what deserves attention now; returns durable playbook-grounded signals, never raw ticks, never a parallel source of truth. Your playbook / your rules say what deserves attention — this tool does not advise entries.
+Ranked view over the formalized event stream (get_events lifecycle). Call this first when asking what deserves attention now; returns durable playbook-grounded signals, never raw ticks, never a parallel source of truth. Your playbook indicates / your rules say what deserves attention — this tool does not advise entries.
 
 ### `get_setup_context`
 

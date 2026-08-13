@@ -118,6 +118,7 @@ pub fn attention_signal_from_kernel_event(
     }
 }
 
+/// Map an event type onto the attention `kind` label used by the inbox.
 pub fn attention_kind_for_event(event_type: &str) -> &'static str {
     if is_dom_family_event_type(event_type) {
         return "dom_family";

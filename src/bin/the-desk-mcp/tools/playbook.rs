@@ -5,7 +5,7 @@ use rmcp::{
 };
 use std::sync::atomic::Ordering;
 use the_desk_backend::attention::{rank_attention_inbox, EVENT_STREAM_VIEW};
-use the_desk_backend::catalog::{coaching_kernel_events_from_db_rows, COACHING_EVENT_FETCH_CAP};
+use the_desk_backend::catalog::{kernel_event_from_db_row, COACHING_EVENT_FETCH_CAP};
 use the_desk_backend::db::{AttentionChangelogQuery, AttentionSignalQuery, TradeIdeaQuery};
 use the_desk_backend::observability::RuntimeEventLevel;
 use the_desk_backend::pipelines::MarketState;
@@ -235,7 +235,7 @@ impl TheDeskMcp {
     }
 
     #[tool(
-        description = "Ranked view over the formalized event stream (get_events lifecycle). Call this first when asking what deserves attention now; returns durable playbook-grounded signals, never raw ticks, never a parallel source of truth. Your playbook / your rules say what deserves attention — this tool does not advise entries."
+        description = "Ranked view over the formalized event stream (get_events lifecycle). Call this first when asking what deserves attention now; returns durable playbook-grounded signals, never raw ticks, never a parallel source of truth. Your playbook indicates / your rules say what deserves attention — this tool does not advise entries."
     )]
     pub(crate) async fn get_attention_inbox(
         &self,
@@ -251,22 +251,29 @@ impl TheDeskMcp {
                     status: params.status,
                     min_priority: params.min_priority,
                     include_expired,
-                    cursor_signal_id: cursor.last_signal_id,
-                    since_ms: cursor.since_ms,
-                    limit: 250,
+                    cursor_signal_id: None,
+                    since_ms: None,
+                    limit: COACHING_EVENT_FETCH_CAP,
                     ..AttentionSignalQuery::default()
                 })
                 .map_err(db_error)?;
             let event_rows = db
-                .list_recent_market_events(COACHING_EVENT_FETCH_CAP, None, None)
+                .list_coaching_market_events(COACHING_EVENT_FETCH_CAP, None, None)
                 .map_err(db_error)?;
             let data_age_ms = compute_data_age(&db);
             (signals, event_rows, data_age_ms)
         };
-        let kernel_events =
-            coaching_kernel_events_from_db_rows(&event_rows, None, COACHING_EVENT_FETCH_CAP);
+        let kernel_events: Vec<_> = event_rows.iter().map(kernel_event_from_db_row).collect();
         let now_ms = chrono::Utc::now().timestamp_millis() as f64;
         signals = rank_attention_inbox(signals, &kernel_events, include_expired, now_ms, "live");
+        if let Some(last_id) = cursor.last_signal_id.as_deref() {
+            if let Some(pos) = signals
+                .iter()
+                .position(|signal| signal.signal_id == last_id)
+            {
+                signals = signals.split_off(pos.saturating_add(1));
+            }
+        }
         if signals.len() > limit {
             signals.truncate(limit);
         }

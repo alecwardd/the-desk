@@ -268,7 +268,8 @@ pub fn kernel_event_from_db_row(row: &Value) -> KernelEvent {
     let stored_severity = row
         .get("severity")
         .and_then(|v| v.as_str())
-        .map(EventSeverity::parse);
+        .map(EventSeverity::parse)
+        .filter(|severity| *severity != EventSeverity::Unspecified);
     let identity_id = row
         .get("identityId")
         .and_then(|v| v.as_str())
@@ -468,6 +469,24 @@ mod tests {
         assert_eq!(evt.frame_ref.root_symbol.as_deref(), Some("NQ"));
         assert_eq!(evt.event_type, "absorption_confirmed");
         assert_eq!(evt.family, EventFamily::Flow);
+    }
+
+    #[test]
+    fn unspecified_stored_severity_does_not_override_family_default() {
+        let row = json!({
+            "eventType": "pinch_detected",
+            "timestampMs": 1.0,
+            "sessionDate": "2026-08-11",
+            "price": 1.0,
+            "lifecycle": "open",
+            "severity": "unspecified",
+            "identityId": "evt_x",
+            "identityKey": "k",
+            "dedupIdentityId": "dedup_x",
+            "dedupIdentityKey": "k"
+        });
+        let evt = kernel_event_from_db_row(&row);
+        assert_eq!(evt.severity, EventSeverity::High);
     }
 
     #[test]

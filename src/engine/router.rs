@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::attention::persist_event_stream_attention;
 use crate::catalog::{
-    coaching_kernel_events_from_db_rows, COACHING_EVENT_FETCH_CAP, EVENT_LIFECYCLE_TTL_MS,
+    collapse_events_latest_per_dedup, kernel_event_from_db_row, EVENT_LIFECYCLE_TTL_MS,
 };
 use crate::db::{Database, DbError, JournalFrameRecord};
 use crate::feed::ContractMetadata;
@@ -482,7 +482,9 @@ impl MarketRouter {
             Ok(stats) => {
                 let clock = self.clock_ms().unwrap_or(0.0);
                 if clock > 0.0 {
-                    let _ = db.expire_event_lifecycles(clock, EVENT_LIFECYCLE_TTL_MS);
+                    if let Err(err) = db.expire_event_lifecycles(clock, EVENT_LIFECYCLE_TTL_MS) {
+                        tracing::warn!(error = %err, "market_router.event_lifecycle_expire");
+                    }
                 }
                 if !events.is_empty() {
                     persist_router_event_attention(db, self, &events, clock);
@@ -565,43 +567,44 @@ fn persist_router_event_attention(
             .map(|(_, e)| e.timestamp_ms)
             .fold(0.0_f64, f64::max)
     };
-    let rows = match db.list_recent_market_events(COACHING_EVENT_FETCH_CAP, None, None) {
+    let pending_ids: Vec<String> = events
+        .iter()
+        .map(|(root, event)| crate::db::market_event_dedup_id(event, Some(root.as_str())))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let rows = match db.list_market_events_by_dedup_ids(&pending_ids) {
         Ok(rows) => rows,
         Err(err) => {
-            tracing::warn!(error = %err, "market_router.attention_persist");
+            tracing::warn!(error = %err, "market_router.attention_event_read");
             return;
         }
     };
-    let kernel_events = coaching_kernel_events_from_db_rows(&rows, None, COACHING_EVENT_FETCH_CAP);
-    let pending_ids: BTreeSet<String> = events
-        .iter()
-        .map(|(root, event)| crate::db::market_event_dedup_id(event, Some(root.as_str())))
-        .collect();
-    let kernel_events: Vec<_> = kernel_events
-        .into_iter()
-        .filter(|event| pending_ids.contains(&event.dedup_identity_id))
-        .collect();
-    let mut by_root: BTreeMap<RouterRoot, Vec<crate::catalog::KernelEvent>> = BTreeMap::new();
+    let kernel_events =
+        collapse_events_latest_per_dedup(rows.iter().map(kernel_event_from_db_row).collect());
+    let mut by_root: BTreeMap<Option<RouterRoot>, Vec<crate::catalog::KernelEvent>> =
+        BTreeMap::new();
     for event in kernel_events {
-        let Some(root_str) = event
+        let root = event
             .root_symbol
             .as_deref()
             .or(event.frame_ref.root_symbol.as_deref())
-        else {
-            by_root.entry(RouterRoot::Nq).or_default().push(event);
-            continue;
-        };
-        match RouterRoot::parse(root_str) {
-            Ok(root) => by_root.entry(root).or_default().push(event),
-            Err(_) => by_root.entry(RouterRoot::Nq).or_default().push(event),
-        }
+            .and_then(|s| match RouterRoot::parse(s) {
+                Ok(root) => Some(root),
+                Err(_) => {
+                    tracing::warn!(root = s, "market_router.attention_unknown_root");
+                    None
+                }
+            });
+        by_root.entry(root).or_default().push(event);
     }
     if by_root.is_empty() {
         return;
     }
     for (root, kernel_events) in by_root {
-        let snapshot =
-            serde_json::from_value::<MarketState>(router.lane(root).snapshot_market_state()).ok();
+        let snapshot = root.and_then(|root| {
+            serde_json::from_value::<MarketState>(router.lane(root).snapshot_market_state()).ok()
+        });
         if let Err(err) = persist_event_stream_attention(
             db,
             &kernel_events,
@@ -611,9 +614,9 @@ fn persist_router_event_attention(
             None,
         ) {
             tracing::warn!(
-                root = root.as_str(),
+                root = root.map(RouterRoot::as_str).unwrap_or("unknown"),
                 error = %err,
-                "market_router.attention_persist"
+                "market_router.attention_upsert"
             );
         }
     }

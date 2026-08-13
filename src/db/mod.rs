@@ -1025,6 +1025,43 @@ pub fn journal_frame_second_from_ts(timestamp_ms: f64) -> Option<i64> {
     }
 }
 
+const MARKET_EVENT_LIST_COLUMNS: &str = "timestamp_ms, event_type, level_name, price, direction, sequence_num, metadata_json,
+                    session_date, session_type, session_segment, trading_day, root_symbol, journal_frame_second,
+                    lifecycle, severity, identity_id, identity_key, dedup_identity_id, dedup_identity_key, event_id";
+
+fn event_dedup_partition_sql() -> &'static str {
+    "COALESCE(NULLIF(dedup_identity_id, ''), NULLIF(event_id, ''), CAST(id AS TEXT))"
+}
+
+fn map_listed_market_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<serde_json::Value> {
+    let metadata_str: Option<String> = row.get(6)?;
+    let metadata: serde_json::Value = metadata_str
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    Ok(serde_json::json!({
+        "timestampMs": row.get::<_, f64>(0)?,
+        "eventType": row.get::<_, String>(1)?,
+        "levelName": row.get::<_, Option<String>>(2)?,
+        "price": row.get::<_, f64>(3)?,
+        "direction": row.get::<_, Option<String>>(4)?,
+        "sequenceNum": row.get::<_, Option<i64>>(5)?,
+        "metadata": metadata,
+        "sessionDate": row.get::<_, String>(7)?,
+        "sessionType": row.get::<_, Option<String>>(8)?,
+        "sessionSegment": row.get::<_, Option<String>>(9)?,
+        "tradingDay": row.get::<_, Option<String>>(10)?,
+        "rootSymbol": row.get::<_, Option<String>>(11)?,
+        "journalFrameSecond": row.get::<_, Option<i64>>(12)?,
+        "lifecycle": row.get::<_, Option<String>>(13)?.unwrap_or_else(|| "open".into()),
+        "severity": row.get::<_, Option<String>>(14)?.unwrap_or_else(|| "unspecified".into()),
+        "identityId": row.get::<_, Option<String>>(15)?,
+        "identityKey": row.get::<_, Option<String>>(16)?,
+        "dedupIdentityId": row.get::<_, Option<String>>(17)?,
+        "dedupIdentityKey": row.get::<_, Option<String>>(18)?,
+        "eventId": row.get::<_, Option<String>>(19)?,
+    }))
+}
+
 /// One persisted Journal Frame row (NQ or ES) on the shared MarketRouter clock.
 #[derive(Debug, Clone)]
 pub struct JournalFrameRecord {
@@ -7489,7 +7526,8 @@ impl Database {
         })
     }
 
-    /// Recent market events across types (newest first) for the SIL `get_events` kernel.
+    /// Recent occurrence rows (newest first). Research counts these; coaching
+    /// reads should use [`Self::list_coaching_market_events`].
     pub fn list_recent_market_events(
         &self,
         limit: usize,
@@ -7497,11 +7535,9 @@ impl Database {
         event_type: Option<&str>,
     ) -> Result<Vec<serde_json::Value>, DbError> {
         let limit = limit.clamp(1, 500);
-        let mut sql = String::from(
-            "SELECT timestamp_ms, event_type, level_name, price, direction, sequence_num, metadata_json,
-                    session_date, session_type, session_segment, trading_day, root_symbol, journal_frame_second,
-                    lifecycle, severity, identity_id, identity_key, dedup_identity_id, dedup_identity_key, event_id
-             FROM market_events WHERE 1=1",
+        let mut sql = format!(
+            "SELECT {MARKET_EVENT_LIST_COLUMNS}
+             FROM market_events WHERE 1=1"
         );
         if since_ms.is_some() {
             sql.push_str(" AND timestamp_ms >= ?1");
@@ -7517,49 +7553,100 @@ impl Database {
         sql.push_str(&limit.to_string());
 
         let mut stmt = self.conn.prepare(&sql)?;
-        let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<serde_json::Value> {
-            let metadata_str: Option<String> = row.get(6)?;
-            let metadata: serde_json::Value = metadata_str
-                .and_then(|s| serde_json::from_str(&s).ok())
-                .unwrap_or_else(|| serde_json::json!({}));
-            Ok(serde_json::json!({
-                "timestampMs": row.get::<_, f64>(0)?,
-                "eventType": row.get::<_, String>(1)?,
-                "levelName": row.get::<_, Option<String>>(2)?,
-                "price": row.get::<_, f64>(3)?,
-                "direction": row.get::<_, Option<String>>(4)?,
-                "sequenceNum": row.get::<_, Option<i64>>(5)?,
-                "metadata": metadata,
-                "sessionDate": row.get::<_, String>(7)?,
-                "sessionType": row.get::<_, Option<String>>(8)?,
-                "sessionSegment": row.get::<_, Option<String>>(9)?,
-                "tradingDay": row.get::<_, Option<String>>(10)?,
-                "rootSymbol": row.get::<_, Option<String>>(11)?,
-                "journalFrameSecond": row.get::<_, Option<i64>>(12)?,
-                "lifecycle": row.get::<_, Option<String>>(13)?.unwrap_or_else(|| "open".into()),
-                "severity": row.get::<_, Option<String>>(14)?.unwrap_or_else(|| "unspecified".into()),
-                "identityId": row.get::<_, Option<String>>(15)?,
-                "identityKey": row.get::<_, Option<String>>(16)?,
-                "dedupIdentityId": row.get::<_, Option<String>>(17)?,
-                "dedupIdentityKey": row.get::<_, Option<String>>(18)?,
-                "eventId": row.get::<_, Option<String>>(19)?,
-            }))
-        };
-
         let rows = match (since_ms, event_type) {
             (Some(since), Some(etype)) => stmt
-                .query_map(rusqlite::params![since, etype], map_row)?
+                .query_map(rusqlite::params![since, etype], map_listed_market_event_row)?
                 .collect::<Result<Vec<_>, _>>()?,
             (Some(since), None) => stmt
-                .query_map(rusqlite::params![since], map_row)?
+                .query_map(rusqlite::params![since], map_listed_market_event_row)?
                 .collect::<Result<Vec<_>, _>>()?,
             (None, Some(etype)) => stmt
-                .query_map(rusqlite::params![etype], map_row)?
+                .query_map(rusqlite::params![etype], map_listed_market_event_row)?
                 .collect::<Result<Vec<_>, _>>()?,
             (None, None) => stmt
-                .query_map([], map_row)?
+                .query_map([], map_listed_market_event_row)?
                 .collect::<Result<Vec<_>, _>>()?,
         };
+        Ok(rows)
+    }
+
+    /// Coaching `get_events` view: latest row per dedup identity, newest first.
+    ///
+    /// `event_type` is applied **after** collapse so a resolved identity is not
+    /// returned as still-`updated` when the caller filters on the confirm type.
+    pub fn list_coaching_market_events(
+        &self,
+        limit: usize,
+        since_ms: Option<f64>,
+        event_type: Option<&str>,
+    ) -> Result<Vec<serde_json::Value>, DbError> {
+        let limit = limit.clamp(1, 500);
+        let partition = event_dedup_partition_sql();
+        let mut sql = format!(
+            "SELECT {MARKET_EVENT_LIST_COLUMNS} FROM (
+                SELECT {MARKET_EVENT_LIST_COLUMNS},
+                       ROW_NUMBER() OVER (
+                         PARTITION BY {partition}
+                         ORDER BY COALESCE(lifecycle_updated_at_ms, timestamp_ms) DESC,
+                                  timestamp_ms DESC, id DESC
+                       ) AS rn
+                  FROM market_events
+                 WHERE 1=1"
+        );
+        if since_ms.is_some() {
+            sql.push_str(" AND timestamp_ms >= ?1");
+        }
+        sql.push_str(") ranked WHERE rn = 1");
+        if event_type.is_some() {
+            if since_ms.is_some() {
+                sql.push_str(" AND event_type = ?2");
+            } else {
+                sql.push_str(" AND event_type = ?1");
+            }
+        }
+        sql.push_str(" ORDER BY timestamp_ms DESC LIMIT ");
+        sql.push_str(&limit.to_string());
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = match (since_ms, event_type) {
+            (Some(since), Some(etype)) => stmt
+                .query_map(rusqlite::params![since, etype], map_listed_market_event_row)?
+                .collect::<Result<Vec<_>, _>>()?,
+            (Some(since), None) => stmt
+                .query_map(rusqlite::params![since], map_listed_market_event_row)?
+                .collect::<Result<Vec<_>, _>>()?,
+            (None, Some(etype)) => stmt
+                .query_map(rusqlite::params![etype], map_listed_market_event_row)?
+                .collect::<Result<Vec<_>, _>>()?,
+            (None, None) => stmt
+                .query_map([], map_listed_market_event_row)?
+                .collect::<Result<Vec<_>, _>>()?,
+        };
+        Ok(rows)
+    }
+
+    /// Occurrence rows for the given dedup identities (engine attention persist).
+    pub fn list_market_events_by_dedup_ids(
+        &self,
+        ids: &[String],
+    ) -> Result<Vec<serde_json::Value>, DbError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = vec!["?"; ids.len()].join(", ");
+        let sql = format!(
+            "SELECT {MARKET_EVENT_LIST_COLUMNS}
+               FROM market_events
+              WHERE dedup_identity_id IN ({placeholders})
+              ORDER BY COALESCE(lifecycle_updated_at_ms, timestamp_ms) DESC, timestamp_ms DESC"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params_from_iter(ids.iter()),
+                map_listed_market_event_row,
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
 
@@ -8113,31 +8200,36 @@ impl Database {
             return Ok(0);
         }
         let cutoff = clock_ms - ttl_ms;
+        let partition = event_dedup_partition_sql();
         let n = self.conn.execute(
-            "UPDATE market_events
-                SET lifecycle = 'expired',
-                    lifecycle_updated_at_ms = ?1
-              WHERE id IN (
-                SELECT id FROM (
-                  SELECT id,
-                         lifecycle,
-                         timestamp_ms,
-                         ROW_NUMBER() OVER (
-                           PARTITION BY COALESCE(
-                             NULLIF(dedup_identity_id, ''),
-                             NULLIF(event_id, ''),
-                             CAST(id AS TEXT)
-                           )
-                           ORDER BY COALESCE(lifecycle_updated_at_ms, timestamp_ms) DESC,
-                                    timestamp_ms DESC,
-                                    id DESC
-                         ) AS rn
-                    FROM market_events
-                ) latest
-                WHERE rn = 1
-                  AND lifecycle IN ('open', 'updated')
-                  AND timestamp_ms < ?2
-              )",
+            &format!(
+                "UPDATE market_events
+                    SET lifecycle = 'expired',
+                        lifecycle_updated_at_ms = ?1
+                  WHERE id IN (
+                    SELECT id FROM (
+                      SELECT id,
+                             lifecycle,
+                             timestamp_ms,
+                             ROW_NUMBER() OVER (
+                               PARTITION BY {partition}
+                               ORDER BY COALESCE(lifecycle_updated_at_ms, timestamp_ms) DESC,
+                                        timestamp_ms DESC,
+                                        id DESC
+                             ) AS rn
+                        FROM market_events
+                       WHERE {partition} IN (
+                         SELECT DISTINCT {partition}
+                           FROM market_events
+                          WHERE lifecycle IN ('open', 'updated')
+                            AND timestamp_ms < ?2
+                       )
+                    ) latest
+                    WHERE rn = 1
+                      AND lifecycle IN ('open', 'updated')
+                      AND timestamp_ms < ?2
+                  )"
+            ),
             params![clock_ms, cutoff],
         )?;
         Ok(n)
@@ -12737,6 +12829,20 @@ mod tests {
         assert_eq!(after_ttl[0]["lifecycle"], "resolved");
         assert!(after_ttl.iter().any(|row| row["lifecycle"] == "open"));
         assert!(after_ttl.iter().any(|row| row["lifecycle"] == "updated"));
+
+        let coaching = db
+            .list_coaching_market_events(10, None, None)
+            .expect("coaching");
+        assert_eq!(coaching.len(), 1);
+        assert_eq!(coaching[0]["lifecycle"], "resolved");
+        assert_eq!(coaching[0]["eventType"], "absorption_invalidated");
+        let confirmed_view = db
+            .list_coaching_market_events(10, None, Some("absorption_confirmed"))
+            .expect("confirmed view");
+        assert!(
+            confirmed_view.is_empty(),
+            "type filter applies after collapse so resolved identities are not still updated"
+        );
     }
 
     #[test]

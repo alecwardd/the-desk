@@ -1117,10 +1117,13 @@ pub struct JournalAsOfSnapshot {
 
 /// Capsule dump still filling the after-window.
 pub const CAPSULE_COMPLETENESS_PENDING: &str = "pending";
-/// After-window closed on the Capsule's own lane clock.
+/// After-window closed on the Capsule's own lane clock with trailing coverage.
 pub const CAPSULE_COMPLETENESS_COMPLETE: &str = "complete";
 /// Session/feed ended (or mix/coverage gap) before the after-window closed.
 pub const CAPSULE_COMPLETENESS_INCOMPLETE: &str = "incomplete";
+/// Pending rows are abandoned only after `window_end_ms` plus this grace, so
+/// another process still filling the dump is not stamped `degraded`.
+pub const CAPSULE_ORPHAN_GRACE_MS: f64 = 2_000.0;
 
 const CAPSULE_SELECT_COLUMNS: &str =
     "id, trigger_identity_id, dedup_identity_id, root_symbol, event_type,
@@ -7456,9 +7459,10 @@ impl Database {
     /// Stamp leftover `pending` Capsules `incomplete` + `degraded`.
     ///
     /// After-window state lives in memory. Rows whose ids are not in `keep_ids`
-    /// were abandoned (process restart, eviction) and must not stay `pending`.
-    /// In-flight dumps on this MarketRouter are listed in `keep_ids` and stay
-    /// pending until the after-window closes or the session/feed ends.
+    /// *and* whose after-window has already elapsed (plus a short grace) were
+    /// abandoned and must not stay `pending`. In-flight dumps on this
+    /// MarketRouter, and pending rows still inside their after-window in
+    /// another process sharing this SQLite file, are left alone.
     pub fn finalize_orphaned_pending_capsules(
         &self,
         keep_ids: &[String],
@@ -7469,14 +7473,20 @@ impl Database {
         } else {
             0.0
         };
+        let cutoff = if clock > 0.0 {
+            clock - CAPSULE_ORPHAN_GRACE_MS
+        } else {
+            0.0
+        };
         if keep_ids.is_empty() {
             let n = self.conn.execute(
                 "UPDATE capsules
                     SET completeness = 'incomplete',
                         degraded = 1,
                         updated_at_ms = CASE WHEN ?1 > 0 THEN ?1 ELSE updated_at_ms END
-                  WHERE completeness = 'pending'",
-                params![clock],
+                  WHERE completeness = 'pending'
+                    AND window_end_ms < ?2",
+                params![clock, cutoff],
             )?;
             return Ok(n);
         }
@@ -7486,14 +7496,18 @@ impl Database {
                     degraded = 1,
                     updated_at_ms = CASE WHEN ?1 > 0 THEN ?1 ELSE updated_at_ms END
               WHERE completeness = 'pending'
+                AND window_end_ms < ?2
                 AND id NOT IN (",
         );
-        let mut params: Vec<rusqlite::types::Value> = vec![rusqlite::types::Value::Real(clock)];
+        let mut params: Vec<rusqlite::types::Value> = vec![
+            rusqlite::types::Value::Real(clock),
+            rusqlite::types::Value::Real(cutoff),
+        ];
         for (i, id) in keep_ids.iter().enumerate() {
             if i > 0 {
                 sql.push_str(", ");
             }
-            sql.push_str(&format!("?{}", i + 2));
+            sql.push_str(&format!("?{}", i + 3));
             params.push(rusqlite::types::Value::Text(id.clone()));
         }
         sql.push(')');
@@ -13341,6 +13355,23 @@ mod tests {
         assert_eq!(by_id("cap_done").completeness, "complete");
         assert!(db.capsule_exists_for_dedup("dedup_x").expect("dedup"));
         assert!(!db.capsule_exists_for_dedup("dedup_missing").expect("none"));
+    }
+
+    #[test]
+    fn finalize_orphaned_pending_does_not_sweep_open_windows() {
+        let db = test_db();
+        let pending = sample_capsule_record("cap_live", "pending", false, 4, "open");
+        db.upsert_capsule(&pending).expect("insert");
+        let n = db
+            .finalize_orphaned_pending_capsules(&[], 1_700_000_010_000.0)
+            .expect("sweep");
+        assert_eq!(n, 0);
+        assert_eq!(db.list_capsules().unwrap()[0].completeness, "pending");
+        let n = db
+            .finalize_orphaned_pending_capsules(&[], 0.0)
+            .expect("no clock");
+        assert_eq!(n, 0);
+        assert_eq!(db.list_capsules().unwrap()[0].completeness, "pending");
     }
 
     #[test]

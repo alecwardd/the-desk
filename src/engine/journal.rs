@@ -649,6 +649,7 @@ mod tests {
 
     #[test]
     fn restart_finalizes_orphaned_pending_capsules() {
+        use crate::engine::CAPSULE_AFTER_MS;
         let db = Database::open(":memory:").expect("db");
         let router = MarketRouter::new(RouterRoot::Nq, SourceProviderKind::File, "orphan-open");
         router.apply_tick(RouterRoot::Nq, &tick(RTH_TS, 20_000.0));
@@ -660,7 +661,45 @@ mod tests {
         let restarted =
             MarketRouter::new(RouterRoot::Nq, SourceProviderKind::File, "orphan-restart");
         restarted.apply_tick(RouterRoot::Nq, &tick(RTH_TS + 1_000.0, 20_000.25));
-        restarted.persist_journal(&db).expect("restart persist");
+        restarted.persist_journal(&db).expect("mid-window restart");
+        assert_eq!(
+            db.list_capsules().unwrap()[0].completeness,
+            "pending",
+            "another process must not stamp a still-open after-window as abandoned"
+        );
+
+        restarted.apply_tick(
+            RouterRoot::Nq,
+            &tick(RTH_TS + 100.0 + CAPSULE_AFTER_MS + 5_000.0, 20_000.5),
+        );
+        restarted.persist_journal(&db).expect("past window");
+        let cap = db.list_capsules().expect("caps").pop().expect("one");
+        assert_eq!(cap.completeness, "incomplete");
+        assert!(cap.degraded);
+    }
+
+    #[test]
+    fn after_window_feed_gap_marks_incomplete_degraded() {
+        use crate::engine::{CAPSULE_LOOKBACK_MS, CAPSULE_RING_STEP_MS};
+        let db = Database::open(":memory:").expect("db");
+        let router = MarketRouter::new(RouterRoot::Nq, SourceProviderKind::File, "gap");
+        let event_ts = RTH_TS + CAPSULE_LOOKBACK_MS;
+        let lookback_n = (CAPSULE_LOOKBACK_MS / CAPSULE_RING_STEP_MS) as i32;
+        for i in 0..=lookback_n {
+            router.apply_tick(
+                RouterRoot::Nq,
+                &tick(RTH_TS + i as f64 * CAPSULE_RING_STEP_MS, 20_000.0),
+            );
+        }
+        router.note_transition_events(RouterRoot::Nq, &[stop_run_at(event_ts)]);
+        for i in 1..=20 {
+            router.apply_tick(
+                RouterRoot::Nq,
+                &tick(event_ts + i as f64 * CAPSULE_RING_STEP_MS, 20_000.25),
+            );
+        }
+        router.apply_tick(RouterRoot::Nq, &tick(event_ts + 40.0 * 60_000.0, 20_001.0));
+        router.persist_journal(&db).expect("persist");
         let cap = db.list_capsules().expect("caps").pop().expect("one");
         assert_eq!(cap.completeness, "incomplete");
         assert!(cap.degraded);

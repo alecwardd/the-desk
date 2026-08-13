@@ -91,10 +91,13 @@ fn golden_stop_run_capsule_window_on_market_clock() {
         cap.end_frame_second,
         journal_frame_second_from_ts(event_ts + 60_000.0)
     );
+    let min_samples =
+        ((CAPSULE_LOOKBACK_MS + CAPSULE_AFTER_MS) / CAPSULE_RING_STEP_MS * 0.9) as i64;
     assert!(
-        cap.sample_count >= 2,
-        "dump must include ring samples, got {}",
-        cap.sample_count
+        cap.sample_count >= min_samples,
+        "250 ms ring must populate the window: sample_count={} min={}",
+        cap.sample_count,
+        min_samples
     );
 
     let events = db

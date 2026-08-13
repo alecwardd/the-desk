@@ -29,6 +29,9 @@ use super::root::RouterRoot;
 pub const CAPSULE_RING_STEP_MS: f64 = 250.0;
 /// Extra ring retention beyond lookback so persist jitter cannot drop the window.
 pub const CAPSULE_RING_MARGIN_MS: f64 = 2_000.0;
+/// Trailing coverage slack: last sample may land one or two 250 ms buckets
+/// before `window_end_ms` without treating the dump as a gap.
+const COMPLETE_COVERAGE_SLACK_MS: f64 = CAPSULE_RING_STEP_MS * 2.0;
 
 /// Intended Capsule window on the MarketRouter clock: 30 s before → 60 s after.
 pub fn capsule_window_bounds(event_timestamp_ms: f64) -> (f64, f64) {
@@ -242,12 +245,21 @@ impl PendingCapsule {
     }
 
     /// Close on MarketRouter clock (complete) or session/feed end (incomplete).
+    ///
+    /// `complete` requires the lane clock to reach `window_end_ms` *and*
+    /// trailing ring coverage through that end. A stall that resumes after the
+    /// window has already elapsed must not advertise a full dump.
     pub fn finalize(&mut self, clock_ms: f64, session_or_feed_ended: bool) {
         if self.is_terminal() {
             return;
         }
         if clock_ms.is_finite() && clock_ms + 0.5 >= self.window_end_ms {
-            self.completeness = CAPSULE_COMPLETENESS_COMPLETE.to_string();
+            if self.last_sample_ms + COMPLETE_COVERAGE_SLACK_MS + 0.5 < self.window_end_ms {
+                self.completeness = CAPSULE_COMPLETENESS_INCOMPLETE.to_string();
+                self.degraded = true;
+            } else {
+                self.completeness = CAPSULE_COMPLETENESS_COMPLETE.to_string();
+            }
             return;
         }
         if session_or_feed_ended {
@@ -490,6 +502,21 @@ mod tests {
             rec.end_frame_second,
             journal_frame_second_from_ts(event_ts + 60_000.0)
         );
+    }
+
+    #[test]
+    fn finalize_marks_incomplete_when_trailing_coverage_is_short() {
+        let mut ring = CapsuleRing::default();
+        let event_ts = 1_704_207_630_000.0;
+        fill_ring(&mut ring, event_ts - 5_000.0, 20);
+        let mut pending = PendingCapsule::open_from_ring(
+            RouterRoot::Nq,
+            &sample_event("stop_run", event_ts),
+            &ring,
+        );
+        pending.finalize(event_ts + CAPSULE_AFTER_MS, false);
+        assert_eq!(pending.completeness, CAPSULE_COMPLETENESS_INCOMPLETE);
+        assert!(pending.degraded);
     }
 
     #[test]

@@ -93,13 +93,14 @@ async fn embedded_and_socket_paths_are_coaching_parity() {
     socket_host.poll_once(&mut provider_b, 100).unwrap();
     let store = socket_host.published_store();
 
-    let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let bind = probe.local_addr().unwrap().to_string();
-    drop(probe);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bind = listener.local_addr().unwrap().to_string();
     let (tx, rx) = watch::channel(false);
     let store_bg = store.clone();
-    let server = EngineSocketServer::new(bind.clone());
-    let serve = tokio::spawn(async move { server.serve(store_bg, rx).await });
+    let serve =
+        tokio::spawn(
+            async move { EngineSocketServer::serve_listener(listener, store_bg, rx).await },
+        );
 
     let client = EngineClient::new(bind);
     for _ in 0..100 {
@@ -141,14 +142,15 @@ async fn kill_the_engine_degrades_and_recovers() {
     host.poll_once(&mut provider, 100).unwrap();
     let store = host.published_store();
 
-    let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let bind = probe.local_addr().unwrap().to_string();
-    drop(probe);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bind = listener.local_addr().unwrap().to_string();
 
     let (tx, rx) = watch::channel(false);
     let store_bg = store.clone();
-    let server = EngineSocketServer::new(bind.clone());
-    let serve = tokio::spawn(async move { server.serve(store_bg, rx).await });
+    let serve =
+        tokio::spawn(
+            async move { EngineSocketServer::serve_listener(listener, store_bg, rx).await },
+        );
 
     let client = EngineClient::new(bind.clone());
     for _ in 0..100 {
@@ -191,8 +193,21 @@ async fn kill_the_engine_degrades_and_recovers() {
     let (tx2, rx2) = watch::channel(false);
     host.poll_once(&mut provider, 100).unwrap();
     let store_bg = store.clone();
-    let server = EngineSocketServer::new(bind.clone());
-    let serve2 = tokio::spawn(async move { server.serve(store_bg, rx2).await });
+    let mut listener2 = None;
+    for _ in 0..80 {
+        match tokio::net::TcpListener::bind(&bind).await {
+            Ok(l) => {
+                listener2 = Some(l);
+                break;
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+        }
+    }
+    let listener2 = listener2.expect("recover bind after kill");
+    let serve2 =
+        tokio::spawn(
+            async move { EngineSocketServer::serve_listener(listener2, store_bg, rx2).await },
+        );
     let mut recovered = client.get_published().await;
     for _ in 0..100 {
         if !recovered.degraded && recovered.generation > 0 {

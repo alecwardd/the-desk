@@ -28,11 +28,12 @@ jobs:
       github.event.pull_request.draft == false &&
       github.event.pull_request.head.repo.full_name == github.repository
 
-    # This is the CEILING for the whole pipeline. A called workflow can only
-    # reduce these, never escalate, so the caller must declare the union of what
-    # the reusable workflow's jobs need. Individual jobs downgrade from here:
-    # only the publisher gets `pull-requests: write`, and the job that runs
-    # Claude is read-only.
+    # The permission CEILING this repository grants. A called workflow can only
+    # reduce these, never escalate, so no job in the reusable workflow can hold
+    # more authority than appears here — whatever that workflow does internally.
+    #
+    # The guarantee that matters is local and verifiable: there is no
+    # `contents: write`, so nothing in this pipeline can commit, push, or merge.
     permissions:
       contents: read
       pull-requests: write

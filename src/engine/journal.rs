@@ -589,6 +589,97 @@ mod tests {
     }
 
     #[test]
+    fn updated_lifecycle_still_writes_first_capsule_when_none_exists() {
+        let db = Database::open(":memory:").expect("db");
+        db.insert_market_events_batch_scoped(Some("NQ"), &[stop_run_at(RTH_TS + 50.0)])
+            .expect("backfill");
+        let router = MarketRouter::new(RouterRoot::Nq, SourceProviderKind::File, "updated-first");
+        router.apply_tick(RouterRoot::Nq, &tick(RTH_TS, 20_000.0));
+        router.note_transition_events(RouterRoot::Nq, &[stop_run_at(RTH_TS + 1_100.0)]);
+        router.persist_journal(&db).expect("persist");
+        assert_eq!(
+            db.count_capsules().expect("count"),
+            1,
+            "first live dump must persist even when the occurrence row is already updated"
+        );
+        let events = db
+            .list_recent_market_events(10, None, Some("stop_run"))
+            .expect("events");
+        assert_eq!(events.len(), 2);
+        assert!(
+            events.iter().any(|e| e["lifecycle"] == "updated"),
+            "prior backfill row must stamp the live occurrence updated"
+        );
+    }
+
+    #[test]
+    fn completed_dedup_repeat_does_not_open_second_capsule() {
+        use crate::engine::{CAPSULE_AFTER_MS, CAPSULE_LOOKBACK_MS, CAPSULE_RING_STEP_MS};
+        let db = Database::open(":memory:").expect("db");
+        let router = MarketRouter::new(RouterRoot::Nq, SourceProviderKind::File, "dedup-complete");
+        let event_ts = RTH_TS + CAPSULE_LOOKBACK_MS;
+        let lookback_n = (CAPSULE_LOOKBACK_MS / CAPSULE_RING_STEP_MS) as i32;
+        for i in 0..=lookback_n {
+            router.apply_tick(
+                RouterRoot::Nq,
+                &tick(RTH_TS + i as f64 * CAPSULE_RING_STEP_MS, 20_000.0),
+            );
+        }
+        router.note_transition_events(RouterRoot::Nq, &[stop_run_at(event_ts)]);
+        let after_n = (CAPSULE_AFTER_MS / CAPSULE_RING_STEP_MS) as i32;
+        for i in 1..=after_n {
+            router.apply_tick(
+                RouterRoot::Nq,
+                &tick(event_ts + i as f64 * CAPSULE_RING_STEP_MS, 20_000.25),
+            );
+        }
+        router.persist_journal(&db).expect("complete");
+        assert_eq!(db.count_capsules().expect("first"), 1);
+        assert_eq!(db.list_capsules().unwrap()[0].completeness, "complete");
+        let mut repeat = stop_run_at(event_ts + 90_000.0);
+        repeat.sequence_num = Some(1);
+        router.note_transition_events(RouterRoot::Nq, &[repeat]);
+        router.persist_journal(&db).expect("repeat");
+        assert_eq!(
+            db.count_capsules().expect("still one"),
+            1,
+            "repeat of the same dedup must not spawn a second Capsule after complete"
+        );
+    }
+
+    #[test]
+    fn restart_finalizes_orphaned_pending_capsules() {
+        let db = Database::open(":memory:").expect("db");
+        let router = MarketRouter::new(RouterRoot::Nq, SourceProviderKind::File, "orphan-open");
+        router.apply_tick(RouterRoot::Nq, &tick(RTH_TS, 20_000.0));
+        router.note_transition_events(RouterRoot::Nq, &[stop_run_at(RTH_TS + 100.0)]);
+        router.persist_journal(&db).expect("open pending");
+        assert_eq!(db.list_capsules().unwrap()[0].completeness, "pending");
+        drop(router);
+
+        let restarted =
+            MarketRouter::new(RouterRoot::Nq, SourceProviderKind::File, "orphan-restart");
+        restarted.apply_tick(RouterRoot::Nq, &tick(RTH_TS + 1_000.0, 20_000.25));
+        restarted.persist_journal(&db).expect("restart persist");
+        let cap = db.list_capsules().expect("caps").pop().expect("one");
+        assert_eq!(cap.completeness, "incomplete");
+        assert!(cap.degraded);
+    }
+
+    #[test]
+    fn in_flight_pending_capsule_survives_later_persist() {
+        let db = Database::open(":memory:").expect("db");
+        let router = MarketRouter::new(RouterRoot::Nq, SourceProviderKind::File, "inflight");
+        router.apply_tick(RouterRoot::Nq, &tick(RTH_TS, 20_000.0));
+        router.note_transition_events(RouterRoot::Nq, &[stop_run_at(RTH_TS + 100.0)]);
+        router.persist_journal(&db).expect("open");
+        router.persist_journal(&db).expect("again");
+        let cap = db.list_capsules().expect("caps").pop().expect("one");
+        assert_eq!(cap.completeness, "pending");
+        assert!(!cap.degraded);
+    }
+
+    #[test]
     fn incomplete_capsule_on_session_end_before_after_window() {
         let db = Database::open(":memory:").expect("db");
         let router = MarketRouter::new(RouterRoot::Nq, SourceProviderKind::File, "incomplete");

@@ -620,6 +620,15 @@ impl MarketRouter {
             Ok(mut g) => std::mem::take(&mut *g),
             Err(_) => return Ok((0, 0)),
         };
+        let keep_ids: Vec<String> = pending.iter().map(|cap| cap.id.clone()).collect();
+        if let Err(err) = db.finalize_orphaned_pending_capsules(&keep_ids, clock_ms) {
+            if let Ok(mut g) = self.pending_capsules.lock() {
+                let mut restore = pending;
+                restore.append(&mut *g);
+                *g = merge_pending_capsules(restore);
+            }
+            return Err(err);
+        }
         let mut opened = 0usize;
         let mut finalized = 0usize;
         let mut keep = Vec::new();
@@ -649,9 +658,21 @@ impl MarketRouter {
                     break;
                 }
             };
+            // `open` writes the first dump. `updated` with no row yet still writes
+            // when this condition has no Capsule (backfill / same-batch stamp).
+            // A later occurrence of the same dedup must not spawn another Capsule.
             let should_write = match lifecycle.as_deref() {
                 Some(state) if should_open_capsule(&cap.event_type, state) => true,
-                Some("updated") if !existed => false,
+                Some("updated") if !existed => {
+                    match db.capsule_exists_for_dedup(&cap.dedup_identity_id) {
+                        Ok(has_dedup) => !has_dedup,
+                        Err(err) => {
+                            keep.push(cap);
+                            persist_err = Some(err);
+                            break;
+                        }
+                    }
+                }
                 None if !existed && !cap.is_terminal() => {
                     keep.push(cap);
                     continue;

@@ -7443,6 +7443,66 @@ impl Database {
         Ok(n > 0)
     }
 
+    /// Whether any Capsule already exists for this condition identity.
+    pub fn capsule_exists_for_dedup(&self, dedup_identity_id: &str) -> Result<bool, DbError> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(1) FROM capsules WHERE dedup_identity_id = ?1",
+            params![dedup_identity_id],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Stamp leftover `pending` Capsules `incomplete` + `degraded`.
+    ///
+    /// After-window state lives in memory. Rows whose ids are not in `keep_ids`
+    /// were abandoned (process restart, eviction) and must not stay `pending`.
+    /// In-flight dumps on this MarketRouter are listed in `keep_ids` and stay
+    /// pending until the after-window closes or the session/feed ends.
+    pub fn finalize_orphaned_pending_capsules(
+        &self,
+        keep_ids: &[String],
+        updated_at_ms: f64,
+    ) -> Result<usize, DbError> {
+        let clock = if updated_at_ms.is_finite() && updated_at_ms > 0.0 {
+            updated_at_ms
+        } else {
+            0.0
+        };
+        if keep_ids.is_empty() {
+            let n = self.conn.execute(
+                "UPDATE capsules
+                    SET completeness = 'incomplete',
+                        degraded = 1,
+                        updated_at_ms = CASE WHEN ?1 > 0 THEN ?1 ELSE updated_at_ms END
+                  WHERE completeness = 'pending'",
+                params![clock],
+            )?;
+            return Ok(n);
+        }
+        let mut sql = String::from(
+            "UPDATE capsules
+                SET completeness = 'incomplete',
+                    degraded = 1,
+                    updated_at_ms = CASE WHEN ?1 > 0 THEN ?1 ELSE updated_at_ms END
+              WHERE completeness = 'pending'
+                AND id NOT IN (",
+        );
+        let mut params: Vec<rusqlite::types::Value> = vec![rusqlite::types::Value::Real(clock)];
+        for (i, id) in keep_ids.iter().enumerate() {
+            if i > 0 {
+                sql.push_str(", ");
+            }
+            sql.push_str(&format!("?{}", i + 2));
+            params.push(rusqlite::types::Value::Text(id.clone()));
+        }
+        sql.push(')');
+        let n = self
+            .conn
+            .execute(&sql, rusqlite::params_from_iter(params))?;
+        Ok(n)
+    }
+
     /// Journal Frames overlapping a Capsule window for the same root.
     pub fn list_journal_frames_for_capsule(
         &self,
@@ -13256,6 +13316,31 @@ mod tests {
                 .as_deref(),
             None
         );
+    }
+
+    #[test]
+    fn finalize_orphaned_pending_capsules_keeps_in_flight_ids() {
+        let db = test_db();
+        let orphan = sample_capsule_record("cap_orphan", "pending", false, 4, "old");
+        let inflight = sample_capsule_record("cap_inflight", "pending", false, 8, "live");
+        let done = sample_capsule_record("cap_done", "complete", false, 12, "full");
+        db.upsert_capsule(&orphan).expect("orphan");
+        db.upsert_capsule(&inflight).expect("inflight");
+        db.upsert_capsule(&done).expect("done");
+
+        let n = db
+            .finalize_orphaned_pending_capsules(&["cap_inflight".into()], 1_700_000_090_000.0)
+            .expect("finalize");
+        assert_eq!(n, 1);
+        let rows = db.list_capsules().expect("list");
+        let by_id = |id: &str| rows.iter().find(|r| r.id == id).expect(id);
+        assert_eq!(by_id("cap_orphan").completeness, "incomplete");
+        assert!(by_id("cap_orphan").degraded);
+        assert_eq!(by_id("cap_inflight").completeness, "pending");
+        assert!(!by_id("cap_inflight").degraded);
+        assert_eq!(by_id("cap_done").completeness, "complete");
+        assert!(db.capsule_exists_for_dedup("dedup_x").expect("dedup"));
+        assert!(!db.capsule_exists_for_dedup("dedup_missing").expect("none"));
     }
 
     #[test]

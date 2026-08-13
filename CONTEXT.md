@@ -11,7 +11,7 @@ exactly in code, docs, ADRs, and agent copy. Do not invent synonyms.
 | **Derived Feature** | Declared Feature-IR program over catalog fields using funded Operator Families. |
 | **Feature-IR** | Typed intermediate representation for Derived Features (later milestones). |
 | **Operator Family** | One of the funded Feature-IR operator classes (cross-symbol, session percentiles, dwell/time-since, event sequences, historical baselines). |
-| **Journal Frame** | 1 Hz persisted market-state frame (later milestone). `get_state(as_of=…)` is served from persisted snapshots until frames ship. |
+| **Journal Frame** | 1 Hz persisted market-state frame on the MarketRouter clock (NQ+ES). Compute/publish may stay at ~250 ms (ADR-019); only 1 Hz frames are persisted. `get_state(as_of=…)` is served from Journal Frames (provenance source = Journal). Transition event rows join via `(journal_frame_second, root_symbol)`. |
 | **Capsule** | High-resolution dump around a salient event (~30s before → ~60s after); mandatory for DOM-family events later. |
 | **Episode Query** | Conjunctive historical query over catalog fields with forward returns / MFE/MAE (later research kernel). |
 | **Positioning** | Dealer/options domain with four record kinds: position-grid, by-strike, Slice, Levels-Only Record. Catalog stub first; providers later. |

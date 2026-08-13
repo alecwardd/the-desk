@@ -648,3 +648,24 @@ This note does not raise the Trust Ceiling and does not introduce Catalog v0.
 This note does not introduce Journal Frames, Capsules, Feature-IR, Positioning providers, or ACSIL.
 
 **Consequences:** Cross-market live `get_state` is one call. Later Journal Frames can persist both symbols on the same clock without a backfill gap for NQ↔ES conjunctions.
+
+---
+
+### Decision note: SIL-M3a Market State Journal — 1 Hz Journal Frames + event rows
+
+**Date:** 2026-08-13
+**Status:** Decided (implements [alecwardd/the-desk#8](https://github.com/alecwardd/the-desk/issues/8); Part of #2)
+
+**Context:** After MarketRouter v0, NQ and ES share one clock. `get_state(as_of=…)` still read from `pipeline_snapshots` (research/context cadence) with a shim note that Journal Frames had not shipped. The ~250 ms analysis pass (ADR-019) must keep publishing for live coaching, but must not persist 4 Hz forever. MFE/MAE / R-result stay tick-driven on `PendingOutcomeSet`.
+
+**Decision:**
+
+1. **1 Hz Journal Frames** persist for **NQ** and **ES** on the shared **MarketRouter** clock (`clock_ms`, `frame_second = floor(clock_ms / 1000)`). Both roots in a second share the first observed clock of that second. Duplicate `(frame_second, root_symbol)` rows are ignored — a 250 ms publish loop cannot store 4 Hz frames. Capsules / 250 ms dumps are out of scope (#10).
+2. **Transition event rows** are written when detectors fire and join to frames on `(journal_frame_second, root_symbol)`. `get_events` remains identity rows (no open/updated/resolved — #9).
+3. **`get_state(as_of=…)`** is served **only** from Journal Frames (provenance source = **Journal**). Live `get_state` without `as_of` stays the published/live path. Multi-symbol envelope shape from SIL-M2b is preserved. Per-domain provenance remains mandatory. `pipeline_snapshots` is not a silent dual source for `as_of`.
+4. **MFE/MAE / R-result** remain tick-driven (ADR-019). The journal writer persists already-computed state and does not sample outcome extremes from frames.
+5. **Embedded-engine fallback** still writes Journal Frames for both symbols (NQ shared coaching pipelines + ES lane). External `the-desk-engine` writes the same tables on the same clock. Trust Ceiling stays **L3**; read/query stays Trust Level **L0**.
+
+This note does not introduce Capsules, event lifecycle formalization, the research query kernel, DuckDB, Positioning providers, Feature-IR, or ACSIL.
+
+**Consequences:** Historical `as_of` reads are co-recorded NQ↔ES frames. Rebuild from `.scid`/`.depth` through MarketRouter reproduces frames within the existing golden strict/derived tolerance model.

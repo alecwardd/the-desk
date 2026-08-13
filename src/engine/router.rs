@@ -12,13 +12,17 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use serde_json::Value;
-
+use crate::db::{Database, DbError, JournalFrameRecord};
 use crate::feed::ContractMetadata;
-use crate::pipelines::{EventDetector, FlowEventEmitter, PipelineEngine};
+use crate::pipelines::{EventDetector, FlowEventEmitter, MarketEvent, PipelineEngine};
+use serde_json::Value;
 
 use super::health::{EngineHealth, FeedStallState};
 use super::host::{EngineHost, IngestOutcome};
+use super::journal::{
+    journal_frame_from_snapshot, journal_frame_second, persist_journal_observation,
+    JournalPersistStats,
+};
 use super::published::{PublishedEngineState, PublishedStateStore};
 use super::root::RouterRoot;
 use super::source::{SourceError, SourceHealth, SourceProvider, SourceProviderKind, SourceTick};
@@ -32,6 +36,9 @@ pub struct MarketRouter {
     provider_kind: SourceProviderKind,
     mode_label: String,
     clock_ms_bits: AtomicU64,
+    pending_journal_events: Mutex<Vec<(RouterRoot, MarketEvent)>>,
+    pending_journal_frames: Mutex<BTreeMap<(i64, RouterRoot), JournalFrameRecord>>,
+    journal_second_clock: Mutex<BTreeMap<i64, f64>>,
 }
 
 impl MarketRouter {
@@ -51,6 +58,9 @@ impl MarketRouter {
             provider_kind,
             mode_label: mode_label.into(),
             clock_ms_bits: AtomicU64::new(0),
+            pending_journal_events: Mutex::new(Vec::new()),
+            pending_journal_frames: Mutex::new(BTreeMap::new()),
+            journal_second_clock: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -87,6 +97,9 @@ impl MarketRouter {
             provider_kind,
             mode_label: mode_label.into(),
             clock_ms_bits: AtomicU64::new(0),
+            pending_journal_events: Mutex::new(Vec::new()),
+            pending_journal_frames: Mutex::new(BTreeMap::new()),
+            journal_second_clock: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -143,6 +156,10 @@ impl MarketRouter {
     pub fn apply_tick(&self, root: RouterRoot, tick: &SourceTick) -> Option<IngestOutcome> {
         let out = self.lane(root).apply_tick(tick)?;
         self.advance_clock(tick.timestamp_ms);
+        if !out.new_events.is_empty() {
+            self.note_transition_events(root, &out.new_events);
+        }
+        self.queue_journal_frames();
         Some(out)
     }
 
@@ -332,6 +349,72 @@ impl MarketRouter {
             }
         }
         out
+    }
+
+    /// Current per-root MarketState keyed by [`RouterRoot`].
+    pub fn snapshots_by_root(&self) -> BTreeMap<RouterRoot, Value> {
+        let mut out = BTreeMap::new();
+        for root in RouterRoot::ALL {
+            let snap = self.lane(root).snapshot_market_state();
+            if !snap.is_null() {
+                out.insert(root, snap);
+            }
+        }
+        out
+    }
+
+    /// Queue transition event rows (embedded NQ ingest that does not call `apply_tick`).
+    pub fn note_transition_events(&self, root: RouterRoot, events: &[MarketEvent]) {
+        if events.is_empty() {
+            return;
+        }
+        if let Ok(mut pending) = self.pending_journal_events.lock() {
+            pending.extend(events.iter().cloned().map(|event| (root, event)));
+        }
+    }
+
+    /// Capture 1 Hz Journal Frames for every root that has a snapshot at this clock second.
+    ///
+    /// First observation of a second pins the shared `clock_ms`. Later 250 ms ticks
+    /// in the same second do not replace the frame. A root that first prints later
+    /// in the second still joins at that pinned clock.
+    pub fn queue_journal_frames(&self) {
+        let Some(clock_ms) = self.clock_ms() else {
+            return;
+        };
+        let Some(frame_second) = journal_frame_second(clock_ms) else {
+            return;
+        };
+        let aligned = {
+            let Ok(mut clocks) = self.journal_second_clock.lock() else {
+                return;
+            };
+            *clocks.entry(frame_second).or_insert(clock_ms)
+        };
+        let Ok(mut pending) = self.pending_journal_frames.lock() else {
+            return;
+        };
+        for (root, snap) in self.snapshots_by_root() {
+            pending
+                .entry((frame_second, root))
+                .or_insert_with(|| journal_frame_from_snapshot(aligned, frame_second, root, &snap));
+        }
+    }
+
+    /// Persist queued Journal Frames + transition events (INSERT OR IGNORE).
+    pub fn persist_journal(&self, db: &Database) -> Result<JournalPersistStats, DbError> {
+        self.queue_journal_frames();
+        let frames: Vec<JournalFrameRecord> = self
+            .pending_journal_frames
+            .lock()
+            .map(|mut g| std::mem::take(&mut *g).into_values().collect())
+            .unwrap_or_default();
+        let events: Vec<(RouterRoot, MarketEvent)> = self
+            .pending_journal_events
+            .lock()
+            .map(|mut g| std::mem::take(&mut *g))
+            .unwrap_or_default();
+        persist_journal_observation(db, &frames, &events)
     }
 
     fn advance_clock(&self, timestamp_ms: f64) {

@@ -1,12 +1,21 @@
 //! Engine bind-address helpers (mode enum lives in `catalog::EngineMode`).
 
 use serde::Deserialize;
+use std::path::PathBuf;
 
 use crate::catalog::EngineMode;
 use crate::feed::default_config_path;
 
 /// Default TCP bind for the read-only engine state socket (localhost only).
 pub const ENGINE_DEFAULT_BIND: &str = "127.0.0.1:17843";
+
+/// Default SQLite path shared with MCP (`~/.the-desk/data.db`).
+pub fn default_engine_database_path() -> PathBuf {
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home).join(".the-desk").join("data.db")
+}
 
 #[derive(Debug, Deserialize, Default)]
 struct RootEngineBind {

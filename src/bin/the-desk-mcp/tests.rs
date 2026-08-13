@@ -1180,6 +1180,107 @@ async fn get_state_returns_nq_and_es_in_one_envelope() {
 }
 
 #[tokio::test]
+async fn get_state_as_of_served_from_journal_frames_not_pipeline_snapshots() {
+    let server = test_server_with_sil();
+    let ts = 1_704_207_600_000.0;
+    server.market_router.apply_tick(
+        the_desk_backend::engine::RouterRoot::Nq,
+        &the_desk_backend::engine::SourceTick {
+            timestamp_ms: ts,
+            price: 20_000.0,
+            volume: 1.0,
+            bid: 19_999.75,
+            ask: 20_000.25,
+            side: TradeSide::Buy,
+            root_symbol: Some("NQ".into()),
+        },
+    );
+    server.market_router.apply_tick(
+        the_desk_backend::engine::RouterRoot::Es,
+        &the_desk_backend::engine::SourceTick {
+            timestamp_ms: ts + 100.0,
+            price: 5_000.0,
+            volume: 1.0,
+            bid: 4_999.75,
+            ask: 5_000.25,
+            side: TradeSide::Buy,
+            root_symbol: Some("ES".into()),
+        },
+    );
+    {
+        let db = server.db.lock().expect("db");
+        db.insert_pipeline_snapshot(
+            ts + 50.0,
+            &serde_json::json!({"lastPrice": 99_999.0, "rootSymbol": "NQ"}),
+        )
+        .expect("decoy pipeline snapshot");
+        server
+            .market_router
+            .persist_journal(&db)
+            .expect("journal frames");
+    }
+
+    let out = parse_text_tool_result(
+        server
+            .get_state(Parameters(GetStateParams {
+                symbols: Some(vec!["NQ".into(), "ES".into()]),
+                domains: Some(vec!["identity".into(), "location_structure".into()]),
+                fields: None,
+                resolution: Some("R0".into()),
+                as_of: Some(ts + 100.0),
+                budget_tokens: None,
+            }))
+            .await
+            .expect("get_state as_of"),
+    );
+    assert_eq!(out["trustLevel"], "L0");
+    assert_eq!(out["mutationAuthority"], false);
+    assert_eq!(out["orderAuthority"], false);
+    assert_eq!(out["asOf"], ts + 100.0);
+    let values = out["values"].as_object().expect("values");
+    assert_eq!(
+        values.get("NQ.market.location_structure.lastPrice"),
+        Some(&serde_json::json!(20_000.0))
+    );
+    assert_eq!(
+        values.get("ES.market.location_structure.lastPrice"),
+        Some(&serde_json::json!(5_000.0))
+    );
+    assert_ne!(
+        values.get("NQ.market.location_structure.lastPrice"),
+        Some(&serde_json::json!(99_999.0)),
+        "as_of must not fall back to pipeline_snapshots"
+    );
+    let provenance = out["provenance"].as_object().expect("provenance");
+    assert_eq!(provenance["NQ.location_structure"]["source"], "journal");
+    assert_eq!(provenance["ES.location_structure"]["source"], "journal");
+    assert!(provenance["NQ.location_structure"]["note"]
+        .as_str()
+        .unwrap_or("")
+        .contains("Journal Frames"));
+}
+
+#[tokio::test]
+async fn get_state_as_of_missing_frames_degrades_with_journal_provenance() {
+    let server = test_server_with_sil();
+    let out = parse_text_tool_result(
+        server
+            .get_state(Parameters(GetStateParams {
+                symbols: Some(vec!["NQ".into()]),
+                domains: Some(vec!["location_structure".into()]),
+                resolution: Some("R1".into()),
+                as_of: Some(1_704_207_600_000.0),
+                ..Default::default()
+            }))
+            .await
+            .expect("degraded as_of"),
+    );
+    assert_eq!(out["trustLevel"], "L0");
+    assert_eq!(out["degraded"]["location_structure"], true);
+    assert_eq!(out["provenance"]["location_structure"]["source"], "journal");
+}
+
+#[tokio::test]
 async fn get_state_rejects_r2_r3() {
     let server = test_server_with_sil();
     let err = server

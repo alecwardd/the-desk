@@ -101,7 +101,7 @@ impl TheDeskMcp {
     }
 
     #[tool(
-        description = "SIL read kernel: parameterized state read returning a StateEnvelope with per-domain provenance and degraded flags. Params: symbols? (NQ and/or ES; MarketRouter v0), domains?, fields?, resolution (R0|R1 required), as_of?, budget_tokens?. When both symbols are requested, values are keyed {ROOT}.{catalogFieldId} in one envelope on the aligned clock. Absence of provenance is a failure; a degraded domain sets its flag rather than failing the whole call. Trust Level L0 — read/query only, no mutation or order authority. Enable via [sil].catalog_discovery."
+        description = "SIL read kernel: parameterized state read returning a StateEnvelope with per-domain provenance and degraded flags. Params: symbols? (NQ and/or ES; MarketRouter v0), domains?, fields?, resolution (R0|R1 required), as_of?, budget_tokens?. Live reads (no as_of) use published/live snapshots. as_of is served from 1 Hz Journal Frames (provenance source = Journal) — never pipeline_snapshots. When both symbols are requested, values are keyed {ROOT}.{catalogFieldId} in one envelope on the aligned clock. Absence of provenance is a failure; a degraded domain sets its flag rather than failing the whole call. Trust Level L0 — read/query only, no mutation or order authority. Enable via [sil].catalog_discovery."
     )]
     pub(crate) async fn get_state(
         &self,
@@ -126,10 +126,15 @@ impl TheDeskMcp {
             })
         })?;
 
-        let (snapshot_owned, snapshot_source, data_time, source_degraded, source_note, as_of) =
-            self.resolve_state_snapshot(params.as_of).await?;
+        if params.as_of.is_some() {
+            return self
+                .get_state_from_journal_frames(&catalog, requested_roots, params, resolution)
+                .await;
+        }
 
-        // as_of is still a single persisted snapshot until Journal Frames (#8).
+        let (snapshot_owned, snapshot_source, data_time, source_degraded, source_note, as_of) =
+            self.resolve_state_snapshot().await?;
+
         // Live path can return both MarketRouter roots in one StateEnvelope.
         let live_by_symbol = if as_of.is_none() {
             self.collect_live_snapshots_by_root()
@@ -353,10 +358,93 @@ impl TheDeskMcp {
 }
 
 impl TheDeskMcp {
-    /// Resolve a market snapshot for `get_state` (live, journal/as_of, or degraded gap).
+    /// Serve `get_state(as_of=…)` from 1 Hz Journal Frames (never `pipeline_snapshots`).
+    async fn get_state_from_journal_frames(
+        &self,
+        catalog: &the_desk_backend::catalog::DeskCatalog,
+        requested_roots: Vec<RouterRoot>,
+        params: GetStateParams,
+        resolution: StateResolution,
+    ) -> Result<CallToolResult, McpError> {
+        let ts = params.as_of.ok_or_else(|| {
+            invalid_params_error("asOf must be a positive finite epoch-milliseconds value")
+        })?;
+        if !ts.is_finite() || ts <= 0.0 {
+            return Err(invalid_params_error(
+                "asOf must be a positive finite epoch-milliseconds value",
+            ));
+        }
+
+        let journal = {
+            let db = self.db.lock().map_err(|_| lock_error())?;
+            db.get_journal_frames_as_of(ts).map_err(db_error)?
+        };
+
+        let note_missing = "as_of Journal Frame unavailable; domains degraded — your playbook reads should treat historical structure as incomplete";
+        let mut by_root = std::collections::BTreeMap::new();
+        for root in &requested_roots {
+            let (snapshot, data_time, degraded, note) = match journal.as_ref() {
+                Some(snap) => match snap.by_root.get(root.as_str()) {
+                    Some(payload) if !payload.is_null() => (
+                        Some(payload.clone()),
+                        Some(snap.clock_ms),
+                        false,
+                        Some("as_of served from Journal Frames".into()),
+                    ),
+                    _ => (None, Some(snap.clock_ms), true, Some(note_missing.into())),
+                },
+                None => (None, None, true, Some(note_missing.into())),
+            };
+            let req = StateReadRequest {
+                symbols: Some(vec![root.as_str().to_string()]),
+                domains: params.domains.clone(),
+                fields: params.fields.clone(),
+                resolution,
+                as_of: Some(ts),
+                budget_tokens: None,
+                snapshot: snapshot.as_ref(),
+                snapshot_source: ProvenanceSource::Journal,
+                data_time,
+                source_degraded: degraded,
+                source_degraded_note: note,
+            };
+            let env = build_state_envelope(catalog, req).map_err(|e| match e {
+                the_desk_backend::catalog::EnvelopeError::MissingProvenance(_) => {
+                    McpError::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None)
+                }
+                other => invalid_params_error(other.to_string()),
+            })?;
+            by_root.insert(root.as_str().to_string(), env);
+        }
+
+        if let Some(budget) = params.budget_tokens {
+            if let Some(env) = by_root.values_mut().next() {
+                env.budget_tokens = Some(budget);
+            }
+        }
+
+        let clock_ms = journal.as_ref().map(|s| s.clock_ms);
+        let include_multi = requested_roots.len() > 1;
+        if include_multi {
+            let envelope = merge_symbol_envelopes(by_root, clock_ms)
+                .map_err(|e| McpError::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?;
+            return Ok(text_result(finish_state_envelope_json(&envelope)?));
+        }
+
+        let envelope = by_root
+            .into_iter()
+            .next()
+            .map(|(_, mut env)| {
+                env.clock_ms = clock_ms;
+                env
+            })
+            .ok_or_else(|| invalid_params_error("get_state as_of required a MarketRouter root"))?;
+        Ok(text_result(finish_state_envelope_json(&envelope)?))
+    }
+
+    /// Resolve a live market snapshot for `get_state` (no `as_of`).
     async fn resolve_state_snapshot(
         &self,
-        as_of: Option<f64>,
     ) -> Result<
         (
             Option<serde_json::Value>,
@@ -368,35 +456,7 @@ impl TheDeskMcp {
         ),
         McpError,
     > {
-        if let Some(ts) = as_of {
-            if !ts.is_finite() || ts <= 0.0 {
-                return Err(invalid_params_error(
-                    "asOf must be a positive finite epoch-milliseconds value",
-                ));
-            }
-            let db = self.db.lock().map_err(|_| lock_error())?;
-            match db.get_snapshot_near(ts).map_err(db_error)? {
-                Some((snapshot_ts, payload)) => Ok((
-                    Some(payload),
-                    ProvenanceSource::Journal,
-                    Some(snapshot_ts),
-                    false,
-                    Some(
-                        "as_of served from persisted pipeline snapshot (Journal Frames not yet shipped)"
-                            .into(),
-                    ),
-                    Some(ts),
-                )),
-                None => Ok((
-                    None,
-                    ProvenanceSource::Journal,
-                    None,
-                    true,
-                    Some("as_of snapshot unavailable; domains degraded".into()),
-                    Some(ts),
-                )),
-            }
-        } else if let Some(r) = self.resolve_live_market_view() {
+        if let Some(r) = self.resolve_live_market_view() {
             let degraded = r.degradation_reason.is_some() || r.snapshot.is_null();
             let note = r.degradation_reason.clone();
             let snap = if r.snapshot.is_null() {

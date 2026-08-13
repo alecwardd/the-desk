@@ -108,7 +108,7 @@ Historical backlog days **enter as Levels-Only Records**. That path is first-cla
 - No scrape and no `Vs3dProvider` required.
 - Completeness is `levels_only`; provenance is manual / as-of the trader's annotation time.
 - Same derived-level fields (`flip`, `walls`, `balance`, `upsideTest`, `downsideTest`) as a Slice-backed card.
-- Durable Positioning write verb productization is owned by #15 (`positioning_entry`); until that lands, backlog exemplars live as pinned `agent_insights` with Levels-Only evidence so `recall_agent_insights` / memory brief can surface them.
+- Durable Positioning write verb: `positioning_entry` (#15). Historical backlog days enter as first-class Levels-Only Records. Teaching exemplars also live as pinned `agent_insights` via `the-desk-mcp --seed-positioning-corpus`.
 
 Never describe a Levels-Only Record as fallback, partial, or second-class.
 
@@ -156,5 +156,5 @@ Calendar-bound habit — do this even when provider work is gated:
 - Corpus fixture: `docs/trader-memory/fixtures/positioning-exemplar-corpus.json`
 - Seed module: `src/memory/positioning_corpus.rs`
 - Catalog Positioning stub: `docs/mcp/desk-catalog-v0.md` § Positioning record kinds
-- Manual Levels-Only write verb (later): #15
+- Manual Levels-Only write verb: #15 (`positioning_entry`)
 - Vs3dProvider scrape path (ToS-gated, later): #16

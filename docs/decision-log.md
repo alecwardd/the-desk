@@ -669,3 +669,23 @@ This note does not introduce Journal Frames, Capsules, Feature-IR, Positioning p
 This note does not introduce Capsules, event lifecycle formalization, the research query kernel, DuckDB, Positioning providers, Feature-IR, or ACSIL.
 
 **Consequences:** Historical `as_of` reads are co-recorded NQ↔ES frames. Rebuild from `.scid`/`.depth` through MarketRouter reproduces frames within the existing golden strict/derived tolerance model.
+
+---
+
+### Decision note: SIL-P-VS-a Levels-Only Record path
+
+**Date:** 2026-08-13
+**Status:** Decided (implements [alecwardd/the-desk#15](https://github.com/alecwardd/the-desk/issues/15); Part of #2)
+
+**Context:** Catalog v0 named four Positioning record kinds, including Levels-Only Record, but `get_state` Positioning was a fail-closed stub (`source=provider`, always degraded, no values). Teaching exemplars (#17) pointed at a durable write verb that did not exist. Vs3dProvider / ToS capture is later (#16). Manual entry is the ToS-denial steady state and the historical backlog path — not a degraded mode.
+
+**Decision:**
+
+1. **Typed write verb `positioning_entry`:** accepts **Levels-Only Records** into Positioning using the same schema a later capture adapter will write (`recordKind`, `completeness`, `capturedAt`, `asOf`, `dataTime`, `derivedLevels`, provenance). Slice / grid / by-strike writes are rejected here. Vendor stamps (`dataTime`, VolSignals) are rejected so a manual card is never presented as live vendor data.
+2. **First-class completeness:** `completeness: levels_only` is a Catalog field and a StateEnvelope value. It is not a fallback, partial, or second-class kind. A fresh same-day Levels-Only Record is `degraded=false`.
+3. **Reads ride `get_state`:** no specialty Positioning getter tools. Positioning stays **unprefixed** in multi-symbol envelopes. Provenance source is **`manual`** with explicit as-of in `provenance.dataTime` / `positioning.asOf`. Missing or prior-day freshness sets `freshnessOk=false` and `degraded=true` without omitting the domain and without `vendor` / `provider` pretence.
+4. **Persistence:** SQLite `positioning_records` (schema v32), written regardless of engine mode (embedded fallback and external engine keep coaching-path parity). Trust Ceiling stays **L3**. `get_state` / discovery stay Trust Level **L0**. `positioning_entry` mutates Positioning records only — not order authority.
+
+This note does not introduce Vs3dProvider, Capsules, Feature-IR, ACSIL, Journal Frame writer changes, or event lifecycle.
+
+**Consequences:** Agents can hand-enter dealer maps with no scrape and no ToS. Later capture writes the same rows. Coaching copy stays "your annotated sessions / your methodology say…".

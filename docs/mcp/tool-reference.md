@@ -4,7 +4,7 @@
 > Regenerate with `cargo run --bin the-desk-mcp -- --write-tool-docs`.
 > The test `tool_reference_doc_is_current` fails when this file is stale.
 
-The Desk MCP server exposes **121 MCP tools** across **9 domains**. Each domain maps to a module under `src/bin/the-desk-mcp/tools/`. For scenario-based routing ("which tool do I call when…"), read `skills/mcp-tools/SKILL.md` first; this file is the exhaustive catalog.
+The Desk MCP server exposes **122 MCP tools** across **9 domains**. Each domain maps to a module under `src/bin/the-desk-mcp/tools/`. For scenario-based routing ("which tool do I call when…"), read `skills/mcp-tools/SKILL.md` first; this file is the exhaustive catalog.
 
 | Domain | Tools | Reach for it when… |
 |---|---|---|
@@ -14,7 +14,7 @@ The Desk MCP server exposes **121 MCP tools** across **9 domains**. Each domain 
 | [Playbook](#playbook) | 16 | you are tracking setups, triaging what deserves attention, or moving a trade idea through its lifecycle |
 | [Risk](#risk) | 9 | sizing a trade, checking limits, or starting/ending a trading session |
 | [Journal](#journal) | 12 | recording or reviewing actual trades and journaling the session |
-| [Memory](#memory) | 12 | you want durable context about the trader, or to persist an insight worth remembering |
+| [Memory](#memory) | 13 | you want durable context about the trader, or to persist an insight worth remembering |
 | [Research](#research) | 23 | answering "how often" / "what happens after" questions or running and comparing backtests |
 | [Admin](#admin) | 12 | diagnosing data problems, backfilling history, or verifying feed and database health |
 
@@ -352,7 +352,7 @@ Create or update a trade journal entry. Supports manual chat-first trade logging
 
 ## Memory
 
-Trader memory: agent insights, behavioral patterns, follow-ups, briefings, and trader-context fit.
+Trader memory: agent insights, behavioral patterns, follow-ups, briefings, and Positioning Levels-Only Records (`positioning_entry`).
 
 Module: `src/bin/the-desk-mcp/tools/memory.rs`
 
@@ -383,6 +383,10 @@ Build a session-start packet that merges ranked memory, current account/risk con
 ### `get_trader_context_fit`
 
 Typed trader memory context fit. Separates executed-trade memory, setup opportunity context, coaching reminders, live post-loss/ordinal state, reliability, and provenance. Memory reports context only and must not drive sizing by itself.
+
+### `positioning_entry`
+
+Typed workflow verb: write a first-class Levels-Only Record into Positioning (same schema a later capture adapter will use). Manual/as-of provenance — not live vendor data, no VolSignals scrape, no ToS. Completeness is levels_only (first-class, not a fallback). Reads ride get_state (domain=positioning); do not use this as a getter. Mutation of Positioning records only — Trust Ceiling stays L3, no order authority. Frame coaching as your annotated sessions / your methodology say…
 
 ### `recall_agent_insights`
 

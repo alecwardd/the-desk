@@ -1,8 +1,12 @@
-//! Trader memory: agent insights, behavioral patterns, follow-ups, briefings.
+//! Trader memory: agent insights, behavioral patterns, follow-ups, briefings,
+//! and Positioning Levels-Only Records (`positioning_entry`).
 
 use chrono::Utc;
 use rmcp::{
     handler::server::wrapper::Parameters, model::*, tool, tool_router, ErrorData as McpError,
+};
+use the_desk_backend::catalog::{
+    accept_levels_only_entry, DerivedLevels, MidDayRead, PositioningEntryInput, PositioningWall,
 };
 use the_desk_backend::mcp::memory::TraderContextFitParams;
 use the_desk_backend::memory::trader_context::{
@@ -506,6 +510,104 @@ impl TheDeskMcp {
             "traderContextFit": fit,
             "snapshotSource": live_view.as_ref().map(|view| view.snapshot_source),
             "dataAgeMs": live_view.as_ref().map(|view| view.data_age_ms)
+        })))
+    }
+
+    #[tool(
+        description = "Typed workflow verb: write a first-class Levels-Only Record into Positioning (same schema a later capture adapter will use). Manual/as-of provenance — not live vendor data, no VolSignals scrape, no ToS. Completeness is levels_only (first-class, not a fallback). Reads ride get_state (domain=positioning); do not use this as a getter. Mutation of Positioning records only — Trust Ceiling stays L3, no order authority. Frame coaching as your annotated sessions / your methodology say…"
+    )]
+    pub(crate) async fn positioning_entry(
+        &self,
+        Parameters(params): Parameters<PositioningEntryParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let now_ms = Utc::now().timestamp_millis() as f64;
+        let derived_levels = match params.derived_levels {
+            Some(raw) => Some(DerivedLevels {
+                flip: raw.flip.ok_or_else(|| {
+                    invalid_params_error("derivedLevels.flip is required")
+                })?,
+                walls: raw
+                    .walls
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|w| {
+                        Ok(PositioningWall {
+                            strike: w.strike.ok_or_else(|| {
+                                invalid_params_error("derivedLevels.walls[].strike is required")
+                            })?,
+                            role: w
+                                .role
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                                .ok_or_else(|| {
+                                    invalid_params_error(
+                                        "derivedLevels.walls[].role is required (call_wall or put_wall)",
+                                    )
+                                })?
+                                .to_string(),
+                        })
+                    })
+                    .collect::<Result<Vec<_>, McpError>>()?,
+                balance: raw.balance.ok_or_else(|| {
+                    invalid_params_error("derivedLevels.balance is required")
+                })?,
+                upside_test: raw.upside_test.ok_or_else(|| {
+                    invalid_params_error("derivedLevels.upsideTest is required")
+                })?,
+                downside_test: raw.downside_test.ok_or_else(|| {
+                    invalid_params_error("derivedLevels.downsideTest is required")
+                })?,
+            }),
+            None => None,
+        };
+        let mid_day_reads = params
+            .mid_day_reads
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| {
+                Ok(MidDayRead {
+                    as_of: r
+                        .as_of
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .ok_or_else(|| invalid_params_error("midDayReads[].asOf is required"))?
+                        .to_string(),
+                    note: r.note,
+                })
+            })
+            .collect::<Result<Vec<_>, McpError>>()?;
+        let record = accept_levels_only_entry(PositioningEntryInput {
+            id: params.id,
+            record_kind: params.record_kind,
+            completeness: params.completeness,
+            trading_day: params.trading_day,
+            captured_at_ms: params.captured_at_ms,
+            as_of_ms: params.as_of_ms,
+            data_time_ms: params.data_time_ms,
+            derived_levels,
+            transitions: params.transitions.unwrap_or_default(),
+            mid_day_reads,
+            note: params.note,
+            vendor: params.vendor,
+            now_ms,
+        })
+        .map_err(|e| invalid_params_error(e.to_string()))?;
+        {
+            let db = self.db.lock().map_err(|_| lock_error())?;
+            db.upsert_positioning_record(&record, now_ms)
+                .map_err(db_error)?;
+        }
+        Ok(text_result(serde_json::json!({
+            "record": record,
+            "completeness": record.completeness,
+            "firstClass": true,
+            "mutationAuthority": true,
+            "orderAuthority": false,
+            "trustCeiling": "L3",
+            "readOperator": "get_state",
+            "note": "Your annotated sessions / your methodology say this Levels-Only Record is first-class Positioning. Completeness is levels_only — not live vendor data. Reads ride get_state (domain=positioning)."
         })))
     }
 }

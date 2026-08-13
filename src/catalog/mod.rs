@@ -14,6 +14,7 @@ mod envelope;
 mod events_kernel;
 mod market_state_fields;
 mod positioning;
+mod positioning_record;
 mod render;
 mod search;
 mod trust;
@@ -27,6 +28,12 @@ pub use envelope::{
 pub use events_kernel::{
     kernel_event_from_db_row, kernel_event_from_market_event, EventsEnvelope, KernelEvent,
     SEVERITY_PLACEHOLDER,
+};
+pub use positioning_record::{
+    accept_levels_only_entry, apply_positioning_slice, empty_positioning_slice, evaluate_freshness,
+    positioning_state_slice, DerivedLevels, MidDayRead, PositioningEntryInput, PositioningError,
+    PositioningRecord, PositioningRecordProvenance, PositioningStateSlice, PositioningWall,
+    LEVELS_ONLY_RECORD_KIND, MANUAL_PROVENANCE_SOURCE,
 };
 pub use render::{
     catalog_json_path, catalog_markdown_path, render_catalog_json, render_catalog_markdown,
@@ -106,6 +113,8 @@ pub fn describe_environment(catalog: &DeskCatalog, discovery_enabled: bool) -> s
         "positioning": {
             "provider": catalog.positioning_provider,
             "recordKinds": catalog.positioning_record_kinds,
+            "writeVerb": "positioning_entry",
+            "levelsOnlyFirstClass": true,
         },
         "specialtyMarketToolsPolicy": "no_catalog_entry_no_new_market_tool",
         "specialtyMarketToolCount": catalog.specialty_market_tools.len(),
@@ -138,6 +147,14 @@ pub fn describe_domain(catalog: &DeskCatalog, domain_id: &str) -> Option<serde_j
                 obj.insert("recordKinds".to_string(), kinds);
             }
             obj.insert("provider".to_string(), serde_json::Value::Null);
+            obj.insert(
+                "writeVerb".to_string(),
+                serde_json::Value::String("positioning_entry".into()),
+            );
+            obj.insert(
+                "levelsOnlyFirstClass".to_string(),
+                serde_json::Value::Bool(true),
+            );
         }
     }
     Some(out)
@@ -190,7 +207,7 @@ fn base_domain_shells() -> Vec<DomainDescriptor> {
         DomainDescriptor {
             id: "positioning".into(),
             name: "Positioning".into(),
-            summary: "Dealer/options Positioning domain (schema stub; no live provider in v0).".into(),
+            summary: "Dealer/options Positioning — first-class Levels-Only Records via positioning_entry; no live Vs3dProvider.".into(),
             field_ids: vec![],
             record_kinds: vec![],
         },
@@ -386,9 +403,25 @@ mod tests {
     }
 
     #[test]
-    fn positioning_domain_stub_names_four_record_kinds() {
+    fn positioning_domain_names_four_record_kinds_including_first_class_levels_only() {
         let cat = build_catalog();
         assert!(cat.positioning_provider.is_none());
+        assert!(cat
+            .fields
+            .iter()
+            .any(|f| f.id == "positioning.completeness"));
+        assert!(cat.fields.iter().any(|f| f.id == "positioning.asOf"));
+        let completeness = cat
+            .fields
+            .iter()
+            .find(|f| f.id == "positioning.completeness")
+            .expect("completeness");
+        assert_eq!(completeness.cost_hint, CostHint::R0);
+        assert!(!completeness
+            .description
+            .to_lowercase()
+            .contains("second-class"));
+        assert!(!completeness.description.to_lowercase().contains("degraded"));
         let kind_ids: BTreeSet<_> = cat
             .positioning_record_kinds
             .iter()

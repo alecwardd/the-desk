@@ -72,7 +72,7 @@ pub(crate) fn tool_domains() -> Vec<ToolDomain> {
         ToolDomain {
             name: "Memory",
             module: "memory",
-            summary: "Trader memory: agent insights, behavioral patterns, follow-ups, briefings, and trader-context fit.",
+            summary: "Trader memory: agent insights, behavioral patterns, follow-ups, briefings, and Positioning Levels-Only Records (`positioning_entry`).",
             reach_for_when: "you want durable context about the trader, or to persist an insight worth remembering",
             router: TheDeskMcp::memory_router,
         },

@@ -71,10 +71,13 @@ pub enum FreshnessSemantics {
     PriorSessionCarry,
     /// Optional delayed DOM/depth summary when available.
     DelayedDepthOptional,
-    /// Schema present; live provider not wired (Positioning stub).
+    /// Schema present; live provider not wired.
     StubUnavailable,
     /// Vendor timestamp must fail closed when present (future provider).
     VendorTimestampFailClosed,
+    /// Manual / as-of Positioning stamp; missing or stale freshness fails closed
+    /// and must never present as live vendor data.
+    ManualAsOfFailClosed,
 }
 
 /// Static annotation used to build [`FieldDescriptor`]s.

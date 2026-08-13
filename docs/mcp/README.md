@@ -8,7 +8,7 @@ connecting to it.
 - **Binary:** `the-desk-mcp` (default run target)
 - **Transport:** stdio (`rmcp` crate). stdout is protocol-only; logs go to
   stderr/file (enforced by the `mcp_stdio` integration test).
-- **Tool surface:** 121 MCP tools in 9 domains. The exhaustive, generated catalog is
+- **Tool surface:** 122 MCP tools in 9 domains. The exhaustive, generated catalog is
   [tool-reference.md](tool-reference.md). Scenario routing for agents is
   [skills/mcp-tools/SKILL.md](../../skills/mcp-tools/SKILL.md).
 
@@ -34,7 +34,7 @@ src/bin/the-desk-mcp/
     ├── playbook.rs  # Setups, attention signals, trade ideas (16)
     ├── risk.rs      # Risk, account, sizing, session bookends (9)
     ├── journal.rs   # Trade entries, fills, journal, reviews (12)
-    ├── memory.rs    # Insights, patterns, follow-ups, briefings (12)
+    ├── memory.rs    # Insights, patterns, follow-ups, briefings, positioning_entry (13)
     ├── research.rs  # Hypotheses, backtests, statistical queries (23)
     └── admin.rs     # Feed health, ingestion, rollover, integrity, backups (12)
 ```
@@ -82,7 +82,7 @@ guarantees the two lists can never diverge.
    `tools/mod.rs`, `service.rs`'s combiner, and `docs.rs`'s `tool_domains()`).
    Exception: SIL kernel operators live in `tools/discovery.rs` and are
    wired only via `tool_router_with_sil` when `[sil].catalog_discovery` is on —
-   they stay out of the default `tool_domains()` registry so the 121-tool
+   they stay out of the default `tool_domains()` registry so the 122-tool
    surface remains unchanged when the flag is off.
 2. Add the parameter struct to `params.rs` deriving
    `Deserialize + JsonSchema + Default` with `#[serde(rename_all = "camelCase")]`.
@@ -115,8 +115,8 @@ guarantees the two lists can never diverge.
 
 The Desk Catalog is the schema waist: a generated, versioned inventory of
 domains and fields (unit, session scope, freshness, cost hint) derived from
-annotated `MarketState` plus the **Positioning** domain stub (grid / by-strike /
-Slice / Levels-Only Record; no live provider).
+annotated `MarketState` plus the **Positioning** domain (grid / by-strike /
+Slice / first-class Levels-Only Records via `positioning_entry`; no live provider).
 
 - Artifacts: [desk-catalog-v0.json](desk-catalog-v0.json),
   [desk-catalog-v0.md](desk-catalog-v0.md)
@@ -124,7 +124,7 @@ Slice / Levels-Only Record; no live provider).
 - Discovery / read-kernel operators: `describe_environment`, `describe_domain`,
   `search_catalog`, `get_state` (StateEnvelope, R0|R1), `get_events` (identity
   rows) — registered only when `[sil].catalog_discovery = true` in
-  `~/.the-desk/config.toml`. Default off → 121-tool surface unchanged.
+  `~/.the-desk/config.toml`. Default off → 122-tool surface unchanged.
   Trust Level L0 (no mutation / order authority). See [CONTEXT.md](../../CONTEXT.md).
 
 ## SIL-M0 tool-call telemetry

@@ -1,3 +1,4 @@
+use crate::catalog::PositioningRecord;
 use crate::depth::DepthRecord;
 use crate::memory::{
     AgentInsightQuery, AgentInsightRecord, BehavioralPatternQuery, BehavioralPatternRecord,
@@ -1417,6 +1418,9 @@ impl Database {
         }
         if version < 31 {
             self.migrate_v31()?;
+        }
+        if version < 32 {
+            self.migrate_v32()?;
         }
 
         Ok(())
@@ -2942,6 +2946,39 @@ impl Database {
               );
 
             UPDATE schema_version SET version = 31;
+            ",
+        )?;
+        Ok(())
+    }
+
+    /// V32: durable Positioning records (SIL-P-VS-a Levels-Only Record path).
+    ///
+    /// Same schema a later capture adapter / Vs3dProvider will write. Manual
+    /// Levels-Only Records are first-class (completeness `levels_only`).
+    fn migrate_v32(&self) -> Result<(), DbError> {
+        self.conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS positioning_records (
+              id TEXT PRIMARY KEY,
+              record_kind TEXT NOT NULL,
+              completeness TEXT NOT NULL,
+              trading_day TEXT NOT NULL,
+              captured_at_ms REAL NOT NULL,
+              as_of_ms REAL NOT NULL,
+              data_time_ms REAL NULL,
+              freshness_ok INTEGER NOT NULL,
+              provenance_source TEXT NOT NULL,
+              first_class INTEGER NOT NULL,
+              derived_levels TEXT NOT NULL,
+              payload TEXT NOT NULL,
+              created_at_ms REAL NOT NULL,
+              updated_at_ms REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_positioning_records_as_of
+              ON positioning_records(as_of_ms, captured_at_ms);
+            CREATE INDEX IF NOT EXISTS idx_positioning_records_day
+              ON positioning_records(trading_day, captured_at_ms);
+            UPDATE schema_version SET version = 32;
             ",
         )?;
         Ok(())
@@ -6819,6 +6856,107 @@ impl Database {
             }))
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Persist a Positioning record (Levels-Only today; same schema later capture uses).
+    pub fn upsert_positioning_record(
+        &self,
+        record: &PositioningRecord,
+        now_ms: f64,
+    ) -> Result<(), DbError> {
+        let payload = serde_json::to_string(record)?;
+        let derived = serde_json::to_string(&record.derived_levels)?;
+        let existing: Option<f64> = self
+            .conn
+            .query_row(
+                "SELECT created_at_ms FROM positioning_records WHERE id = ?1",
+                params![record.id],
+                |r| r.get(0),
+            )
+            .ok();
+        let created_at = existing.unwrap_or(now_ms);
+        self.conn.execute(
+            "INSERT INTO positioning_records (
+                id, record_kind, completeness, trading_day, captured_at_ms, as_of_ms,
+                data_time_ms, freshness_ok, provenance_source, first_class,
+                derived_levels, payload, created_at_ms, updated_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+             ON CONFLICT(id) DO UPDATE SET
+                record_kind = excluded.record_kind,
+                completeness = excluded.completeness,
+                trading_day = excluded.trading_day,
+                captured_at_ms = excluded.captured_at_ms,
+                as_of_ms = excluded.as_of_ms,
+                data_time_ms = excluded.data_time_ms,
+                freshness_ok = excluded.freshness_ok,
+                provenance_source = excluded.provenance_source,
+                first_class = excluded.first_class,
+                derived_levels = excluded.derived_levels,
+                payload = excluded.payload,
+                updated_at_ms = excluded.updated_at_ms",
+            params![
+                record.id,
+                record.record_kind,
+                record.completeness,
+                record.trading_day,
+                record.captured_at_ms,
+                record.as_of_ms,
+                record.data_time_ms,
+                i64::from(record.freshness_ok),
+                record.provenance.source,
+                i64::from(record.provenance.first_class),
+                derived,
+                payload,
+                created_at,
+                now_ms,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Latest Positioning record (live `get_state` overlay).
+    pub fn latest_positioning_record(&self) -> Result<Option<PositioningRecord>, DbError> {
+        self.load_positioning_record(
+            "SELECT payload FROM positioning_records
+             ORDER BY as_of_ms DESC, captured_at_ms DESC, updated_at_ms DESC
+             LIMIT 1",
+            (),
+        )
+    }
+
+    /// Positioning record at or before `as_of_ms` (historical `get_state`).
+    pub fn get_positioning_record_as_of(
+        &self,
+        as_of_ms: f64,
+    ) -> Result<Option<PositioningRecord>, DbError> {
+        if !as_of_ms.is_finite() || as_of_ms <= 0.0 {
+            return Err(DbError::InvalidQuery(
+                "asOf must be a positive finite epoch-milliseconds value".into(),
+            ));
+        }
+        self.load_positioning_record(
+            "SELECT payload FROM positioning_records
+             WHERE as_of_ms <= ?1
+             ORDER BY as_of_ms DESC, captured_at_ms DESC, updated_at_ms DESC
+             LIMIT 1",
+            params![as_of_ms],
+        )
+    }
+
+    fn load_positioning_record(
+        &self,
+        sql: &str,
+        params: impl rusqlite::Params,
+    ) -> Result<Option<PositioningRecord>, DbError> {
+        let payload: Option<String> = match self.conn.query_row(sql, params, |r| r.get(0)) {
+            Ok(v) => Some(v),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(err) => return Err(err.into()),
+        };
+        match payload {
+            None => Ok(None),
+            Some(raw) => Ok(Some(serde_json::from_str(&raw)?)),
+        }
     }
 
     pub fn raw_tick_count(&self) -> Result<i64, DbError> {
@@ -12236,6 +12374,70 @@ mod tests {
         assert_eq!(as_of.by_root["NQ"]["lastPrice"], 20_000.0);
         assert_eq!(as_of.by_root["ES"]["lastPrice"], 5_000.0);
         assert_ne!(as_of.by_root["NQ"]["lastPrice"], 99_999.0);
+    }
+
+    #[test]
+    fn positioning_levels_only_round_trip_and_as_of_lookup() {
+        use crate::catalog::{
+            accept_levels_only_entry, DerivedLevels, PositioningEntryInput, PositioningWall,
+            LEVELS_ONLY_RECORD_KIND,
+        };
+        let db = test_db();
+        let earlier = 1_771_372_800_000.0;
+        let later = earlier + 3_600_000.0;
+        let levels = DerivedLevels {
+            flip: 5750.0,
+            walls: vec![PositioningWall {
+                strike: 5800.0,
+                role: "call_wall".into(),
+            }],
+            balance: 5745.0,
+            upside_test: 5825.0,
+            downside_test: 5680.0,
+        };
+        let first = accept_levels_only_entry(PositioningEntryInput {
+            id: Some("pos-1".into()),
+            trading_day: Some("2026-02-18".into()),
+            captured_at_ms: Some(earlier),
+            as_of_ms: Some(earlier),
+            derived_levels: Some(levels.clone()),
+            now_ms: earlier,
+            ..Default::default()
+        })
+        .expect("first");
+        let second = accept_levels_only_entry(PositioningEntryInput {
+            id: Some("pos-2".into()),
+            trading_day: Some("2026-02-18".into()),
+            captured_at_ms: Some(later),
+            as_of_ms: Some(later),
+            derived_levels: Some(DerivedLevels {
+                flip: 5760.0,
+                ..levels
+            }),
+            now_ms: later,
+            ..Default::default()
+        })
+        .expect("second");
+        db.upsert_positioning_record(&first, earlier)
+            .expect("insert 1");
+        db.upsert_positioning_record(&second, later)
+            .expect("insert 2");
+        let live = db.latest_positioning_record().expect("live").expect("some");
+        assert_eq!(live.id, "pos-2");
+        assert_eq!(live.record_kind, LEVELS_ONLY_RECORD_KIND);
+        assert_eq!(live.completeness, LEVELS_ONLY_RECORD_KIND);
+        assert!(live.provenance.first_class);
+        assert_eq!(live.derived_levels.flip, 5760.0);
+        let historical = db
+            .get_positioning_record_as_of(earlier + 1_000.0)
+            .expect("as_of")
+            .expect("some");
+        assert_eq!(historical.id, "pos-1");
+        assert_eq!(historical.derived_levels.flip, 5750.0);
+        assert!(db
+            .get_positioning_record_as_of(earlier - 1_000.0)
+            .expect("before")
+            .is_none());
     }
 
     #[test]

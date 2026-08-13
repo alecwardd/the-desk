@@ -7,8 +7,8 @@
 - **catalogVersion:** `0.1.0`
 - **Trust Ceiling:** L3 (ADR-022)
 - **domains:** 10
-- **fields:** 144
-- **Positioning provider:** none (schema stub — grid / by-strike / Slice / Levels-Only Record)
+- **fields:** 146
+- **Positioning provider:** none (no Vs3dProvider). Levels-Only Records are first-class via `positioning_entry` (manual/as-of).
 
 ## Domains
 
@@ -178,17 +178,19 @@ Catalog and envelope metadata (version pins, cost bands).
 
 ### `positioning` — Positioning
 
-Dealer/options Positioning — grid aggregations, by-strike positions, greek Slices, and Levels-Only Records. Schema stub only in Catalog v0 (no live provider).
+Dealer/options Positioning — grid aggregations, by-strike positions, greek Slices, and first-class Levels-Only Records. Manual write via positioning_entry; no live Vs3dProvider.
 
 Record kinds: position_grid, positions_by_strike, slice, levels_only
 
 | Field id | Unit | Session scope | Freshness | Cost |
 |---|---|---|---|---|
-| `positioning.capturedAt` | Milliseconds | Session | StubUnavailable | R1 |
+| `positioning.asOf` | Milliseconds | Session | ManualAsOfFailClosed | R1 |
+| `positioning.capturedAt` | Milliseconds | Session | ManualAsOfFailClosed | R1 |
+| `positioning.completeness` | EnumLabel | Session | ManualAsOfFailClosed | R0 |
 | `positioning.dataTime` | Milliseconds | Session | VendorTimestampFailClosed | R1 |
-| `positioning.derivedLevels` | StructuredBlob | Session | StubUnavailable | R1 |
-| `positioning.freshnessOk` | Bool | Session | StubUnavailable | R0 |
-| `positioning.recordKind` | EnumLabel | Session | StubUnavailable | R1 |
+| `positioning.derivedLevels` | StructuredBlob | Session | ManualAsOfFailClosed | R1 |
+| `positioning.freshnessOk` | Bool | Session | ManualAsOfFailClosed | R0 |
+| `positioning.recordKind` | EnumLabel | Session | ManualAsOfFailClosed | R1 |
 
 ### `response` — Response
 
@@ -233,7 +235,7 @@ Relative volume and related session volatility framing.
 - **grid** (`position_grid`): Primary capture panel — grid aggregations of dealer positioning (schema v1).
 - **by-strike** (`positions_by_strike`): By-strike positions; Desk may aggregate from the position grid rather than capture separately.
 - **Slice** (`slice`): Price-indexed greek surface values at one moment (capturedAt/dataTime) plus Desk-derived levels at ingest. Vendor forward projections are never part of a Slice.
-- **Levels-Only Record** (`levels_only`): First-class positioning record carrying only derived levels (flip, walls, BALANCE / UPSIDE / DOWNSIDE TEST) — manual-entry unit and ToS-denial steady state (ADR-025).
+- **Levels-Only Record** (`levels_only`): First-class Positioning record carrying only derived levels (flip, walls, BALANCE / UPSIDE / DOWNSIDE TEST) — manual-entry unit, ToS-denial steady state, and historical backlog path (ADR-025). Written via positioning_entry.
 
 ## Specialty market tools (allowlist)
 

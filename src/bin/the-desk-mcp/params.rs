@@ -826,6 +826,57 @@ pub(crate) struct JournalPatternParams {
     pub(crate) limit: Option<u64>,
 }
 
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PositioningWallParams {
+    pub(crate) strike: Option<f64>,
+    pub(crate) role: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DerivedLevelsParams {
+    pub(crate) flip: Option<f64>,
+    pub(crate) walls: Option<Vec<PositioningWallParams>>,
+    pub(crate) balance: Option<f64>,
+    pub(crate) upside_test: Option<f64>,
+    pub(crate) downside_test: Option<f64>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct MidDayReadParams {
+    pub(crate) as_of: Option<String>,
+    pub(crate) note: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PositioningEntryParams {
+    /// Optional durable id (UUID generated when omitted).
+    pub(crate) id: Option<String>,
+    /// Positioning record kind. This verb accepts `levels_only` only.
+    pub(crate) record_kind: Option<String>,
+    /// Completeness; must be `levels_only` (first-class, not a fallback kind).
+    pub(crate) completeness: Option<String>,
+    /// Trading day YYYY-MM-DD. Derived from asOf/capturedAt when omitted.
+    pub(crate) trading_day: Option<String>,
+    /// Desk annotation timestamp (epoch ms). Defaults to now.
+    pub(crate) captured_at_ms: Option<f64>,
+    /// Explicit manual/as-of timestamp (epoch ms). Defaults to capturedAt.
+    pub(crate) as_of_ms: Option<f64>,
+    /// Vendor dataTime — rejected on the Levels-Only path.
+    pub(crate) data_time_ms: Option<f64>,
+    /// Desk-derived levels (flip, walls, BALANCE / UPSIDE / DOWNSIDE TEST).
+    pub(crate) derived_levels: Option<DerivedLevelsParams>,
+    pub(crate) transitions: Option<Vec<String>>,
+    pub(crate) mid_day_reads: Option<Vec<MidDayReadParams>>,
+    /// Optional note. Frame as your annotated sessions / your methodology — never advisory.
+    pub(crate) note: Option<String>,
+    /// Vendor stamp — rejected (Vs3dProvider is a later ticket).
+    pub(crate) vendor: Option<String>,
+}
+
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SaveAgentInsightParams {

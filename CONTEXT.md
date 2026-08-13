@@ -14,12 +14,12 @@ exactly in code, docs, ADRs, and agent copy. Do not invent synonyms.
 | **Journal Frame** | 1 Hz persisted market-state frame on the MarketRouter clock (NQ+ES). Compute/publish may stay at ~250 ms (ADR-019); only 1 Hz frames are persisted. A root is recorded for a second only when that root printed in that second (session scope stays per-lane). `get_state(as_of=…)` is served from Journal Frames (provenance source = Journal). Transition event rows join via `(journal_frame_second, root_symbol)`. |
 | **Capsule** | High-resolution dump around a salient event (~30s before → ~60s after); mandatory for DOM-family events later. |
 | **Episode Query** | Conjunctive historical query over catalog fields with forward returns / MFE/MAE (later research kernel). |
-| **Positioning** | Dealer/options domain with four record kinds: position-grid, by-strike, Slice, Levels-Only Record. Catalog stub first; providers later. |
+| **Positioning** | Dealer/options domain with four record kinds: position-grid, by-strike, Slice, Levels-Only Record. Manual Levels-Only Records are written via the `positioning_entry` workflow verb (same schema a later capture adapter will use). No live Vs3dProvider yet. |
 | **Slice** | Price-indexed greek values plus Desk-derived levels at capture time (Positioning record kind). |
-| **Levels-Only Record** | First-class manual Positioning path when capture is unavailable. |
+| **Levels-Only Record** | First-class manual Positioning path (ToS-denial steady state and historical backlog). Written via `positioning_entry`; completeness `levels_only` is not a fallback. Provenance is manual/as-of — never live vendor data. |
 | **MarketRouter** | Concurrent per-symbol pipeline host (NQ+ES) on one clock. Each root owns an isolated pipeline set; ticks are merge-sorted by `(timestamp_ms, root)` so cross-market predicates are co-recorded from the first row. Session scope (RTH/Globex) is classified per tick on the owning lane — never mixed across symbols. MES/MNQ are out of scope. |
 | **StateEnvelope** | `get_state` response: `values`, per-domain `provenance`, per-domain `degraded`, `catalogVersion`. Absence of provenance is a failure. Multi-symbol reads (NQ+ES) live in one envelope: values keyed `{ROOT}.{catalogFieldId}`, symbol-scoped provenance keyed `{ROOT}.{domain}`, plus `clockMs` for the aligned MarketRouter clock. |
-| **Desk Catalog** | Versioned schema waist over annotated runtime fields + Positioning stub. Discovery is metadata-only. |
+| **Desk Catalog** | Versioned schema waist over annotated runtime fields + Positioning (Levels-Only Records via `positioning_entry`; no live Vs3dProvider). Discovery is metadata-only. |
 | **SourceProvider** | Market-data provider seam for the engine host. **FileProvider** covers Sierra `.scid`/`.depth`; **SierraProvider** is stubbed until ACSIL (#23). |
 | **FileProvider** | Real SourceProvider adapter over on-disk `.scid` + discovered `.depth` paths. |
 | **SierraProvider** | Stubbed SourceProvider slot for a future ACSIL bridge — not implemented in M2a. |
@@ -40,6 +40,6 @@ exactly in code, docs, ADRs, and agent copy. Do not invent synonyms.
 
 `describe_environment`, `describe_domain`, `search_catalog`, `get_state`, `get_events`.
 
-Default-off keeps the 121-tool surface unchanged. Orientation specialty getters
+Default-off keeps the 122-tool surface unchanged. Orientation specialty getters
 (`get_session_context`, `get_market_snapshot`) shim to `get_state` when the flag
 is on (`deprecated: true` + `suggestedReplacementOperator`).

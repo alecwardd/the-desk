@@ -36,8 +36,9 @@ use crate::research::{reliability_tier, ReliabilityTier};
 
 use super::query_kernel::{
     flagship_episode_predicates, query_episodes, query_episodes_with_opts, QueryEpisodesOpts,
-    QueryEpisodesRequest, QueryEpisodesResult, QueryWindow, DEFAULT_POSITIONING_NEAR_TICKS,
-    FLAGSHIP_SELLER_AGGRESSION_SESSION_DELTA, FUTURES_TICK_SIZE, QUERY_EPISODES_MAX_MATCHES,
+    QueryEpisodesRequest, QueryEpisodesResult, QueryResultMeta, QueryWindow,
+    DEFAULT_POSITIONING_NEAR_TICKS, FLAGSHIP_SELLER_AGGRESSION_SESSION_DELTA, FUTURES_TICK_SIZE,
+    QUERY_EPISODES_MAX_FRAMES, QUERY_EPISODES_MAX_MATCHES,
 };
 
 /// Owner SLO: Path B p95 over ~2 weeks of 1 Hz frames (upper end of 2–3 s).
@@ -568,6 +569,20 @@ fn contracts_ok(result: &QueryEpisodesResult) -> Result<(), EpisodeBenchError> {
     Ok(())
 }
 
+/// Path A stops at [`QUERY_EPISODES_MAX_FRAMES`] / [`QUERY_EPISODES_MAX_MATCHES`].
+/// B and C have no such scan cap, so a truncated A result is not comparable.
+fn reject_if_path_a_truncated(meta: &QueryResultMeta) -> Result<(), EpisodeBenchError> {
+    if !meta.truncated {
+        return Ok(());
+    }
+    Err(EpisodeBenchError::Invalid(format!(
+        "Path A hit QUERY_EPISODES_MAX_FRAMES ({QUERY_EPISODES_MAX_FRAMES}) or \
+         QUERY_EPISODES_MAX_MATCHES ({QUERY_EPISODES_MAX_MATCHES}); A/B/C are not \
+         comparable at this scale: {:?}",
+        meta.notes
+    )))
+}
+
 /// Path A: live `query_episodes` over SQLite JSON blobs.
 pub fn path_a(
     db: &Database,
@@ -587,6 +602,7 @@ pub fn path_a(
         )?
     };
     contracts_ok(&result)?;
+    reject_if_path_a_truncated(&result.meta)?;
     Ok(result)
 }
 
@@ -1643,5 +1659,34 @@ mod tests {
             err.to_string().contains("cold hive already has partitions"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn path_a_rejects_truncated_scan() {
+        let truncated = QueryResultMeta {
+            n: 11,
+            sample_size: 11,
+            reliability_tier: ReliabilityTier::Insufficient,
+            population_size: QUERY_EPISODES_MAX_FRAMES + 1,
+            rows_scanned: QUERY_EPISODES_MAX_FRAMES,
+            truncated: true,
+            degraded: true,
+            scope: Some("RTH".into()),
+            notes: vec!["query_episodes truncated at 500 matches or 500000 frames".into()],
+            catalog_version: "test".into(),
+            trust_level: TrustLevel::L0,
+            trust_ceiling: TrustCeiling::L3,
+            mutation_authority: false,
+            order_authority: false,
+            journal_backed: true,
+            unavailable_fields: Vec::new(),
+        };
+        let err = reject_if_path_a_truncated(&truncated).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("not comparable"), "{msg}");
+        assert!(msg.contains("QUERY_EPISODES_MAX_FRAMES"), "{msg}");
+        let mut comparable = truncated.clone();
+        comparable.truncated = false;
+        reject_if_path_a_truncated(&comparable).expect("non-truncated Path A is comparable");
     }
 }

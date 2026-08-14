@@ -1777,6 +1777,9 @@ impl Database {
         if version < 37 {
             self.migrate_v37()?;
         }
+        if version < 38 {
+            self.migrate_v38()?;
+        }
 
         Ok(())
     }
@@ -3475,6 +3478,24 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_research_query_jobs_status
               ON research_query_jobs(status, submitted_at_ms DESC);
             UPDATE schema_version SET version = 37;
+            ",
+        )?;
+        Ok(())
+    }
+
+    /// V38: `timestamp_ms` leading index for research window scans.
+    ///
+    /// `list_market_events_in_window` filters `timestamp_ms` then `LIMIT`.
+    /// Existing indexes lead with `session_date` / `event_type` / `lifecycle`
+    /// / `journal_frame_second`, so a bare time range was a full table scan
+    /// (once per Episode Query page). `IF NOT EXISTS` is safe on DBs that
+    /// already ran v37.
+    fn migrate_v38(&self) -> Result<(), DbError> {
+        self.conn.execute_batch(
+            "
+            CREATE INDEX IF NOT EXISTS idx_market_events_ts
+              ON market_events(timestamp_ms);
+            UPDATE schema_version SET version = 38;
             ",
         )?;
         Ok(())
@@ -13758,8 +13779,8 @@ mod tests {
             )
             .expect("version");
         assert!(
-            version >= 37,
-            "schema v37 research query jobs, got {version}"
+            version >= 38,
+            "schema v38 market_events timestamp index, got {version}"
         );
         let identity_idx: i64 = db
             .conn
@@ -13791,6 +13812,16 @@ mod tests {
             )
             .expect("jobs idx");
         assert_eq!(jobs_idx, 1);
+        let events_ts_idx: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(1) FROM sqlite_master
+                  WHERE type='index' AND name='idx_market_events_ts'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("events ts idx");
+        assert_eq!(events_ts_idx, 1);
     }
 
     fn sample_capsule_record(

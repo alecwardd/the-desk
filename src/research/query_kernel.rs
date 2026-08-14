@@ -64,6 +64,12 @@ pub const QUERY_FORWARD_HORIZON_MS: f64 = 15.0 * 60_000.0;
 /// Hard cap on ticks scanned for one episode's forward MFE/MAE.
 pub const QUERY_FORWARD_TICK_CAP: usize = 50_000;
 
+/// Max episode matches for which tick-driven MFE/MAE is computed.
+///
+/// Each match issues its own `[clock, clock+15m]` tick scan. Without an
+/// aggregate bound, a 500-match run is 500 overlapping 15-minute reads.
+pub const QUERY_FORWARD_MAX_MATCHES: usize = 50;
+
 /// Page size for Episode Query / series scans (bounds peak memory).
 pub const QUERY_PAGE_MS: f64 = 30.0 * 60_000.0;
 
@@ -595,6 +601,44 @@ fn session_label_for_timestamp(timestamp_ms: f64) -> Option<&'static str> {
     }
 }
 
+/// Intersect `[start_ms, end_ms]` with the requested session on the ET clock.
+///
+/// `query_ticks_filtered_scoped` applies `LIMIT` before any session filter, so
+/// Globex ticks at the open can consume the cap and hide later RTH rows.
+/// Returns `None` when the intersection is empty.
+fn clamp_window_to_session(
+    start_ms: f64,
+    end_ms: f64,
+    session: Option<&str>,
+) -> Option<(f64, f64)> {
+    let Some(want) = session else {
+        return Some((start_ms, end_ms));
+    };
+    let mut first: Option<f64> = None;
+    let mut last: Option<f64> = None;
+    let mut t = start_ms;
+    loop {
+        if session_label_for_timestamp(t) == Some(want) {
+            first.get_or_insert(t);
+            let minute_end = ((t / 60_000.0).floor() + 1.0) * 60_000.0 - 1.0;
+            last = Some(minute_end.min(end_ms).max(t));
+        }
+        if t >= end_ms {
+            break;
+        }
+        let next_minute = ((t / 60_000.0).floor() + 1.0) * 60_000.0;
+        let next = next_minute.min(end_ms);
+        if next <= t {
+            break;
+        }
+        t = next;
+    }
+    match (first, last) {
+        (Some(lo), Some(hi)) if lo <= hi => Some((lo, hi)),
+        _ => None,
+    }
+}
+
 fn event_matches_session(evt: &Value, session: Option<&str>) -> bool {
     let Some(want) = session else {
         return true;
@@ -1120,6 +1164,8 @@ pub fn query_episodes(
     let mut any_missing_positioning = false;
     let mut any_stale_positioning = false;
     let mut any_partial_forward = false;
+    let mut any_forward_capped = false;
+    let mut forwards_computed = 0usize;
     let mut truncated = false;
     let mut scanned_seconds = 0usize;
     let mut scanned_frames = 0usize;
@@ -1253,21 +1299,27 @@ pub fn query_episodes(
                         .and_then(as_f64)
                 });
             let forward = if let Some(entry) = es_entry {
-                let root = if roots.contains_key("ES") {
-                    "ES"
+                if forwards_computed >= QUERY_FORWARD_MAX_MATCHES {
+                    any_forward_capped = true;
+                    None
                 } else {
-                    roots.keys().next().map(String::as_str).unwrap_or("NQ")
-                };
-                match tick_forward_return(db, entry, clock, root, direction)? {
-                    Some(fwd) => {
-                        if fwd.truncated {
-                            any_partial_forward = true;
+                    let root = if roots.contains_key("ES") {
+                        "ES"
+                    } else {
+                        roots.keys().next().map(String::as_str).unwrap_or("NQ")
+                    };
+                    forwards_computed += 1;
+                    match tick_forward_return(db, entry, clock, root, direction)? {
+                        Some(fwd) => {
+                            if fwd.truncated {
+                                any_partial_forward = true;
+                            }
+                            Some(fwd)
                         }
-                        Some(fwd)
-                    }
-                    None => {
-                        any_missing_ticks = true;
-                        None
+                        None => {
+                            any_missing_ticks = true;
+                            None
+                        }
                     }
                 }
             } else {
@@ -1340,6 +1392,12 @@ pub fn query_episodes(
         meta.degraded = true;
         meta.notes.push(format!(
             "tick-driven MFE/MAE truncated at {QUERY_FORWARD_TICK_CAP} ticks; forward horizon is partial"
+        ));
+    }
+    if any_forward_capped {
+        meta.degraded = true;
+        meta.notes.push(format!(
+            "tick-driven MFE/MAE computed for the first {QUERY_FORWARD_MAX_MATCHES} matches (named cap); later matches have forward=null — not a fill simulator"
         ));
     }
     if matches.iter().any(|m| m.forward.is_none()) {
@@ -1442,10 +1500,15 @@ pub fn query_raw(db: &Database, req: &QueryRawRequest) -> Result<QueryRawResult,
         }
         "ticks" => {
             for root in &roots {
+                let Some((tick_start, tick_end)) =
+                    clamp_window_to_session(start, end, session.as_deref())
+                else {
+                    continue;
+                };
                 let fetch = cap.saturating_add(1);
                 let ticks = db.query_ticks_filtered_scoped(
-                    Some(start),
-                    Some(end),
+                    Some(tick_start),
+                    Some(tick_end),
                     None,
                     None,
                     None,
@@ -2830,6 +2893,134 @@ mod tests {
                 .get("sessionType")
                 .and_then(|v| v.as_str()),
             Some("RTH")
+        );
+    }
+
+    #[test]
+    fn clamp_window_to_session_intersects_rth_across_the_open() {
+        let rth_open_ms = FLAGSHIP_CLOCK_MS - 30.0 * 60_000.0;
+        let start = rth_open_ms - 10.0 * 60_000.0;
+        let end = rth_open_ms + 5.0 * 60_000.0;
+        let (lo, hi) = clamp_window_to_session(start, end, Some("RTH")).expect("rth overlap");
+        assert!(
+            (lo - rth_open_ms).abs() < 1.0,
+            "RTH clamp must start at the open, got {lo} vs open {rth_open_ms}"
+        );
+        assert_eq!(hi, end);
+        assert!(clamp_window_to_session(start, rth_open_ms - 1.0, Some("RTH")).is_none());
+        assert!(clamp_window_to_session(start, end, None).is_some());
+    }
+
+    #[test]
+    fn query_raw_ticks_apply_session_filter_before_limit() {
+        let db = test_db();
+        let rth_open_ms = FLAGSHIP_CLOCK_MS - 30.0 * 60_000.0;
+        let start = rth_open_ms - 10.0 * 60_000.0;
+        let end = rth_open_ms + 5.0 * 60_000.0;
+        for i in 0..5 {
+            db.insert_raw_tick_with_contract(
+                start + f64::from(i),
+                FLAGSHIP_ES_PRICE,
+                1.0,
+                FLAGSHIP_ES_PRICE - 0.25,
+                FLAGSHIP_ES_PRICE + 0.25,
+                true,
+                FLAGSHIP_TRADING_DAY,
+                Some("ES"),
+                Some("ESH24.CME"),
+            )
+            .expect("globex tick");
+        }
+        let rth_tick_ms = rth_open_ms + 60_000.0;
+        db.insert_raw_tick_with_contract(
+            rth_tick_ms,
+            FLAGSHIP_ES_PRICE + 1.0,
+            1.0,
+            FLAGSHIP_ES_PRICE + 0.75,
+            FLAGSHIP_ES_PRICE + 1.25,
+            true,
+            FLAGSHIP_TRADING_DAY,
+            Some("ES"),
+            Some("ESH24.CME"),
+        )
+        .expect("rth tick");
+        let result = query_raw(
+            &db,
+            &QueryRawRequest {
+                window: QueryWindow {
+                    start_ms: Some(start),
+                    end_ms: Some(end),
+                    session_type: Some("RTH".into()),
+                    symbols: Some(vec!["ES".into()]),
+                },
+                source: "ticks".into(),
+                limit: Some(3),
+            },
+        )
+        .expect("raw ticks");
+        assert_eq!(
+            result.rows.len(),
+            1,
+            "RTH tick must still be returned when five Globex ticks would fill LIMIT 3"
+        );
+        assert_eq!(result.rows[0].timestamp_ms, rth_tick_ms);
+    }
+
+    #[test]
+    fn query_episodes_caps_forward_mfe_mae_scans() {
+        let db = test_db();
+        seed_positioning(&db, FLAGSHIP_CLOCK_MS);
+        let n = QUERY_FORWARD_MAX_MATCHES + 1;
+        let mut frames = Vec::with_capacity(n * 2);
+        for i in 0..n {
+            let clock = FLAGSHIP_CLOCK_MS + (i as f64) * 1_000.0;
+            frames.push(frame(clock, "ES", "RTH", matching_es_payload()));
+            frames.push(frame(clock, "NQ", "RTH", matching_nq_payload()));
+        }
+        db.insert_journal_frames(&frames).expect("frames");
+        db.insert_raw_tick_with_contract(
+            FLAGSHIP_CLOCK_MS + (n as f64) * 1_000.0,
+            FLAGSHIP_ES_PRICE - 1.0,
+            1.0,
+            FLAGSHIP_ES_PRICE - 1.25,
+            FLAGSHIP_ES_PRICE - 0.75,
+            false,
+            FLAGSHIP_TRADING_DAY,
+            Some("ES"),
+            Some("ESH24.CME"),
+        )
+        .expect("tick");
+        let result = query_episodes(
+            &db,
+            &flagship_request(
+                FLAGSHIP_CLOCK_MS,
+                FLAGSHIP_CLOCK_MS + (n as f64) * 1_000.0,
+                "RTH",
+            ),
+        )
+        .expect("episodes");
+        assert_eq!(result.matches.len(), n);
+        assert!(
+            result.matches[..QUERY_FORWARD_MAX_MATCHES]
+                .iter()
+                .all(|m| m.forward.is_some()),
+            "first {QUERY_FORWARD_MAX_MATCHES} matches must compute forward MFE/MAE"
+        );
+        assert!(
+            result.matches[QUERY_FORWARD_MAX_MATCHES].forward.is_none(),
+            "matches beyond the named forward cap must not scan ticks"
+        );
+        assert!(result.meta.degraded);
+        assert!(result.meta.notes.iter().any(|note| {
+            note.contains(&QUERY_FORWARD_MAX_MATCHES.to_string()) && note.contains("named cap")
+        }));
+        assert!(
+            !result
+                .meta
+                .notes
+                .iter()
+                .any(|note| note.contains("no raw_ticks")),
+            "capped matches must not be reported as missing ticks"
         );
     }
 

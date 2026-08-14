@@ -1536,6 +1536,12 @@ pub struct Database {
 }
 
 impl Database {
+    /// SQLite connection for research/bench rebuilds that must not alter the
+    /// live `journal_frames` schema (TEMP/side tables only).
+    pub(crate) fn sqlite_connection(&self) -> &Connection {
+        &self.conn
+    }
+
     pub fn open(path: &str) -> Result<Self, DbError> {
         let conn = Connection::open(path)?;
         conn.busy_timeout(Duration::from_secs(5))?;

@@ -30,7 +30,7 @@ directly, not the database.
 But "the DB is just a cache" is only half true. Split `data.db` into three categories:
 
 1. **Authoritative external source** — Sierra `.scid` / `.depth`. Raw market data; safe as long as Sierra records.
-2. **Rebuildable derived market data** — `raw_ticks`, `depth_events`, `market_events`, `session_summaries`, `prior_day_levels`, snapshots, backtest `signal_outcomes`, SQLite **Journal Frames** (hot window) and session-partitioned **cold** Journal Frame dumps (`~/.the-desk/journal-frames`, JSONL.zst). Regenerable from the files via re-ingest / `backfill_history` / replay / MarketRouter persist. DuckDB is not required for the cold path.
+2. **Rebuildable derived market data** — `raw_ticks`, `depth_events`, `market_events`, `session_summaries`, `prior_day_levels`, snapshots, backtest `signal_outcomes`, SQLite **Journal Frames** (hot window) and session-partitioned **cold** Journal Frame dumps (`~/.the-desk/journal-frames`, JSONL.zst). Regenerable from the files via re-ingest / `backfill_history` / replay / MarketRouter persist. DuckDB is not required for the cold path and is **not adopted** as a query engine (SIL-M3e: Path B dense SQLite columns met the two-week Episode Query SLO; `the-desk-eq-bench` is the repeatable harness).
 3. **Durable local state** — `risk_config`, `setups`, `research_hypotheses`, journal/trade records, memory, account/risk state. **NOT** regenerable from `.scid`/`.depth`; it survives *only* via the `[backup]` snapshots (on `X:`) and seeded reference DBs. Treat it like any database you must back up — a DB wipe loses it.
 
 ---

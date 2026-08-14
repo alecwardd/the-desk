@@ -756,6 +756,58 @@ This note does not introduce DuckDB / three-path Episode Query benchmark (#13), 
 
 ---
 
+### Decision note: SIL-M3e Three-path Episode Query benchmark (DEFER DuckDB)
+
+**Date:** 2026-08-14
+**Status:** Decided (implements [alecwardd/the-desk#13](https://github.com/alecwardd/the-desk/issues/13); Part of #2)
+
+**Context:** M3c shipped `query_episodes` over SQLite `journal_frames` JSON blobs. M3d shipped hive-partitioned JSONL.zst cold dumps (`desk-journal-frames-v1`), not Apache Parquet. Issue #2 asked for a measured DuckDB go/no-go: adopt DuckDB only if a dense SQLite projection (Path B) misses roughly **p95 ≤ 2–3 s over ~2 weeks of frames**, or **≤ 10 s over ~90 days / ~1 year once available**, or Path B degenerates into a hand-built columnar store. Default bias: **DEFER**.
+
+**Decision: DEFER DuckDB.** Do not add DuckDB as a default/required runtime of MCP or the engine. Cold frames remain JSONL.zst. The live Episode Query path remains Path A (hot SQLite blobs) with optional `store=cold` (M3d). Path B stays a **benchmark-only** side table.
+
+**Harness:** `the-desk-eq-bench` (not an MCP tool, not a tenth kernel operator). Flagship predicates are `flagship_episode_predicates()` in `src/research/query_kernel.rs`. Trust Level **L0**, Trust Ceiling **L3**. Forward MFE/MAE stays tick-driven. Cargo feature `duckdb-bench` is **off by default**; `cargo test` / `cargo clippy --all-targets` / `the-desk-mcp` do not require libduckdb.
+
+**Correctness (same flagship predicates, Trust L0 / ceiling L3, same window/session/`N`/`reliabilityTier` contracts):**
+
+- **Golden fixture** (4 frames / 1 planted match): Paths A, B, and C agree on `N=1` and fingerprint `db0eb410136ce252005bda09d069c2c78d5de9b3ba1643595640887b22dcd26d`.
+- **10 RTH days** (486000 frames / 10 planted matches): Paths A, B, and C agree on `N=10` and fingerprint `dbc064cc03bce70a8406bf285b21d908eb8e37b7dbb2e55922b04108e9df6dad`.
+- Missing `domSummary.bidReplenishing` fails closed. Live `query_episodes` still rejects windows > 7 calendar days; the SLO scan may skip that product cap inside the bench only.
+
+**Latency (synthetic 1 Hz NQ+ES, not committed; no Sierra `.scid`):**
+
+Primary SLO table (5 timed iters, default features; Path C not in that binary):
+
+| Path | p50 (ms) | p95 (ms) | n iters | notes |
+|------|----------|----------|---------|-------|
+| A — SQLite JSON blobs | 76726 | 79676 | 5 | status-quo `query_episodes` |
+| B — SQLite dense side table | 21.2 | 34.3 | 5 | rebuild 1579 ms (not in query p50/p95) |
+
+Path C confirmation (`--features duckdb-bench`, same generator, 1 timed iter after a correctness pass that already agreed A/B/C):
+
+| Path | sample (ms) | n iters | notes |
+|------|-------------|---------|-------|
+| A | 61917 | 1 | same order of magnitude as the 5-iter run |
+| B | 64.6 | 1 | 5-iter p95 34.3 ms is the SLO number |
+| C — DuckDB `read_json` of JSONL.zst | 519.6 | 1 | `N=10`, same fingerprint as A/B; not Parquet |
+
+Golden Path C (4 frames, 5 iters): p50 **38.2 ms**, p95 **39.2 ms**. Fixture-scale milliseconds are not a go.
+
+- **n frames:** 486000 (10 RTH days × 1 Hz × NQ+ES)
+- **Planted matches / N:** 10 (reliability **Insufficient** per AGENT.md; this is a latency run, not a research claim)
+- **Span:** 2024-01-08 09:30 ET → 2024-01-19 16:14:59 ET (10 weekdays; `spanMs` 974699000)
+- **Machine:** linux x86_64, `availableParallelism` 4, ~16 GiB RAM (Cursor Cloud)
+- **90-day / 1-year:** **not in this environment** (not faked)
+
+**SLO comparison:** Path B p95 **34 ms** is inside **p95 ≤ 3000 ms over ~2 weeks**. Path B is typed SQLite columns (`eq_bench_dense`), not a hand-built columnar engine. Path A (~80 s p95) is the JSON-blob status quo — slow, but the owner bar is Path B, not Path A. Path C at this scale is ~0.5 s — slower than B, faster than A, and not a reason to adopt DuckDB.
+
+**Path C toolchain (genuine attempt; ran here; still DEFER):** `duckdb` 1.10505 bundled, Cargo feature `duckdb-bench` **off by default**. Default `cc`/clang failed (`#include <memory>` not found under `--target=x86_64-unknown-linux-gnu`). Link needs `CXX=g++ CC=gcc RUSTFLAGS="-C link-arg=-L/usr/lib/gcc/x86_64-linux-gnu/13"` (rust-lld cannot find `libstdc++` without gcc's lib dir). `.github/workflows/rust.yml` stays feature-off (`windows-latest` must not require DuckDB / libduckdb). Path C is not a silent no-op: it is compile-gated, documented, and was executed on this Cloud image.
+
+This note does not adopt DuckDB in MCP/engine, does not convert the M3d hive to Parquet, does not stop `depth_events` as hot store (#14), does not add DOM cluster Base Detectors (#22), Feature-IR (#18–#21), Vs3dProvider (#16), ACSIL (#23), `get_capsule`, a 250 ms forever-store, a tenth kernel operator / `run_job` poll tool, new specialty market tools, new `config.toml` knobs, or raise the Trust Ceiling.
+
+**Consequences:** Keep SQLite as the Episode Query store. Revisit DuckDB if a 90-day / 1-year corpus exists and Path B p95 misses 10 s, or if a future Path B rewrite becomes a hand-rolled columnar engine.
+
+---
+
 ### Decision note: SIL-P-VS-a Levels-Only Record path
 
 **Date:** 2026-08-13

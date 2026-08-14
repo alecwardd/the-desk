@@ -97,7 +97,9 @@ pub struct HypothesisRunSummary {
     pub engine_version: serde_json::Value,
     pub gate: GateDecision,
     pub warnings: Vec<String>,
-    /// Journal Frame windows for each fire (`frame_ref`). Empty when no frames exist.
+    /// One window per summarized fire (`frame_ref`). Empty when there are no
+    /// fires. Missing Journal Frames set `journal_backed: false`; they do not
+    /// omit the entry.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence_windows: Vec<super::query_kernel::JournalBackedEvidenceWindow>,
 }

@@ -1096,7 +1096,7 @@ pub fn query_episodes(
     });
     let needs_positioning = req.predicates.iter().any(predicate_needs_positioning);
     let positioning_records = if needs_positioning {
-        db.list_positioning_records_as_of(end)?
+        db.list_positioning_records_covering_window(start, end)?
     } else {
         Vec::new()
     };
@@ -1162,8 +1162,14 @@ pub fn query_episodes(
         let mut events_by_second: BTreeMap<i64, Vec<Value>> = BTreeMap::new();
         if needs_events {
             let event_cap = remain.saturating_add(1).min(10_000);
-            let mut events =
-                db.list_market_events_in_window(page_start, page_end, None, None, event_cap)?;
+            let mut events = db.list_market_events_in_window(
+                page_start,
+                page_end,
+                None,
+                None,
+                session.as_deref(),
+                event_cap,
+            )?;
             if events.len() >= event_cap {
                 truncated = true;
                 events.truncate(event_cap.saturating_sub(1).max(1));
@@ -1404,8 +1410,14 @@ pub fn query_raw(db: &Database, req: &QueryRawRequest) -> Result<QueryRawResult,
         "events" => {
             for root in &roots {
                 let fetch = cap.saturating_add(1);
-                let events =
-                    db.list_market_events_in_window(start, end, root.as_deref(), None, fetch)?;
+                let events = db.list_market_events_in_window(
+                    start,
+                    end,
+                    root.as_deref(),
+                    None,
+                    session.as_deref(),
+                    fetch,
+                )?;
                 if events.len() > cap {
                     truncated = true;
                 }
@@ -1958,6 +1970,7 @@ mod tests {
         LEVELS_ONLY_RECORD_KIND,
     };
     use crate::db::JournalFrameRecord;
+    use crate::pipelines::event_detector::MarketEvent;
     use tempfile::{NamedTempFile, TempDir};
 
     const FLAGSHIP_CLOCK_MS: f64 = 1_704_207_600_000.0;
@@ -2755,6 +2768,69 @@ mod tests {
         )
         .expect("rth ticks");
         assert_eq!(rth_ticks.rows.len(), 3);
+    }
+
+    #[test]
+    fn query_raw_events_apply_session_filter_before_limit() {
+        let db = test_db();
+        let start = FLAGSHIP_CLOCK_MS;
+        let mut events = Vec::new();
+        for i in 0..5 {
+            events.push(MarketEvent {
+                session_date: FLAGSHIP_TRADING_DAY.into(),
+                timestamp_ms: start + f64::from(i),
+                event_type: "poor_low".into(),
+                level_name: None,
+                price: FLAGSHIP_NQ_PRICE,
+                direction: Some("down".into()),
+                sequence_num: Some(i),
+                metadata: None,
+                session_type: "Globex".into(),
+                session_segment: "None".into(),
+                trading_day: FLAGSHIP_TRADING_DAY.into(),
+            });
+        }
+        events.push(MarketEvent {
+            session_date: FLAGSHIP_TRADING_DAY.into(),
+            timestamp_ms: start + 5.0,
+            event_type: "poor_low".into(),
+            level_name: None,
+            price: FLAGSHIP_NQ_PRICE + 1.0,
+            direction: Some("down".into()),
+            sequence_num: Some(5),
+            metadata: None,
+            session_type: "RTH".into(),
+            session_segment: "None".into(),
+            trading_day: FLAGSHIP_TRADING_DAY.into(),
+        });
+        db.insert_market_events_batch_scoped(Some("NQ"), &events)
+            .expect("events");
+        let result = query_raw(
+            &db,
+            &QueryRawRequest {
+                window: QueryWindow {
+                    start_ms: Some(start),
+                    end_ms: Some(start + 10.0),
+                    session_type: Some("RTH".into()),
+                    symbols: Some(vec!["NQ".into()]),
+                },
+                source: "events".into(),
+                limit: Some(3),
+            },
+        )
+        .expect("raw events");
+        assert_eq!(
+            result.rows.len(),
+            1,
+            "RTH event must still be returned when five Globex rows would fill LIMIT 3"
+        );
+        assert_eq!(
+            result.rows[0]
+                .payload
+                .get("sessionType")
+                .and_then(|v| v.as_str()),
+            Some("RTH")
+        );
     }
 
     #[test]

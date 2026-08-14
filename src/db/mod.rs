@@ -7835,22 +7835,45 @@ impl Database {
         )
     }
 
-    /// Positioning records with `as_of_ms <= as_of_ms`, oldest first (query kernel join).
-    pub fn list_positioning_records_as_of(
+    /// Positioning records that cover `[start_ms, end_ms]` for as-of joins.
+    ///
+    /// Returns the latest record with `as_of_ms <= start_ms` (the predecessor
+    /// that is still in force at the window open) plus every record with
+    /// `start_ms < as_of_ms <= end_ms`, oldest first. Records after `end_ms`
+    /// and older superseded history are omitted so an episode query cannot
+    /// deserialize unbounded Positioning history.
+    pub fn list_positioning_records_covering_window(
         &self,
-        as_of_ms: f64,
+        start_ms: f64,
+        end_ms: f64,
     ) -> Result<Vec<PositioningRecord>, DbError> {
-        if !as_of_ms.is_finite() || as_of_ms <= 0.0 {
+        if !start_ms.is_finite() || !end_ms.is_finite() || start_ms <= 0.0 || end_ms <= 0.0 {
             return Err(DbError::InvalidQuery(
-                "asOf must be a positive finite epoch-milliseconds value".into(),
+                "covering window bounds must be positive finite epoch-milliseconds".into(),
+            ));
+        }
+        if end_ms < start_ms {
+            return Err(DbError::InvalidQuery(
+                "covering window end must be >= start".into(),
             ));
         }
         let mut stmt = self.conn.prepare(
-            "SELECT payload FROM positioning_records
-             WHERE as_of_ms <= ?1
-             ORDER BY as_of_ms ASC, captured_at_ms ASC, updated_at_ms ASC",
+            "WITH pred AS (
+                SELECT MAX(as_of_ms) AS as_of_ms
+                FROM positioning_records
+                WHERE as_of_ms <= ?1
+             )
+             SELECT p.payload
+             FROM positioning_records p
+             CROSS JOIN pred
+             WHERE p.as_of_ms <= ?2
+               AND (
+                    (pred.as_of_ms IS NOT NULL AND p.as_of_ms >= pred.as_of_ms)
+                    OR (pred.as_of_ms IS NULL AND p.as_of_ms > ?1)
+               )
+             ORDER BY p.as_of_ms ASC, p.captured_at_ms ASC, p.updated_at_ms ASC",
         )?;
-        let rows = stmt.query_map(params![as_of_ms], |row| row.get::<_, String>(0))?;
+        let rows = stmt.query_map(params![start_ms, end_ms], |row| row.get::<_, String>(0))?;
         let mut out = Vec::new();
         for payload in rows {
             out.push(serde_json::from_str(&payload?)?);
@@ -8276,13 +8299,16 @@ impl Database {
     /// Occurrence rows in `[start_ms, end_ms]` oldest-first (research query kernel).
     ///
     /// Unlike [`Self::list_recent_market_events`], this does not collapse to
-    /// latest-per-dedup and does not reverse to newest-first.
+    /// latest-per-dedup and does not reverse to newest-first. Optional
+    /// `session_type` is applied in SQL before `LIMIT` so Globex rows cannot
+    /// consume the cap and drop later RTH rows (or the reverse).
     pub fn list_market_events_in_window(
         &self,
         start_ms: f64,
         end_ms: f64,
         root_symbol: Option<&str>,
         event_type: Option<&str>,
+        session_type: Option<&str>,
         limit: usize,
     ) -> Result<Vec<serde_json::Value>, DbError> {
         let limit = limit.max(1);
@@ -8291,46 +8317,35 @@ impl Database {
              FROM market_events
              WHERE timestamp_ms >= ?1 AND timestamp_ms <= ?2"
         );
-        if root_symbol.is_some() {
-            sql.push_str(" AND root_symbol = ?3");
+        let mut bind: Vec<rusqlite::types::Value> = vec![
+            rusqlite::types::Value::Real(start_ms),
+            rusqlite::types::Value::Real(end_ms),
+        ];
+        if let Some(root) = root_symbol {
+            bind.push(rusqlite::types::Value::Text(root.to_string()));
+            sql.push_str(" AND root_symbol = ?");
+            sql.push_str(&bind.len().to_string());
         }
-        if event_type.is_some() {
-            if root_symbol.is_some() {
-                sql.push_str(" AND event_type = ?4");
-            } else {
-                sql.push_str(" AND event_type = ?3");
-            }
+        if let Some(etype) = event_type {
+            bind.push(rusqlite::types::Value::Text(etype.to_string()));
+            sql.push_str(" AND event_type = ?");
+            sql.push_str(&bind.len().to_string());
+        }
+        if let Some(session) = session_type {
+            bind.push(rusqlite::types::Value::Text(session.to_string()));
+            sql.push_str(" AND session_type = ?");
+            sql.push_str(&bind.len().to_string());
         }
         sql.push_str(" ORDER BY timestamp_ms ASC, COALESCE(root_symbol, '') ASC LIMIT ");
         sql.push_str(&limit.to_string());
 
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = match (root_symbol, event_type) {
-            (Some(root), Some(etype)) => stmt
-                .query_map(
-                    rusqlite::params![start_ms, end_ms, root, etype],
-                    map_listed_market_event_row,
-                )?
-                .collect::<Result<Vec<_>, _>>()?,
-            (Some(root), None) => stmt
-                .query_map(
-                    rusqlite::params![start_ms, end_ms, root],
-                    map_listed_market_event_row,
-                )?
-                .collect::<Result<Vec<_>, _>>()?,
-            (None, Some(etype)) => stmt
-                .query_map(
-                    rusqlite::params![start_ms, end_ms, etype],
-                    map_listed_market_event_row,
-                )?
-                .collect::<Result<Vec<_>, _>>()?,
-            (None, None) => stmt
-                .query_map(
-                    rusqlite::params![start_ms, end_ms],
-                    map_listed_market_event_row,
-                )?
-                .collect::<Result<Vec<_>, _>>()?,
-        };
+        let rows = stmt
+            .query_map(
+                rusqlite::params_from_iter(bind),
+                map_listed_market_event_row,
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
 
@@ -13529,6 +13544,144 @@ mod tests {
             .get_positioning_record_as_of(earlier - 1_000.0)
             .expect("before")
             .is_none());
+    }
+
+    #[test]
+    fn positioning_covering_window_keeps_predecessor_not_full_history() {
+        use crate::catalog::{
+            accept_levels_only_entry, DerivedLevels, PositioningEntryInput, PositioningWall,
+        };
+        let db = test_db();
+        let start = 1_771_372_800_000.0;
+        let end = start + 60_000.0;
+        let levels = DerivedLevels {
+            flip: 5750.0,
+            walls: vec![PositioningWall {
+                strike: 5800.0,
+                role: "call_wall".into(),
+            }],
+            balance: 5745.0,
+            upside_test: 5825.0,
+            downside_test: 5680.0,
+        };
+        for i in 0..5 {
+            let as_of = start - 86_400_000.0 * f64::from(5 - i);
+            let record = accept_levels_only_entry(PositioningEntryInput {
+                id: Some(format!("pos-old-{i}")),
+                captured_at_ms: Some(as_of),
+                as_of_ms: Some(as_of),
+                derived_levels: Some(levels.clone()),
+                now_ms: as_of,
+                ..Default::default()
+            })
+            .expect("old");
+            db.upsert_positioning_record(&record, as_of)
+                .expect("insert old");
+        }
+        let in_window_ms = start + 1_000.0;
+        let in_window = accept_levels_only_entry(PositioningEntryInput {
+            id: Some("pos-in-window".into()),
+            captured_at_ms: Some(in_window_ms),
+            as_of_ms: Some(in_window_ms),
+            derived_levels: Some(levels.clone()),
+            now_ms: in_window_ms,
+            ..Default::default()
+        })
+        .expect("in-window");
+        db.upsert_positioning_record(&in_window, in_window_ms)
+            .expect("insert in-window");
+        let after_end_ms = end + 1_000.0;
+        let after_end = accept_levels_only_entry(PositioningEntryInput {
+            id: Some("pos-after-end".into()),
+            captured_at_ms: Some(after_end_ms),
+            as_of_ms: Some(after_end_ms),
+            derived_levels: Some(levels),
+            now_ms: after_end_ms,
+            ..Default::default()
+        })
+        .expect("after");
+        db.upsert_positioning_record(&after_end, after_end_ms)
+            .expect("insert after");
+
+        let before_only = db
+            .list_positioning_records_covering_window(start, start)
+            .expect("before-only");
+        assert_eq!(
+            before_only
+                .iter()
+                .map(|r| r.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["pos-old-4"],
+            "five pre-start records must collapse to the latest predecessor"
+        );
+
+        let covering = db
+            .list_positioning_records_covering_window(start, end)
+            .expect("covering");
+        assert_eq!(
+            covering.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["pos-old-4", "pos-in-window"],
+            "covering window is predecessor + in-window; not older history or after-end"
+        );
+    }
+
+    #[test]
+    fn list_market_events_in_window_filters_session_before_limit() {
+        let db = test_db();
+        let start = 1_704_207_600_000.0;
+        let mut events = Vec::new();
+        for i in 0..5 {
+            events.push(MarketEvent {
+                session_date: "2024-01-02".into(),
+                timestamp_ms: start + f64::from(i),
+                event_type: "poor_low".into(),
+                level_name: None,
+                price: 20_000.0,
+                direction: Some("down".into()),
+                sequence_num: Some(i),
+                metadata: None,
+                session_type: "Globex".into(),
+                session_segment: "None".into(),
+                trading_day: "2024-01-02".into(),
+            });
+        }
+        events.push(MarketEvent {
+            session_date: "2024-01-02".into(),
+            timestamp_ms: start + 5.0,
+            event_type: "poor_low".into(),
+            level_name: None,
+            price: 20_001.0,
+            direction: Some("down".into()),
+            sequence_num: Some(5),
+            metadata: None,
+            session_type: "RTH".into(),
+            session_segment: "None".into(),
+            trading_day: "2024-01-02".into(),
+        });
+        db.insert_market_events_batch_scoped(Some("NQ"), &events)
+            .expect("insert");
+
+        let unfiltered = db
+            .list_market_events_in_window(start, start + 10.0, None, None, None, 3)
+            .expect("unfiltered");
+        assert_eq!(unfiltered.len(), 3);
+        assert!(unfiltered
+            .iter()
+            .all(|e| e.get("sessionType").and_then(|v| v.as_str()) == Some("Globex")));
+
+        let rth = db
+            .list_market_events_in_window(start, start + 10.0, None, None, Some("RTH"), 3)
+            .expect("rth");
+        assert_eq!(
+            rth.len(),
+            1,
+            "RTH row must survive when Globex would fill LIMIT 3"
+        );
+        assert_eq!(
+            rth[0].get("sessionType").and_then(|v| v.as_str()),
+            Some("RTH")
+        );
+        assert_eq!(rth[0].get("price").and_then(|v| v.as_f64()), Some(20_001.0));
     }
 
     #[test]

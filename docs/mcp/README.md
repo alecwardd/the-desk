@@ -74,7 +74,8 @@ guarantees the two lists can never diverge.
 > (`tools/market.rs`). The rule is **no catalog entry → no new market tool**
 > (allowlist in `docs/mcp/desk-catalog-v0.json`). Workflow domains (playbook /
 > risk / journal / memory / research / admin) and SIL kernel operators
-> (`describe_*` / `search_catalog` / `get_state` / `get_events`, behind
+> (`describe_*` / `search_catalog` / `get_state` / `get_events` /
+> `query_series` / `query_episodes` / `query_raw` / `run_job`, behind
 > `[sil].catalog_discovery`) are not specialty market tools; do not delete
 > existing tools in the name of this policy.
 
@@ -123,9 +124,11 @@ Slice / first-class Levels-Only Records via `positioning_entry`; no live provide
 - Regenerate: `cargo run --bin the-desk-mcp -- --write-catalog-docs`
 - Discovery / read-kernel operators: `describe_environment`, `describe_domain`,
   `search_catalog`, `get_state` (StateEnvelope, R0|R1), `get_events` (identity
-  rows) — registered only when `[sil].catalog_discovery = true` in
+  rows), `query_series`, `query_episodes`, `query_raw`, `run_job` (artifact
+  handle) — registered only when `[sil].catalog_discovery = true` in
   `~/.the-desk/config.toml`. Default off → 122-tool surface unchanged.
-  Trust Level L0 (no mutation / order authority). See [CONTEXT.md](../../CONTEXT.md).
+  Trust Level L0 (no mutation / order authority). Unbounded query windows are
+  rejected. See [CONTEXT.md](../../CONTEXT.md).
 
 ## SIL-M0 tool-call telemetry
 
@@ -159,6 +162,22 @@ With `[sil].catalog_discovery = true`:
   `deprecated: true` + `suggestedReplacementOperator: "get_state"`.
 - Opinionated bundles remain: `get_context_frame`, `get_attention_inbox`,
   `evaluate_playbook`.
+
+## SIL-M3c research query kernel
+
+With `[sil].catalog_discovery = true`:
+
+- `query_series` (R2) — time series of catalog fields from 1 Hz Journal Frames.
+- `query_episodes` (R2) — conjunctive Episode Query over catalog fields /
+  events; flagship five-predicate query is expressible; tick-driven MFE/MAE.
+- `query_raw` (R3) — hard-capped raw read of `journal_frames` / `events` /
+  `ticks`. Unbounded windows are rejected.
+- `run_job` — job id + artifact handle (columnar path + summary), never a
+  token flood. Does not mutate playbook / risk / journal / memory / orders.
+
+Every result includes `N` and `reliabilityTier`. Missing detector/vendor
+fields fail closed. These operators stay out of `tool_domains()` so the
+generated 122-tool reference is unchanged when the flag is off.
 
 ## SIL-M2a engine extract + embedded fallback
 

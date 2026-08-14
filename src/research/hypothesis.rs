@@ -97,6 +97,11 @@ pub struct HypothesisRunSummary {
     pub engine_version: serde_json::Value,
     pub gate: GateDecision,
     pub warnings: Vec<String>,
+    /// One window per summarized fire (`frame_ref`). Empty when there are no
+    /// fires. Missing Journal Frames set `journal_backed: false`; they do not
+    /// omit the entry.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_windows: Vec<super::query_kernel::JournalBackedEvidenceWindow>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -639,7 +644,18 @@ pub fn summarize_hypothesis_run(
     let rows = db
         .list_hypothesis_signal_outcomes(setup_id, job_id, Some(&scope))
         .map_err(|e| e.to_string())?;
-    summarize_rows(setup_id, job_id, &setup, rows, run_engine_version)
+    let (evidence_windows, evidence_truncated) =
+        super::query_kernel::journal_backed_evidence_windows(db, &rows)
+            .map_err(|e| e.to_string())?;
+    summarize_rows(
+        setup_id,
+        job_id,
+        &setup,
+        rows,
+        run_engine_version,
+        evidence_windows,
+        evidence_truncated,
+    )
 }
 
 fn summarize_rows(
@@ -648,6 +664,8 @@ fn summarize_rows(
     setup: &SetupDefinition,
     rows: Vec<HypothesisSignalOutcomeRow>,
     engine_version: serde_json::Value,
+    evidence_windows: Vec<super::query_kernel::JournalBackedEvidenceWindow>,
+    evidence_truncated: bool,
 ) -> Result<HypothesisRunSummary, String> {
     let r_points = r_points(setup);
     let total = rows.len();
@@ -749,6 +767,12 @@ fn summarize_rows(
              — likely re-firing on a sticky state flag rather than a discrete entry; tighten conditions or raise duplicateSuppressionMs."
         ));
     }
+    if evidence_truncated {
+        warnings.push(format!(
+            "evidence_windows truncated at {} (use query_episodes / run_job for bulk journal-backed windows)",
+            super::query_kernel::HYPOTHESIS_EVIDENCE_WINDOW_CAP
+        ));
+    }
 
     Ok(HypothesisRunSummary {
         setup_id: setup_id.to_string(),
@@ -771,6 +795,7 @@ fn summarize_rows(
         engine_version,
         gate,
         warnings,
+        evidence_windows,
     })
 }
 
@@ -1055,6 +1080,8 @@ mod tests {
             &setup,
             rows_over_sessions(&["2026-01-05", "2026-01-06"], 6),
             current_engine_version(),
+            Vec::new(),
+            false,
         )
         .unwrap();
         assert_eq!(chatty.active_session_count, 2);
@@ -1069,6 +1096,8 @@ mod tests {
             &setup,
             rows_over_sessions(&["2026-01-05", "2026-01-06"], 2),
             current_engine_version(),
+            Vec::new(),
+            false,
         )
         .unwrap();
         assert!(!calm.chatty);

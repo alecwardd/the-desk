@@ -3,6 +3,7 @@
 use rmcp::handler::server::tool::ToolRouter;
 use schemars::{json_schema, Schema, SchemaGenerator};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
@@ -134,6 +135,20 @@ pub(crate) fn schemars_optional_loose_object(_: &mut SchemaGenerator) -> Schema 
     json_schema!({
         "anyOf": [
             { "type": "null" },
+            { "type": "object", "additionalProperties": true }
+        ]
+    })
+}
+
+/// Predicate `value` may be a number, bool, string, or object (e.g. Positioning source).
+pub(crate) fn schemars_json_value(_: &mut SchemaGenerator) -> Schema {
+    json_schema!({
+        "anyOf": [
+            { "type": "null" },
+            { "type": "boolean" },
+            { "type": "number" },
+            { "type": "string" },
+            { "type": "array" },
             { "type": "object", "additionalProperties": true }
         ]
     })
@@ -430,6 +445,8 @@ pub struct TheDeskMcp {
     /// MarketRouter v0: concurrent NQ + ES lanes on one clock (embedded ES lane;
     /// NQ shares the live coaching pipelines).
     pub(crate) market_router: std::sync::Arc<the_desk_backend::engine::MarketRouter>,
+    /// Directory for `run_job` columnar artifacts (tests override to a TempDir).
+    pub(crate) research_artifact_dir: PathBuf,
 }
 
 #[derive(Debug)]

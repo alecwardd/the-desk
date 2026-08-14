@@ -14,7 +14,7 @@ use super::types::{CostHint, DeskCatalog, FieldDescriptor, TrustCeiling, CATALOG
 
 /// Pull-band resolution accepted by `get_state` (R0 orientation / R1 state).
 ///
-/// R2 evidence and R3 raw stay on later query operators (`query_series` /
+/// R2 evidence and R3 raw stay on query operators (`query_series` /
 /// `query_episodes` / `query_raw`) — never widen the state read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]

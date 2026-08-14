@@ -754,6 +754,32 @@ pub struct HistoricalJobRunUpdate<'a> {
     pub finished_at_ms: Option<f64>,
 }
 
+/// Durable `run_job` row for the SIL research query kernel (Trust Level L0).
+///
+/// Artifact files on disk are the bulk payload; this row is the cross-process
+/// handle. It does not mutate playbook, risk, journal, memory, or orders.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResearchQueryJobRecord {
+    pub id: String,
+    pub kind: String,
+    pub status: String,
+    pub submitted_at_ms: f64,
+    pub started_at_ms: Option<f64>,
+    pub finished_at_ms: Option<f64>,
+    pub window_start_ms: Option<f64>,
+    pub window_end_ms: Option<f64>,
+    pub request: serde_json::Value,
+    pub summary: Option<serde_json::Value>,
+    pub artifact_dir: Option<String>,
+    pub columnar_path: Option<String>,
+    pub summary_path: Option<String>,
+    pub sample_size: Option<i64>,
+    pub reliability_tier: Option<String>,
+    pub degraded: bool,
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResearchHypothesisRecord {
@@ -1056,6 +1082,45 @@ pub fn journal_frame_second_from_ts(timestamp_ms: f64) -> Option<i64> {
     } else {
         None
     }
+}
+
+fn map_journal_frame_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JournalFrameRecord> {
+    let payload: String = row.get(6)?;
+    let value = serde_json::from_str::<serde_json::Value>(&payload)
+        .unwrap_or_else(|_| serde_json::json!({}));
+    Ok(JournalFrameRecord {
+        clock_ms: row.get(0)?,
+        frame_second: row.get(1)?,
+        root_symbol: row.get(2)?,
+        session_type: row.get(3)?,
+        session_segment: row.get(4)?,
+        trading_day: row.get(5)?,
+        payload: value,
+    })
+}
+
+fn map_research_query_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ResearchQueryJobRecord> {
+    let request_str: String = row.get(8)?;
+    let summary_str: Option<String> = row.get(9)?;
+    Ok(ResearchQueryJobRecord {
+        id: row.get(0)?,
+        kind: row.get(1)?,
+        status: row.get(2)?,
+        submitted_at_ms: row.get(3)?,
+        started_at_ms: row.get(4)?,
+        finished_at_ms: row.get(5)?,
+        window_start_ms: row.get(6)?,
+        window_end_ms: row.get(7)?,
+        request: serde_json::from_str(&request_str).unwrap_or_else(|_| serde_json::json!({})),
+        summary: summary_str.and_then(|s| serde_json::from_str(&s).ok()),
+        artifact_dir: row.get(10)?,
+        columnar_path: row.get(11)?,
+        summary_path: row.get(12)?,
+        sample_size: row.get(13)?,
+        reliability_tier: row.get(14)?,
+        degraded: row.get::<_, i64>(15)? != 0,
+        error: row.get(16)?,
+    })
 }
 
 const MARKET_EVENT_LIST_COLUMNS: &str = "timestamp_ms, event_type, level_name, price, direction, sequence_num, metadata_json,
@@ -1708,6 +1773,12 @@ impl Database {
         }
         if version < 36 {
             self.migrate_v36()?;
+        }
+        if version < 37 {
+            self.migrate_v37()?;
+        }
+        if version < 38 {
+            self.migrate_v38()?;
         }
 
         Ok(())
@@ -3373,6 +3444,58 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_market_events_identity
               ON market_events(identity_id);
             UPDATE schema_version SET version = 36;
+            ",
+        )?;
+        Ok(())
+    }
+
+    /// V37: SIL-M3c research query jobs (artifact handles for `run_job`).
+    ///
+    /// Index is created in the same batch as the table (`IF NOT EXISTS`) so a
+    /// partial checkout that already created the table still gets the index.
+    fn migrate_v37(&self) -> Result<(), DbError> {
+        self.conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS research_query_jobs (
+              id TEXT PRIMARY KEY,
+              kind TEXT NOT NULL,
+              status TEXT NOT NULL,
+              submitted_at_ms REAL NOT NULL,
+              started_at_ms REAL NULL,
+              finished_at_ms REAL NULL,
+              window_start_ms REAL NULL,
+              window_end_ms REAL NULL,
+              request_json TEXT NOT NULL,
+              summary_json TEXT NULL,
+              artifact_dir TEXT NULL,
+              columnar_path TEXT NULL,
+              summary_path TEXT NULL,
+              sample_size INTEGER NULL,
+              reliability_tier TEXT NULL,
+              degraded INTEGER NOT NULL DEFAULT 0,
+              error_text TEXT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_research_query_jobs_status
+              ON research_query_jobs(status, submitted_at_ms DESC);
+            UPDATE schema_version SET version = 37;
+            ",
+        )?;
+        Ok(())
+    }
+
+    /// V38: `timestamp_ms` leading index for research window scans.
+    ///
+    /// `list_market_events_in_window` filters `timestamp_ms` then `LIMIT`.
+    /// Existing indexes lead with `session_date` / `event_type` / `lifecycle`
+    /// / `journal_frame_second`, so a bare time range was a full table scan
+    /// (once per Episode Query page). `IF NOT EXISTS` is safe on DBs that
+    /// already ran v37.
+    fn migrate_v38(&self) -> Result<(), DbError> {
+        self.conn.execute_batch(
+            "
+            CREATE INDEX IF NOT EXISTS idx_market_events_ts
+              ON market_events(timestamp_ms);
+            UPDATE schema_version SET version = 38;
             ",
         )?;
         Ok(())
@@ -7199,20 +7322,150 @@ impl Database {
              FROM journal_frames
              ORDER BY clock_ms ASC, root_symbol ASC",
         )?;
-        let rows = stmt.query_map([], |row| {
-            let payload: String = row.get(6)?;
-            let value = serde_json::from_str::<serde_json::Value>(&payload)
-                .unwrap_or_else(|_| serde_json::json!({}));
-            Ok(JournalFrameRecord {
-                clock_ms: row.get(0)?,
-                frame_second: row.get(1)?,
-                root_symbol: row.get(2)?,
-                session_type: row.get(3)?,
-                session_segment: row.get(4)?,
-                trading_day: row.get(5)?,
-                payload: value,
-            })
-        })?;
+        let rows = stmt.query_map([], map_journal_frame_row)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Journal Frames at exact `frame_second` values for one root.
+    ///
+    /// Bounded lookup for hypothesis evidence joins: a 50-fire cap must not
+    /// expand into a multi-day range scan. Empty `seconds` returns no rows.
+    /// Duplicate seconds are ignored. Result size is at most `seconds.len()`.
+    pub fn list_journal_frames_at_seconds(
+        &self,
+        root_symbol: &str,
+        seconds: &[i64],
+    ) -> Result<Vec<JournalFrameRecord>, DbError> {
+        if seconds.is_empty() {
+            return Ok(Vec::new());
+        }
+        let unique: BTreeSet<i64> = seconds.iter().copied().collect();
+        let secs: Vec<i64> = unique.into_iter().collect();
+        let mut sql = String::from(
+            "SELECT clock_ms, frame_second, root_symbol, session_type, session_segment, trading_day, payload
+               FROM journal_frames
+              WHERE root_symbol = ?1
+                AND frame_second IN (",
+        );
+        for i in 0..secs.len() {
+            if i > 0 {
+                sql.push(',');
+            }
+            sql.push('?');
+            sql.push_str(&(i + 2).to_string());
+        }
+        sql.push_str(") ORDER BY frame_second ASC");
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut bind: Vec<rusqlite::types::Value> = Vec::with_capacity(secs.len() + 1);
+        bind.push(rusqlite::types::Value::Text(root_symbol.to_string()));
+        for second in &secs {
+            bind.push(rusqlite::types::Value::Integer(*second));
+        }
+        let rows = stmt.query_map(rusqlite::params_from_iter(bind), map_journal_frame_row)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Journal Frames whose `clock_ms` falls in `[start_ms, end_ms]` (inclusive).
+    ///
+    /// Optional `root_symbol` / `session_type` filters are exact matches.
+    /// `limit` caps rows returned; use [`Self::count_journal_frames_in_window`]
+    /// to detect truncation. Results are oldest-first.
+    pub fn list_journal_frames_in_window(
+        &self,
+        start_ms: f64,
+        end_ms: f64,
+        root_symbol: Option<&str>,
+        session_type: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<JournalFrameRecord>, DbError> {
+        let limit = limit.max(1) as i64;
+        let mut sql = String::from(
+            "SELECT clock_ms, frame_second, root_symbol, session_type, session_segment, trading_day, payload
+             FROM journal_frames
+             WHERE clock_ms >= ?1 AND clock_ms <= ?2",
+        );
+        if root_symbol.is_some() {
+            sql.push_str(" AND root_symbol = ?3");
+        }
+        if session_type.is_some() {
+            if root_symbol.is_some() {
+                sql.push_str(" AND session_type = ?4");
+            } else {
+                sql.push_str(" AND session_type = ?3");
+            }
+        }
+        sql.push_str(" ORDER BY clock_ms ASC, root_symbol ASC LIMIT ");
+        sql.push_str(&limit.to_string());
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = match (root_symbol, session_type) {
+            (Some(root), Some(session)) => stmt
+                .query_map(
+                    params![start_ms, end_ms, root, session],
+                    map_journal_frame_row,
+                )?
+                .collect::<Result<Vec<_>, _>>()?,
+            (Some(root), None) => stmt
+                .query_map(params![start_ms, end_ms, root], map_journal_frame_row)?
+                .collect::<Result<Vec<_>, _>>()?,
+            (None, Some(session)) => stmt
+                .query_map(params![start_ms, end_ms, session], map_journal_frame_row)?
+                .collect::<Result<Vec<_>, _>>()?,
+            (None, None) => stmt
+                .query_map(params![start_ms, end_ms], map_journal_frame_row)?
+                .collect::<Result<Vec<_>, _>>()?,
+        };
+        Ok(rows)
+    }
+
+    /// Count Journal Frames in `[start_ms, end_ms]` with the same filters as
+    /// [`Self::list_journal_frames_in_window`].
+    pub fn count_journal_frames_in_window(
+        &self,
+        start_ms: f64,
+        end_ms: f64,
+        root_symbol: Option<&str>,
+        session_type: Option<&str>,
+    ) -> Result<i64, DbError> {
+        let mut sql = String::from(
+            "SELECT COUNT(1) FROM journal_frames WHERE clock_ms >= ?1 AND clock_ms <= ?2",
+        );
+        if root_symbol.is_some() {
+            sql.push_str(" AND root_symbol = ?3");
+        }
+        if session_type.is_some() {
+            if root_symbol.is_some() {
+                sql.push_str(" AND session_type = ?4");
+            } else {
+                sql.push_str(" AND session_type = ?3");
+            }
+        }
+        let mut stmt = self.conn.prepare(&sql)?;
+        let count = match (root_symbol, session_type) {
+            (Some(root), Some(session)) => {
+                stmt.query_row(params![start_ms, end_ms, root, session], |r| r.get(0))?
+            }
+            (Some(root), None) => stmt.query_row(params![start_ms, end_ms, root], |r| r.get(0))?,
+            (None, Some(session)) => {
+                stmt.query_row(params![start_ms, end_ms, session], |r| r.get(0))?
+            }
+            (None, None) => stmt.query_row(params![start_ms, end_ms], |r| r.get(0))?,
+        };
+        Ok(count)
+    }
+
+    /// Distinct `session_type` labels present in the window (for mixed-scope detection).
+    pub fn list_journal_session_types_in_window(
+        &self,
+        start_ms: f64,
+        end_ms: f64,
+    ) -> Result<Vec<String>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT session_type FROM journal_frames
+             WHERE clock_ms >= ?1 AND clock_ms <= ?2
+             ORDER BY session_type ASC",
+        )?;
+        let rows = stmt.query_map(params![start_ms, end_ms], |row| row.get::<_, String>(0))?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
@@ -7534,20 +7787,7 @@ impl Database {
         )?;
         let rows = stmt.query_map(
             params![root_symbol, start_frame_second, end_frame_second],
-            |row| {
-                let payload: String = row.get(6)?;
-                let value = serde_json::from_str::<serde_json::Value>(&payload)
-                    .unwrap_or_else(|_| serde_json::json!({}));
-                Ok(JournalFrameRecord {
-                    clock_ms: row.get(0)?,
-                    frame_second: row.get(1)?,
-                    root_symbol: row.get(2)?,
-                    session_type: row.get(3)?,
-                    session_segment: row.get(4)?,
-                    trading_day: row.get(5)?,
-                    payload: value,
-                })
-            },
+            map_journal_frame_row,
         )?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
@@ -7614,6 +7854,52 @@ impl Database {
              LIMIT 1",
             params![as_of_ms],
         )
+    }
+
+    /// Positioning records that cover `[start_ms, end_ms]` for as-of joins.
+    ///
+    /// Returns the latest record with `as_of_ms <= start_ms` (the predecessor
+    /// that is still in force at the window open) plus every record with
+    /// `start_ms < as_of_ms <= end_ms`, oldest first. Records after `end_ms`
+    /// and older superseded history are omitted so an episode query cannot
+    /// deserialize unbounded Positioning history.
+    pub fn list_positioning_records_covering_window(
+        &self,
+        start_ms: f64,
+        end_ms: f64,
+    ) -> Result<Vec<PositioningRecord>, DbError> {
+        if !start_ms.is_finite() || !end_ms.is_finite() || start_ms <= 0.0 || end_ms <= 0.0 {
+            return Err(DbError::InvalidQuery(
+                "covering window bounds must be positive finite epoch-milliseconds".into(),
+            ));
+        }
+        if end_ms < start_ms {
+            return Err(DbError::InvalidQuery(
+                "covering window end must be >= start".into(),
+            ));
+        }
+        let mut stmt = self.conn.prepare(
+            "WITH pred AS (
+                SELECT MAX(as_of_ms) AS as_of_ms
+                FROM positioning_records
+                WHERE as_of_ms <= ?1
+             )
+             SELECT p.payload
+             FROM positioning_records p
+             CROSS JOIN pred
+             WHERE p.as_of_ms <= ?2
+               AND (
+                    (pred.as_of_ms IS NOT NULL AND p.as_of_ms >= pred.as_of_ms)
+                    OR (pred.as_of_ms IS NULL AND p.as_of_ms > ?1)
+               )
+             ORDER BY p.as_of_ms ASC, p.captured_at_ms ASC, p.updated_at_ms ASC",
+        )?;
+        let rows = stmt.query_map(params![start_ms, end_ms], |row| row.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for payload in rows {
+            out.push(serde_json::from_str(&payload?)?);
+        }
+        Ok(out)
     }
 
     fn load_positioning_record(
@@ -8028,6 +8314,59 @@ impl Database {
                 .query_map([], map_listed_market_event_row)?
                 .collect::<Result<Vec<_>, _>>()?,
         };
+        Ok(rows)
+    }
+
+    /// Occurrence rows in `[start_ms, end_ms]` oldest-first (research query kernel).
+    ///
+    /// Unlike [`Self::list_recent_market_events`], this does not collapse to
+    /// latest-per-dedup and does not reverse to newest-first. Optional
+    /// `session_type` is applied in SQL before `LIMIT` so Globex rows cannot
+    /// consume the cap and drop later RTH rows (or the reverse).
+    pub fn list_market_events_in_window(
+        &self,
+        start_ms: f64,
+        end_ms: f64,
+        root_symbol: Option<&str>,
+        event_type: Option<&str>,
+        session_type: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<serde_json::Value>, DbError> {
+        let limit = limit.max(1);
+        let mut sql = format!(
+            "SELECT {MARKET_EVENT_LIST_COLUMNS}
+             FROM market_events
+             WHERE timestamp_ms >= ?1 AND timestamp_ms <= ?2"
+        );
+        let mut bind: Vec<rusqlite::types::Value> = vec![
+            rusqlite::types::Value::Real(start_ms),
+            rusqlite::types::Value::Real(end_ms),
+        ];
+        if let Some(root) = root_symbol {
+            bind.push(rusqlite::types::Value::Text(root.to_string()));
+            sql.push_str(" AND root_symbol = ?");
+            sql.push_str(&bind.len().to_string());
+        }
+        if let Some(etype) = event_type {
+            bind.push(rusqlite::types::Value::Text(etype.to_string()));
+            sql.push_str(" AND event_type = ?");
+            sql.push_str(&bind.len().to_string());
+        }
+        if let Some(session) = session_type {
+            bind.push(rusqlite::types::Value::Text(session.to_string()));
+            sql.push_str(" AND session_type = ?");
+            sql.push_str(&bind.len().to_string());
+        }
+        sql.push_str(" ORDER BY timestamp_ms ASC, COALESCE(root_symbol, '') ASC LIMIT ");
+        sql.push_str(&limit.to_string());
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params_from_iter(bind),
+                map_listed_market_event_row,
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
 
@@ -11463,6 +11802,76 @@ impl Database {
         Ok(())
     }
 
+    /// Persist a SIL research query job handle (`run_job`). Trust Level L0 —
+    /// does not mutate workflow-verb state.
+    pub fn upsert_research_query_job(&self, job: &ResearchQueryJobRecord) -> Result<(), DbError> {
+        self.conn.execute(
+            "INSERT INTO research_query_jobs (
+                id, kind, status, submitted_at_ms, started_at_ms, finished_at_ms,
+                window_start_ms, window_end_ms, request_json, summary_json,
+                artifact_dir, columnar_path, summary_path, sample_size,
+                reliability_tier, degraded, error_text
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+             ON CONFLICT(id) DO UPDATE SET
+                status = excluded.status,
+                started_at_ms = excluded.started_at_ms,
+                finished_at_ms = excluded.finished_at_ms,
+                window_start_ms = excluded.window_start_ms,
+                window_end_ms = excluded.window_end_ms,
+                request_json = excluded.request_json,
+                summary_json = excluded.summary_json,
+                artifact_dir = excluded.artifact_dir,
+                columnar_path = excluded.columnar_path,
+                summary_path = excluded.summary_path,
+                sample_size = excluded.sample_size,
+                reliability_tier = excluded.reliability_tier,
+                degraded = excluded.degraded,
+                error_text = excluded.error_text",
+            params![
+                job.id,
+                job.kind,
+                job.status,
+                job.submitted_at_ms,
+                job.started_at_ms,
+                job.finished_at_ms,
+                job.window_start_ms,
+                job.window_end_ms,
+                serde_json::to_string(&job.request)?,
+                job.summary
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()?,
+                job.artifact_dir,
+                job.columnar_path,
+                job.summary_path,
+                job.sample_size,
+                job.reliability_tier,
+                i64::from(job.degraded),
+                job.error,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Load a research query job by id.
+    pub fn get_research_query_job(
+        &self,
+        id: &str,
+    ) -> Result<Option<ResearchQueryJobRecord>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, kind, status, submitted_at_ms, started_at_ms, finished_at_ms,
+                    window_start_ms, window_end_ms, request_json, summary_json,
+                    artifact_dir, columnar_path, summary_path, sample_size,
+                    reliability_tier, degraded, error_text
+             FROM research_query_jobs WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query(params![id])?;
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+        Ok(Some(map_research_query_job_row(row)?))
+    }
+
     pub fn update_historical_job_run(
         &self,
         id: &str,
@@ -13159,6 +13568,144 @@ mod tests {
     }
 
     #[test]
+    fn positioning_covering_window_keeps_predecessor_not_full_history() {
+        use crate::catalog::{
+            accept_levels_only_entry, DerivedLevels, PositioningEntryInput, PositioningWall,
+        };
+        let db = test_db();
+        let start = 1_771_372_800_000.0;
+        let end = start + 60_000.0;
+        let levels = DerivedLevels {
+            flip: 5750.0,
+            walls: vec![PositioningWall {
+                strike: 5800.0,
+                role: "call_wall".into(),
+            }],
+            balance: 5745.0,
+            upside_test: 5825.0,
+            downside_test: 5680.0,
+        };
+        for i in 0..5 {
+            let as_of = start - 86_400_000.0 * f64::from(5 - i);
+            let record = accept_levels_only_entry(PositioningEntryInput {
+                id: Some(format!("pos-old-{i}")),
+                captured_at_ms: Some(as_of),
+                as_of_ms: Some(as_of),
+                derived_levels: Some(levels.clone()),
+                now_ms: as_of,
+                ..Default::default()
+            })
+            .expect("old");
+            db.upsert_positioning_record(&record, as_of)
+                .expect("insert old");
+        }
+        let in_window_ms = start + 1_000.0;
+        let in_window = accept_levels_only_entry(PositioningEntryInput {
+            id: Some("pos-in-window".into()),
+            captured_at_ms: Some(in_window_ms),
+            as_of_ms: Some(in_window_ms),
+            derived_levels: Some(levels.clone()),
+            now_ms: in_window_ms,
+            ..Default::default()
+        })
+        .expect("in-window");
+        db.upsert_positioning_record(&in_window, in_window_ms)
+            .expect("insert in-window");
+        let after_end_ms = end + 1_000.0;
+        let after_end = accept_levels_only_entry(PositioningEntryInput {
+            id: Some("pos-after-end".into()),
+            captured_at_ms: Some(after_end_ms),
+            as_of_ms: Some(after_end_ms),
+            derived_levels: Some(levels),
+            now_ms: after_end_ms,
+            ..Default::default()
+        })
+        .expect("after");
+        db.upsert_positioning_record(&after_end, after_end_ms)
+            .expect("insert after");
+
+        let before_only = db
+            .list_positioning_records_covering_window(start, start)
+            .expect("before-only");
+        assert_eq!(
+            before_only
+                .iter()
+                .map(|r| r.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["pos-old-4"],
+            "five pre-start records must collapse to the latest predecessor"
+        );
+
+        let covering = db
+            .list_positioning_records_covering_window(start, end)
+            .expect("covering");
+        assert_eq!(
+            covering.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["pos-old-4", "pos-in-window"],
+            "covering window is predecessor + in-window; not older history or after-end"
+        );
+    }
+
+    #[test]
+    fn list_market_events_in_window_filters_session_before_limit() {
+        let db = test_db();
+        let start = 1_704_207_600_000.0;
+        let mut events = Vec::new();
+        for i in 0..5 {
+            events.push(MarketEvent {
+                session_date: "2024-01-02".into(),
+                timestamp_ms: start + f64::from(i),
+                event_type: "poor_low".into(),
+                level_name: None,
+                price: 20_000.0,
+                direction: Some("down".into()),
+                sequence_num: Some(i),
+                metadata: None,
+                session_type: "Globex".into(),
+                session_segment: "None".into(),
+                trading_day: "2024-01-02".into(),
+            });
+        }
+        events.push(MarketEvent {
+            session_date: "2024-01-02".into(),
+            timestamp_ms: start + 5.0,
+            event_type: "poor_low".into(),
+            level_name: None,
+            price: 20_001.0,
+            direction: Some("down".into()),
+            sequence_num: Some(5),
+            metadata: None,
+            session_type: "RTH".into(),
+            session_segment: "None".into(),
+            trading_day: "2024-01-02".into(),
+        });
+        db.insert_market_events_batch_scoped(Some("NQ"), &events)
+            .expect("insert");
+
+        let unfiltered = db
+            .list_market_events_in_window(start, start + 10.0, None, None, None, 3)
+            .expect("unfiltered");
+        assert_eq!(unfiltered.len(), 3);
+        assert!(unfiltered
+            .iter()
+            .all(|e| e.get("sessionType").and_then(|v| v.as_str()) == Some("Globex")));
+
+        let rth = db
+            .list_market_events_in_window(start, start + 10.0, None, None, Some("RTH"), 3)
+            .expect("rth");
+        assert_eq!(
+            rth.len(),
+            1,
+            "RTH row must survive when Globex would fill LIMIT 3"
+        );
+        assert_eq!(
+            rth[0].get("sessionType").and_then(|v| v.as_str()),
+            Some("RTH")
+        );
+        assert_eq!(rth[0].get("price").and_then(|v| v.as_f64()), Some(20_001.0));
+    }
+
+    #[test]
     fn journal_transition_events_join_to_frames() {
         let db = test_db();
         let ts = 1_704_207_600_250.0;
@@ -13231,7 +13778,10 @@ mod tests {
                 |r| r.get(0),
             )
             .expect("version");
-        assert!(version >= 36, "schema v36 identity index, got {version}");
+        assert!(
+            version >= 38,
+            "schema v38 market_events timestamp index, got {version}"
+        );
         let identity_idx: i64 = db
             .conn
             .query_row(
@@ -13242,6 +13792,36 @@ mod tests {
             )
             .expect("identity idx");
         assert_eq!(identity_idx, 1);
+        let jobs_table: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(1) FROM sqlite_master
+                  WHERE type='table' AND name='research_query_jobs'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("jobs table");
+        assert_eq!(jobs_table, 1);
+        let jobs_idx: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(1) FROM sqlite_master
+                  WHERE type='index' AND name='idx_research_query_jobs_status'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("jobs idx");
+        assert_eq!(jobs_idx, 1);
+        let events_ts_idx: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(1) FROM sqlite_master
+                  WHERE type='index' AND name='idx_market_events_ts'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("events ts idx");
+        assert_eq!(events_ts_idx, 1);
     }
 
     fn sample_capsule_record(

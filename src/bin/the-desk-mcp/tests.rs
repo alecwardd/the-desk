@@ -121,7 +121,7 @@ fn test_server_with_sil() -> TheDeskMcp {
         runtime_event_suppression_window_ms: 0,
         ..the_desk_backend::observability::LoggingConfig::default()
     };
-    let server = TheDeskMcp::with_runtime_events_and_sil(
+    let mut server = TheDeskMcp::with_runtime_events_and_sil(
         db,
         PipelineEngine::new(),
         ":memory:".into(),
@@ -133,6 +133,9 @@ fn test_server_with_sil() -> TheDeskMcp {
             ..Default::default()
         },
     );
+    let artifacts = tempfile::tempdir().expect("research artifacts");
+    server.research_artifact_dir = artifacts.path().to_path_buf();
+    std::mem::forget(artifacts);
     server
         .hydrate_playbook_runtime_cache()
         .expect("hydrate playbook cache");
@@ -927,7 +930,7 @@ fn discovery_tools_present_when_sil_flag_on() {
             "{tool} must appear when [sil].catalog_discovery = true"
         );
     }
-    assert_eq!(names.len(), 127);
+    assert_eq!(names.len(), 131);
 }
 
 #[test]
@@ -1891,6 +1894,300 @@ async fn get_events_rejects_invalid_since_ms() {
         .await
         .expect_err("invalid sinceMs");
     assert!(err.to_string().contains("sinceMs"));
+}
+
+#[tokio::test]
+async fn query_episodes_flagship_is_expressible_and_l0() {
+    use the_desk_backend::catalog::{
+        accept_levels_only_entry, DerivedLevels, PositioningEntryInput, LEVELS_ONLY_RECORD_KIND,
+    };
+    use the_desk_backend::db::JournalFrameRecord;
+    use the_desk_backend::research::query_kernel::{
+        flagship_episode_predicates, FIELD_LAST_PRICE, FUTURES_TICK_SIZE,
+    };
+
+    let server = test_server_with_sil();
+    let clock = 1_704_207_600_000.0;
+    let second = the_desk_backend::db::journal_frame_second_from_ts(clock).unwrap();
+    {
+        let db = server.db.lock().expect("db");
+        db.insert_journal_frames(&[
+            JournalFrameRecord {
+                clock_ms: clock,
+                frame_second: second,
+                root_symbol: "ES".into(),
+                session_type: "RTH".into(),
+                session_segment: "None".into(),
+                trading_day: "2024-01-02".into(),
+                payload: serde_json::json!({
+                    "lastPrice": 5750.0,
+                    "sessionDelta": -500.0,
+                    "poorLow": true,
+                    "domSummary": { "bidReplenishing": true },
+                    "rootSymbol": "ES"
+                }),
+            },
+            JournalFrameRecord {
+                clock_ms: clock,
+                frame_second: second,
+                root_symbol: "NQ".into(),
+                session_type: "RTH".into(),
+                session_segment: "None".into(),
+                trading_day: "2024-01-02".into(),
+                payload: serde_json::json!({
+                    "lastPrice": 20000.0,
+                    "sessionDelta": 50.0,
+                    "rootSymbol": "NQ"
+                }),
+            },
+        ])
+        .expect("frames");
+        let record = accept_levels_only_entry(PositioningEntryInput {
+            id: Some("pos-mcp".into()),
+            record_kind: Some(LEVELS_ONLY_RECORD_KIND.into()),
+            completeness: Some(LEVELS_ONLY_RECORD_KIND.into()),
+            trading_day: Some("2024-01-02".into()),
+            captured_at_ms: Some(clock),
+            as_of_ms: Some(clock),
+            derived_levels: Some(DerivedLevels {
+                flip: 5750.0,
+                walls: vec![],
+                balance: 5745.0,
+                upside_test: 5825.0,
+                downside_test: 5680.0,
+            }),
+            now_ms: clock,
+            ..Default::default()
+        })
+        .expect("pos");
+        db.upsert_positioning_record(&record, clock).expect("pos");
+        db.insert_raw_tick_with_contract(
+            clock + 1_000.0,
+            5750.0 - FUTURES_TICK_SIZE,
+            1.0,
+            5749.5,
+            5750.0,
+            false,
+            "2024-01-02",
+            Some("ES"),
+            Some("ESH24.CME"),
+        )
+        .expect("tick");
+    }
+
+    let predicates: Vec<CatalogPredicateParams> = flagship_episode_predicates()
+        .into_iter()
+        .map(|p| CatalogPredicateParams {
+            id: p.id,
+            symbol: p.symbol,
+            field: Some(p.field),
+            op: Some(
+                match p.op {
+                    the_desk_backend::research::query_kernel::PredicateOp::Eq => "eq",
+                    the_desk_backend::research::query_kernel::PredicateOp::Ne => "ne",
+                    the_desk_backend::research::query_kernel::PredicateOp::Gt => "gt",
+                    the_desk_backend::research::query_kernel::PredicateOp::Gte => "gte",
+                    the_desk_backend::research::query_kernel::PredicateOp::Lt => "lt",
+                    the_desk_backend::research::query_kernel::PredicateOp::Lte => "lte",
+                    the_desk_backend::research::query_kernel::PredicateOp::Near => "near",
+                    the_desk_backend::research::query_kernel::PredicateOp::Exists => "exists",
+                }
+                .into(),
+            ),
+            value: p.value,
+            path: p.path,
+            tolerance_ticks: p.tolerance_ticks,
+            event_type: p.event_type,
+        })
+        .collect();
+
+    let out = parse_text_tool_result(
+        server
+            .query_episodes(Parameters(QueryEpisodesParams {
+                start_ms: Some(clock),
+                end_ms: Some(clock + 4_000.0),
+                session_type: Some("RTH".into()),
+                symbols: Some(vec!["NQ".into(), "ES".into()]),
+                predicates: Some(predicates),
+                forward_direction: Some("short".into()),
+            }))
+            .await
+            .expect("query_episodes"),
+    );
+    assert_eq!(out["trustLevel"], "L0");
+    assert_eq!(out["mutationAuthority"], false);
+    assert_eq!(out["orderAuthority"], false);
+    assert_eq!(out["meta"]["n"], 1);
+    assert_eq!(out["meta"]["reliabilityTier"], "insufficient");
+    assert_eq!(out["matches"].as_array().expect("matches").len(), 1);
+    assert_eq!(out["matches"][0]["journalBacked"], true);
+    assert!(out["matches"][0]["forward"]["mfePoints"].is_number());
+    assert!(out["matches"][0]["positioningId"].is_string());
+    let _ = FIELD_LAST_PRICE;
+}
+
+#[tokio::test]
+async fn query_episodes_file_backed_db_uses_read_pool() {
+    use the_desk_backend::db::JournalFrameRecord;
+
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let db_path = dir.path().join("data.db");
+    let path_str = db_path.to_string_lossy().to_string();
+    let db = Database::open(&path_str).expect("db");
+    let logging_config = the_desk_backend::observability::LoggingConfig {
+        destination: "none".to_string(),
+        runtime_event_suppression_window_ms: 0,
+        ..the_desk_backend::observability::LoggingConfig::default()
+    };
+    let mut server = TheDeskMcp::with_runtime_events_and_sil(
+        db,
+        PipelineEngine::new(),
+        path_str,
+        std::sync::Arc::new(the_desk_backend::observability::RuntimeEventStore::new(
+            &logging_config,
+        )),
+        the_desk_backend::catalog::SilConfig {
+            catalog_discovery: true,
+            ..Default::default()
+        },
+    );
+    server.research_artifact_dir = dir.path().join("artifacts");
+    server
+        .hydrate_playbook_runtime_cache()
+        .expect("hydrate playbook cache");
+
+    let clock = 1_704_207_600_000.0;
+    let second = the_desk_backend::db::journal_frame_second_from_ts(clock).unwrap();
+    {
+        let db = server.db.lock().expect("db");
+        db.insert_journal_frames(&[JournalFrameRecord {
+            clock_ms: clock,
+            frame_second: second,
+            root_symbol: "ES".into(),
+            session_type: "RTH".into(),
+            session_segment: "None".into(),
+            trading_day: "2024-01-02".into(),
+            payload: serde_json::json!({
+                "lastPrice": 5750.0,
+                "poorLow": true,
+                "rootSymbol": "ES"
+            }),
+        }])
+        .expect("frames");
+        db.insert_raw_tick_with_contract(
+            clock + 1_000.0,
+            5749.0,
+            1.0,
+            5748.75,
+            5749.25,
+            false,
+            "2024-01-02",
+            Some("ES"),
+            Some("ESH24.CME"),
+        )
+        .expect("tick");
+    }
+
+    let out = parse_text_tool_result(
+        server
+            .query_episodes(Parameters(QueryEpisodesParams {
+                start_ms: Some(clock),
+                end_ms: Some(clock + 4_000.0),
+                session_type: Some("RTH".into()),
+                predicates: Some(vec![CatalogPredicateParams {
+                    id: Some("poorAuctionEfficiency".into()),
+                    symbol: Some("ES".into()),
+                    field: Some("market.location_structure.poorLow".into()),
+                    op: Some("eq".into()),
+                    value: Some(serde_json::json!(true)),
+                    ..Default::default()
+                }]),
+                forward_direction: Some("short".into()),
+                ..Default::default()
+            }))
+            .await
+            .expect("query_episodes via read pool"),
+    );
+    assert_eq!(out["trustLevel"], "L0");
+    assert_eq!(out["meta"]["n"], 1);
+    assert_eq!(out["matches"].as_array().expect("matches").len(), 1);
+}
+
+#[tokio::test]
+async fn query_raw_rejects_unbounded_window() {
+    let server = test_server_with_sil();
+    let err = server
+        .query_raw(Parameters(QueryRawParams {
+            start_ms: None,
+            end_ms: Some(1_704_207_600_000.0),
+            source: Some("journal_frames".into()),
+            ..Default::default()
+        }))
+        .await
+        .expect_err("unbounded");
+    assert!(
+        err.to_string().contains("unbounded"),
+        "rejection must mention unbounded, got {err}"
+    );
+}
+
+#[tokio::test]
+async fn run_job_returns_artifact_handle_not_rows() {
+    use the_desk_backend::db::JournalFrameRecord;
+
+    let server = test_server_with_sil();
+    let clock = 1_704_207_600_000.0;
+    let second = the_desk_backend::db::journal_frame_second_from_ts(clock).unwrap();
+    {
+        let db = server.db.lock().expect("db");
+        db.insert_journal_frames(&[JournalFrameRecord {
+            clock_ms: clock,
+            frame_second: second,
+            root_symbol: "NQ".into(),
+            session_type: "RTH".into(),
+            session_segment: "None".into(),
+            trading_day: "2024-01-02".into(),
+            payload: serde_json::json!({ "lastPrice": 20000.0, "sessionDelta": 1.0 }),
+        }])
+        .expect("frame");
+    }
+    let out = parse_text_tool_result(
+        server
+            .run_job(Parameters(RunJobParams {
+                kind: Some("series".into()),
+                start_ms: Some(clock),
+                end_ms: Some(clock + 1_000.0),
+                session_type: Some("RTH".into()),
+                symbols: Some(vec!["NQ".into()]),
+                fields: Some(vec!["market.location_structure.lastPrice".into()]),
+                ..Default::default()
+            }))
+            .await
+            .expect("run_job"),
+    );
+    assert_eq!(out["trustLevel"], "L0");
+    assert_eq!(out["mutationAuthority"], false);
+    assert_eq!(out["orderAuthority"], false);
+    assert!(out["jobId"].as_str().unwrap_or("").starts_with("rq-"));
+    assert!(out["artifact"]["columnarPath"]
+        .as_str()
+        .unwrap_or("")
+        .ends_with("columns.csv"));
+    assert!(out["artifact"]["summaryPath"]
+        .as_str()
+        .unwrap_or("")
+        .ends_with("summary.json"));
+    let columnar = out["artifact"]["columnarPath"].as_str().unwrap_or("");
+    assert!(
+        std::path::Path::new(columnar).starts_with(&server.research_artifact_dir),
+        "run_job must write under the test artifact dir, got {columnar}"
+    );
+    assert!(
+        !columnar.contains(".the-desk/research-artifacts"),
+        "run_job must not write to $HOME/.the-desk/research-artifacts in tests"
+    );
+    assert!(out.get("points").is_none());
+    assert_eq!(out["meta"]["n"], 1);
 }
 
 #[tokio::test]

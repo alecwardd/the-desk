@@ -61,6 +61,69 @@ pub(crate) struct GetEventsParams {
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct CatalogPredicateParams {
+    pub(crate) id: Option<String>,
+    pub(crate) symbol: Option<String>,
+    pub(crate) field: Option<String>,
+    pub(crate) op: Option<String>,
+    #[schemars(schema_with = "schemars_json_value")]
+    pub(crate) value: Option<serde_json::Value>,
+    pub(crate) path: Option<String>,
+    pub(crate) tolerance_ticks: Option<f64>,
+    pub(crate) event_type: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct QuerySeriesParams {
+    pub(crate) start_ms: Option<f64>,
+    pub(crate) end_ms: Option<f64>,
+    pub(crate) session_type: Option<String>,
+    pub(crate) symbols: Option<Vec<String>>,
+    pub(crate) fields: Option<Vec<String>>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct QueryEpisodesParams {
+    pub(crate) start_ms: Option<f64>,
+    pub(crate) end_ms: Option<f64>,
+    pub(crate) session_type: Option<String>,
+    pub(crate) symbols: Option<Vec<String>>,
+    pub(crate) predicates: Option<Vec<CatalogPredicateParams>>,
+    pub(crate) forward_direction: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct QueryRawParams {
+    pub(crate) start_ms: Option<f64>,
+    pub(crate) end_ms: Option<f64>,
+    pub(crate) session_type: Option<String>,
+    pub(crate) symbols: Option<Vec<String>>,
+    /// `journal_frames` | `events` | `ticks`.
+    pub(crate) source: Option<String>,
+    pub(crate) limit: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RunJobParams {
+    /// `series` | `episodes` | `raw`.
+    pub(crate) kind: Option<String>,
+    pub(crate) start_ms: Option<f64>,
+    pub(crate) end_ms: Option<f64>,
+    pub(crate) session_type: Option<String>,
+    pub(crate) symbols: Option<Vec<String>>,
+    pub(crate) fields: Option<Vec<String>>,
+    pub(crate) predicates: Option<Vec<CatalogPredicateParams>>,
+    pub(crate) forward_direction: Option<String>,
+    pub(crate) source: Option<String>,
+    pub(crate) limit: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct OptionsSnapshotParams {
     /// Optional root symbol. Defaults to [options].convexvalue_probe_root.
     pub(crate) root: Option<String>,

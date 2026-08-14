@@ -139,6 +139,8 @@ impl TheDeskMcp {
             engine_adapter_error: Arc::new(Mutex::new(None)),
             sil_config,
             market_router,
+            research_artifact_dir:
+                the_desk_backend::research::query_kernel::default_research_artifact_dir(),
         }
     }
 
@@ -224,11 +226,18 @@ impl TheDeskMcp {
     /// contends on the single writer mutex (`self.db`) nor blocks the async
     /// runtime worker thread. Use this for read-only `query_*` / `get_*` tools;
     /// keep writes on the mutex-guarded writer connection.
+    ///
+    /// `:memory:` writers are not visible to other connections, so in-memory
+    /// tests fall back to the writer mutex.
     pub(crate) async fn with_read_db<T, F>(&self, f: F) -> Result<T, McpError>
     where
         F: FnOnce(&Database) -> Result<T, McpError> + Send + 'static,
         T: Send + 'static,
     {
+        if self.db_path.as_str() == ":memory:" {
+            let db = self.db.lock().map_err(|_| lock_error())?;
+            return f(&db);
+        }
         let mut guard = self.read_pool.acquire().await.map_err(db_error)?;
         let db = guard.take();
         let (db, result) = tokio::task::spawn_blocking(move || {

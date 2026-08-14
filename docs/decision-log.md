@@ -714,6 +714,27 @@ This note does not introduce DOM cluster Base Detectors, Episode Query, DuckDB, 
 
 ---
 
+### Decision note: SIL-M3c Research query kernel
+
+**Date:** 2026-08-14
+**Status:** Decided (implements [alecwardd/the-desk#11](https://github.com/alecwardd/the-desk/issues/11); Part of #2)
+
+**Context:** Journal Frames (M3a / #8) persist 1 Hz NQ+ES state so historical conjunctions are answerable. Capsules (#10) are joinable forensic dumps around DOM-family Events. Hypothesis / research evidence still could not cite journal-backed windows, and the flagship Episode Query (ES near a Positioning level ∧ extreme seller aggression ∧ poor auction efficiency ∧ replenishing bids ∧ NQ non-confirmation → tick-driven MFE/MAE) was not expressible on the MCP surface.
+
+**Decision:**
+
+1. **SIL read-kernel operators** `query_series`, `query_episodes`, `query_raw`, and `run_job` register behind `[sil].catalog_discovery` (same gate as `get_events`). Default-off keeps the 122-tool surface unchanged. Trust Level **L0**: structurally no mutation of workflow-verb state and no order authority (`run_job` is not classified as a `run_*` mutation). Trust Ceiling stays **L3**.
+2. **`query_episodes`** is conjunctive over Desk Catalog fields (and optional event types) across co-recorded NQ+ES Journal Frames. The flagship five-predicate query is expressible end-to-end. Missing detector math (`domSummary.bidReplenishing`) and missing vendor Positioning fail closed with provenance — no invented detectors, no pretend live grid. Positioning today is **Levels-Only Records** via `positioning_entry`. Forward returns reuse tick-driven MFE/MAE (`outcomes::signed_excursion` / `raw_ticks`) — not a fill simulator. Capsules are joinable and are **not** required for the flagship query to be expressible.
+3. **`query_series`** (R2) and **`query_raw`** (R3) require `startMs` and `endMs`. Unbounded, inverted, non-finite, and oversized windows are rejected (named caps; not `config.toml` knobs). Mixed RTH+Globex without explicit `sessionType` is rejected. Every result includes sample-size `N` and `reliabilityTier` (AGENT.md Research Sample Size Policy). Truncation / unavailability sets `degraded` — a full window is never advertised as clean when it was capped. Positioning joins load a covering window (predecessor at `start` plus in-window records), not unbounded history. Event window reads apply `session_type` in SQL before `LIMIT`. Tick window reads clamp `[startMs, endMs]` to the requested session on the ET clock before `LIMIT` so Globex prints cannot hide later RTH rows.
+4. **`run_job`** persists a job id (schema v37 `research_query_jobs`) and returns an artifact handle (columnar CSV path + summary JSON), never the full row set as tokens. The MCP tool inserts `queued` on the writer, computes on the read pool via `execute_research_job` (SQLite reads + filesystem write, no upsert), then persists `completed`/`error`. The MCP call still **awaits** so the returned handle is populated. A separate poll operator is out of scope for M3c (would be a tenth kernel operator). Episode forward MFE/MAE is bounded by `QUERY_FORWARD_MAX_MATCHES` (named cap; later matches have `forward=null` and `degraded`). Hypothesis evidence joins look up at most 50 exact `(root, frame_second)` keys (`list_journal_frames_at_seconds`) — they do not range-scan Journal Frames. Schema v38 adds `idx_market_events_ts` so paged event-window scans are index range reads, not a full table scan per page.
+5. **Hypothesis evidence** (`summarize_hypothesis_run`) cites journal-backed windows via `frame_ref`.
+
+This note does not introduce DuckDB / Episode Query benchmarks (#13), cold session-partitioned Parquet (#12), stopping `depth_events` as hot store (#14), DOM cluster Base Detectors (#22), Feature-IR (#18–#21), Vs3dProvider (#16), ACSIL (#23), `get_capsule`, a 250 ms forever-store, or raising the Trust Ceiling.
+
+**Consequences:** Agents can express the flagship Episode Query against Journal Frames and cite `N` + reliability. Bulk research rides artifact handles. Live market tools still return "no data" in cloud without a Sierra `.scid` feed.
+
+---
+
 ### Decision note: SIL-P-VS-a Levels-Only Record path
 
 **Date:** 2026-08-13

@@ -214,16 +214,24 @@ fn resolve_at_price(
     outcome.r_result = recompute_r_result(outcome);
 }
 
+/// Signed (favorable, adverse) excursion in points from `entry` to `price`.
+///
+/// Favorable is how far price moved in the trade's direction; adverse is the
+/// opposite. Negative legs are clamped by callers when accumulating MFE/MAE.
+pub fn signed_excursion(direction: OutcomeDirection, entry: f64, price: f64) -> (f64, f64) {
+    match direction {
+        OutcomeDirection::Long => (price - entry, entry - price),
+        OutcomeDirection::Short => (entry - price, price - entry),
+    }
+}
+
 fn update_excursions(
     outcome: &mut SignalOutcome,
     direction: OutcomeDirection,
     entry: f64,
     price: f64,
 ) {
-    let (favorable, adverse) = match direction {
-        OutcomeDirection::Long => (price - entry, entry - price),
-        OutcomeDirection::Short => (entry - price, price - entry),
-    };
+    let (favorable, adverse) = signed_excursion(direction, entry, price);
     outcome.max_favorable_excursion = Some(
         outcome
             .max_favorable_excursion

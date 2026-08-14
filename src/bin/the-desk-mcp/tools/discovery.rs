@@ -378,6 +378,204 @@ impl TheDeskMcp {
         }
         Ok(text_result(out))
     }
+
+    #[tool(
+        description = "SIL read kernel (R2): time-series of Desk Catalog fields from 1 Hz Journal Frames. Requires startMs and endMs — unbounded windows are rejected. Hard-capped. Every result includes N and reliabilityTier (AGENT.md Research Sample Size Policy). Your backtest shows / your rules say — never buy/sell advice. Trust Level L0 (read/query). Enable via [sil].catalog_discovery."
+    )]
+    pub(crate) async fn query_series(
+        &self,
+        Parameters(params): Parameters<QuerySeriesParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let req = the_desk_backend::research::query_kernel::QuerySeriesRequest {
+            window: query_window_from_params(
+                params.start_ms,
+                params.end_ms,
+                params.session_type,
+                params.symbols,
+            ),
+            fields: params.fields.unwrap_or_default(),
+        };
+        let result = self
+            .with_read_db(move |db| {
+                the_desk_backend::research::query_kernel::query_series(db, &req)
+                    .map_err(query_kernel_error)
+            })
+            .await?;
+        Ok(text_result(merge_l0(
+            serde_json::to_value(&result).unwrap_or_default(),
+        )))
+    }
+
+    #[tool(
+        description = "SIL read kernel Episode Query (R2): conjunctive multi-predicate filters over Desk Catalog fields across NQ+ES Journal Frames / events. The flagship query is expressible as five predicates (ES near positioning.derivedLevels, ES sessionDelta extreme seller aggression, ES poorLow, ES domSummary.bidReplenishing, NQ sessionDelta non-confirmation) and returns tick-driven MFE/MAE — not a fill simulator. Missing detector/vendor fields fail closed with provenance. Requires startMs and endMs. Every result includes N and reliabilityTier. Trust Level L0. Enable via [sil].catalog_discovery."
+    )]
+    pub(crate) async fn query_episodes(
+        &self,
+        Parameters(params): Parameters<QueryEpisodesParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let predicates = convert_predicates(params.predicates)?;
+        let req = the_desk_backend::research::query_kernel::QueryEpisodesRequest {
+            window: query_window_from_params(
+                params.start_ms,
+                params.end_ms,
+                params.session_type,
+                params.symbols,
+            ),
+            predicates,
+            forward_direction: params.forward_direction,
+        };
+        let result = self
+            .with_read_db(move |db| {
+                the_desk_backend::research::query_kernel::query_episodes(db, &req)
+                    .map_err(query_kernel_error)
+            })
+            .await?;
+        Ok(text_result(merge_l0(
+            serde_json::to_value(&result).unwrap_or_default(),
+        )))
+    }
+
+    #[tool(
+        description = "SIL read kernel (R3): hard-capped raw read of journal_frames, events, or ticks. Requires startMs and endMs — unbounded windows are rejected. Use run_job when you need a bulk artifact instead of tokens. Every result includes N and reliabilityTier. Trust Level L0. Enable via [sil].catalog_discovery."
+    )]
+    pub(crate) async fn query_raw(
+        &self,
+        Parameters(params): Parameters<QueryRawParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let req = the_desk_backend::research::query_kernel::QueryRawRequest {
+            window: query_window_from_params(
+                params.start_ms,
+                params.end_ms,
+                params.session_type,
+                params.symbols,
+            ),
+            source: params.source.unwrap_or_else(|| "journal_frames".into()),
+            limit: params.limit.map(|n| n as usize),
+        };
+        let result = self
+            .with_read_db(move |db| {
+                the_desk_backend::research::query_kernel::query_raw(db, &req)
+                    .map_err(query_kernel_error)
+            })
+            .await?;
+        Ok(text_result(merge_l0(
+            serde_json::to_value(&result).unwrap_or_default(),
+        )))
+    }
+
+    #[tool(
+        description = "SIL read kernel: run a series/episodes/raw query as an async job and return a job id plus artifact handle (columnar path + summary). Never returns the full row set as tokens. Does not mutate playbook, risk, journal, memory, hypothesis, or orders. Trust Level L0. Enable via [sil].catalog_discovery."
+    )]
+    pub(crate) async fn run_job(
+        &self,
+        Parameters(params): Parameters<RunJobParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let kind_raw = params
+            .kind
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| invalid_params_error("run_job requires kind=series|episodes|raw"))?;
+        let kind = the_desk_backend::research::query_kernel::QueryKind::parse(kind_raw)
+            .map_err(query_kernel_error)?;
+        let request = match kind {
+            the_desk_backend::research::query_kernel::QueryKind::Series => serde_json::to_value(
+                the_desk_backend::research::query_kernel::QuerySeriesRequest {
+                    window: query_window_from_params(
+                        params.start_ms,
+                        params.end_ms,
+                        params.session_type,
+                        params.symbols,
+                    ),
+                    fields: params.fields.unwrap_or_default(),
+                },
+            )
+            .unwrap_or_default(),
+            the_desk_backend::research::query_kernel::QueryKind::Episodes => serde_json::to_value(
+                the_desk_backend::research::query_kernel::QueryEpisodesRequest {
+                    window: query_window_from_params(
+                        params.start_ms,
+                        params.end_ms,
+                        params.session_type,
+                        params.symbols,
+                    ),
+                    predicates: convert_predicates(params.predicates)?,
+                    forward_direction: params.forward_direction,
+                },
+            )
+            .unwrap_or_default(),
+            the_desk_backend::research::query_kernel::QueryKind::Raw => {
+                serde_json::to_value(the_desk_backend::research::query_kernel::QueryRawRequest {
+                    window: query_window_from_params(
+                        params.start_ms,
+                        params.end_ms,
+                        params.session_type,
+                        params.symbols,
+                    ),
+                    source: params.source.unwrap_or_else(|| "journal_frames".into()),
+                    limit: params.limit.map(|n| n as usize),
+                })
+                .unwrap_or_default()
+            }
+        };
+        let job_id = the_desk_backend::research::query_kernel::new_research_job_id();
+        let now_ms = chrono::Utc::now().timestamp_millis() as f64;
+        {
+            let db = self.db.lock().map_err(|_| lock_error())?;
+            db.upsert_research_query_job(
+                &the_desk_backend::research::query_kernel::queued_research_job_record(
+                    &job_id, kind, &request, now_ms,
+                ),
+            )
+            .map_err(db_error)?;
+        }
+        let artifact_dir = self.research_artifact_dir.clone();
+        let request_for_exec = request.clone();
+        let job_id_for_exec = job_id.clone();
+        let exec = self
+            .with_read_db(move |db| {
+                the_desk_backend::research::query_kernel::execute_research_job(
+                    db,
+                    kind,
+                    &request_for_exec,
+                    &artifact_dir,
+                    now_ms,
+                    &job_id_for_exec,
+                )
+                .map_err(query_kernel_error)
+            })
+            .await;
+        match exec {
+            Ok(result) => {
+                {
+                    let db = self.db.lock().map_err(|_| lock_error())?;
+                    the_desk_backend::research::query_kernel::persist_research_job(
+                        &db, &result, &request, now_ms, None,
+                    )
+                    .map_err(query_kernel_error)?;
+                }
+                Ok(text_result(merge_l0(
+                    serde_json::to_value(&result).unwrap_or_default(),
+                )))
+            }
+            Err(e) => {
+                if let Ok(db) = self.db.lock() {
+                    let failed =
+                        the_desk_backend::research::query_kernel::failed_research_job_result(
+                            job_id, kind,
+                        );
+                    let _ = the_desk_backend::research::query_kernel::persist_research_job(
+                        &db,
+                        &failed,
+                        &request,
+                        now_ms,
+                        Some(e.to_string()),
+                    );
+                }
+                Err(e)
+            }
+        }
+    }
 }
 
 impl TheDeskMcp {
@@ -745,4 +943,69 @@ fn merge_published_live_events(
         events.truncate(limit);
     }
     events
+}
+
+fn query_window_from_params(
+    start_ms: Option<f64>,
+    end_ms: Option<f64>,
+    session_type: Option<String>,
+    symbols: Option<Vec<String>>,
+) -> the_desk_backend::research::query_kernel::QueryWindow {
+    the_desk_backend::research::query_kernel::QueryWindow {
+        start_ms,
+        end_ms,
+        session_type,
+        symbols,
+    }
+}
+
+fn convert_predicates(
+    raw: Option<Vec<CatalogPredicateParams>>,
+) -> Result<Vec<the_desk_backend::research::query_kernel::CatalogPredicate>, McpError> {
+    let mut out = Vec::new();
+    for pred in raw.unwrap_or_default() {
+        let field = pred.field.unwrap_or_default();
+        let op_raw = pred.op.unwrap_or_else(|| "eq".into());
+        let op = the_desk_backend::research::query_kernel::PredicateOp::parse(&op_raw)
+            .map_err(query_kernel_error)?;
+        if field.trim().is_empty()
+            && pred
+                .event_type
+                .as_deref()
+                .is_none_or(|s| s.trim().is_empty())
+        {
+            return Err(invalid_params_error(
+                "each predicate requires `field` or `eventType`",
+            ));
+        }
+        out.push(the_desk_backend::research::query_kernel::CatalogPredicate {
+            id: pred.id,
+            symbol: pred.symbol,
+            field,
+            op,
+            value: pred.value,
+            path: pred.path,
+            tolerance_ticks: pred.tolerance_ticks,
+            event_type: pred.event_type,
+        });
+    }
+    Ok(out)
+}
+
+fn query_kernel_error(e: the_desk_backend::research::query_kernel::QueryKernelError) -> McpError {
+    use the_desk_backend::research::query_kernel::QueryKernelError;
+    match e {
+        QueryKernelError::Db(_) | QueryKernelError::Io(_) => db_error(e),
+        other => invalid_params_error(other.to_string()),
+    }
+}
+
+fn merge_l0(mut value: serde_json::Value) -> serde_json::Value {
+    if let Some(obj) = value.as_object_mut() {
+        obj.entry("trustLevel".to_string())
+            .or_insert(serde_json::json!(TrustLevel::L0));
+        obj.insert("mutationAuthority".into(), serde_json::json!(false));
+        obj.insert("orderAuthority".into(), serde_json::json!(false));
+    }
+    value
 }

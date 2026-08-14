@@ -7305,6 +7305,45 @@ impl Database {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// Journal Frames at exact `frame_second` values for one root.
+    ///
+    /// Bounded lookup for hypothesis evidence joins: a 50-fire cap must not
+    /// expand into a multi-day range scan. Empty `seconds` returns no rows.
+    /// Duplicate seconds are ignored. Result size is at most `seconds.len()`.
+    pub fn list_journal_frames_at_seconds(
+        &self,
+        root_symbol: &str,
+        seconds: &[i64],
+    ) -> Result<Vec<JournalFrameRecord>, DbError> {
+        if seconds.is_empty() {
+            return Ok(Vec::new());
+        }
+        let unique: BTreeSet<i64> = seconds.iter().copied().collect();
+        let secs: Vec<i64> = unique.into_iter().collect();
+        let mut sql = String::from(
+            "SELECT clock_ms, frame_second, root_symbol, session_type, session_segment, trading_day, payload
+               FROM journal_frames
+              WHERE root_symbol = ?1
+                AND frame_second IN (",
+        );
+        for i in 0..secs.len() {
+            if i > 0 {
+                sql.push(',');
+            }
+            sql.push('?');
+            sql.push_str(&(i + 2).to_string());
+        }
+        sql.push_str(") ORDER BY frame_second ASC");
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut bind: Vec<rusqlite::types::Value> = Vec::with_capacity(secs.len() + 1);
+        bind.push(rusqlite::types::Value::Text(root_symbol.to_string()));
+        for second in &secs {
+            bind.push(rusqlite::types::Value::Integer(*second));
+        }
+        let rows = stmt.query_map(rusqlite::params_from_iter(bind), map_journal_frame_row)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     /// Journal Frames whose `clock_ms` falls in `[start_ms, end_ms]` (inclusive).
     ///
     /// Optional `root_symbol` / `session_type` filters are exact matches.

@@ -956,40 +956,51 @@ pub fn query_series(
             db.count_journal_frames_in_window(start, end, Some(root.as_str()), session.as_deref())?
                 as usize;
         scanned += count;
-        let rows = db.list_journal_frames_in_window(
-            start,
-            end,
-            Some(root.as_str()),
-            session.as_deref(),
-            QUERY_SERIES_MAX_POINTS,
-        )?;
-        if rows.len() < count {
-            truncated = true;
-        }
-        for frame in rows {
-            let mut values = BTreeMap::new();
-            for field in &fields {
-                match extract_field_value(&frame.payload, field, None) {
-                    Some(v) => {
-                        values.insert(field.id.clone(), v);
-                    }
-                    None => {
-                        unavailable.insert(field.id.clone());
+        let mut page_start = start;
+        let mut root_emitted = 0usize;
+        while page_start <= end && points.len() < QUERY_SERIES_MAX_POINTS {
+            let page_end = (page_start + QUERY_PAGE_MS).min(end);
+            let remain = QUERY_SERIES_MAX_POINTS.saturating_sub(points.len());
+            let rows = db.list_journal_frames_in_window(
+                page_start,
+                page_end,
+                Some(root.as_str()),
+                session.as_deref(),
+                remain,
+            )?;
+            root_emitted += rows.len();
+            for frame in rows {
+                let mut values = BTreeMap::new();
+                for field in &fields {
+                    match extract_field_value(&frame.payload, field, None) {
+                        Some(v) => {
+                            values.insert(field.id.clone(), v);
+                        }
+                        None => {
+                            unavailable.insert(field.id.clone());
+                        }
                     }
                 }
+                points.push(SeriesPoint {
+                    clock_ms: frame.clock_ms,
+                    frame_second: frame.frame_second,
+                    root_symbol: frame.root_symbol,
+                    session_type: frame.session_type,
+                    trading_day: frame.trading_day,
+                    values,
+                });
+                if points.len() >= QUERY_SERIES_MAX_POINTS {
+                    truncated = true;
+                    break;
+                }
             }
-            points.push(SeriesPoint {
-                clock_ms: frame.clock_ms,
-                frame_second: frame.frame_second,
-                root_symbol: frame.root_symbol,
-                session_type: frame.session_type,
-                trading_day: frame.trading_day,
-                values,
-            });
-            if points.len() >= QUERY_SERIES_MAX_POINTS {
-                truncated = true;
+            if page_end >= end {
                 break;
             }
+            page_start = page_end + 1.0;
+        }
+        if root_emitted < count {
+            truncated = true;
         }
     }
     points.sort_by(|a, b| {
@@ -1036,6 +1047,23 @@ pub fn query_episodes(
             "query_episodes requires at least one catalog predicate".into(),
         ));
     }
+    for pred in &req.predicates {
+        let event_pred = pred
+            .event_type
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty());
+        if !event_pred
+            && pred
+                .symbol
+                .as_deref()
+                .map(str::trim)
+                .is_none_or(|s| s.is_empty())
+        {
+            return Err(QueryKernelError::Invalid(
+                "query_episodes catalog predicates require `symbol` (NQ or ES); a missing symbol is not defaulted per-second".into(),
+            ));
+        }
+    }
     let session = resolve_session_type(db, start, end, req.window.session_type.as_deref())?;
     let catalog = build_catalog();
     let mut resolved_fields: Vec<Option<&FieldDescriptor>> = Vec::new();
@@ -1051,8 +1079,16 @@ pub fn query_episodes(
         resolved_fields.push(Some(resolve_catalog_field(&catalog, &pred.field)?));
     }
 
-    let population =
-        db.count_journal_frames_in_window(start, end, None, session.as_deref())? as usize;
+    let root_filters: Vec<Option<String>> = match &req.window.symbols {
+        Some(syms) if !syms.is_empty() => syms.iter().cloned().map(Some).collect(),
+        _ => vec![None],
+    };
+    let mut population = 0usize;
+    for root in &root_filters {
+        population +=
+            db.count_journal_frames_in_window(start, end, root.as_deref(), session.as_deref())?
+                as usize;
+    }
     let needs_events = req.predicates.iter().any(|p| {
         p.event_type
             .as_deref()
@@ -1095,13 +1131,20 @@ pub fn query_episodes(
     {
         let page_end = (page_start + QUERY_PAGE_MS).min(end);
         let remain = QUERY_EPISODES_MAX_FRAMES.saturating_sub(scanned_frames);
-        let frames = db.list_journal_frames_in_window(
-            page_start,
-            page_end,
-            None,
-            session.as_deref(),
-            remain,
-        )?;
+        let mut frames = Vec::new();
+        for root in &root_filters {
+            let remaining = remain.saturating_sub(frames.len());
+            if remaining == 0 {
+                break;
+            }
+            frames.extend(db.list_journal_frames_in_window(
+                page_start,
+                page_end,
+                root.as_deref(),
+                session.as_deref(),
+                remaining,
+            )?);
+        }
         scanned_frames += frames.len();
         if scanned_frames >= QUERY_EPISODES_MAX_FRAMES && page_end < end {
             truncated = true;
@@ -1810,7 +1853,7 @@ pub fn journal_backed_evidence_windows(
         return Ok((Vec::new(), truncated));
     }
 
-    let mut by_root: BTreeMap<String, (i64, i64)> = BTreeMap::new();
+    let mut seconds_by_root: BTreeMap<String, Vec<i64>> = BTreeMap::new();
     for row in slice {
         let Some(root) = row
             .root_symbol
@@ -1823,21 +1866,20 @@ pub fn journal_backed_evidence_windows(
         let Some(second) = journal_frame_second_from_ts(row.fired_at_ms) else {
             continue;
         };
-        let entry = by_root.entry(root.to_string()).or_insert((second, second));
-        entry.0 = entry.0.min(second);
-        entry.1 = entry.1.max(second);
+        seconds_by_root
+            .entry(root.to_string())
+            .or_default()
+            .push(second);
     }
 
-    let mut frames: Vec<JournalFrameRecord> = Vec::new();
-    for (root, (lo, hi)) in &by_root {
-        frames.extend(db.list_journal_frames_for_capsule(root, *lo, *hi)?);
-    }
     let mut meta_by_key: BTreeMap<(String, i64), (String, String)> = BTreeMap::new();
-    for frame in &frames {
-        meta_by_key.insert(
-            (frame.root_symbol.clone(), frame.frame_second),
-            (frame.trading_day.clone(), frame.session_type.clone()),
-        );
+    for (root, seconds) in &seconds_by_root {
+        for frame in db.list_journal_frames_at_seconds(root, seconds)? {
+            meta_by_key.insert(
+                (frame.root_symbol.clone(), frame.frame_second),
+                (frame.trading_day.clone(), frame.session_type.clone()),
+            );
+        }
     }
 
     let mut out = Vec::with_capacity(slice.len());
@@ -2749,5 +2791,187 @@ mod tests {
         assert_eq!(fwd.tick_count, QUERY_FORWARD_TICK_CAP);
         assert!(result.meta.degraded);
         assert!(result.meta.notes.iter().any(|n| n.contains("truncated")));
+    }
+
+    #[test]
+    fn journal_frame_second_lookup_does_not_range_scan() {
+        let db = test_db();
+        let start = FLAGSHIP_CLOCK_MS;
+        let mut frames = Vec::with_capacity(100);
+        for i in 0..100 {
+            frames.push(frame(
+                start + i as f64 * 1_000.0,
+                "NQ",
+                "RTH",
+                matching_nq_payload(),
+            ));
+        }
+        db.insert_journal_frames(&frames).expect("dense frames");
+        let lo = journal_frame_second_from_ts(start).unwrap();
+        let hi = journal_frame_second_from_ts(start + 99_000.0).unwrap();
+        let found = db
+            .list_journal_frames_at_seconds("NQ", &[lo, hi])
+            .expect("bounded lookup");
+        assert_eq!(
+            found.len(),
+            2,
+            "must return only the requested seconds, not the 100-second span"
+        );
+        let (windows, truncated) = journal_backed_evidence_windows(
+            &db,
+            &[
+                outcome_row(start, Some("NQ")),
+                outcome_row(start + 99_000.0, Some("NQ")),
+            ],
+        )
+        .expect("windows");
+        assert!(!truncated);
+        assert_eq!(windows.len(), 2);
+        assert!(windows.iter().all(|w| w.journal_backed));
+    }
+
+    #[test]
+    fn query_episodes_requires_symbol_on_catalog_predicates() {
+        let db = test_db();
+        let err = query_episodes(
+            &db,
+            &QueryEpisodesRequest {
+                window: QueryWindow {
+                    start_ms: Some(FLAGSHIP_CLOCK_MS),
+                    end_ms: Some(FLAGSHIP_CLOCK_MS + 1_000.0),
+                    session_type: Some("RTH".into()),
+                    symbols: None,
+                },
+                predicates: vec![CatalogPredicate {
+                    id: Some("noSymbol".into()),
+                    symbol: None,
+                    field: FIELD_POOR_LOW.into(),
+                    op: PredicateOp::Eq,
+                    value: Some(Value::Bool(true)),
+                    path: None,
+                    tolerance_ticks: None,
+                    event_type: None,
+                }],
+                forward_direction: None,
+            },
+        )
+        .unwrap_err();
+        match err {
+            QueryKernelError::Invalid(msg) => {
+                assert!(
+                    msg.contains("symbol"),
+                    "rejection must mention symbol, got {msg}"
+                );
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn query_episodes_honours_symbols_filter() {
+        let db = test_db();
+        let clock = FLAGSHIP_CLOCK_MS;
+        db.insert_journal_frames(&[
+            frame(clock, "ES", "RTH", matching_es_payload()),
+            frame(clock, "NQ", "RTH", matching_nq_payload()),
+        ])
+        .expect("frames");
+        db.insert_raw_tick_with_contract(
+            clock + 1_000.0,
+            FLAGSHIP_ES_PRICE - 1.0,
+            1.0,
+            FLAGSHIP_ES_PRICE - 1.25,
+            FLAGSHIP_ES_PRICE - 0.75,
+            false,
+            FLAGSHIP_TRADING_DAY,
+            Some("ES"),
+            Some("ESH24.CME"),
+        )
+        .expect("tick");
+        let nq_only = query_episodes(
+            &db,
+            &QueryEpisodesRequest {
+                window: QueryWindow {
+                    start_ms: Some(clock),
+                    end_ms: Some(clock + 1_000.0),
+                    session_type: Some("RTH".into()),
+                    symbols: Some(vec!["NQ".into()]),
+                },
+                predicates: vec![CatalogPredicate {
+                    id: Some("poorAuctionEfficiency".into()),
+                    symbol: Some("ES".into()),
+                    field: FIELD_POOR_LOW.into(),
+                    op: PredicateOp::Eq,
+                    value: Some(Value::Bool(true)),
+                    path: None,
+                    tolerance_ticks: None,
+                    event_type: None,
+                }],
+                forward_direction: Some("short".into()),
+            },
+        )
+        .expect("nq-only");
+        assert_eq!(
+            nq_only.matches.len(),
+            0,
+            "symbols=[NQ] must not load ES frames; ES poorLow must fail closed"
+        );
+
+        let both = query_episodes(
+            &db,
+            &QueryEpisodesRequest {
+                window: QueryWindow {
+                    start_ms: Some(clock),
+                    end_ms: Some(clock + 1_000.0),
+                    session_type: Some("RTH".into()),
+                    symbols: Some(vec!["NQ".into(), "ES".into()]),
+                },
+                predicates: vec![CatalogPredicate {
+                    id: Some("poorAuctionEfficiency".into()),
+                    symbol: Some("ES".into()),
+                    field: FIELD_POOR_LOW.into(),
+                    op: PredicateOp::Eq,
+                    value: Some(Value::Bool(true)),
+                    path: None,
+                    tolerance_ticks: None,
+                    event_type: None,
+                }],
+                forward_direction: Some("short".into()),
+            },
+        )
+        .expect("both");
+        assert_eq!(both.matches.len(), 1);
+    }
+
+    #[test]
+    fn query_series_pages_across_query_page_ms() {
+        let db = test_db();
+        let first = FLAGSHIP_CLOCK_MS;
+        let second = FLAGSHIP_CLOCK_MS + QUERY_PAGE_MS + 1_000.0;
+        db.insert_journal_frames(&[
+            frame(first, "ES", "RTH", matching_es_payload()),
+            frame(second, "ES", "RTH", matching_es_payload()),
+        ])
+        .expect("paged frames");
+        let result = query_series(
+            &db,
+            &QuerySeriesRequest {
+                window: QueryWindow {
+                    start_ms: Some(first),
+                    end_ms: Some(second + 1_000.0),
+                    session_type: Some("RTH".into()),
+                    symbols: Some(vec!["ES".into()]),
+                },
+                fields: vec![FIELD_LAST_PRICE.into()],
+            },
+        )
+        .expect("series");
+        assert_eq!(
+            result.points.len(),
+            2,
+            "frames on either side of QUERY_PAGE_MS must both be returned"
+        );
+        assert_eq!(result.meta.n, 2);
+        assert!(!result.meta.truncated);
     }
 }

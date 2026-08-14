@@ -168,16 +168,46 @@ With `[sil].catalog_discovery = true`:
 With `[sil].catalog_discovery = true`:
 
 - `query_series` (R2) — time series of catalog fields from 1 Hz Journal Frames.
+  Optional `store=hot` (default) or `store=cold`.
 - `query_episodes` (R2) — conjunctive Episode Query over catalog fields /
   events; flagship five-predicate query is expressible; tick-driven MFE/MAE.
+  Optional `store=hot|cold` for frames.
 - `query_raw` (R3) — hard-capped raw read of `journal_frames` / `events` /
-  `ticks`. Unbounded windows are rejected.
+  `ticks`. Unbounded windows are rejected. Optional `store=hot|cold` for
+  `journal_frames` only.
 - `run_job` — job id + artifact handle (columnar path + summary), never a
   token flood. Does not mutate playbook / risk / journal / memory / orders.
+  Optional `store=hot|cold`.
 
 Every result includes `N` and `reliabilityTier`. Missing detector/vendor
 fields fail closed. These operators stay out of `tool_domains()` so the
 generated 122-tool reference is unchanged when the flag is off.
+
+## SIL-M3d cold session-partitioned frames
+
+SQLite remains the hot window and transactional/control plane. 1 Hz Journal
+Frames are also dumped to hive-partitioned JSONL.zst under
+`~/.the-desk/journal-frames` (`desk-journal-frames-v1`; not DuckDB, not a
+`config.toml` knob). Partitions never mix RTH with Globex or NQ with ES.
+Rebuild from `.scid`/`.depth` matches the M3a golden strict fingerprint.
+
+Live writes are **append-only** (concatenated zstd frames). Duplicate
+`(frame_second, root)` keys are suppressed in memory; session close
+`compact()` rewrites one sorted frame. A cold IO error is best-effort
+(`tracing::warn!`); SQLite persist, attention, and Capsules still complete.
+
+**Single-writer:** only the process that owns ingest writes the hive.
+Embedded MCP (`[sil].engine_mode = "embedded"`) attaches the dump store.
+`engine_mode = "external"` leaves dumps to `the-desk-engine`. Do not run
+both writers against the same root. Compact rewrites use a unique temp
+suffix (`frames.jsonl.zst.{pid}.{nanos}.tmp`). MCP `store=cold` reads are
+safe from either process — they construct a store at query time from
+`~/.the-desk/journal-frames`.
+
+The same four operators accept optional `store=hot` (default) or `store=cold`.
+Envelope fields, Trust Level L0, window/session/`N`/reliability contracts are
+unchanged. Events and ticks stay on SQLite; `query_raw` + `store=cold` +
+`source=events|ticks` fails closed. Unknown store labels fail closed.
 
 ## SIL-M2a engine extract + embedded fallback
 

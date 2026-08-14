@@ -16,8 +16,9 @@ use std::time::Duration;
 
 use the_desk_backend::db::Database;
 use the_desk_backend::engine::{
-    default_engine_database_path, load_engine_bind_addr, EngineSocketServer, FileProvider,
-    MarketRouter, RouterRoot, SourceProvider, SourceProviderKind, ENGINE_DEFAULT_BIND,
+    default_cold_frames_dir, default_engine_database_path, load_engine_bind_addr, ColdFrameStore,
+    EngineSocketServer, FileProvider, MarketRouter, RouterRoot, SourceProvider, SourceProviderKind,
+    ENGINE_DEFAULT_BIND,
 };
 use the_desk_backend::feed::{load_feed_config, resolve_contract_metadata};
 use the_desk_backend::observability::{init_logging, load_logging_config};
@@ -110,6 +111,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         SourceProviderKind::File,
         "external",
     ));
+    router.set_cold_frame_store(ColdFrameStore::new(default_cold_frames_dir()));
     router.set_contract_metadata(
         RouterRoot::Nq,
         resolve_contract_metadata(&{
@@ -186,10 +188,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match router_bg.poll_once(&mut providers, max_ticks) {
             Ok(n) => {
                 if let Some(db) = journal_db.as_ref() {
-                    match db.lock() {
+                    let db = Arc::clone(db);
+                    let persist_router = Arc::clone(&router_bg);
+                    if let Err(err) = tokio::task::spawn_blocking(move || match db.lock() {
                         Ok(d) => {
-                            if let Err(err) = router_bg.persist_journal(&d) {
-                                tracing::warn!(error = %err, "the-desk-engine.journal_persist");
+                            if let Err(err) = persist_router.persist_journal(&d) {
+                                tracing::warn!(
+                                    error = %err,
+                                    "the-desk-engine.journal_persist"
+                                );
                             }
                         }
                         Err(err) => {
@@ -198,6 +205,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 "the-desk-engine.journal_persist_lock"
                             );
                         }
+                    })
+                    .await
+                    {
+                        tracing::warn!(
+                            error = %err,
+                            "the-desk-engine.journal_persist_join"
+                        );
                     }
                 }
                 if n > 0 {

@@ -10,6 +10,7 @@
 //! here reaches order placement.
 
 pub mod capsule;
+pub mod cold_frames;
 pub mod config;
 pub mod health;
 pub mod host;
@@ -24,6 +25,10 @@ pub use crate::catalog::EngineMode;
 pub use capsule::{
     capsule_window_bounds, CAPSULE_AFTER_MS, CAPSULE_LOOKBACK_MS, CAPSULE_RING_STEP_MS,
 };
+pub use cold_frames::{
+    default_cold_frames_dir, ColdFrameError, ColdFrameStore, FrameStoreKind, JournalFrameRead,
+    COLD_FRAMES_FORMAT, COLD_FRAMES_ZSTD_LEVEL,
+};
 pub use config::{default_engine_database_path, load_engine_bind_addr, ENGINE_DEFAULT_BIND};
 pub use health::{EngineHealth, FeedStallState};
 pub use host::{coaching_parity_fingerprint, EngineHost, IngestOutcome};
@@ -33,7 +38,7 @@ pub use journal::{
 };
 pub use published::{PublishedEngineState, PublishedStateStore};
 pub use root::{parse_requested_roots, primary_root_from_config, RouterRoot, RouterRootError};
-pub use router::{sort_ticks_one_clock, MarketRouter};
+pub use router::{sort_ticks_one_clock, MarketRouter, PENDING_JOURNAL_MAX_FRAMES};
 pub use socket::{EngineClient, EngineSocketServer, SocketRequest, SocketResponse};
 pub use source::{
     FileProvider, SierraProvider, SourceError, SourceProvider, SourceProviderKind, SourceTick,

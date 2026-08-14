@@ -39,10 +39,10 @@ operators appear (Trust Level L0 — read/query, no mutation/order authority):
 3. `search_catalog` — text search over field ids / names / descriptions.
 4. `get_state` — StateEnvelope (`values` + per-domain `provenance` + `degraded`; resolution R0|R1 only). MarketRouter v0: `symbols=["NQ","ES"]` returns both roots in one envelope.
 5. `get_events` — formalized event rows (lifecycle, severity, dedup identity, `frameRef` to the producing Journal Frame, `capsuleRef` on DOM-family rows). Trust Level L0.
-6. `query_series` — R2 time series of catalog fields from 1 Hz Journal Frames. Requires `startMs`/`endMs`.
-7. `query_episodes` — R2 Episode Query: conjunctive catalog predicates across NQ+ES Journal Frames / events, tick-driven MFE/MAE (not a fill simulator). Flagship five-predicate query is expressible; missing detector/vendor fields fail closed.
-8. `query_raw` — R3 hard-capped raw read (`journal_frames` / `events` / `ticks`). Unbounded windows are rejected.
-9. `run_job` — run series/episodes/raw as a job; returns job id + artifact handle (columnar path + summary), never a token flood. Not a workflow-verb mutation.
+6. `query_series` — R2 time series of catalog fields from 1 Hz Journal Frames. Requires `startMs`/`endMs`. Optional `store=hot` (SQLite window, default) or `store=cold` (session-partitioned dumps).
+7. `query_episodes` — R2 Episode Query: conjunctive catalog predicates across NQ+ES Journal Frames / events, tick-driven MFE/MAE (not a fill simulator). Flagship five-predicate query is expressible; missing detector/vendor fields fail closed. Optional `store=hot|cold` for frames (events stay on SQLite).
+8. `query_raw` — R3 hard-capped raw read (`journal_frames` / `events` / `ticks`). Unbounded windows are rejected. Optional `store=hot|cold` for `journal_frames` only (`events`/`ticks` on cold fail closed).
+9. `run_job` — run series/episodes/raw as a job; returns job id + artifact handle (columnar path + summary), never a token flood. Not a workflow-verb mutation. Optional `store=hot|cold` (same contracts).
 
 Default off keeps the **122 MCP tools** surface unchanged. Artifacts:
 [docs/mcp/desk-catalog-v0.json](../../docs/mcp/desk-catalog-v0.json).

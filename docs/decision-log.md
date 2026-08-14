@@ -735,6 +735,27 @@ This note does not introduce DuckDB / Episode Query benchmarks (#13), cold sessi
 
 ---
 
+### Decision note: SIL-M3d Cold session-partitioned rebuildable frames
+
+**Date:** 2026-08-14
+**Status:** Decided (implements [alecwardd/the-desk#12](https://github.com/alecwardd/the-desk/issues/12); Part of #2)
+
+**Context:** Journal Frames (M3a / #8) persist 1 Hz NQ+ES state in SQLite. The query kernel (M3c / #11) reads that hot window. Issue #2's storage plane requires a **cold**, session-partitioned, rebuildable dump of those frames (Parquet or equivalent) so archival and the later three-path Episode Query benchmark have a substrate. DuckDB is **not** adopted here — #13 is the benchmark that decides. SQLite stays the transactional/control plane and the hot window.
+
+**Decision:**
+
+1. **Format:** hive-partitioned **JSONL.zst** (`desk-journal-frames-v1`), not Apache Parquet and not DuckDB. Layout is `{root}/trading_day=YYYY-MM-DD/session_type={RTH|Globex}/root={NQ|ES}/frames.jsonl.zst` plus `_format.json`. zstd level **3** matches raw-tick cold archives. DuckDB can later `read_json` this layout without this ticket adopting it.
+2. **Default root:** `~/.the-desk/journal-frames` via `default_cold_frames_dir()`. Named constant — not a `config.toml` knob.
+3. **Write path:** `MarketRouter::persist_journal` writes SQLite first (INSERT OR IGNORE), then appends to the attached `ColdFrameStore`. Duplicate `(frame_second, root)` is suppressed from an in-memory key set (hydrated once per partition per process) so live persist does not decode the day's file. Session-close `compact()` rewrites a single sorted zstd frame using a unique temp suffix. A cold IO error is best-effort (`tracing::warn!`): pending frames are re-queued up to `PENDING_JOURNAL_MAX_FRAMES` and persist still returns `Ok` so attention and Capsules run. Cold IO runs after cloning the store out of the router mutex, on a `spawn_blocking` thread. Embedded MCP attaches the store only when it owns ingest; `engine_mode=external` leaves dumps to `the-desk-engine` (single-writer).
+4. **Query pointing:** optional MCP/`run_job` param `store=hot|cold` (default `hot`). Same four operators (`query_series` / `query_episodes` / `query_raw` / `run_job`), same Trust Level **L0** envelopes, same window/session/`N`/reliability contracts. Cold path adds a note; it does not add envelope fields. Events and ticks stay on SQLite. `query_raw` + `store=cold` + `source=events|ticks` fails closed. Unknown labels (including `duckdb`) fail closed. `run_job` injects the server `coldRoot`; clients do not supply a filesystem path.
+5. **Rebuild:** replaying the same `.scid` fixtures through MarketRouter produces cold dumps that match hot Journal Frames on the M3a strict fingerprint (`lastPrice` / `rootSymbol` / `sessionType` / `sessionHigh` / `sessionLow` / clock).
+
+This note does not introduce DuckDB / three-path Episode Query benchmark (#13), stopping `depth_events` as hot store (#14), DOM cluster Base Detectors (#22), Feature-IR (#18–#21), Vs3dProvider (#16), ACSIL (#23), `get_capsule`, a 250 ms forever-store, a tenth kernel operator / `run_job` poll tool, new specialty market tools, or raising the Trust Ceiling.
+
+**Consequences:** Research queries can be pointed at cold dumps without changing operator contracts. The three-path benchmark (#13) can compare SQLite vs this dump vs a later DuckDB path against the same hive files.
+
+---
+
 ### Decision note: SIL-P-VS-a Levels-Only Record path
 
 **Date:** 2026-08-13

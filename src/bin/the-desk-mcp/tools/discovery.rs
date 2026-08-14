@@ -380,7 +380,7 @@ impl TheDeskMcp {
     }
 
     #[tool(
-        description = "SIL read kernel (R2): time-series of Desk Catalog fields from 1 Hz Journal Frames. Requires startMs and endMs — unbounded windows are rejected. Hard-capped. Every result includes N and reliabilityTier (AGENT.md Research Sample Size Policy). Your backtest shows / your rules say — never buy/sell advice. Trust Level L0 (read/query). Enable via [sil].catalog_discovery."
+        description = "SIL read kernel (R2): time-series of Desk Catalog fields from 1 Hz Journal Frames. Requires startMs and endMs — unbounded windows are rejected. Hard-capped. Optional store=hot (SQLite window, default) or store=cold (session-partitioned dumps). Every result includes N and reliabilityTier (AGENT.md Research Sample Size Policy). Your backtest shows / your rules say — never buy/sell advice. Trust Level L0 (read/query). Enable via [sil].catalog_discovery."
     )]
     pub(crate) async fn query_series(
         &self,
@@ -395,9 +395,13 @@ impl TheDeskMcp {
             ),
             fields: params.fields.unwrap_or_default(),
         };
+        let store = params.store.clone();
+        let cold_dir = self.cold_frames_dir.clone();
         let result = self
             .with_read_db(move |db| {
-                the_desk_backend::research::query_kernel::query_series(db, &req)
+                let cold = the_desk_backend::engine::ColdFrameStore::new(cold_dir);
+                let frames = frame_read_for(db, store.as_deref(), &cold)?;
+                the_desk_backend::research::query_kernel::query_series_with(frames, &req)
                     .map_err(query_kernel_error)
             })
             .await?;
@@ -407,7 +411,7 @@ impl TheDeskMcp {
     }
 
     #[tool(
-        description = "SIL read kernel Episode Query (R2): conjunctive multi-predicate filters over Desk Catalog fields across NQ+ES Journal Frames / events. The flagship query is expressible as five predicates (ES near positioning.derivedLevels, ES sessionDelta extreme seller aggression, ES poorLow, ES domSummary.bidReplenishing, NQ sessionDelta non-confirmation) and returns tick-driven MFE/MAE — not a fill simulator. Missing detector/vendor fields fail closed with provenance. Requires startMs and endMs. Every result includes N and reliabilityTier. Trust Level L0. Enable via [sil].catalog_discovery."
+        description = "SIL read kernel Episode Query (R2): conjunctive multi-predicate filters over Desk Catalog fields across NQ+ES Journal Frames / events. The flagship query is expressible as five predicates (ES near positioning.derivedLevels, ES sessionDelta extreme seller aggression, ES poorLow, ES domSummary.bidReplenishing, NQ sessionDelta non-confirmation) and returns tick-driven MFE/MAE — not a fill simulator. Missing detector/vendor fields fail closed with provenance. Requires startMs and endMs. Optional store=hot (default) or store=cold for frames (events/ticks stay on SQLite). Every result includes N and reliabilityTier. Trust Level L0. Enable via [sil].catalog_discovery."
     )]
     pub(crate) async fn query_episodes(
         &self,
@@ -424,9 +428,13 @@ impl TheDeskMcp {
             predicates,
             forward_direction: params.forward_direction,
         };
+        let store = params.store.clone();
+        let cold_dir = self.cold_frames_dir.clone();
         let result = self
             .with_read_db(move |db| {
-                the_desk_backend::research::query_kernel::query_episodes(db, &req)
+                let cold = the_desk_backend::engine::ColdFrameStore::new(cold_dir);
+                let frames = frame_read_for(db, store.as_deref(), &cold)?;
+                the_desk_backend::research::query_kernel::query_episodes_with(db, frames, &req)
                     .map_err(query_kernel_error)
             })
             .await?;
@@ -436,7 +444,7 @@ impl TheDeskMcp {
     }
 
     #[tool(
-        description = "SIL read kernel (R3): hard-capped raw read of journal_frames, events, or ticks. Requires startMs and endMs — unbounded windows are rejected. Use run_job when you need a bulk artifact instead of tokens. Every result includes N and reliabilityTier. Trust Level L0. Enable via [sil].catalog_discovery."
+        description = "SIL read kernel (R3): hard-capped raw read of journal_frames, events, or ticks. Requires startMs and endMs — unbounded windows are rejected. Optional store=hot (default) or store=cold for journal_frames only (events/ticks stay on SQLite). Use run_job when you need a bulk artifact instead of tokens. Every result includes N and reliabilityTier. Trust Level L0. Enable via [sil].catalog_discovery."
     )]
     pub(crate) async fn query_raw(
         &self,
@@ -452,9 +460,13 @@ impl TheDeskMcp {
             source: params.source.unwrap_or_else(|| "journal_frames".into()),
             limit: params.limit.map(|n| n as usize),
         };
+        let store = params.store.clone();
+        let cold_dir = self.cold_frames_dir.clone();
         let result = self
             .with_read_db(move |db| {
-                the_desk_backend::research::query_kernel::query_raw(db, &req)
+                let cold = the_desk_backend::engine::ColdFrameStore::new(cold_dir);
+                let frames = frame_read_for(db, store.as_deref(), &cold)?;
+                the_desk_backend::research::query_kernel::query_raw_with(db, frames, &req)
                     .map_err(query_kernel_error)
             })
             .await?;
@@ -464,7 +476,7 @@ impl TheDeskMcp {
     }
 
     #[tool(
-        description = "SIL read kernel: run a series/episodes/raw query as an async job and return a job id plus artifact handle (columnar path + summary). Never returns the full row set as tokens. Does not mutate playbook, risk, journal, memory, hypothesis, or orders. Trust Level L0. Enable via [sil].catalog_discovery."
+        description = "SIL read kernel: run a series/episodes/raw query as an async job and return a job id plus artifact handle (columnar path + summary). Never returns the full row set as tokens. Optional store=hot (SQLite window, default) or store=cold (session-partitioned Journal Frame dumps; events/ticks stay on SQLite). Does not mutate playbook, risk, journal, memory, hypothesis, or orders. Trust Level L0. Enable via [sil].catalog_discovery."
     )]
     pub(crate) async fn run_job(
         &self,
@@ -478,7 +490,8 @@ impl TheDeskMcp {
             .ok_or_else(|| invalid_params_error("run_job requires kind=series|episodes|raw"))?;
         let kind = the_desk_backend::research::query_kernel::QueryKind::parse(kind_raw)
             .map_err(query_kernel_error)?;
-        let request = match kind {
+        let _store_kind = parse_store_kind(params.store.as_deref())?;
+        let mut request = match kind {
             the_desk_backend::research::query_kernel::QueryKind::Series => serde_json::to_value(
                 the_desk_backend::research::query_kernel::QuerySeriesRequest {
                     window: query_window_from_params(
@@ -518,6 +531,24 @@ impl TheDeskMcp {
                 .unwrap_or_default()
             }
         };
+        if let Some(obj) = request.as_object_mut() {
+            if let Some(store) = params
+                .store
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                obj.insert("store".into(), serde_json::json!(store));
+            }
+            if parse_store_kind(params.store.as_deref())?
+                == the_desk_backend::engine::FrameStoreKind::Cold
+            {
+                obj.insert(
+                    "coldRoot".into(),
+                    serde_json::json!(self.cold_frames_dir.to_string_lossy()),
+                );
+            }
+        }
         let job_id = the_desk_backend::research::query_kernel::new_research_job_id();
         let now_ms = chrono::Utc::now().timestamp_millis() as f64;
         {
@@ -956,6 +987,39 @@ fn query_window_from_params(
         end_ms,
         session_type,
         symbols,
+    }
+}
+
+fn parse_store_kind(
+    raw: Option<&str>,
+) -> Result<the_desk_backend::engine::FrameStoreKind, McpError> {
+    match raw
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("hot")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "hot" => Ok(the_desk_backend::engine::FrameStoreKind::Hot),
+        "cold" => Ok(the_desk_backend::engine::FrameStoreKind::Cold),
+        other => Err(invalid_params_error(format!(
+            "unknown frame store `{other}` (expected hot or cold)"
+        ))),
+    }
+}
+
+fn frame_read_for<'a>(
+    db: &'a the_desk_backend::db::Database,
+    store: Option<&str>,
+    cold: &'a the_desk_backend::engine::ColdFrameStore,
+) -> Result<the_desk_backend::engine::JournalFrameRead<'a>, McpError> {
+    match parse_store_kind(store)? {
+        the_desk_backend::engine::FrameStoreKind::Hot => {
+            Ok(the_desk_backend::engine::JournalFrameRead::Hot(db))
+        }
+        the_desk_backend::engine::FrameStoreKind::Cold => {
+            Ok(the_desk_backend::engine::JournalFrameRead::Cold(cold))
+        }
     }
 }
 

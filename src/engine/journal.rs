@@ -4,7 +4,10 @@
 //! module persists **Journal Frames** only when the MarketRouter clock advances
 //! into a new Unix second — never every 250 ms snapshot. Capsules (SIL-M3b) are
 //! high-resolution dumps around DOM-family Events, stored separately — never as
-//! a permanent 250 ms frame table.
+//! a permanent 250 ms frame table. SIL-M3d writes the same 1 Hz frames to
+//! session-partitioned cold dumps when a [`crate::engine::ColdFrameStore`] is
+//! attached — SQLite stays the hot window. Cold IO is append-only and
+//! best-effort; a dump failure must not abort the persist cycle.
 //!
 //! MFE/MAE / R-result stay tick-driven via [`crate::outcome_tracker`] /
 //! `PendingOutcomeSet`. This writer persists already-computed state only and
@@ -31,6 +34,8 @@ pub struct JournalPersistStats {
     pub events_written: usize,
     pub capsules_opened: usize,
     pub capsules_finalized: usize,
+    /// Newly inserted cold-dump rows (0 when no cold store is attached).
+    pub cold_frames_written: usize,
     pub frame_second: Option<i64>,
 }
 

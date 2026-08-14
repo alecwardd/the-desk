@@ -6,6 +6,11 @@
 //! use tick-driven MFE/MAE (`outcomes::signed_excursion`); this is not a fill
 //! simulator. Unbounded windows are rejected. Bulk output rides `run_job`
 //! artifact handles (columnar path + summary), never a token flood.
+//!
+//! SIL-M3d: the same four operators can be pointed at cold session-partitioned
+//! Journal Frame dumps (`store=cold`) without new tools, new envelope fields,
+//! or DuckDB. Default `store=hot` is the SQLite window. Events / ticks stay
+//! on SQLite even when frames are read from cold.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -23,6 +28,9 @@ use crate::catalog::{
 use crate::db::{
     journal_frame_second_from_ts, Database, DbError, HypothesisSignalOutcomeRow,
     JournalFrameRecord, ResearchQueryJobRecord,
+};
+use crate::engine::{
+    default_cold_frames_dir, ColdFrameError, ColdFrameStore, FrameStoreKind, JournalFrameRead,
 };
 use crate::outcomes::{signed_excursion, OutcomeDirection};
 
@@ -120,6 +128,10 @@ pub enum QueryKernelError {
     UnknownKind(String),
     #[error("unknown query_raw source `{0}` (expected journal_frames, events, or ticks)")]
     UnknownRawSource(String),
+    #[error("unknown frame store `{0}` (expected hot or cold)")]
+    UnknownFrameStore(String),
+    #[error("cold frame store only serves journal_frames; `{0}` remains on the SQLite hot window")]
+    ColdStoreUnsupportedSource(String),
     #[error("{0}")]
     Db(String),
     #[error("{0}")]
@@ -131,6 +143,15 @@ pub enum QueryKernelError {
 impl From<DbError> for QueryKernelError {
     fn from(e: DbError) -> Self {
         Self::Db(e.to_string())
+    }
+}
+
+impl From<ColdFrameError> for QueryKernelError {
+    fn from(e: ColdFrameError) -> Self {
+        match e {
+            ColdFrameError::Io(s) => Self::Io(s),
+            ColdFrameError::Invalid(s) => Self::Invalid(s),
+        }
     }
 }
 
@@ -564,7 +585,7 @@ pub fn validate_window(
 }
 
 fn resolve_session_type(
-    db: &Database,
+    frames: &JournalFrameRead<'_>,
     start_ms: f64,
     end_ms: f64,
     requested: Option<&str>,
@@ -572,7 +593,7 @@ fn resolve_session_type(
     if let Some(raw) = requested.map(str::trim).filter(|s| !s.is_empty()) {
         return Ok(Some(normalize_session_label(raw)?.to_string()));
     }
-    let types = db.list_journal_session_types_in_window(start_ms, end_ms)?;
+    let types = frames.session_types_in_window(start_ms, end_ms)?;
     let distinct: BTreeSet<String> = types.into_iter().filter(|t| t != "Unknown").collect();
     if distinct.contains("RTH") && distinct.contains("Globex") {
         return Err(QueryKernelError::MixedSessionScope);
@@ -910,6 +931,38 @@ fn l0_meta_notes(session: Option<&str>) -> QueryResultMeta {
     meta
 }
 
+fn note_cold_store(meta: &mut QueryResultMeta, frames: &JournalFrameRead<'_>) {
+    if frames.is_cold() {
+        meta.notes.push(
+            "served from cold session-partitioned Journal Frames (SQLite remains the hot window)"
+                .into(),
+        );
+    }
+}
+
+/// Parse `store` from a `run_job` request body. Missing/empty → hot.
+pub fn frame_store_kind_from_request(request: &Value) -> Result<FrameStoreKind, QueryKernelError> {
+    let raw = request
+        .get("store")
+        .and_then(|v| v.as_str())
+        .unwrap_or("hot");
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "hot" => Ok(FrameStoreKind::Hot),
+        "cold" => Ok(FrameStoreKind::Cold),
+        other => Err(QueryKernelError::UnknownFrameStore(other.to_string())),
+    }
+}
+
+fn cold_root_from_request(request: &Value) -> PathBuf {
+    request
+        .get("coldRoot")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(default_cold_frames_dir)
+}
+
 fn tick_forward_return(
     db: &Database,
     entry_price: f64,
@@ -968,13 +1021,21 @@ fn parse_direction(raw: Option<&str>) -> OutcomeDirection {
         .unwrap_or(OutcomeDirection::Short)
 }
 
-/// Time-series read of catalog fields from 1 Hz Journal Frames.
+/// Time-series read of catalog fields from 1 Hz Journal Frames (SQLite hot window).
 pub fn query_series(
     db: &Database,
     req: &QuerySeriesRequest,
 ) -> Result<QuerySeriesResult, QueryKernelError> {
+    query_series_with(JournalFrameRead::Hot(db), req)
+}
+
+/// Time-series read from a hot or cold Journal Frame store.
+pub fn query_series_with(
+    frames: JournalFrameRead<'_>,
+    req: &QuerySeriesRequest,
+) -> Result<QuerySeriesResult, QueryKernelError> {
     let (start, end) = validate_window(QueryKind::Series, req.window.start_ms, req.window.end_ms)?;
-    let session = resolve_session_type(db, start, end, req.window.session_type.as_deref())?;
+    let session = resolve_session_type(&frames, start, end, req.window.session_type.as_deref())?;
     let catalog = build_catalog();
     let mut fields = Vec::new();
     for id in &req.fields {
@@ -997,15 +1058,14 @@ pub fn query_series(
     let mut unavailable: BTreeSet<String> = BTreeSet::new();
     for root in &roots {
         let count =
-            db.count_journal_frames_in_window(start, end, Some(root.as_str()), session.as_deref())?
-                as usize;
+            frames.count_in_window(start, end, Some(root.as_str()), session.as_deref())? as usize;
         scanned += count;
         let mut page_start = start;
         let mut root_emitted = 0usize;
         while page_start <= end && points.len() < QUERY_SERIES_MAX_POINTS {
             let page_end = (page_start + QUERY_PAGE_MS).min(end);
             let remain = QUERY_SERIES_MAX_POINTS.saturating_sub(points.len());
-            let rows = db.list_journal_frames_in_window(
+            let rows = frames.list_in_window(
                 page_start,
                 page_end,
                 Some(root.as_str()),
@@ -1072,6 +1132,7 @@ pub fn query_series(
             "query_series truncated at {QUERY_SERIES_MAX_POINTS} points; use run_job for the artifact handle"
         ));
     }
+    note_cold_store(&mut meta, &frames);
     Ok(QuerySeriesResult {
         kind: QueryKind::Series,
         points,
@@ -1082,6 +1143,15 @@ pub fn query_series(
 /// Conjunctive Episode Query over catalog fields with tick-driven forward returns.
 pub fn query_episodes(
     db: &Database,
+    req: &QueryEpisodesRequest,
+) -> Result<QueryEpisodesResult, QueryKernelError> {
+    query_episodes_with(db, JournalFrameRead::Hot(db), req)
+}
+
+/// Episode Query with an explicit hot/cold Journal Frame store.
+pub fn query_episodes_with(
+    db: &Database,
+    frame_src: JournalFrameRead<'_>,
     req: &QueryEpisodesRequest,
 ) -> Result<QueryEpisodesResult, QueryKernelError> {
     let (start, end) =
@@ -1108,7 +1178,7 @@ pub fn query_episodes(
             ));
         }
     }
-    let session = resolve_session_type(db, start, end, req.window.session_type.as_deref())?;
+    let session = resolve_session_type(&frame_src, start, end, req.window.session_type.as_deref())?;
     let catalog = build_catalog();
     let mut resolved_fields: Vec<Option<&FieldDescriptor>> = Vec::new();
     for pred in &req.predicates {
@@ -1130,8 +1200,7 @@ pub fn query_episodes(
     let mut population = 0usize;
     for root in &root_filters {
         population +=
-            db.count_journal_frames_in_window(start, end, root.as_deref(), session.as_deref())?
-                as usize;
+            frame_src.count_in_window(start, end, root.as_deref(), session.as_deref())? as usize;
     }
     let needs_events = req.predicates.iter().any(|p| {
         p.event_type
@@ -1183,7 +1252,7 @@ pub fn query_episodes(
             if remaining == 0 {
                 break;
             }
-            frames.extend(db.list_journal_frames_in_window(
+            frames.extend(frame_src.list_in_window(
                 page_start,
                 page_end,
                 root.as_deref(),
@@ -1408,6 +1477,7 @@ pub fn query_episodes(
             "query_episodes truncated at {QUERY_EPISODES_MAX_MATCHES} matches or {QUERY_EPISODES_MAX_FRAMES} frames"
         ));
     }
+    note_cold_store(&mut meta, &frame_src);
     Ok(QueryEpisodesResult {
         kind: QueryKind::Episodes,
         matches,
@@ -1416,15 +1486,29 @@ pub fn query_episodes(
     })
 }
 
-/// Hard-capped raw read of journal frames, events, or ticks.
+/// Hard-capped raw read of journal frames, events, or ticks (SQLite hot window).
 pub fn query_raw(db: &Database, req: &QueryRawRequest) -> Result<QueryRawResult, QueryKernelError> {
+    query_raw_with(db, JournalFrameRead::Hot(db), req)
+}
+
+/// Raw read with an explicit hot/cold Journal Frame store.
+pub fn query_raw_with(
+    db: &Database,
+    frame_src: JournalFrameRead<'_>,
+    req: &QueryRawRequest,
+) -> Result<QueryRawResult, QueryKernelError> {
     let (start, end) = validate_window(QueryKind::Raw, req.window.start_ms, req.window.end_ms)?;
-    let session = resolve_session_type(db, start, end, req.window.session_type.as_deref())?;
+    let session = resolve_session_type(&frame_src, start, end, req.window.session_type.as_deref())?;
     let source = if req.source.trim().is_empty() {
         "journal_frames"
     } else {
         req.source.trim()
     };
+    if frame_src.is_cold() && source != "journal_frames" {
+        return Err(QueryKernelError::ColdStoreUnsupportedSource(
+            source.to_string(),
+        ));
+    }
     let cap = req
         .limit
         .unwrap_or(QUERY_RAW_MAX_ROWS)
@@ -1447,9 +1531,8 @@ pub fn query_raw(db: &Database, req: &QueryRawRequest) -> Result<QueryRawResult,
             for root in &roots {
                 let root_ref = root.as_deref();
                 population +=
-                    db.count_journal_frames_in_window(start, end, root_ref, session.as_deref())?
-                        as usize;
-                let frames = db.list_journal_frames_in_window(
+                    frame_src.count_in_window(start, end, root_ref, session.as_deref())? as usize;
+                let frames = frame_src.list_in_window(
                     start,
                     end,
                     root_ref,
@@ -1566,6 +1649,7 @@ pub fn query_raw(db: &Database, req: &QueryRawRequest) -> Result<QueryRawResult,
             "query_raw truncated at {cap} rows (hard cap {QUERY_RAW_MAX_ROWS}); use run_job for the artifact handle"
         ));
     }
+    note_cold_store(&mut meta, &frame_src);
     Ok(QueryRawResult {
         kind: QueryKind::Raw,
         source: source.to_string(),
@@ -1631,11 +1715,22 @@ pub fn execute_research_job(
     let columnar_path = job_dir.join("columns.csv");
     let summary_path = job_dir.join("summary.json");
 
+    let store_kind = frame_store_kind_from_request(request)?;
+    let cold_store = if store_kind == FrameStoreKind::Cold {
+        Some(ColdFrameStore::new(cold_root_from_request(request)))
+    } else {
+        None
+    };
+    let frame_read = match &cold_store {
+        Some(store) => JournalFrameRead::Cold(store),
+        None => JournalFrameRead::Hot(db),
+    };
+
     let (meta, summary, csv_header, csv_rows) = match kind {
         QueryKind::Series => {
             let req: QuerySeriesRequest = serde_json::from_value(request.clone())
                 .map_err(|e| QueryKernelError::Invalid(e.to_string()))?;
-            let result = query_series(db, &req)?;
+            let result = query_series_with(frame_read, &req)?;
             let header = vec![
                 "clockMs",
                 "frameSecond",
@@ -1672,7 +1767,7 @@ pub fn execute_research_job(
         QueryKind::Episodes => {
             let req: QueryEpisodesRequest = serde_json::from_value(request.clone())
                 .map_err(|e| QueryKernelError::Invalid(e.to_string()))?;
-            let result = query_episodes(db, &req)?;
+            let result = query_episodes_with(db, frame_read, &req)?;
             let header = vec![
                 "clockMs",
                 "frameSecond",
@@ -1723,7 +1818,7 @@ pub fn execute_research_job(
         QueryKind::Raw => {
             let req: QueryRawRequest = serde_json::from_value(request.clone())
                 .map_err(|e| QueryKernelError::Invalid(e.to_string()))?;
-            let result = query_raw(db, &req)?;
+            let result = query_raw_with(db, frame_read, &req)?;
             let header = vec!["timestampMs", "rootSymbol", "payloadJson"];
             let rows: Vec<Vec<String>> = result
                 .rows
@@ -2525,6 +2620,55 @@ mod tests {
             .expect("row");
         assert_eq!(stored.status, "completed");
         assert_eq!(stored.sample_size, Some(FLAGSHIP_MATCHING_SECONDS as i64));
+    }
+
+    #[test]
+    fn execute_research_job_store_cold_keeps_l0_and_rejects_unknown_store() {
+        let db = test_db();
+        let cold_dir = TempDir::new().expect("cold");
+        let store = ColdFrameStore::new(cold_dir.path());
+        store
+            .upsert_frames(&[frame(FLAGSHIP_CLOCK_MS, "ES", "RTH", matching_es_payload())])
+            .expect("cold");
+        let artifact = TempDir::new().expect("artifacts");
+        let mut request = serde_json::json!({
+            "startMs": FLAGSHIP_CLOCK_MS,
+            "endMs": FLAGSHIP_CLOCK_MS + 2_000.0,
+            "sessionType": "RTH",
+            "symbols": ["ES"],
+            "fields": [FIELD_LAST_PRICE],
+            "store": "cold",
+            "coldRoot": cold_dir.path().to_string_lossy(),
+        });
+        let job = execute_research_job(
+            &db,
+            QueryKind::Series,
+            &request,
+            artifact.path(),
+            FLAGSHIP_CLOCK_MS,
+            "rq-cold-test",
+        )
+        .expect("cold job");
+        assert_eq!(job.trust_level, TrustLevel::L0);
+        assert!(!job.mutation_authority);
+        assert!(!job.order_authority);
+        assert_eq!(
+            job.meta.n, 1,
+            "store=cold must read dumps, not empty SQLite"
+        );
+        assert!(job.meta.notes.iter().any(|n| n.contains("cold")));
+
+        request["store"] = serde_json::json!("duckdb");
+        let err = execute_research_job(
+            &db,
+            QueryKind::Series,
+            &request,
+            artifact.path(),
+            FLAGSHIP_CLOCK_MS,
+            "rq-duckdb",
+        )
+        .expect_err("unknown store");
+        assert!(matches!(err, QueryKernelError::UnknownFrameStore(_)));
     }
 
     #[test]

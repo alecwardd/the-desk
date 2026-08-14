@@ -10,8 +10,8 @@ use rmcp::{
     handler::server::wrapper::Parameters, model::*, tool, tool_router, ErrorData as McpError,
 };
 use the_desk_backend::catalog::{
-    apply_positioning_slice, apply_token_budget, build_catalog, build_state_envelope,
-    collapse_events_latest_per_dedup, describe_domain, describe_environment,
+    apply_positioning_slice, apply_token_budget, attach_capsule_refs, build_catalog,
+    build_state_envelope, collapse_events_latest_per_dedup, describe_domain, describe_environment,
     kernel_event_from_db_row, kernel_event_from_market_event_scoped, merge_symbol_envelopes,
     positioning_state_slice, search_catalog, state_envelope_json, EventsEnvelope, KernelEvent,
     PositioningStateSlice, ProvenanceSource, StateEnvelope, StateReadRequest, StateResolution,
@@ -299,7 +299,7 @@ impl TheDeskMcp {
     }
 
     #[tool(
-        description = "SIL read kernel: formalized market events with lifecycle (open → updated → resolved|expired), severity, dedup identity, and frame_ref joining each row to the producing Journal Frame. Trust Level L0 (read/query) — structurally incapable of mutation or order authority. Attention inbox is a ranked view over this stream (get_attention_inbox). Enable via [sil].catalog_discovery."
+        description = "SIL read kernel: formalized market events with lifecycle (open → updated → resolved|expired), severity, dedup identity, frameRef to the producing Journal Frame, and capsuleRef on DOM-family rows (stop_run, iceberg_reload, pull_intent, book_velocity_regime_shift). Trust Level L0 (read/query) — structurally incapable of mutation or order authority. Attention inbox is a ranked view over this stream (get_attention_inbox). Enable via [sil].catalog_discovery."
     )]
     pub(crate) async fn get_events(
         &self,
@@ -349,6 +349,26 @@ impl TheDeskMcp {
                 event_type,
                 limit,
             );
+        }
+        {
+            let capsules = if events.iter().any(|e| e.requires_capsule) {
+                let trigger_ids: Vec<String> = events
+                    .iter()
+                    .filter(|e| e.requires_capsule)
+                    .map(|e| e.identity_id.clone())
+                    .collect();
+                let dedup_ids: Vec<String> = events
+                    .iter()
+                    .filter(|e| e.requires_capsule)
+                    .map(|e| e.dedup_identity_id.clone())
+                    .collect();
+                let db = self.db.lock().map_err(|_| lock_error())?;
+                db.list_capsules_matching(&trigger_ids, &dedup_ids)
+                    .map_err(db_error)?
+            } else {
+                Vec::new()
+            };
+            attach_capsule_refs(&mut events, &capsules);
         }
         let envelope = EventsEnvelope::from_events(events);
         let mut out = serde_json::to_value(&envelope).unwrap_or_else(|_| serde_json::json!({}));

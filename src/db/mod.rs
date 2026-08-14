@@ -1115,6 +1115,46 @@ pub struct JournalAsOfSnapshot {
     pub by_root: BTreeMap<String, serde_json::Value>,
 }
 
+/// Capsule dump still filling the after-window.
+pub const CAPSULE_COMPLETENESS_PENDING: &str = "pending";
+/// After-window closed on the Capsule's own lane clock with trailing coverage.
+pub const CAPSULE_COMPLETENESS_COMPLETE: &str = "complete";
+/// Session/feed ended (or mix/coverage gap) before the after-window closed.
+pub const CAPSULE_COMPLETENESS_INCOMPLETE: &str = "incomplete";
+/// Pending rows are abandoned only after `window_end_ms` plus this grace, so
+/// another process still filling the dump is not stamped `degraded`.
+pub const CAPSULE_ORPHAN_GRACE_MS: f64 = 2_000.0;
+
+const CAPSULE_SELECT_COLUMNS: &str =
+    "id, trigger_identity_id, dedup_identity_id, root_symbol, event_type,
+                    event_timestamp_ms, window_start_ms, window_end_ms,
+                    observed_start_ms, observed_end_ms, start_frame_second, end_frame_second,
+                    completeness, degraded, sample_count, payload, created_at_ms, updated_at_ms";
+
+/// One persisted Capsule dump (SIL-M3b). Joinable to the triggering Event and
+/// surrounding Journal Frames. This is **not** a 250 ms frame store.
+#[derive(Debug, Clone)]
+pub struct CapsuleRecord {
+    pub id: String,
+    pub trigger_identity_id: String,
+    pub dedup_identity_id: String,
+    pub root_symbol: String,
+    pub event_type: String,
+    pub event_timestamp_ms: f64,
+    pub window_start_ms: f64,
+    pub window_end_ms: f64,
+    pub observed_start_ms: Option<f64>,
+    pub observed_end_ms: Option<f64>,
+    pub start_frame_second: Option<i64>,
+    pub end_frame_second: Option<i64>,
+    pub completeness: String,
+    pub degraded: bool,
+    pub sample_count: i64,
+    pub payload: serde_json::Value,
+    pub created_at_ms: f64,
+    pub updated_at_ms: f64,
+}
+
 fn min_priority_score(priority: Option<&str>) -> f64 {
     match priority {
         Some("urgent") => 80.0,
@@ -1662,6 +1702,12 @@ impl Database {
         }
         if version < 34 {
             self.migrate_v34()?;
+        }
+        if version < 35 {
+            self.migrate_v35()?;
+        }
+        if version < 36 {
+            self.migrate_v36()?;
         }
 
         Ok(())
@@ -3270,6 +3316,63 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_market_events_lifecycle_ts
               ON market_events(lifecycle, timestamp_ms);
             UPDATE schema_version SET version = 34;
+            ",
+        )?;
+        Ok(())
+    }
+
+    /// V35: SIL-M3b Capsules (high-resolution dumps around DOM-family Events).
+    ///
+    /// Joinable to the triggering occurrence (`trigger_identity_id`) and to
+    /// Journal Frames via `(start_frame_second, end_frame_second) × root_symbol`.
+    /// This is **not** a permanent 250 ms frame store.
+    fn migrate_v35(&self) -> Result<(), DbError> {
+        self.conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS capsules (
+              id TEXT PRIMARY KEY,
+              trigger_identity_id TEXT NOT NULL,
+              dedup_identity_id TEXT NOT NULL,
+              root_symbol TEXT NOT NULL,
+              event_type TEXT NOT NULL,
+              event_timestamp_ms REAL NOT NULL,
+              window_start_ms REAL NOT NULL,
+              window_end_ms REAL NOT NULL,
+              observed_start_ms REAL NULL,
+              observed_end_ms REAL NULL,
+              start_frame_second INTEGER NULL,
+              end_frame_second INTEGER NULL,
+              completeness TEXT NOT NULL,
+              degraded INTEGER NOT NULL DEFAULT 0,
+              sample_count INTEGER NOT NULL DEFAULT 0,
+              payload TEXT NOT NULL,
+              created_at_ms REAL NOT NULL,
+              updated_at_ms REAL NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_capsules_trigger
+              ON capsules(trigger_identity_id);
+            CREATE INDEX IF NOT EXISTS idx_capsules_dedup
+              ON capsules(dedup_identity_id, event_timestamp_ms);
+            CREATE INDEX IF NOT EXISTS idx_capsules_root_frames
+              ON capsules(root_symbol, start_frame_second, end_frame_second);
+            CREATE INDEX IF NOT EXISTS idx_market_events_identity
+              ON market_events(identity_id);
+            UPDATE schema_version SET version = 35;
+            ",
+        )?;
+        Ok(())
+    }
+
+    /// V36: identity_id index for Capsule persist lookups.
+    ///
+    /// v35 added this index in the same batch as the Capsules table. Branch
+    /// checkouts that already ran the first v35 batch skipped the later index.
+    fn migrate_v36(&self) -> Result<(), DbError> {
+        self.conn.execute_batch(
+            "
+            CREATE INDEX IF NOT EXISTS idx_market_events_identity
+              ON market_events(identity_id);
+            UPDATE schema_version SET version = 36;
             ",
         )?;
         Ok(())
@@ -7146,6 +7249,306 @@ impl Database {
                 "frameRootSymbol": row.get::<_, String>(6)?,
             }))
         })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Persist or update a Capsule dump. Unique on `trigger_identity_id`.
+    pub fn upsert_capsule(&self, record: &CapsuleRecord) -> Result<bool, DbError> {
+        let payload = serde_json::to_string(&record.payload)?;
+        let n = self.conn.execute(
+            "INSERT INTO capsules (
+                id, trigger_identity_id, dedup_identity_id, root_symbol, event_type,
+                event_timestamp_ms, window_start_ms, window_end_ms,
+                observed_start_ms, observed_end_ms, start_frame_second, end_frame_second,
+                completeness, degraded, sample_count, payload, created_at_ms, updated_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+             ON CONFLICT(id) DO UPDATE SET
+                completeness = CASE
+                  WHEN capsules.completeness = 'complete' THEN capsules.completeness
+                  WHEN capsules.completeness = 'incomplete'
+                       AND excluded.completeness = 'pending'
+                  THEN capsules.completeness
+                  WHEN excluded.sample_count >= capsules.sample_count THEN excluded.completeness
+                  ELSE capsules.completeness
+                END,
+                degraded = capsules.degraded OR excluded.degraded,
+                sample_count = MAX(capsules.sample_count, excluded.sample_count),
+                payload = CASE
+                  WHEN excluded.sample_count >= capsules.sample_count THEN excluded.payload
+                  ELSE capsules.payload
+                END,
+                observed_start_ms = CASE
+                  WHEN excluded.sample_count >= capsules.sample_count THEN excluded.observed_start_ms
+                  ELSE capsules.observed_start_ms
+                END,
+                observed_end_ms = CASE
+                  WHEN excluded.sample_count >= capsules.sample_count THEN excluded.observed_end_ms
+                  ELSE capsules.observed_end_ms
+                END,
+                start_frame_second = CASE
+                  WHEN excluded.sample_count >= capsules.sample_count THEN excluded.start_frame_second
+                  ELSE capsules.start_frame_second
+                END,
+                end_frame_second = CASE
+                  WHEN excluded.sample_count >= capsules.sample_count THEN excluded.end_frame_second
+                  ELSE capsules.end_frame_second
+                END,
+                updated_at_ms = excluded.updated_at_ms",
+            params![
+                record.id,
+                record.trigger_identity_id,
+                record.dedup_identity_id,
+                record.root_symbol,
+                record.event_type,
+                record.event_timestamp_ms,
+                record.window_start_ms,
+                record.window_end_ms,
+                record.observed_start_ms,
+                record.observed_end_ms,
+                record.start_frame_second,
+                record.end_frame_second,
+                record.completeness,
+                record.degraded as i32,
+                record.sample_count,
+                payload,
+                record.created_at_ms,
+                record.updated_at_ms,
+            ],
+        )?;
+        Ok(n > 0)
+    }
+
+    fn map_capsule_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CapsuleRecord> {
+        let payload: String = row.get(15)?;
+        let value = serde_json::from_str::<serde_json::Value>(&payload)
+            .unwrap_or_else(|_| serde_json::json!({}));
+        let degraded: i32 = row.get(13)?;
+        Ok(CapsuleRecord {
+            id: row.get(0)?,
+            trigger_identity_id: row.get(1)?,
+            dedup_identity_id: row.get(2)?,
+            root_symbol: row.get(3)?,
+            event_type: row.get(4)?,
+            event_timestamp_ms: row.get(5)?,
+            window_start_ms: row.get(6)?,
+            window_end_ms: row.get(7)?,
+            observed_start_ms: row.get(8)?,
+            observed_end_ms: row.get(9)?,
+            start_frame_second: row.get(10)?,
+            end_frame_second: row.get(11)?,
+            completeness: row.get(12)?,
+            degraded: degraded != 0,
+            sample_count: row.get(14)?,
+            payload: value,
+            created_at_ms: row.get(16)?,
+            updated_at_ms: row.get(17)?,
+        })
+    }
+
+    /// All Capsules (tests / overnight asserts).
+    pub fn list_capsules(&self) -> Result<Vec<CapsuleRecord>, DbError> {
+        let sql = format!(
+            "SELECT {CAPSULE_SELECT_COLUMNS}
+               FROM capsules
+              ORDER BY event_timestamp_ms ASC, id ASC"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map([], Self::map_capsule_row)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    fn capsules_where_in(
+        &self,
+        column: &str,
+        ids: &[String],
+        out: &mut Vec<CapsuleRecord>,
+    ) -> Result<(), DbError> {
+        for chunk in ids.chunks(400) {
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+            let sql = format!(
+                "SELECT {CAPSULE_SELECT_COLUMNS}
+                   FROM capsules
+                  WHERE {column} IN ({placeholders})"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(
+                rusqlite::params_from_iter(chunk.iter()),
+                Self::map_capsule_row,
+            )?;
+            for row in rows {
+                out.push(row?);
+            }
+        }
+        Ok(())
+    }
+
+    /// Capsules matching occurrence and/or dedup identities (coaching join).
+    pub fn list_capsules_matching(
+        &self,
+        trigger_ids: &[String],
+        dedup_ids: &[String],
+    ) -> Result<Vec<CapsuleRecord>, DbError> {
+        if trigger_ids.is_empty() && dedup_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        if !trigger_ids.is_empty() {
+            self.capsules_where_in("trigger_identity_id", trigger_ids, &mut out)?;
+        }
+        if !dedup_ids.is_empty() {
+            self.capsules_where_in("dedup_identity_id", dedup_ids, &mut out)?;
+        }
+        out.sort_by(|a, b| {
+            a.event_timestamp_ms
+                .partial_cmp(&b.event_timestamp_ms)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        out.dedup_by(|a, b| a.id == b.id);
+        Ok(out)
+    }
+
+    /// Stored lifecycle for one occurrence identity (Capsule open policy).
+    pub fn market_event_lifecycle_for_identity(
+        &self,
+        identity_id: &str,
+    ) -> Result<Option<String>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT lifecycle FROM (
+                 SELECT lifecycle, lifecycle_updated_at_ms, timestamp_ms, id
+                   FROM market_events WHERE identity_id = ?1
+                 UNION ALL
+                 SELECT lifecycle, lifecycle_updated_at_ms, timestamp_ms, id
+                   FROM market_events WHERE event_id = ?1
+               )
+              ORDER BY COALESCE(lifecycle_updated_at_ms, timestamp_ms) DESC, id DESC
+              LIMIT 1",
+        )?;
+        Ok(stmt
+            .query_row(params![identity_id], |row| row.get(0))
+            .optional()?)
+    }
+
+    /// Number of persisted Capsule rows.
+    pub fn count_capsules(&self) -> Result<i64, DbError> {
+        Ok(self
+            .conn
+            .query_row("SELECT COUNT(1) FROM capsules", [], |r| r.get(0))?)
+    }
+
+    /// Whether a Capsule row already exists (open-policy / stats).
+    pub fn capsule_exists(&self, id: &str) -> Result<bool, DbError> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(1) FROM capsules WHERE id = ?1",
+            params![id],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Whether any Capsule already exists for this condition identity.
+    pub fn capsule_exists_for_dedup(&self, dedup_identity_id: &str) -> Result<bool, DbError> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(1) FROM capsules WHERE dedup_identity_id = ?1",
+            params![dedup_identity_id],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Stamp leftover `pending` Capsules `incomplete` + `degraded`.
+    ///
+    /// After-window state lives in memory. Rows whose ids are not in `keep_ids`
+    /// *and* whose after-window has already elapsed (plus a short grace) were
+    /// abandoned and must not stay `pending`. In-flight dumps on this
+    /// MarketRouter, and pending rows still inside their after-window in
+    /// another process sharing this SQLite file, are left alone.
+    pub fn finalize_orphaned_pending_capsules(
+        &self,
+        keep_ids: &[String],
+        updated_at_ms: f64,
+    ) -> Result<usize, DbError> {
+        let clock = if updated_at_ms.is_finite() && updated_at_ms > 0.0 {
+            updated_at_ms
+        } else {
+            0.0
+        };
+        let cutoff = if clock > 0.0 {
+            clock - CAPSULE_ORPHAN_GRACE_MS
+        } else {
+            0.0
+        };
+        if keep_ids.is_empty() {
+            let n = self.conn.execute(
+                "UPDATE capsules
+                    SET completeness = 'incomplete',
+                        degraded = 1,
+                        updated_at_ms = CASE WHEN ?1 > 0 THEN ?1 ELSE updated_at_ms END
+                  WHERE completeness = 'pending'
+                    AND window_end_ms < ?2",
+                params![clock, cutoff],
+            )?;
+            return Ok(n);
+        }
+        let mut sql = String::from(
+            "UPDATE capsules
+                SET completeness = 'incomplete',
+                    degraded = 1,
+                    updated_at_ms = CASE WHEN ?1 > 0 THEN ?1 ELSE updated_at_ms END
+              WHERE completeness = 'pending'
+                AND window_end_ms < ?2
+                AND id NOT IN (",
+        );
+        let mut params: Vec<rusqlite::types::Value> = vec![
+            rusqlite::types::Value::Real(clock),
+            rusqlite::types::Value::Real(cutoff),
+        ];
+        for (i, id) in keep_ids.iter().enumerate() {
+            if i > 0 {
+                sql.push_str(", ");
+            }
+            sql.push_str(&format!("?{}", i + 3));
+            params.push(rusqlite::types::Value::Text(id.clone()));
+        }
+        sql.push(')');
+        let n = self
+            .conn
+            .execute(&sql, rusqlite::params_from_iter(params))?;
+        Ok(n)
+    }
+
+    /// Journal Frames overlapping a Capsule window for the same root.
+    pub fn list_journal_frames_for_capsule(
+        &self,
+        root_symbol: &str,
+        start_frame_second: i64,
+        end_frame_second: i64,
+    ) -> Result<Vec<JournalFrameRecord>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT clock_ms, frame_second, root_symbol, session_type, session_segment, trading_day, payload
+               FROM journal_frames
+              WHERE root_symbol = ?1
+                AND frame_second >= ?2
+                AND frame_second <= ?3
+              ORDER BY frame_second ASC",
+        )?;
+        let rows = stmt.query_map(
+            params![root_symbol, start_frame_second, end_frame_second],
+            |row| {
+                let payload: String = row.get(6)?;
+                let value = serde_json::from_str::<serde_json::Value>(&payload)
+                    .unwrap_or_else(|_| serde_json::json!({}));
+                Ok(JournalFrameRecord {
+                    clock_ms: row.get(0)?,
+                    frame_second: row.get(1)?,
+                    root_symbol: row.get(2)?,
+                    session_type: row.get(3)?,
+                    session_segment: row.get(4)?,
+                    trading_day: row.get(5)?,
+                    payload: value,
+                })
+            },
+        )?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
@@ -12795,6 +13198,180 @@ mod tests {
         assert_eq!(joined[0]["rootSymbol"], "NQ");
         assert_eq!(joined[0]["journalFrameSecond"], frame_second);
         assert_eq!(joined[0]["frameRootSymbol"], "NQ");
+    }
+
+    #[test]
+    fn capsules_table_is_not_a_250ms_frame_store() {
+        let db = test_db();
+        let n: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(1) FROM sqlite_master WHERE type='table' AND name='capsules'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("table");
+        assert_eq!(n, 1);
+        let dense: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(1) FROM sqlite_master WHERE type='table' AND (
+                    name LIKE '%250%' OR name LIKE '%highres%' OR name LIKE '%high_res%'
+                 )",
+                [],
+                |r| r.get(0),
+            )
+            .expect("dense");
+        assert_eq!(dense, 0);
+        let version: i32 = db
+            .conn
+            .query_row(
+                "SELECT COALESCE(MAX(version), 0) FROM schema_version",
+                [],
+                |r| r.get(0),
+            )
+            .expect("version");
+        assert!(version >= 36, "schema v36 identity index, got {version}");
+        let identity_idx: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(1) FROM sqlite_master
+                  WHERE type='index' AND name='idx_market_events_identity'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("identity idx");
+        assert_eq!(identity_idx, 1);
+    }
+
+    fn sample_capsule_record(
+        id: &str,
+        completeness: &str,
+        degraded: bool,
+        sample_count: i64,
+        payload_mark: &str,
+    ) -> CapsuleRecord {
+        CapsuleRecord {
+            id: id.into(),
+            trigger_identity_id: format!("trig_{id}"),
+            dedup_identity_id: "dedup_x".into(),
+            root_symbol: "NQ".into(),
+            event_type: "stop_run".into(),
+            event_timestamp_ms: 1_700_000_000_000.0,
+            window_start_ms: 1_700_000_000_000.0 - 30_000.0,
+            window_end_ms: 1_700_000_000_000.0 + 60_000.0,
+            observed_start_ms: Some(1_700_000_000_000.0),
+            observed_end_ms: Some(1_700_000_000_000.0),
+            start_frame_second: Some(1_699_999_970),
+            end_frame_second: Some(1_700_000_060),
+            completeness: completeness.into(),
+            degraded,
+            sample_count,
+            payload: serde_json::json!({"mark": payload_mark}),
+            created_at_ms: 1_700_000_000_000.0,
+            updated_at_ms: 1_700_000_000_000.0,
+        }
+    }
+
+    #[test]
+    fn upsert_capsule_keeps_degraded_and_complete_monotonic() {
+        let db = test_db();
+        let first = sample_capsule_record("cap_sticky", "complete", true, 20, "full");
+        db.upsert_capsule(&first).expect("insert");
+
+        let clearer = sample_capsule_record("cap_sticky", "complete", false, 40, "more");
+        db.upsert_capsule(&clearer).expect("fuller");
+        let row = &db.list_capsules().expect("list")[0];
+        assert!(
+            row.degraded,
+            "degraded must stay sticky when a fuller dump arrives"
+        );
+        assert_eq!(row.completeness, "complete");
+        assert_eq!(row.sample_count, 40);
+        assert_eq!(row.payload["mark"], "more");
+
+        let truncated = sample_capsule_record("cap_sticky", "incomplete", false, 5, "thin");
+        db.upsert_capsule(&truncated).expect("thin");
+        let row = &db.list_capsules().expect("list")[0];
+        assert_eq!(row.completeness, "complete");
+        assert!(row.degraded);
+        assert_eq!(row.sample_count, 40);
+        assert_eq!(row.payload["mark"], "more");
+    }
+
+    #[test]
+    fn market_event_lifecycle_for_identity_hits_identity_or_event_id() {
+        let db = test_db();
+        let event = MarketEvent {
+            session_date: "2024-01-02".into(),
+            timestamp_ms: 1_704_207_600_250.0,
+            event_type: "stop_run".into(),
+            level_name: None,
+            price: 20_000.0,
+            direction: Some("up".into()),
+            sequence_num: Some(1),
+            metadata: None,
+            session_type: "RTH".into(),
+            session_segment: "None".into(),
+            trading_day: "2024-01-02".into(),
+        };
+        db.insert_market_events_batch_scoped(Some("NQ"), std::slice::from_ref(&event))
+            .expect("insert");
+        let identity = market_event_id(&event);
+        assert_eq!(
+            db.market_event_lifecycle_for_identity(&identity)
+                .expect("lookup")
+                .as_deref(),
+            Some("open")
+        );
+        assert_eq!(
+            db.market_event_lifecycle_for_identity("missing")
+                .expect("missing")
+                .as_deref(),
+            None
+        );
+    }
+
+    #[test]
+    fn finalize_orphaned_pending_capsules_keeps_in_flight_ids() {
+        let db = test_db();
+        let orphan = sample_capsule_record("cap_orphan", "pending", false, 4, "old");
+        let inflight = sample_capsule_record("cap_inflight", "pending", false, 8, "live");
+        let done = sample_capsule_record("cap_done", "complete", false, 12, "full");
+        db.upsert_capsule(&orphan).expect("orphan");
+        db.upsert_capsule(&inflight).expect("inflight");
+        db.upsert_capsule(&done).expect("done");
+
+        let n = db
+            .finalize_orphaned_pending_capsules(&["cap_inflight".into()], 1_700_000_090_000.0)
+            .expect("finalize");
+        assert_eq!(n, 1);
+        let rows = db.list_capsules().expect("list");
+        let by_id = |id: &str| rows.iter().find(|r| r.id == id).expect(id);
+        assert_eq!(by_id("cap_orphan").completeness, "incomplete");
+        assert!(by_id("cap_orphan").degraded);
+        assert_eq!(by_id("cap_inflight").completeness, "pending");
+        assert!(!by_id("cap_inflight").degraded);
+        assert_eq!(by_id("cap_done").completeness, "complete");
+        assert!(db.capsule_exists_for_dedup("dedup_x").expect("dedup"));
+        assert!(!db.capsule_exists_for_dedup("dedup_missing").expect("none"));
+    }
+
+    #[test]
+    fn finalize_orphaned_pending_does_not_sweep_open_windows() {
+        let db = test_db();
+        let pending = sample_capsule_record("cap_live", "pending", false, 4, "open");
+        db.upsert_capsule(&pending).expect("insert");
+        let n = db
+            .finalize_orphaned_pending_capsules(&[], 1_700_000_010_000.0)
+            .expect("sweep");
+        assert_eq!(n, 0);
+        assert_eq!(db.list_capsules().unwrap()[0].completeness, "pending");
+        let n = db
+            .finalize_orphaned_pending_capsules(&[], 0.0)
+            .expect("no clock");
+        assert_eq!(n, 0);
+        assert_eq!(db.list_capsules().unwrap()[0].completeness, "pending");
     }
 
     #[test]

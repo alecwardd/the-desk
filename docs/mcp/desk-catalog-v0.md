@@ -24,7 +24,7 @@ Cross-session inventory and multi-session trend framing.
 
 ### `events` — Events
 
-Formalized event stream: lifecycle (open → updated → resolved|expired), severity, dedup identity, and frame_ref joining each row to the producing Journal Frame. DOM-family types (stop_run, iceberg_reload, pull_intent, book_velocity_regime_shift) are named for later Capsule policy — Capsules are not emitted here. Reads ride get_events; the attention inbox is a ranked view over this stream.
+Formalized event stream: lifecycle (open → updated → resolved|expired), severity, dedup identity, frameRef to the producing Journal Frame, and capsuleRef on DOM-family rows (stop_run, iceberg_reload, pull_intent, book_velocity_regime_shift). Reads ride get_events; the attention inbox is a ranked view over this stream.
 
 | Field id | Unit | Session scope | Freshness | Cost |
 |---|---|---|---|---|

@@ -153,7 +153,7 @@ With `[sil].catalog_discovery = true`:
 - `get_state` returns a StateEnvelope (`values`, per-domain `provenance`,
   per-domain `degraded`, `catalogVersion`). Missing provenance is a failure;
   degraded domains set their flag and stay visible.
-- `get_events` returns formalized rows: lifecycle (`open` → `updated` → `resolved`|`expired`), severity, occurrence + dedup identity, and `frame_ref` joining each event to the producing Journal Frame. Trust Level L0.
+- `get_events` returns formalized rows: lifecycle (`open` → `updated` → `resolved`|`expired`), severity, occurrence + dedup identity, `frameRef` joining each event to the producing Journal Frame, and `capsuleRef` on DOM-family rows. Trust Level L0.
 - `get_attention_inbox` is a ranked view over that event stream (`viewOf: eventStream`), not a parallel source of truth.
 - `get_session_context` / `get_market_snapshot` still answer and include
   `deprecated: true` + `suggestedReplacementOperator: "get_state"`.

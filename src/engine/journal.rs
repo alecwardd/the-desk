@@ -2,8 +2,9 @@
 //!
 //! Compute/publish may stay on the ~250 ms analysis cadence (ADR-019). This
 //! module persists **Journal Frames** only when the MarketRouter clock advances
-//! into a new Unix second — never every 250 ms snapshot. Capsules (high-resolution
-//! dumps) are a later ticket.
+//! into a new Unix second — never every 250 ms snapshot. Capsules (SIL-M3b) are
+//! high-resolution dumps around DOM-family Events, stored separately — never as
+//! a permanent 250 ms frame table.
 //!
 //! MFE/MAE / R-result stay tick-driven via [`crate::outcome_tracker`] /
 //! `PendingOutcomeSet`. This writer persists already-computed state only and
@@ -23,11 +24,13 @@ use super::root::RouterRoot;
 /// Journal Frame persistence interval on the MarketRouter clock (1 Hz).
 pub const JOURNAL_FRAME_INTERVAL_MS: f64 = 1000.0;
 
-/// Result of one journal observation (frames + transition rows).
+/// Result of one journal observation (frames + transition rows + Capsules).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct JournalPersistStats {
     pub frames_written: usize,
     pub events_written: usize,
+    pub capsules_opened: usize,
+    pub capsules_finalized: usize,
     pub frame_second: Option<i64>,
 }
 
@@ -426,5 +429,323 @@ mod tests {
             .summary
             .to_ascii_lowercase()
             .contains("you should buy"));
+    }
+
+    fn stop_run_at(ts: f64) -> MarketEvent {
+        MarketEvent {
+            session_date: "2024-01-02".into(),
+            timestamp_ms: ts,
+            event_type: "stop_run".into(),
+            level_name: None,
+            price: 20_000.25,
+            direction: Some("up".into()),
+            sequence_num: Some(1),
+            metadata: None,
+            session_type: "RTH".into(),
+            session_segment: "None".into(),
+            trading_day: "2024-01-02".into(),
+        }
+    }
+
+    #[test]
+    fn persist_journal_writes_dom_capsules_without_mcp() {
+        use crate::engine::{CAPSULE_AFTER_MS, CAPSULE_LOOKBACK_MS, CAPSULE_RING_STEP_MS};
+        let db = Database::open(":memory:").expect("db");
+        let router = MarketRouter::new(RouterRoot::Nq, SourceProviderKind::File, "capsule");
+        let event_ts = RTH_TS + CAPSULE_LOOKBACK_MS;
+        let lookback_n = (CAPSULE_LOOKBACK_MS / CAPSULE_RING_STEP_MS) as i32;
+        for i in 0..=lookback_n {
+            let ts = RTH_TS + i as f64 * CAPSULE_RING_STEP_MS;
+            router.apply_tick(RouterRoot::Nq, &tick(ts, 20_000.0));
+        }
+        router.note_transition_events(RouterRoot::Nq, &[stop_run_at(event_ts)]);
+        let after_n = (CAPSULE_AFTER_MS / CAPSULE_RING_STEP_MS) as i32;
+        for i in 1..=after_n {
+            let ts = event_ts + i as f64 * CAPSULE_RING_STEP_MS;
+            router.apply_tick(RouterRoot::Nq, &tick(ts, 20_000.25));
+        }
+        let stats = router.persist_journal(&db).expect("persist");
+        assert!(stats.events_written >= 1);
+        assert!(stats.capsules_opened >= 1);
+        assert!(stats.capsules_finalized >= 1);
+        let capsules = db.list_capsules().expect("capsules");
+        assert_eq!(capsules.len(), 1);
+        let cap = &capsules[0];
+        assert_eq!(cap.event_type, "stop_run");
+        assert_eq!(cap.completeness, "complete");
+        assert!((cap.window_start_ms - (event_ts - CAPSULE_LOOKBACK_MS)).abs() < 1.0);
+        assert!((cap.window_end_ms - (event_ts + CAPSULE_AFTER_MS)).abs() < 1.0);
+        assert_eq!(
+            cap.start_frame_second,
+            crate::db::journal_frame_second_from_ts(event_ts - CAPSULE_LOOKBACK_MS)
+        );
+        assert_eq!(
+            cap.end_frame_second,
+            crate::db::journal_frame_second_from_ts(event_ts + CAPSULE_AFTER_MS)
+        );
+        let events = db
+            .list_recent_market_events(10, None, Some("stop_run"))
+            .expect("events");
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            cap.trigger_identity_id,
+            events[0]["identityId"].as_str().unwrap()
+        );
+        let frames = db
+            .list_journal_frames_for_capsule(
+                "NQ",
+                cap.start_frame_second.unwrap(),
+                cap.end_frame_second.unwrap(),
+            )
+            .expect("frames");
+        assert!(
+            !frames.is_empty(),
+            "Capsule must join surrounding Journal Frames"
+        );
+        let frame_count = db.count_journal_frames().expect("frames");
+        let span_seconds = cap.end_frame_second.unwrap() - cap.start_frame_second.unwrap() + 1;
+        assert!(
+            frame_count <= span_seconds + 2,
+            "1 Hz frames only, not 250 ms store: frames={frame_count} span={span_seconds}"
+        );
+    }
+
+    #[test]
+    fn persist_keeps_capsule_when_es_clock_expires_nq_trigger() {
+        use crate::engine::{CAPSULE_LOOKBACK_MS, CAPSULE_RING_STEP_MS};
+        let db = Database::open(":memory:").expect("db");
+        let router = MarketRouter::new(RouterRoot::Nq, SourceProviderKind::File, "expire-cap");
+        let event_ts = RTH_TS + CAPSULE_LOOKBACK_MS;
+        let lookback_n = (CAPSULE_LOOKBACK_MS / CAPSULE_RING_STEP_MS) as i32;
+        for i in 0..=lookback_n {
+            let ts = RTH_TS + i as f64 * CAPSULE_RING_STEP_MS;
+            router.apply_tick(RouterRoot::Nq, &tick(ts, 20_000.0));
+        }
+        router.note_transition_events(RouterRoot::Nq, &[stop_run_at(event_ts)]);
+        router.persist_journal(&db).expect("open");
+        assert_eq!(db.count_capsules().expect("opened"), 1);
+        router.apply_tick(RouterRoot::Es, &tick(event_ts + 40.0 * 60_000.0, 5_000.0));
+        router.persist_journal(&db).expect("after es jump");
+        assert_eq!(
+            db.count_capsules().expect("kept"),
+            1,
+            "expired trigger must not drop an in-flight Capsule"
+        );
+        let cap = &db.list_capsules().expect("list")[0];
+        assert_eq!(cap.event_type, "stop_run");
+        assert_ne!(
+            cap.completeness, "complete",
+            "NQ Capsule must not complete off the ES lane clock"
+        );
+    }
+
+    #[test]
+    fn non_dom_events_do_not_open_capsules() {
+        let db = Database::open(":memory:").expect("db");
+        let router = MarketRouter::new(RouterRoot::Nq, SourceProviderKind::File, "no-cap");
+        router.apply_tick(RouterRoot::Nq, &tick(RTH_TS, 20_000.0));
+        let event = MarketEvent {
+            session_date: "2024-01-02".into(),
+            timestamp_ms: RTH_TS + 100.0,
+            event_type: "pinch_detected".into(),
+            level_name: None,
+            price: 20_000.25,
+            direction: Some("up".into()),
+            sequence_num: Some(1),
+            metadata: None,
+            session_type: "RTH".into(),
+            session_segment: "None".into(),
+            trading_day: "2024-01-02".into(),
+        };
+        router.note_transition_events(RouterRoot::Nq, &[event]);
+        router.persist_journal(&db).expect("persist");
+        assert_eq!(db.count_capsules().expect("count"), 0);
+        assert_eq!(
+            db.list_recent_market_events(10, None, Some("pinch_detected"))
+                .expect("ev")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn repeat_dedup_does_not_spawn_unbounded_capsules() {
+        let db = Database::open(":memory:").expect("db");
+        let router = MarketRouter::new(RouterRoot::Nq, SourceProviderKind::File, "dedup-cap");
+        router.apply_tick(RouterRoot::Nq, &tick(RTH_TS, 20_000.0));
+        let first = stop_run_at(RTH_TS + 100.0);
+        let mut repeat = first.clone();
+        repeat.timestamp_ms = RTH_TS + 1_100.0;
+        router.note_transition_events(RouterRoot::Nq, &[first]);
+        router.persist_journal(&db).expect("open");
+        router.note_transition_events(RouterRoot::Nq, &[repeat]);
+        router.persist_journal(&db).expect("repeat");
+        assert_eq!(db.count_capsules().expect("count"), 1);
+        let occ = db
+            .list_recent_market_events(10, None, Some("stop_run"))
+            .expect("occ");
+        assert_eq!(occ.len(), 2);
+        assert_eq!(occ[0]["lifecycle"], "updated");
+    }
+
+    #[test]
+    fn updated_lifecycle_still_writes_first_capsule_when_none_exists() {
+        let db = Database::open(":memory:").expect("db");
+        db.insert_market_events_batch_scoped(Some("NQ"), &[stop_run_at(RTH_TS + 50.0)])
+            .expect("backfill");
+        let router = MarketRouter::new(RouterRoot::Nq, SourceProviderKind::File, "updated-first");
+        router.apply_tick(RouterRoot::Nq, &tick(RTH_TS, 20_000.0));
+        router.note_transition_events(RouterRoot::Nq, &[stop_run_at(RTH_TS + 1_100.0)]);
+        router.persist_journal(&db).expect("persist");
+        assert_eq!(
+            db.count_capsules().expect("count"),
+            1,
+            "first live dump must persist even when the occurrence row is already updated"
+        );
+        let events = db
+            .list_recent_market_events(10, None, Some("stop_run"))
+            .expect("events");
+        assert_eq!(events.len(), 2);
+        assert!(
+            events.iter().any(|e| e["lifecycle"] == "updated"),
+            "prior backfill row must stamp the live occurrence updated"
+        );
+    }
+
+    #[test]
+    fn completed_dedup_repeat_does_not_open_second_capsule() {
+        use crate::engine::{CAPSULE_AFTER_MS, CAPSULE_LOOKBACK_MS, CAPSULE_RING_STEP_MS};
+        let db = Database::open(":memory:").expect("db");
+        let router = MarketRouter::new(RouterRoot::Nq, SourceProviderKind::File, "dedup-complete");
+        let event_ts = RTH_TS + CAPSULE_LOOKBACK_MS;
+        let lookback_n = (CAPSULE_LOOKBACK_MS / CAPSULE_RING_STEP_MS) as i32;
+        for i in 0..=lookback_n {
+            router.apply_tick(
+                RouterRoot::Nq,
+                &tick(RTH_TS + i as f64 * CAPSULE_RING_STEP_MS, 20_000.0),
+            );
+        }
+        router.note_transition_events(RouterRoot::Nq, &[stop_run_at(event_ts)]);
+        let after_n = (CAPSULE_AFTER_MS / CAPSULE_RING_STEP_MS) as i32;
+        for i in 1..=after_n {
+            router.apply_tick(
+                RouterRoot::Nq,
+                &tick(event_ts + i as f64 * CAPSULE_RING_STEP_MS, 20_000.25),
+            );
+        }
+        router.persist_journal(&db).expect("complete");
+        assert_eq!(db.count_capsules().expect("first"), 1);
+        assert_eq!(db.list_capsules().unwrap()[0].completeness, "complete");
+        let mut repeat = stop_run_at(event_ts + 90_000.0);
+        repeat.sequence_num = Some(1);
+        router.note_transition_events(RouterRoot::Nq, &[repeat]);
+        router.persist_journal(&db).expect("repeat");
+        assert_eq!(
+            db.count_capsules().expect("still one"),
+            1,
+            "repeat of the same dedup must not spawn a second Capsule after complete"
+        );
+    }
+
+    #[test]
+    fn restart_finalizes_orphaned_pending_capsules() {
+        use crate::engine::CAPSULE_AFTER_MS;
+        let db = Database::open(":memory:").expect("db");
+        let router = MarketRouter::new(RouterRoot::Nq, SourceProviderKind::File, "orphan-open");
+        router.apply_tick(RouterRoot::Nq, &tick(RTH_TS, 20_000.0));
+        router.note_transition_events(RouterRoot::Nq, &[stop_run_at(RTH_TS + 100.0)]);
+        router.persist_journal(&db).expect("open pending");
+        assert_eq!(db.list_capsules().unwrap()[0].completeness, "pending");
+        drop(router);
+
+        let restarted =
+            MarketRouter::new(RouterRoot::Nq, SourceProviderKind::File, "orphan-restart");
+        restarted.apply_tick(RouterRoot::Nq, &tick(RTH_TS + 1_000.0, 20_000.25));
+        restarted.persist_journal(&db).expect("mid-window restart");
+        assert_eq!(
+            db.list_capsules().unwrap()[0].completeness,
+            "pending",
+            "another process must not stamp a still-open after-window as abandoned"
+        );
+
+        restarted.apply_tick(
+            RouterRoot::Nq,
+            &tick(RTH_TS + 100.0 + CAPSULE_AFTER_MS + 5_000.0, 20_000.5),
+        );
+        restarted.persist_journal(&db).expect("past window");
+        let cap = db.list_capsules().expect("caps").pop().expect("one");
+        assert_eq!(cap.completeness, "incomplete");
+        assert!(cap.degraded);
+    }
+
+    #[test]
+    fn after_window_feed_gap_marks_incomplete_degraded() {
+        use crate::engine::{CAPSULE_LOOKBACK_MS, CAPSULE_RING_STEP_MS};
+        let db = Database::open(":memory:").expect("db");
+        let router = MarketRouter::new(RouterRoot::Nq, SourceProviderKind::File, "gap");
+        let event_ts = RTH_TS + CAPSULE_LOOKBACK_MS;
+        let lookback_n = (CAPSULE_LOOKBACK_MS / CAPSULE_RING_STEP_MS) as i32;
+        for i in 0..=lookback_n {
+            router.apply_tick(
+                RouterRoot::Nq,
+                &tick(RTH_TS + i as f64 * CAPSULE_RING_STEP_MS, 20_000.0),
+            );
+        }
+        router.note_transition_events(RouterRoot::Nq, &[stop_run_at(event_ts)]);
+        for i in 1..=20 {
+            router.apply_tick(
+                RouterRoot::Nq,
+                &tick(event_ts + i as f64 * CAPSULE_RING_STEP_MS, 20_000.25),
+            );
+        }
+        router.apply_tick(RouterRoot::Nq, &tick(event_ts + 40.0 * 60_000.0, 20_001.0));
+        router.persist_journal(&db).expect("persist");
+        let cap = db.list_capsules().expect("caps").pop().expect("one");
+        assert_eq!(cap.completeness, "incomplete");
+        assert!(cap.degraded);
+    }
+
+    #[test]
+    fn in_flight_pending_capsule_survives_later_persist() {
+        let db = Database::open(":memory:").expect("db");
+        let router = MarketRouter::new(RouterRoot::Nq, SourceProviderKind::File, "inflight");
+        router.apply_tick(RouterRoot::Nq, &tick(RTH_TS, 20_000.0));
+        router.note_transition_events(RouterRoot::Nq, &[stop_run_at(RTH_TS + 100.0)]);
+        router.persist_journal(&db).expect("open");
+        router.persist_journal(&db).expect("again");
+        let cap = db.list_capsules().expect("caps").pop().expect("one");
+        assert_eq!(cap.completeness, "pending");
+        assert!(!cap.degraded);
+    }
+
+    #[test]
+    fn incomplete_capsule_on_session_end_before_after_window() {
+        let db = Database::open(":memory:").expect("db");
+        let router = MarketRouter::new(RouterRoot::Nq, SourceProviderKind::File, "incomplete");
+        router.apply_tick(RouterRoot::Nq, &tick(RTH_TS, 20_000.0));
+        router.note_transition_events(RouterRoot::Nq, &[stop_run_at(RTH_TS + 100.0)]);
+        router.persist_journal(&db).expect("open pending");
+        assert_eq!(db.count_capsules().expect("pending count"), 1);
+        assert_eq!(db.list_capsules().unwrap()[0].completeness, "pending");
+        router.mark_stopped();
+        router.persist_journal(&db).expect("flush");
+        let cap = db.list_capsules().expect("caps").pop().expect("one");
+        assert_eq!(cap.completeness, "incomplete");
+        assert!(cap.degraded);
+    }
+
+    #[test]
+    fn every_dom_family_type_emits_a_capsule() {
+        let db = Database::open(":memory:").expect("db");
+        let router = MarketRouter::new(RouterRoot::Nq, SourceProviderKind::File, "all-dom");
+        router.apply_tick(RouterRoot::Nq, &tick(RTH_TS, 20_000.0));
+        for (i, name) in crate::catalog::DOM_FAMILY_EVENT_TYPES.iter().enumerate() {
+            let mut event = stop_run_at(RTH_TS + 100.0 + i as f64);
+            event.event_type = (*name).into();
+            event.sequence_num = Some(i as i32 + 1);
+            router.note_transition_events(RouterRoot::Nq, &[event]);
+        }
+        router.persist_journal(&db).expect("persist");
+        assert_eq!(db.count_capsules().expect("count"), 4);
     }
 }

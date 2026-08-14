@@ -1,8 +1,8 @@
 //! SIL-M4 event lifecycle, severity, dedup identity, `frame_ref`, and DOM-family taxonomy.
 //!
 //! Formalizes the existing detector stream — it does not rebuild EventDetector.
-//! Capsules are **later** (#10): DOM-family types are named here so Capsule
-//! policy can key off them; this module never dumps Capsules.
+//! DOM-family types are Capsule-mandatory (SIL-M3b). This module names the
+//! taxonomy and `requires_capsule` policy; the dump lives in `engine::capsule`.
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -205,7 +205,7 @@ impl std::fmt::Display for EventSeverity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum EventFamily {
-    /// Depth-of-market family — Capsules are mandatory later (#10).
+    /// Depth-of-market family — Capsules are mandatory (SIL-M3b).
     Dom,
     Flow,
     Structure,
@@ -224,10 +224,10 @@ impl EventFamily {
     }
 }
 
-/// DOM-family event types Capsules will key off (naming + taxonomy only).
+/// DOM-family event types Capsules key off.
 ///
-/// These types are not emitted by today's detectors. The registry may extend
-/// this list; adding a name here does **not** dump a Capsule.
+/// These types are not emitted by today's detectors (SIL-M5e). Tests inject
+/// synthetic rows. The registry may extend this list.
 pub const DOM_FAMILY_EVENT_TYPES: &[&str] = &[
     "stop_run",
     "iceberg_reload",
@@ -235,13 +235,37 @@ pub const DOM_FAMILY_EVENT_TYPES: &[&str] = &[
     "book_velocity_regime_shift",
 ];
 
-/// True when `event_type` is in the DOM family (Capsule-mandatory later).
+/// True when `event_type` is in the DOM family (Capsule-mandatory).
 pub fn is_dom_family_event_type(event_type: &str) -> bool {
     let normalized = normalize_event_type_key(event_type);
     DOM_FAMILY_EVENT_TYPES
         .iter()
         .any(|name| *name == normalized)
 }
+
+/// True when this type is a DOM-family stem, including `*_invalidated` rows.
+pub fn is_dom_family_stem(event_type: &str) -> bool {
+    if is_dom_family_event_type(event_type) {
+        return true;
+    }
+    let family = event_family_key(event_type);
+    DOM_FAMILY_EVENT_TYPES.iter().any(|name| *name == family)
+}
+
+/// Capsule dump is mandatory for this event type (DOM-family only in M3b).
+///
+/// Invalidation rows of a DOM stem also require `capsuleRef` so the coaching
+/// view still joins the dump after collapse-to-latest-per-dedup.
+pub fn requires_capsule(event_type: &str) -> bool {
+    is_dom_family_stem(event_type)
+}
+
+/// Lookback before the triggering Event (ADR-024 / #10).
+/// Named constants — tests must not require `config.toml`.
+pub const CAPSULE_LOOKBACK_MS: f64 = 30_000.0;
+/// After-window following the triggering Event (ADR-024 / #10).
+/// Named constants — tests must not require `config.toml`.
+pub const CAPSULE_AFTER_MS: f64 = 60_000.0;
 
 fn normalize_event_type_key(event_type: &str) -> String {
     event_type
@@ -292,7 +316,7 @@ pub fn event_dedup_identity_id(event: &MarketEvent, root_symbol: Option<&str>) -
 
 /// Classify an event type into an operator family.
 pub fn classify_event_family(event_type: &str) -> EventFamily {
-    if is_dom_family_event_type(event_type) {
+    if is_dom_family_stem(event_type) {
         return EventFamily::Dom;
     }
     let family = event_family_key(event_type);
@@ -459,14 +483,17 @@ mod tests {
         ] {
             assert!(
                 is_dom_family_event_type(name),
-                "{name} must be DOM-family for later Capsule policy"
+                "{name} must be DOM-family (Capsule-mandatory)"
             );
             assert_eq!(classify_event_family(name), EventFamily::Dom);
-            assert!(
-                !name.contains("capsule"),
-                "taxonomy must not imply Capsule emission"
-            );
+            assert!(requires_capsule(name), "{name}");
         }
+        assert!(requires_capsule("stop_run_invalidated"));
+        assert_eq!(
+            classify_event_family("stop_run_invalidated"),
+            EventFamily::Dom
+        );
+        assert!(!is_dom_family_event_type("stop_run_invalidated"));
         assert!(!is_dom_family_event_type("ib_extension_hit"));
         assert!(!is_dom_family_event_type("absorption_confirmed"));
         assert_eq!(DOM_FAMILY_EVENT_TYPES.len(), 4);

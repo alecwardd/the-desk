@@ -31,14 +31,15 @@ pub use event_lifecycle::{
     apply_lifecycle_transition, cheap_model_may_invoke, classify_event_family,
     detection_kind_for_event_type, event_dedup_identity_id, event_dedup_identity_key,
     event_family_key, is_dom_family_event_type, is_invalidation_event_type,
-    next_lifecycle_for_detection, resolve_event_severity, DetectionKind, EventFamily,
-    EventLifecycle, EventSeverity, FrameRef, LifecycleError, DOM_FAMILY_EVENT_TYPES,
-    EVENT_LIFECYCLE_STATES, EVENT_LIFECYCLE_TTL_MS, SEVERITY_UNSPECIFIED,
+    next_lifecycle_for_detection, requires_capsule, resolve_event_severity, DetectionKind,
+    EventFamily, EventLifecycle, EventSeverity, FrameRef, LifecycleError, CAPSULE_AFTER_MS,
+    CAPSULE_LOOKBACK_MS, DOM_FAMILY_EVENT_TYPES, EVENT_LIFECYCLE_STATES, EVENT_LIFECYCLE_TTL_MS,
+    SEVERITY_UNSPECIFIED,
 };
 pub use events_kernel::{
-    coaching_kernel_events_from_db_rows, collapse_events_latest_per_dedup,
+    attach_capsule_refs, coaching_kernel_events_from_db_rows, collapse_events_latest_per_dedup,
     kernel_event_envelope_fields_present, kernel_event_from_db_row, kernel_event_from_market_event,
-    kernel_event_from_market_event_scoped, kernel_event_from_persisted, EventsEnvelope,
+    kernel_event_from_market_event_scoped, kernel_event_from_persisted, CapsuleRef, EventsEnvelope,
     KernelEvent, COACHING_EVENT_FETCH_CAP, SEVERITY_PLACEHOLDER,
 };
 pub use positioning_record::{
@@ -275,7 +276,7 @@ fn base_domain_shells() -> Vec<DomainDescriptor> {
         DomainDescriptor {
             id: "events".into(),
             name: "Events".into(),
-            summary: "Formalized event stream: lifecycle (open → updated → resolved|expired), severity, dedup identity, and frame_ref joining each row to the producing Journal Frame. DOM-family types (stop_run, iceberg_reload, pull_intent, book_velocity_regime_shift) are named for later Capsule policy — Capsules are not emitted here. Reads ride get_events; the attention inbox is a ranked view over this stream.".into(),
+            summary: "Formalized event stream: lifecycle (open → updated → resolved|expired), severity, dedup identity, frameRef to the producing Journal Frame, and capsuleRef on DOM-family rows (stop_run, iceberg_reload, pull_intent, book_velocity_regime_shift). Reads ride get_events; the attention inbox is a ranked view over this stream.".into(),
             field_ids: vec![],
             record_kinds: vec![],
         },

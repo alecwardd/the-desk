@@ -1735,6 +1735,10 @@ async fn get_events_returns_identity_rows() {
     );
     assert_eq!(evt["frameRef"]["journalFrameSecond"], 1_700_000_000i64);
     assert_eq!(evt["requiresCapsule"], false);
+    assert!(
+        evt.get("capsuleRef").is_none(),
+        "non-DOM rows must not pretend to have Capsules"
+    );
 }
 
 #[tokio::test]
@@ -1823,6 +1827,57 @@ async fn get_events_identity_distinguishes_sequence_num() {
     let id0 = out["events"][0]["identityId"].as_str().expect("id0");
     let id1 = out["events"][1]["identityId"].as_str().expect("id1");
     assert_ne!(id0, id1, "sequence_num must differentiate identityId");
+}
+
+#[tokio::test]
+async fn get_events_dom_family_never_omits_capsule_ref() {
+    let server = test_server_with_sil();
+    {
+        let db = server.db.lock().expect("db");
+        db.insert_market_events_batch_scoped(
+            Some("NQ"),
+            &[MarketEvent {
+                session_date: "2026-08-11".into(),
+                timestamp_ms: 1_700_000_000_000.0,
+                event_type: "stop_run".into(),
+                level_name: None,
+                price: 21000.0,
+                direction: Some("up".into()),
+                sequence_num: Some(1),
+                metadata: None,
+                session_type: "RTH".into(),
+                session_segment: "None".into(),
+                trading_day: "2026-08-11".into(),
+            }],
+        )
+        .expect("insert stop_run");
+    }
+    let out = parse_text_tool_result(
+        server
+            .get_events(Parameters(GetEventsParams {
+                event_type: Some("stop_run".into()),
+                limit: Some(10),
+                ..Default::default()
+            }))
+            .await
+            .expect("get_events"),
+    );
+    assert_eq!(out["trustLevel"], "L0");
+    assert_eq!(out["count"], 1);
+    let evt = &out["events"][0];
+    assert_eq!(evt["requiresCapsule"], true);
+    assert_eq!(evt["family"], "dom");
+    let cap = evt
+        .get("capsuleRef")
+        .expect("DOM-family rows must carry capsuleRef");
+    assert!(cap.get("id").is_some());
+    assert!(cap.get("windowStartMs").is_some());
+    assert!(cap.get("windowEndMs").is_some());
+    assert!(cap.get("completeness").is_some());
+    assert_eq!(cap["completeness"], "pending");
+    assert!(cap["id"].is_null());
+    assert_eq!(cap["windowStartMs"], 1_700_000_000_000.0 - 30_000.0);
+    assert_eq!(cap["windowEndMs"], 1_700_000_000_000.0 + 60_000.0);
 }
 
 #[tokio::test]

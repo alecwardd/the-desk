@@ -38,7 +38,7 @@ pub use journal::{
 };
 pub use published::{PublishedEngineState, PublishedStateStore};
 pub use root::{parse_requested_roots, primary_root_from_config, RouterRoot, RouterRootError};
-pub use router::{sort_ticks_one_clock, MarketRouter};
+pub use router::{sort_ticks_one_clock, MarketRouter, PENDING_JOURNAL_MAX_FRAMES};
 pub use socket::{EngineClient, EngineSocketServer, SocketRequest, SocketResponse};
 pub use source::{
     FileProvider, SierraProvider, SourceError, SourceProvider, SourceProviderKind, SourceTick,

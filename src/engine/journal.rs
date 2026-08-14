@@ -6,7 +6,8 @@
 //! high-resolution dumps around DOM-family Events, stored separately — never as
 //! a permanent 250 ms frame table. SIL-M3d writes the same 1 Hz frames to
 //! session-partitioned cold dumps when a [`crate::engine::ColdFrameStore`] is
-//! attached — SQLite stays the hot window.
+//! attached — SQLite stays the hot window. Cold IO is append-only and
+//! best-effort; a dump failure must not abort the persist cycle.
 //!
 //! MFE/MAE / R-result stay tick-driven via [`crate::outcome_tracker`] /
 //! `PendingOutcomeSet`. This writer persists already-computed state only and

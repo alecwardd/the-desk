@@ -191,6 +191,19 @@ Frames are also dumped to hive-partitioned JSONL.zst under
 `config.toml` knob). Partitions never mix RTH with Globex or NQ with ES.
 Rebuild from `.scid`/`.depth` matches the M3a golden strict fingerprint.
 
+Live writes are **append-only** (concatenated zstd frames). Duplicate
+`(frame_second, root)` keys are suppressed in memory; session close
+`compact()` rewrites one sorted frame. A cold IO error is best-effort
+(`tracing::warn!`); SQLite persist, attention, and Capsules still complete.
+
+**Single-writer:** only the process that owns ingest writes the hive.
+Embedded MCP (`[sil].engine_mode = "embedded"`) attaches the dump store.
+`engine_mode = "external"` leaves dumps to `the-desk-engine`. Do not run
+both writers against the same root. Compact rewrites use a unique temp
+suffix (`frames.jsonl.zst.{pid}.{nanos}.tmp`). MCP `store=cold` reads are
+safe from either process — they construct a store at query time from
+`~/.the-desk/journal-frames`.
+
 The same four operators accept optional `store=hot` (default) or `store=cold`.
 Envelope fields, Trust Level L0, window/session/`N`/reliability contracts are
 unchanged. Events and ticks stay on SQLite; `query_raw` + `store=cold` +

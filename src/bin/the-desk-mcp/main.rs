@@ -193,11 +193,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         db_path.to_string_lossy().to_string(),
         Arc::clone(&runtime_events),
     );
-    server
-        .market_router
-        .set_cold_frame_store(the_desk_backend::engine::ColdFrameStore::new(
-            server.cold_frames_dir.clone(),
-        ));
     spawn_runtime_event_pruner(Arc::clone(&server.runtime_events), Arc::clone(&server.db));
     spawn_attention_periodic_pulse(
         Arc::clone(&server.pipelines),
@@ -236,6 +231,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // SIL-M2a: external engine mode — MCP is a thin adapter; do not own ingest.
     let external_engine = server.uses_external_engine();
+    if !external_engine {
+        // Single-writer: embedded MCP owns the cold root. External mode leaves
+        // dumps to `the-desk-engine` so two processes never share the hive.
+        server
+            .market_router
+            .set_cold_frame_store(the_desk_backend::engine::ColdFrameStore::new(
+                server.cold_frames_dir.clone(),
+            ));
+    }
     if external_engine {
         server.spawn_engine_adapter_refresh();
         server
@@ -303,10 +307,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             loop {
                 match router.poll_once(&mut providers, max_ticks) {
                     Ok(n) => {
-                        match db_es.lock() {
+                        let db_es = Arc::clone(&db_es);
+                        let persist_router = Arc::clone(&router);
+                        if let Err(err) = tokio::task::spawn_blocking(move || match db_es.lock() {
                             Ok(db) => {
-                                if let Err(err) = router.persist_journal(&db) {
-                                    tracing::warn!(error = %err, "market_router.journal_persist");
+                                if let Err(err) = persist_router.persist_journal(&db) {
+                                    tracing::warn!(
+                                        error = %err,
+                                        "market_router.journal_persist"
+                                    );
                                 }
                             }
                             Err(err) => {
@@ -315,6 +324,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     "market_router.journal_persist_lock"
                                 );
                             }
+                        })
+                        .await
+                        {
+                            tracing::warn!(
+                                error = %err,
+                                "market_router.journal_persist_join"
+                            );
                         }
                         if n > 0 {
                             continue;
@@ -1251,15 +1267,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 if ticks_this_poll > 0 {
-                    match db_bg.lock() {
+                    let db_persist = Arc::clone(&db_bg);
+                    let router_persist = Arc::clone(&market_router_bg);
+                    if let Err(err) = tokio::task::spawn_blocking(move || match db_persist.lock() {
                         Ok(db) => {
-                            if let Err(err) = market_router_bg.persist_journal(&db) {
+                            if let Err(err) = router_persist.persist_journal(&db) {
                                 tracing::warn!(error = %err, "scid.journal_persist");
                             }
                         }
                         Err(err) => {
                             tracing::warn!(error = %err, "scid.journal_persist_lock");
                         }
+                    })
+                    .await
+                    {
+                        tracing::warn!(error = %err, "scid.journal_persist_join");
                     }
                 }
 

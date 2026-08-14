@@ -11,11 +11,20 @@
 //!
 //! Layout:
 //! `{root}/trading_day=YYYY-MM-DD/session_type={RTH|Globex}/root={NQ|ES}/frames.jsonl.zst`
+//!
+//! The live write path is **append-only** (concatenated zstd frames) so
+//! `persist_journal` does not decode the day's partition on every poll.
+//! Duplicate `(frame_second, root)` keys are suppressed from an in-memory
+//! set (hydrated once per partition per process). Readers sort and keep
+//! first-write-wins. Session-close compaction rewrites a single sorted
+//! frame. SQLite remains the hot window — a cold IO error must not abort
+//! the persist cycle.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
-use std::io::Write;
+use std::fs::{self, OpenOptions};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -100,6 +109,9 @@ pub fn default_cold_frames_dir() -> PathBuf {
 #[derive(Debug, Clone)]
 pub struct ColdFrameStore {
     root: PathBuf,
+    /// Keys already on disk per partition. Shared across clones so persist
+    /// can clone the store out of the router mutex before filesystem IO.
+    seen: Arc<Mutex<SeenPartitions>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -108,6 +120,10 @@ struct ColdPartition {
     session_type: String,
     root_symbol: String,
 }
+
+type FrameKey = (i64, String);
+type PartitionKeys = BTreeSet<FrameKey>;
+type SeenPartitions = BTreeMap<ColdPartition, PartitionKeys>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -153,7 +169,10 @@ impl ColdFrameStore {
     /// Open (or create later on write) a store at `root`. Does not create the
     /// directory until the first upsert.
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            seen: Arc::new(Mutex::new(BTreeMap::new())),
+        }
     }
 
     /// Store root directory.
@@ -262,37 +281,73 @@ impl ColdFrameStore {
         Ok(rows)
     }
 
+    /// Rewrite each partition as one sorted zstd frame (session close).
+    ///
+    /// Live persist is append-only; this is the explicit merge step so a
+    /// later DuckDB/`read_json` scan sees a single compressed blob per hive
+    /// directory. Best-effort — readers already sort and first-write-wins.
+    pub fn compact(&self) -> Result<(), ColdFrameError> {
+        for part in self.list_partitions()? {
+            let mut rows = self.read_partition(&part)?;
+            rows.sort_by(|a, b| {
+                a.clock_ms
+                    .total_cmp(&b.clock_ms)
+                    .then_with(|| a.root_symbol.cmp(&b.root_symbol))
+                    .then_with(|| a.frame_second.cmp(&b.frame_second))
+            });
+            self.write_partition(&part, &rows)?;
+            self.remember_keys(
+                &part,
+                rows.iter()
+                    .map(|f| (f.frame_second, f.root_symbol.clone()))
+                    .collect(),
+            );
+        }
+        Ok(())
+    }
+
     fn upsert_partition(
         &self,
         part: &ColdPartition,
         incoming: &[&JournalFrameRecord],
     ) -> Result<usize, ColdFrameError> {
-        let mut existing = self.read_partition(part)?;
-        let mut seen: BTreeSet<(i64, String)> = existing
-            .iter()
-            .map(|f| (f.frame_second, f.root_symbol.clone()))
-            .collect();
-        let mut inserted = 0usize;
+        let mut seen = self.keys_for_partition(part)?;
+        let mut new_frames = Vec::new();
         for frame in incoming {
             let key = (frame.frame_second, frame.root_symbol.clone());
             if seen.contains(&key) {
                 continue;
             }
             seen.insert(key);
-            existing.push((*frame).clone());
-            inserted += 1;
+            new_frames.push((*frame).clone());
         }
-        if inserted == 0 && self.partition_path(part).exists() {
+        self.remember_keys(part, seen);
+        if new_frames.is_empty() {
             return Ok(0);
         }
-        existing.sort_by(|a, b| {
-            a.clock_ms
-                .total_cmp(&b.clock_ms)
-                .then_with(|| a.root_symbol.cmp(&b.root_symbol))
-                .then_with(|| a.frame_second.cmp(&b.frame_second))
-        });
-        self.write_partition(part, &existing)?;
-        Ok(inserted)
+        self.append_partition(part, &new_frames)?;
+        Ok(new_frames.len())
+    }
+
+    fn keys_for_partition(&self, part: &ColdPartition) -> Result<PartitionKeys, ColdFrameError> {
+        if let Ok(seen) = self.seen.lock() {
+            if let Some(keys) = seen.get(part) {
+                return Ok(keys.clone());
+            }
+        }
+        let keys: PartitionKeys = self
+            .read_partition(part)?
+            .into_iter()
+            .map(|f| (f.frame_second, f.root_symbol))
+            .collect();
+        self.remember_keys(part, keys.clone());
+        Ok(keys)
+    }
+
+    fn remember_keys(&self, part: &ColdPartition, keys: PartitionKeys) {
+        if let Ok(mut seen) = self.seen.lock() {
+            seen.insert(part.clone(), keys);
+        }
     }
 
     fn scan_window(
@@ -305,8 +360,12 @@ impl ColdFrameStore {
         if !self.root.exists() {
             return Ok(Vec::new());
         }
+        let (day_lo, day_hi) = trading_day_bounds(start_ms, end_ms);
         let mut out = Vec::new();
         for part in self.list_partitions()? {
+            if part.trading_day < day_lo || part.trading_day > day_hi {
+                continue;
+            }
             if let Some(root) = root_symbol {
                 if part.root_symbol != root {
                     continue;
@@ -407,10 +466,7 @@ impl ColdFrameStore {
             return Ok(Vec::new());
         }
         let compressed = fs::read(&path)?;
-        let raw = zstd::decode_all(compressed.as_slice())
-            .map_err(|e| ColdFrameError::Io(format!("zstd decode {}: {e}", path.display())))?;
-        let text = String::from_utf8(raw)
-            .map_err(|e| ColdFrameError::Invalid(format!("utf8 {}: {e}", path.display())))?;
+        let text = decode_concatenated_zstd(&path, &compressed)?;
         let mut rows = Vec::new();
         for (i, line) in text.lines().enumerate() {
             let line = line.trim();
@@ -442,18 +498,23 @@ impl ColdFrameStore {
             }
             rows.push(JournalFrameRecord::from(row));
         }
-        Ok(rows)
+        let mut first_wins: BTreeMap<(i64, String), JournalFrameRecord> = BTreeMap::new();
+        let mut ordered = Vec::new();
+        for row in rows {
+            let key = (row.frame_second, row.root_symbol.clone());
+            if first_wins.contains_key(&key) {
+                continue;
+            }
+            first_wins.insert(key, row.clone());
+            ordered.push(row);
+        }
+        Ok(ordered)
     }
 
-    fn write_partition(
-        &self,
+    fn encode_frames(
         part: &ColdPartition,
         frames: &[JournalFrameRecord],
-    ) -> Result<(), ColdFrameError> {
-        let path = self.partition_path(part);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
+    ) -> Result<Vec<u8>, ColdFrameError> {
         let mut jsonl = String::new();
         for frame in frames {
             if frame.session_type != part.session_type {
@@ -470,9 +531,37 @@ impl ColdFrameStore {
             jsonl.push_str(&serde_json::to_string(&row)?);
             jsonl.push('\n');
         }
-        let compressed = zstd::encode_all(jsonl.as_bytes(), COLD_FRAMES_ZSTD_LEVEL)
-            .map_err(|e| ColdFrameError::Io(format!("zstd encode: {e}")))?;
-        let tmp = path.with_file_name("frames.jsonl.zst.tmp");
+        zstd::encode_all(jsonl.as_bytes(), COLD_FRAMES_ZSTD_LEVEL)
+            .map_err(|e| ColdFrameError::Io(format!("zstd encode: {e}")))
+    }
+
+    fn append_partition(
+        &self,
+        part: &ColdPartition,
+        frames: &[JournalFrameRecord],
+    ) -> Result<(), ColdFrameError> {
+        let path = self.partition_path(part);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let compressed = Self::encode_frames(part, frames)?;
+        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+        file.write_all(&compressed)?;
+        file.sync_all()?;
+        Ok(())
+    }
+
+    fn write_partition(
+        &self,
+        part: &ColdPartition,
+        frames: &[JournalFrameRecord],
+    ) -> Result<(), ColdFrameError> {
+        let path = self.partition_path(part);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let compressed = Self::encode_frames(part, frames)?;
+        let tmp = partition_tmp_path(&path);
         {
             let mut file = fs::File::create(&tmp)?;
             file.write_all(&compressed)?;
@@ -608,6 +697,39 @@ fn hive_value(dir_name: &str, key: &str) -> Option<String> {
     dir_name.strip_prefix(&prefix).map(|s| s.to_string())
 }
 
+/// Inclusive `[day_lo, day_hi]` covering the clock window plus one calendar
+/// day of slack each side for the 18:00 ET Globex trading-day roll.
+fn trading_day_bounds(start_ms: f64, end_ms: f64) -> (String, String) {
+    const SLACK_MS: f64 = 86_400_000.0;
+    let lo = crate::trading_day_from_timestamp_ms((start_ms - SLACK_MS).max(0.0));
+    let hi = crate::trading_day_from_timestamp_ms(end_ms + SLACK_MS);
+    (lo, hi)
+}
+
+/// Decode concatenated zstd frames (append-only live writes).
+fn decode_concatenated_zstd(path: &Path, compressed: &[u8]) -> Result<String, ColdFrameError> {
+    let mut decoder = zstd::Decoder::new(compressed)
+        .map_err(|e| ColdFrameError::Io(format!("zstd decode {}: {e}", path.display())))?;
+    let mut raw = Vec::new();
+    decoder
+        .read_to_end(&mut raw)
+        .map_err(|e| ColdFrameError::Io(format!("zstd decode {}: {e}", path.display())))?;
+    String::from_utf8(raw)
+        .map_err(|e| ColdFrameError::Invalid(format!("utf8 {}: {e}", path.display())))
+}
+
+fn partition_tmp_path(path: &Path) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    path.with_file_name(format!(
+        "frames.jsonl.zst.{}.{}.tmp",
+        std::process::id(),
+        nanos
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -724,5 +846,84 @@ mod tests {
     fn unknown_store_label_fails_closed() {
         let err = FrameStoreKind::parse("duckdb").unwrap_err();
         assert!(err.to_string().contains("hot or cold"));
+    }
+
+    #[test]
+    fn duplicate_upsert_does_not_grow_the_partition_file() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let store = ColdFrameStore::new(dir.path());
+        let first = frame(1_704_207_600_000.0, "NQ", "RTH", "2024-01-02", 20_000.0);
+        assert_eq!(
+            store
+                .upsert_frames(std::slice::from_ref(&first))
+                .expect("first"),
+            1
+        );
+        let path = dir
+            .path()
+            .join("trading_day=2024-01-02")
+            .join("session_type=RTH")
+            .join("root=NQ")
+            .join(COLD_FRAMES_FILE_NAME);
+        let size = fs::metadata(&path).expect("meta").len();
+        assert_eq!(store.upsert_frames(&[first]).expect("dup"), 0);
+        assert_eq!(
+            fs::metadata(&path).expect("meta2").len(),
+            size,
+            "duplicate persist must not rewrite or append the partition"
+        );
+    }
+
+    #[test]
+    fn appended_seconds_are_all_readable_then_compact_preserves_them() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let store = ColdFrameStore::new(dir.path());
+        let first = frame(1_704_207_600_000.0, "NQ", "RTH", "2024-01-02", 20_000.0);
+        let second = frame(1_704_207_601_000.0, "NQ", "RTH", "2024-01-02", 20_000.25);
+        assert_eq!(store.upsert_frames(&[first]).expect("first"), 1);
+        assert_eq!(store.upsert_frames(&[second]).expect("second"), 1);
+        let path = dir
+            .path()
+            .join("trading_day=2024-01-02")
+            .join("session_type=RTH")
+            .join("root=NQ")
+            .join(COLD_FRAMES_FILE_NAME);
+        let appended = fs::metadata(&path).expect("meta").len();
+        let all = store.list_all().expect("all");
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].payload["lastPrice"], 20_000.0);
+        assert_eq!(all[1].payload["lastPrice"], 20_000.25);
+        store.compact().expect("compact");
+        let compacted = fs::metadata(&path).expect("meta2").len();
+        assert!(
+            compacted <= appended,
+            "compact must rewrite a single zstd frame, not grow the partition"
+        );
+        let after = store.list_all().expect("after compact");
+        assert_eq!(after.len(), 2);
+        assert_eq!(after[0].payload["lastPrice"], 20_000.0);
+        assert_eq!(after[1].payload["lastPrice"], 20_000.25);
+    }
+
+    #[test]
+    fn scan_window_skips_trading_days_outside_the_clock_window() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let store = ColdFrameStore::new(dir.path());
+        let rth = 1_704_207_600_000.0;
+        store
+            .upsert_frames(&[frame(rth, "NQ", "RTH", "2024-01-02", 20_000.0)])
+            .expect("upsert");
+        let junk = dir
+            .path()
+            .join("trading_day=2020-01-01")
+            .join("session_type=RTH")
+            .join("root=NQ");
+        fs::create_dir_all(&junk).expect("junk dir");
+        fs::write(junk.join(COLD_FRAMES_FILE_NAME), b"not-zstd").expect("junk file");
+        let rows = store
+            .list_in_window(rth, rth + 1_000.0, Some("NQ"), Some("RTH"), 100)
+            .expect("must not decode the 2020 partition");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].payload["lastPrice"], 20_000.0);
     }
 }

@@ -188,10 +188,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match router_bg.poll_once(&mut providers, max_ticks) {
             Ok(n) => {
                 if let Some(db) = journal_db.as_ref() {
-                    match db.lock() {
+                    let db = Arc::clone(db);
+                    let persist_router = Arc::clone(&router_bg);
+                    if let Err(err) = tokio::task::spawn_blocking(move || match db.lock() {
                         Ok(d) => {
-                            if let Err(err) = router_bg.persist_journal(&d) {
-                                tracing::warn!(error = %err, "the-desk-engine.journal_persist");
+                            if let Err(err) = persist_router.persist_journal(&d) {
+                                tracing::warn!(
+                                    error = %err,
+                                    "the-desk-engine.journal_persist"
+                                );
                             }
                         }
                         Err(err) => {
@@ -200,6 +205,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 "the-desk-engine.journal_persist_lock"
                             );
                         }
+                    })
+                    .await
+                    {
+                        tracing::warn!(
+                            error = %err,
+                            "the-desk-engine.journal_persist_join"
+                        );
                     }
                 }
                 if n > 0 {

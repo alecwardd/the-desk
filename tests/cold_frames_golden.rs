@@ -10,8 +10,10 @@ use tempfile::NamedTempFile;
 use the_desk_backend::db::Database;
 use the_desk_backend::engine::{
     ColdFrameStore, FileProvider, JournalFrameRead, MarketRouter, RouterRoot, SourceProvider,
-    SourceProviderKind,
+    SourceProviderKind, SourceTick, PENDING_JOURNAL_MAX_FRAMES,
 };
+use the_desk_backend::feed::TradeSide;
+use the_desk_backend::pipelines::MarketEvent;
 use the_desk_backend::research::query_kernel::{
     query_episodes_with, query_raw, query_raw_with, query_series, query_series_with,
     QueryEpisodesRequest, QueryRawRequest, QuerySeriesRequest, QueryWindow, FIELD_LAST_PRICE,
@@ -67,6 +69,18 @@ fn frame_fingerprint(payload: &Value) -> Value {
         "sessionHigh": payload.get("sessionHigh"),
         "sessionLow": payload.get("sessionLow"),
     })
+}
+
+fn tick(ts: f64, price: f64) -> SourceTick {
+    SourceTick {
+        timestamp_ms: ts,
+        price,
+        volume: 1.0,
+        bid: price - 0.25,
+        ask: price + 0.25,
+        side: TradeSide::Buy,
+        root_symbol: None,
+    }
 }
 
 fn persist_from_scid(
@@ -399,4 +413,100 @@ fn query_episodes_on_cold_frames_keeps_flagship_n_and_l0() {
     assert!(!cold.meta.order_authority);
     assert_eq!(hot.matches.len(), cold.matches.len());
     assert!(cold.matches[0].journal_backed);
+}
+
+#[test]
+fn repeated_persist_appends_at_most_once_per_frame_second() {
+    let nq = write_scid(&fixture_ticks(20_000.0, 0.0));
+    let es = write_scid(&fixture_ticks(5_000.0, 10.0));
+    let cold_dir = tempfile::tempdir().expect("cold");
+    let store = ColdFrameStore::new(cold_dir.path());
+    let db = Database::open(":memory:").expect("db");
+    let router = MarketRouter::new(RouterRoot::Nq, SourceProviderKind::File, "cold-repeat");
+    router.set_cold_frame_store(store);
+    let mut providers = std::collections::BTreeMap::new();
+    providers.insert(
+        RouterRoot::Nq,
+        Box::new(FileProvider::from_paths(nq.path(), vec![], 1.0)) as Box<dyn SourceProvider>,
+    );
+    providers.insert(
+        RouterRoot::Es,
+        Box::new(FileProvider::from_paths(es.path(), vec![], 1.0)) as Box<dyn SourceProvider>,
+    );
+    router.poll_once(&mut providers, 10_000).expect("poll");
+    let first = router.persist_journal(&db).expect("first");
+    assert!(first.cold_frames_written > 0);
+    let nq_path = cold_dir
+        .path()
+        .join("trading_day=2024-01-02")
+        .join("session_type=RTH")
+        .join("root=NQ")
+        .join("frames.jsonl.zst");
+    let size = std::fs::metadata(&nq_path).expect("meta").len();
+    let repeat = router.persist_journal(&db).expect("repeat");
+    assert_eq!(repeat.cold_frames_written, 0);
+    assert_eq!(
+        std::fs::metadata(&nq_path).expect("meta2").len(),
+        size,
+        "duplicate persist must not rewrite or append the partition"
+    );
+    router.apply_tick(RouterRoot::Nq, &tick(RTH_TS + 5_000.0, 20_001.0));
+    let next = router.persist_journal(&db).expect("next second");
+    assert!(next.cold_frames_written >= 1);
+    assert!(
+        std::fs::metadata(&nq_path).expect("meta3").len() > size,
+        "a new frame_second must append"
+    );
+}
+
+#[test]
+fn persist_journal_survives_unwritable_cold_store_and_bounds_pending() {
+    let db = Database::open(":memory:").expect("db");
+    let router = MarketRouter::new(RouterRoot::Nq, SourceProviderKind::File, "cold-fail");
+    let blocker = NamedTempFile::new().expect("file");
+    router.set_cold_frame_store(ColdFrameStore::new(blocker.path()));
+    router.apply_tick(RouterRoot::Nq, &tick(RTH_TS, 20_000.0));
+    router.note_transition_events(
+        RouterRoot::Nq,
+        &[MarketEvent {
+            session_date: "2024-01-02".into(),
+            timestamp_ms: RTH_TS + 100.0,
+            event_type: "ib_extension_hit".into(),
+            level_name: Some("ib_high".into()),
+            price: 20_000.25,
+            direction: Some("from_below".into()),
+            sequence_num: Some(1),
+            metadata: None,
+            session_type: "RTH".into(),
+            session_segment: "None".into(),
+            trading_day: "2024-01-02".into(),
+        }],
+    );
+    let stats = router
+        .persist_journal(&db)
+        .expect("hot persist must succeed when the cold dump fails");
+    assert_eq!(stats.cold_frames_written, 0);
+    assert!(stats.frames_written >= 1);
+    assert!(stats.events_written >= 1);
+    let signals = db
+        .query_attention_signals(&the_desk_backend::db::AttentionSignalQuery {
+            include_expired: true,
+            limit: 50,
+            ..the_desk_backend::db::AttentionSignalQuery::default()
+        })
+        .expect("attention");
+    assert!(
+        !signals.is_empty(),
+        "cold dump failure must not skip attention"
+    );
+    for i in 1..=8 {
+        router.apply_tick(RouterRoot::Nq, &tick(RTH_TS + i as f64 * 1_000.0, 20_000.0));
+        router.persist_journal(&db).expect("retry ok");
+    }
+    let pending = router.pending_journal_frame_count();
+    assert!(pending > 1, "failed cold dumps must re-queue frames");
+    assert!(
+        pending <= PENDING_JOURNAL_MAX_FRAMES,
+        "pending journal frames must stay bounded"
+    );
 }

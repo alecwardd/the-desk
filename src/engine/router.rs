@@ -39,6 +39,8 @@ use super::source::{SourceError, SourceHealth, SourceProvider, SourceProviderKin
 
 /// Bound in-memory transition-event queue when persist is delayed.
 const PENDING_JOURNAL_MAX_EVENTS: usize = 8_192;
+/// Bound in-memory Journal Frames waiting to persist (SQLite failure or cold retry).
+pub const PENDING_JOURNAL_MAX_FRAMES: usize = 8_192;
 /// Bound in-memory Capsules waiting for an after-window or a trigger row.
 const PENDING_CAPSULES_MAX: usize = 256;
 
@@ -179,7 +181,14 @@ impl MarketRouter {
     /// Mark lanes stopped and persist Journal Frames + Capsules (session/feed end).
     pub fn flush_journal_on_stop(&self, db: &Database) -> Result<JournalPersistStats, DbError> {
         self.mark_stopped();
-        self.persist_journal(db)
+        let stats = self.persist_journal(db)?;
+        let store = self.cold_frames.lock().ok().and_then(|slot| slot.clone());
+        if let Some(store) = store {
+            if let Err(err) = store.compact() {
+                tracing::warn!(error = %err, "market_router.cold_frame_compact");
+            }
+        }
+        Ok(stats)
     }
 
     /// Aligned clock: max market timestamp across lanes (epoch ms).
@@ -498,6 +507,9 @@ impl MarketRouter {
     }
 
     /// Persist queued Journal Frames + transition events (INSERT OR IGNORE).
+    ///
+    /// Cold dumps are best-effort: a filesystem error re-queues frames (bounded)
+    /// and this still returns `Ok` so attention and Capsules run.
     pub fn persist_journal(&self, db: &Database) -> Result<JournalPersistStats, DbError> {
         if !self.journal_enabled.load(Ordering::Acquire) {
             return Ok(JournalPersistStats::default());
@@ -515,16 +527,13 @@ impl MarketRouter {
             .unwrap_or_default();
         match persist_journal_observation(db, &frames, &events) {
             Ok(mut stats) => {
-                if let Ok(slot) = self.cold_frames.lock() {
-                    if let Some(store) = slot.as_ref() {
-                        match store.upsert_frames(&frames) {
-                            Ok(n) => stats.cold_frames_written = n,
-                            Err(err) => {
-                                self.restore_pending_frames(frames);
-                                return Err(DbError::InvalidQuery(format!(
-                                    "cold Journal Frame dump: {err}"
-                                )));
-                            }
+                let cold_store = self.cold_frames.lock().ok().and_then(|slot| slot.clone());
+                if let Some(store) = cold_store {
+                    match store.upsert_frames(&frames) {
+                        Ok(n) => stats.cold_frames_written = n,
+                        Err(err) => {
+                            tracing::warn!(error = %err, "market_router.cold_frame_dump");
+                            self.restore_pending_frames(frames);
                         }
                     }
                 }
@@ -762,7 +771,16 @@ impl MarketRouter {
                     pending.entry((frame.frame_second, root)).or_insert(frame);
                 }
             }
+            cap_pending_journal_map(&mut pending);
         }
+    }
+
+    /// Frames waiting to persist (tests / bounded-retry visibility).
+    pub fn pending_journal_frame_count(&self) -> usize {
+        self.pending_journal_frames
+            .lock()
+            .map(|g| g.len())
+            .unwrap_or(0)
     }
 
     fn advance_clock(&self, timestamp_ms: f64) {
@@ -786,6 +804,12 @@ impl MarketRouter {
                 Err(seen) => current = seen,
             }
         }
+    }
+}
+
+fn cap_pending_journal_map(pending: &mut BTreeMap<(i64, RouterRoot), JournalFrameRecord>) {
+    while pending.len() > PENDING_JOURNAL_MAX_FRAMES {
+        pending.pop_first();
     }
 }
 
@@ -1172,6 +1196,33 @@ mod tests {
         let stats = router.persist_journal(&db).expect("persist");
         assert!(stats.frames_written >= 2);
         assert!(db.count_journal_frames().expect("count") >= 2);
+    }
+
+    #[test]
+    fn pending_journal_frames_drop_oldest_past_cap() {
+        let mut pending = BTreeMap::new();
+        for i in 0..(PENDING_JOURNAL_MAX_FRAMES + 10) {
+            pending.insert(
+                (i as i64, RouterRoot::Nq),
+                JournalFrameRecord {
+                    clock_ms: i as f64 * 1_000.0,
+                    frame_second: i as i64,
+                    root_symbol: "NQ".into(),
+                    session_type: "RTH".into(),
+                    session_segment: "None".into(),
+                    trading_day: "2024-01-02".into(),
+                    payload: serde_json::json!({ "lastPrice": 20_000.0 }),
+                },
+            );
+        }
+        cap_pending_journal_map(&mut pending);
+        assert_eq!(pending.len(), PENDING_JOURNAL_MAX_FRAMES);
+        assert!(
+            !pending.contains_key(&(0, RouterRoot::Nq)),
+            "oldest keys must drop first"
+        );
+        assert!(pending.contains_key(&(10, RouterRoot::Nq)));
+        assert!(pending.contains_key(&((PENDING_JOURNAL_MAX_FRAMES + 9) as i64, RouterRoot::Nq)));
     }
 
     #[test]

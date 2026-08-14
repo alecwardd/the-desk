@@ -7796,6 +7796,29 @@ impl Database {
         )
     }
 
+    /// Positioning records with `as_of_ms <= as_of_ms`, oldest first (query kernel join).
+    pub fn list_positioning_records_as_of(
+        &self,
+        as_of_ms: f64,
+    ) -> Result<Vec<PositioningRecord>, DbError> {
+        if !as_of_ms.is_finite() || as_of_ms <= 0.0 {
+            return Err(DbError::InvalidQuery(
+                "asOf must be a positive finite epoch-milliseconds value".into(),
+            ));
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT payload FROM positioning_records
+             WHERE as_of_ms <= ?1
+             ORDER BY as_of_ms ASC, captured_at_ms ASC, updated_at_ms ASC",
+        )?;
+        let rows = stmt.query_map(params![as_of_ms], |row| row.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for payload in rows {
+            out.push(serde_json::from_str(&payload?)?);
+        }
+        Ok(out)
+    }
+
     fn load_positioning_record(
         &self,
         sql: &str,

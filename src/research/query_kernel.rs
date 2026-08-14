@@ -17,8 +17,8 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::catalog::{
-    build_catalog, DeskCatalog, FieldDescriptor, FrameRef, TrustCeiling, TrustLevel,
-    CATALOG_VERSION,
+    build_catalog, DeskCatalog, FieldDescriptor, FrameRef, PositioningRecord, TrustCeiling,
+    TrustLevel, CATALOG_VERSION,
 };
 use crate::db::{
     journal_frame_second_from_ts, Database, DbError, HypothesisSignalOutcomeRow,
@@ -60,6 +60,18 @@ pub const QUERY_EPISODES_MAX_FRAMES: usize = 500_000;
 
 /// Forward horizon for tick-driven MFE/MAE after an episode (15 minutes).
 pub const QUERY_FORWARD_HORIZON_MS: f64 = 15.0 * 60_000.0;
+
+/// Hard cap on ticks scanned for one episode's forward MFE/MAE.
+pub const QUERY_FORWARD_TICK_CAP: usize = 50_000;
+
+/// Page size for Episode Query / series scans (bounds peak memory).
+pub const QUERY_PAGE_MS: f64 = 30.0 * 60_000.0;
+
+/// Positioning as-of older than this relative to the episode clock is degraded.
+pub const POSITIONING_STALE_MS: f64 = 7.0 * 86_400_000.0;
+
+/// Max journal-backed windows inlined on a hypothesis summary.
+pub const HYPOTHESIS_EVIDENCE_WINDOW_CAP: usize = 50;
 
 /// Catalog field: ES/NQ last price.
 pub const FIELD_LAST_PRICE: &str = "market.location_structure.lastPrice";
@@ -346,6 +358,8 @@ pub struct ForwardReturn {
     pub entry_price: f64,
     pub horizon_ms: f64,
     pub source: String,
+    /// True when the forward tick scan hit `QUERY_FORWARD_TICK_CAP`.
+    pub truncated: bool,
 }
 
 /// One conjunctive Episode Query match.
@@ -360,6 +374,10 @@ pub struct EpisodeMatch {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub forward: Option<ForwardReturn>,
     pub journal_backed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub positioning_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub positioning_as_of_ms: Option<f64>,
 }
 
 /// Coverage of one predicate across scanned seconds.
@@ -546,14 +564,7 @@ fn resolve_session_type(
     requested: Option<&str>,
 ) -> Result<Option<String>, QueryKernelError> {
     if let Some(raw) = requested.map(str::trim).filter(|s| !s.is_empty()) {
-        let normalized = if raw.eq_ignore_ascii_case("rth") {
-            "RTH"
-        } else if raw.eq_ignore_ascii_case("globex") {
-            "Globex"
-        } else {
-            raw
-        };
-        return Ok(Some(normalized.to_string()));
+        return Ok(Some(normalize_session_label(raw)?.to_string()));
     }
     let types = db.list_journal_session_types_in_window(start_ms, end_ms)?;
     let distinct: BTreeSet<String> = types.into_iter().filter(|t| t != "Unknown").collect();
@@ -561,6 +572,40 @@ fn resolve_session_type(
         return Err(QueryKernelError::MixedSessionScope);
     }
     Ok(distinct.into_iter().next())
+}
+
+fn normalize_session_label(raw: &str) -> Result<&'static str, QueryKernelError> {
+    if raw.eq_ignore_ascii_case("rth") {
+        Ok("RTH")
+    } else if raw.eq_ignore_ascii_case("globex") {
+        Ok("Globex")
+    } else {
+        Err(QueryKernelError::Invalid(format!(
+            "sessionType `{raw}` is not RTH or Globex"
+        )))
+    }
+}
+
+fn session_label_for_timestamp(timestamp_ms: f64) -> Option<&'static str> {
+    let mins = crate::et_minutes_from_timestamp(timestamp_ms)?;
+    match crate::classify_session(mins) {
+        crate::SessionType::Rth => Some("RTH"),
+        crate::SessionType::Globex => Some("Globex"),
+        crate::SessionType::Unknown => Some("Unknown"),
+    }
+}
+
+fn event_matches_session(evt: &Value, session: Option<&str>) -> bool {
+    let Some(want) = session else {
+        return true;
+    };
+    if let Some(got) = evt.get("sessionType").and_then(|v| v.as_str()) {
+        return got.eq_ignore_ascii_case(want);
+    }
+    evt.get("timestampMs")
+        .and_then(|v| v.as_f64())
+        .and_then(session_label_for_timestamp)
+        .is_some_and(|got| got.eq_ignore_ascii_case(want))
 }
 
 fn resolve_catalog_field<'a>(
@@ -617,6 +662,15 @@ fn positioning_level_prices(record: &crate::catalog::PositioningRecord) -> Vec<f
     }
     out.retain(|p| p.is_finite());
     out
+}
+
+fn select_positioning(records: &[PositioningRecord], clock_ms: f64) -> Option<&PositioningRecord> {
+    let idx = records.partition_point(|r| r.as_of_ms <= clock_ms);
+    idx.checked_sub(1).map(|i| &records[i])
+}
+
+fn positioning_is_stale(record: &PositioningRecord, clock_ms: f64) -> bool {
+    clock_ms - record.as_of_ms > POSITIONING_STALE_MS
 }
 
 struct PredicateEval {
@@ -719,7 +773,7 @@ fn eval_predicate(
         let present = extract_field_value(payload, field, pred.path.as_deref()).is_some();
         return PredicateEval {
             matched: present,
-            available: present,
+            available: true,
             note: None,
         };
     }
@@ -828,15 +882,21 @@ fn tick_forward_return(
         None,
         Some(root_symbol),
         None,
-        50_000,
+        QUERY_FORWARD_TICK_CAP.saturating_add(1),
     )?;
     if ticks.is_empty() {
         return Ok(None);
     }
+    let truncated = ticks.len() > QUERY_FORWARD_TICK_CAP;
+    let used = if truncated {
+        &ticks[..QUERY_FORWARD_TICK_CAP]
+    } else {
+        ticks.as_slice()
+    };
     let mut mfe = 0.0_f64;
     let mut mae = 0.0_f64;
     let mut last = entry_price;
-    for tick in &ticks {
+    for tick in used {
         last = tick.price;
         let (fav, adv) = signed_excursion(direction, entry_price, tick.price);
         mfe = mfe.max(fav.max(0.0));
@@ -850,11 +910,12 @@ fn tick_forward_return(
         mfe_points: mfe,
         mae_points: mae,
         forward_return_points: forward,
-        tick_count: ticks.len(),
+        tick_count: used.len(),
         direction: direction.as_str().to_string(),
         entry_price,
         horizon_ms: QUERY_FORWARD_HORIZON_MS,
         source: "raw_ticks".into(),
+        truncated,
     }))
 }
 
@@ -992,42 +1053,17 @@ pub fn query_episodes(
 
     let population =
         db.count_journal_frames_in_window(start, end, None, session.as_deref())? as usize;
-    let frames = db.list_journal_frames_in_window(
-        start,
-        end,
-        None,
-        session.as_deref(),
-        QUERY_EPISODES_MAX_FRAMES,
-    )?;
-    let mut truncated = frames.len() < population;
-
-    let mut by_second: BTreeMap<i64, BTreeMap<String, JournalFrameRecord>> = BTreeMap::new();
-    for frame in frames {
-        by_second
-            .entry(frame.frame_second)
-            .or_default()
-            .insert(frame.root_symbol.clone(), frame);
-    }
-
-    let event_fetch = QUERY_EPISODES_MAX_FRAMES.saturating_add(1);
-    let events = db.list_market_events_in_window(start, end, None, None, event_fetch)?;
-    if events.len() > QUERY_EPISODES_MAX_FRAMES {
-        truncated = true;
-    }
-    let mut events_by_second: BTreeMap<i64, Vec<Value>> = BTreeMap::new();
-    for evt in events {
-        let second = evt
-            .get("journalFrameSecond")
-            .and_then(|v| v.as_i64())
-            .or_else(|| {
-                evt.get("timestampMs")
-                    .and_then(|v| v.as_f64())
-                    .and_then(journal_frame_second_from_ts)
-            });
-        if let Some(second) = second {
-            events_by_second.entry(second).or_default().push(evt);
-        }
-    }
+    let needs_events = req.predicates.iter().any(|p| {
+        p.event_type
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty())
+    });
+    let needs_positioning = req.predicates.iter().any(predicate_needs_positioning);
+    let positioning_records = if needs_positioning {
+        db.list_positioning_records_as_of(end)?
+    } else {
+        Vec::new()
+    };
 
     let mut coverage: Vec<PredicateCoverage> = req
         .predicates
@@ -1042,115 +1078,193 @@ pub fn query_episodes(
         .collect();
 
     let direction = parse_direction(req.forward_direction.as_deref());
-    let needs_positioning = req.predicates.iter().any(predicate_needs_positioning);
     let mut matches = Vec::new();
     let mut unavailable: BTreeSet<String> = BTreeSet::new();
     let mut any_missing_ticks = false;
     let mut any_missing_positioning = false;
+    let mut any_stale_positioning = false;
+    let mut any_partial_forward = false;
+    let mut truncated = false;
+    let mut scanned_seconds = 0usize;
+    let mut scanned_frames = 0usize;
+    let mut page_start = start;
 
-    for (second, roots) in &by_second {
-        let refs: BTreeMap<String, &JournalFrameRecord> =
-            roots.iter().map(|(k, v)| (k.clone(), v)).collect();
-        let clock = roots.values().map(|f| f.clock_ms).fold(0.0_f64, f64::max);
-        let (levels_owned, positioning_missing) = if needs_positioning {
-            let positioning = db.get_positioning_record_as_of(clock)?;
-            let missing = positioning.is_none();
-            (positioning.as_ref().map(positioning_level_prices), missing)
-        } else {
-            (None, false)
-        };
-        let levels = levels_owned.as_deref();
-        if positioning_missing {
-            any_missing_positioning = true;
-        }
-        let second_events = events_by_second.get(second).cloned().unwrap_or_default();
-
-        let mut all_match = true;
-        for (i, pred) in req.predicates.iter().enumerate() {
-            let eval = eval_predicate(pred, resolved_fields[i], &refs, &second_events, levels);
-            if eval.available {
-                coverage[i].available_seconds += 1;
-            } else {
-                coverage[i].missing_seconds += 1;
-                coverage[i].note = eval.note.clone();
-                unavailable.insert(pred.field.clone());
-                all_match = false;
-            }
-            if !eval.matched {
-                all_match = false;
-            }
-        }
-        if !all_match {
-            continue;
+    while page_start <= end
+        && matches.len() < QUERY_EPISODES_MAX_MATCHES
+        && scanned_frames < QUERY_EPISODES_MAX_FRAMES
+    {
+        let page_end = (page_start + QUERY_PAGE_MS).min(end);
+        let remain = QUERY_EPISODES_MAX_FRAMES.saturating_sub(scanned_frames);
+        let frames = db.list_journal_frames_in_window(
+            page_start,
+            page_end,
+            None,
+            session.as_deref(),
+            remain,
+        )?;
+        scanned_frames += frames.len();
+        if scanned_frames >= QUERY_EPISODES_MAX_FRAMES && page_end < end {
+            truncated = true;
         }
 
-        let sample = roots.values().next();
-        let mut values = BTreeMap::new();
-        for (root, frame) in roots {
-            if let Some(v) = frame.payload.get("lastPrice") {
-                values.insert(format!("{root}.{FIELD_LAST_PRICE}"), v.clone());
-            }
-            if let Some(v) = frame.payload.get("sessionDelta") {
-                values.insert(format!("{root}.{FIELD_SESSION_DELTA}"), v.clone());
-            }
+        let mut by_second: BTreeMap<i64, BTreeMap<String, JournalFrameRecord>> = BTreeMap::new();
+        for frame in frames {
+            by_second
+                .entry(frame.frame_second)
+                .or_default()
+                .insert(frame.root_symbol.clone(), frame);
         }
+        scanned_seconds += by_second.len();
 
-        let es_entry = roots
-            .get("ES")
-            .and_then(|f| f.payload.get("lastPrice"))
-            .and_then(as_f64)
-            .or_else(|| {
-                roots
-                    .values()
-                    .next()
-                    .and_then(|f| f.payload.get("lastPrice"))
-                    .and_then(as_f64)
-            });
-        let forward = if let Some(entry) = es_entry {
-            let root = if roots.contains_key("ES") {
-                "ES"
-            } else {
-                roots.keys().next().map(String::as_str).unwrap_or("NQ")
-            };
-            match tick_forward_return(db, entry, clock, root, direction)? {
-                Some(fwd) => Some(fwd),
-                None => {
-                    any_missing_ticks = true;
-                    None
+        let mut events_by_second: BTreeMap<i64, Vec<Value>> = BTreeMap::new();
+        if needs_events {
+            let event_cap = remain.saturating_add(1).min(10_000);
+            let mut events =
+                db.list_market_events_in_window(page_start, page_end, None, None, event_cap)?;
+            if events.len() >= event_cap {
+                truncated = true;
+                events.truncate(event_cap.saturating_sub(1).max(1));
+            }
+            for evt in events {
+                if !event_matches_session(&evt, session.as_deref()) {
+                    continue;
+                }
+                let second = evt
+                    .get("journalFrameSecond")
+                    .and_then(|v| v.as_i64())
+                    .or_else(|| {
+                        evt.get("timestampMs")
+                            .and_then(|v| v.as_f64())
+                            .and_then(journal_frame_second_from_ts)
+                    });
+                if let Some(second) = second {
+                    events_by_second.entry(second).or_default().push(evt);
                 }
             }
-        } else {
-            any_missing_ticks = true;
-            None
-        };
+        }
 
-        let frame_ref = FrameRef {
-            journal_frame_second: Some(*second),
-            root_symbol: Some(if roots.contains_key("ES") {
-                "ES".into()
+        for (second, roots) in &by_second {
+            let refs: BTreeMap<String, &JournalFrameRecord> =
+                roots.iter().map(|(k, v)| (k.clone(), v)).collect();
+            let clock = roots.values().map(|f| f.clock_ms).fold(0.0_f64, f64::max);
+            let selected = if needs_positioning {
+                select_positioning(&positioning_records, clock)
             } else {
-                roots.keys().next().cloned().unwrap_or_else(|| "NQ".into())
-            }),
-        };
-        matches.push(EpisodeMatch {
-            clock_ms: clock,
-            frame_ref,
-            session_type: sample
-                .map(|f| f.session_type.clone())
-                .unwrap_or_else(|| "Unknown".into()),
-            trading_day: sample.map(|f| f.trading_day.clone()).unwrap_or_default(),
-            values,
-            forward,
-            journal_backed: true,
-        });
-        if matches.len() >= QUERY_EPISODES_MAX_MATCHES {
-            truncated = true;
+                None
+            };
+            let levels_owned = selected.map(positioning_level_prices);
+            let levels = levels_owned.as_deref();
+            if needs_positioning && selected.is_none() {
+                any_missing_positioning = true;
+            }
+            if selected.is_some_and(|r| positioning_is_stale(r, clock)) {
+                any_stale_positioning = true;
+            }
+            let second_events = events_by_second.get(second).cloned().unwrap_or_default();
+
+            let mut all_match = true;
+            for (i, pred) in req.predicates.iter().enumerate() {
+                let eval = eval_predicate(pred, resolved_fields[i], &refs, &second_events, levels);
+                if eval.available {
+                    coverage[i].available_seconds += 1;
+                } else {
+                    coverage[i].missing_seconds += 1;
+                    coverage[i].note = eval.note.clone();
+                    unavailable.insert(pred.field.clone());
+                    all_match = false;
+                }
+                if !eval.matched {
+                    all_match = false;
+                }
+            }
+            if !all_match {
+                continue;
+            }
+
+            let sample = roots.values().next();
+            let mut values = BTreeMap::new();
+            for (root, frame) in roots {
+                if let Some(v) = frame.payload.get("lastPrice") {
+                    values.insert(format!("{root}.{FIELD_LAST_PRICE}"), v.clone());
+                }
+                if let Some(v) = frame.payload.get("sessionDelta") {
+                    values.insert(format!("{root}.{FIELD_SESSION_DELTA}"), v.clone());
+                }
+            }
+
+            let es_entry = roots
+                .get("ES")
+                .and_then(|f| f.payload.get("lastPrice"))
+                .and_then(as_f64)
+                .or_else(|| {
+                    roots
+                        .values()
+                        .next()
+                        .and_then(|f| f.payload.get("lastPrice"))
+                        .and_then(as_f64)
+                });
+            let forward = if let Some(entry) = es_entry {
+                let root = if roots.contains_key("ES") {
+                    "ES"
+                } else {
+                    roots.keys().next().map(String::as_str).unwrap_or("NQ")
+                };
+                match tick_forward_return(db, entry, clock, root, direction)? {
+                    Some(fwd) => {
+                        if fwd.truncated {
+                            any_partial_forward = true;
+                        }
+                        Some(fwd)
+                    }
+                    None => {
+                        any_missing_ticks = true;
+                        None
+                    }
+                }
+            } else {
+                any_missing_ticks = true;
+                None
+            };
+
+            let frame_ref = FrameRef {
+                journal_frame_second: Some(*second),
+                root_symbol: Some(if roots.contains_key("ES") {
+                    "ES".into()
+                } else {
+                    roots.keys().next().cloned().unwrap_or_else(|| "NQ".into())
+                }),
+            };
+            matches.push(EpisodeMatch {
+                clock_ms: clock,
+                frame_ref,
+                session_type: sample
+                    .map(|f| f.session_type.clone())
+                    .unwrap_or_else(|| "Unknown".into()),
+                trading_day: sample.map(|f| f.trading_day.clone()).unwrap_or_default(),
+                values,
+                forward,
+                journal_backed: true,
+                positioning_id: selected.map(|r| r.id.clone()),
+                positioning_as_of_ms: selected.map(|r| r.as_of_ms),
+            });
+            if matches.len() >= QUERY_EPISODES_MAX_MATCHES {
+                truncated = true;
+                break;
+            }
+        }
+
+        if page_end >= end {
             break;
         }
+        page_start = page_end + 1.0;
+    }
+
+    if scanned_frames < population && population > QUERY_EPISODES_MAX_FRAMES {
+        truncated = true;
     }
 
     let n = matches.len();
-    let mut meta = QueryResultMeta::new(n, population, scanned_seconds(&by_second));
+    let mut meta = QueryResultMeta::new(n, population, scanned_seconds);
     meta.scope = session;
     meta.unavailable_fields = unavailable.into_iter().collect();
     if coverage.iter().any(|c| c.missing_seconds > 0) || any_missing_positioning {
@@ -1160,12 +1274,24 @@ pub fn query_episodes(
                 .into(),
         );
     }
+    if any_stale_positioning {
+        meta.degraded = true;
+        meta.notes.push(format!(
+            "Positioning as-of is older than {POSITIONING_STALE_MS} ms before the episode clock (Levels-Only Record still applied; not live vendor data)"
+        ));
+    }
     if any_missing_ticks {
         meta.degraded = true;
         meta.notes.push(
             "tick-driven MFE/MAE unavailable for some matches (no raw_ticks in the forward horizon; no fill simulator)"
                 .into(),
         );
+    }
+    if any_partial_forward {
+        meta.degraded = true;
+        meta.notes.push(format!(
+            "tick-driven MFE/MAE truncated at {QUERY_FORWARD_TICK_CAP} ticks; forward horizon is partial"
+        ));
     }
     if matches.iter().any(|m| m.forward.is_none()) {
         meta.degraded = true;
@@ -1181,10 +1307,6 @@ pub fn query_episodes(
         predicate_coverage: coverage,
         meta,
     })
-}
-
-fn scanned_seconds(by_second: &BTreeMap<i64, BTreeMap<String, JournalFrameRecord>>) -> usize {
-    by_second.len()
 }
 
 /// Hard-capped raw read of journal frames, events, or ticks.
@@ -1205,96 +1327,122 @@ pub fn query_raw(db: &Database, req: &QueryRawRequest) -> Result<QueryRawResult,
             "query_raw limit must be at least 1".into(),
         ));
     }
-    let root = req
-        .window
-        .symbols
-        .as_ref()
-        .and_then(|s| s.first())
-        .map(String::as_str);
+    let roots: Vec<Option<String>> = match &req.window.symbols {
+        Some(syms) if !syms.is_empty() => syms.iter().cloned().map(Some).collect(),
+        _ => vec![None],
+    };
 
-    let (rows, population, truncated) = match source {
+    let mut rows = Vec::new();
+    let mut population = 0usize;
+    let mut truncated = false;
+    match source {
         "journal_frames" => {
-            let population =
-                db.count_journal_frames_in_window(start, end, root, session.as_deref())? as usize;
-            let frames =
-                db.list_journal_frames_in_window(start, end, root, session.as_deref(), cap)?;
-            let truncated = frames.len() < population;
-            let rows: Vec<RawRow> = frames
-                .into_iter()
-                .map(|f| RawRow {
-                    timestamp_ms: f.clock_ms,
-                    root_symbol: Some(f.root_symbol),
-                    payload: f.payload,
-                })
-                .collect();
-            (rows, population, truncated)
+            for root in &roots {
+                let root_ref = root.as_deref();
+                population +=
+                    db.count_journal_frames_in_window(start, end, root_ref, session.as_deref())?
+                        as usize;
+                let frames = db.list_journal_frames_in_window(
+                    start,
+                    end,
+                    root_ref,
+                    session.as_deref(),
+                    cap.saturating_add(1),
+                )?;
+                for f in frames {
+                    rows.push(RawRow {
+                        timestamp_ms: f.clock_ms,
+                        root_symbol: Some(f.root_symbol),
+                        payload: f.payload,
+                    });
+                }
+            }
         }
         "events" => {
-            let fetch = cap.saturating_add(1);
-            let mut events = db.list_market_events_in_window(start, end, root, None, fetch)?;
-            let truncated = events.len() > cap;
-            if truncated {
-                events.truncate(cap);
+            for root in &roots {
+                let fetch = cap.saturating_add(1);
+                let events =
+                    db.list_market_events_in_window(start, end, root.as_deref(), None, fetch)?;
+                if events.len() > cap {
+                    truncated = true;
+                }
+                for evt in events {
+                    if !event_matches_session(&evt, session.as_deref()) {
+                        continue;
+                    }
+                    rows.push(RawRow {
+                        timestamp_ms: evt
+                            .get("timestampMs")
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(0.0),
+                        root_symbol: evt
+                            .get("rootSymbol")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string),
+                        payload: evt,
+                    });
+                }
             }
-            let n = events.len();
-            let population = if truncated { n.saturating_add(1) } else { n };
-            let rows = events
-                .into_iter()
-                .map(|evt| RawRow {
-                    timestamp_ms: evt
-                        .get("timestampMs")
-                        .and_then(|v| v.as_f64())
-                        .unwrap_or(0.0),
-                    root_symbol: evt
-                        .get("rootSymbol")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string),
-                    payload: evt,
-                })
-                .collect();
-            (rows, population, truncated)
+            population = rows.len();
         }
         "ticks" => {
-            let fetch = cap.saturating_add(1);
-            let mut ticks = db.query_ticks_filtered_scoped(
-                Some(start),
-                Some(end),
-                None,
-                None,
-                None,
-                root,
-                None,
-                fetch,
-            )?;
-            let truncated = ticks.len() > cap;
-            if truncated {
-                ticks.truncate(cap);
+            for root in &roots {
+                let fetch = cap.saturating_add(1);
+                let ticks = db.query_ticks_filtered_scoped(
+                    Some(start),
+                    Some(end),
+                    None,
+                    None,
+                    None,
+                    root.as_deref(),
+                    None,
+                    fetch,
+                )?;
+                if ticks.len() > cap {
+                    truncated = true;
+                }
+                for t in ticks {
+                    if let Some(want) = session.as_deref() {
+                        if session_label_for_timestamp(t.timestamp_ms) != Some(want) {
+                            continue;
+                        }
+                    }
+                    rows.push(RawRow {
+                        timestamp_ms: t.timestamp_ms,
+                        root_symbol: t.root_symbol,
+                        payload: serde_json::json!({
+                            "price": t.price,
+                            "volume": t.volume,
+                            "bid": t.bid,
+                            "ask": t.ask,
+                            "isBuy": t.is_buy,
+                            "sessionDate": t.session_date,
+                        }),
+                    });
+                }
             }
-            let n = ticks.len();
-            let population = if truncated { n.saturating_add(1) } else { n };
-            let rows = ticks
-                .into_iter()
-                .map(|t| RawRow {
-                    timestamp_ms: t.timestamp_ms,
-                    root_symbol: t.root_symbol,
-                    payload: serde_json::json!({
-                        "price": t.price,
-                        "volume": t.volume,
-                        "bid": t.bid,
-                        "ask": t.ask,
-                        "isBuy": t.is_buy,
-                        "sessionDate": t.session_date,
-                    }),
-                })
-                .collect();
-            (rows, population, truncated)
+            population = rows.len();
         }
         other => return Err(QueryKernelError::UnknownRawSource(other.to_string())),
-    };
+    }
+
+    rows.sort_by(|a, b| {
+        a.timestamp_ms
+            .partial_cmp(&b.timestamp_ms)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.root_symbol.cmp(&b.root_symbol))
+    });
+    if rows.len() > cap {
+        rows.truncate(cap);
+        truncated = true;
+    }
+    if source == "journal_frames" && rows.len() < population {
+        truncated = true;
+    }
 
     let n = rows.len();
     let mut meta = QueryResultMeta::new(n, population, n);
-    meta.scope = session;
+    meta.scope = session.clone();
     if truncated {
         meta.mark_truncated(format!(
             "query_raw truncated at {cap} rows (hard cap {QUERY_RAW_MAX_ROWS}); use run_job for the artifact handle"
@@ -1347,24 +1495,25 @@ fn json_cell(v: &Value) -> String {
     }
 }
 
-/// Run a query asynchronously-shaped: persist a job id and write a columnar artifact.
+/// Compute a research job's artifacts (read-only against SQLite).
 ///
-/// The MCP response is the handle + summary, never the full row set.
-pub fn run_job(
+/// Does not upsert the job row — the MCP path inserts `queued` on the writer,
+/// runs this on the read pool, then persists `completed`/`error`.
+pub fn execute_research_job(
     db: &Database,
     kind: QueryKind,
     request: &Value,
     artifact_dir: &Path,
-    now_ms: f64,
+    _now_ms: f64,
+    job_id: &str,
 ) -> Result<RunJobResult, QueryKernelError> {
-    let job_id = format!("rq-{}", Uuid::new_v4());
     fs::create_dir_all(artifact_dir)?;
-    let job_dir = artifact_dir.join(&job_id);
+    let job_dir = artifact_dir.join(job_id);
     fs::create_dir_all(&job_dir)?;
     let columnar_path = job_dir.join("columns.csv");
     let summary_path = job_dir.join("summary.json");
 
-    let (meta, summary, csv_header, csv_rows, window) = match kind {
+    let (meta, summary, csv_header, csv_rows) = match kind {
         QueryKind::Series => {
             let req: QuerySeriesRequest = serde_json::from_value(request.clone())
                 .map_err(|e| QueryKernelError::Invalid(e.to_string()))?;
@@ -1400,13 +1549,7 @@ pub fn run_job(
                 "truncated": result.meta.truncated,
                 "notes": result.meta.notes,
             });
-            (
-                result.meta,
-                summary,
-                header,
-                rows,
-                (req.window.start_ms, req.window.end_ms),
-            )
+            (result.meta, summary, header, rows)
         }
         QueryKind::Episodes => {
             let req: QueryEpisodesRequest = serde_json::from_value(request.clone())
@@ -1457,13 +1600,7 @@ pub fn run_job(
                 "predicateCoverage": result.predicate_coverage,
                 "notes": result.meta.notes,
             });
-            (
-                result.meta,
-                summary,
-                header,
-                rows,
-                (req.window.start_ms, req.window.end_ms),
-            )
+            (result.meta, summary, header, rows)
         }
         QueryKind::Raw => {
             let req: QueryRawRequest = serde_json::from_value(request.clone())
@@ -1491,13 +1628,7 @@ pub fn run_job(
                 "truncated": result.meta.truncated,
                 "notes": result.meta.notes,
             });
-            (
-                result.meta,
-                summary,
-                header,
-                rows,
-                (req.window.start_ms, req.window.end_ms),
-            )
+            (result.meta, summary, header, rows)
         }
     };
 
@@ -1517,29 +1648,8 @@ pub fn run_job(
         serde_json::to_vec_pretty(&summary_doc).unwrap_or_default(),
     )?;
 
-    let record = ResearchQueryJobRecord {
-        id: job_id.clone(),
-        kind: kind.as_str().to_string(),
-        status: "completed".into(),
-        submitted_at_ms: now_ms,
-        started_at_ms: Some(now_ms),
-        finished_at_ms: Some(now_ms),
-        window_start_ms: window.0,
-        window_end_ms: window.1,
-        request: request.clone(),
-        summary: Some(summary.clone()),
-        artifact_dir: Some(job_dir.to_string_lossy().to_string()),
-        columnar_path: Some(columnar_path.to_string_lossy().to_string()),
-        summary_path: Some(summary_path.to_string_lossy().to_string()),
-        sample_size: Some(meta.sample_size as i64),
-        reliability_tier: Some(format!("{:?}", meta.reliability_tier).to_ascii_lowercase()),
-        degraded: meta.degraded,
-        error: None,
-    };
-    db.upsert_research_query_job(&record)?;
-
     Ok(RunJobResult {
-        job_id,
+        job_id: job_id.to_string(),
         status: "completed".into(),
         kind,
         artifact: ArtifactHandle {
@@ -1554,33 +1664,229 @@ pub fn run_job(
     })
 }
 
+/// Queued job row written on the writer before compute (MCP `run_job`).
+pub fn queued_research_job_record(
+    job_id: &str,
+    kind: QueryKind,
+    request: &Value,
+    now_ms: f64,
+) -> ResearchQueryJobRecord {
+    let (start, end) = window_from_request(request);
+    ResearchQueryJobRecord {
+        id: job_id.to_string(),
+        kind: kind.as_str().to_string(),
+        status: "queued".into(),
+        submitted_at_ms: now_ms,
+        started_at_ms: None,
+        finished_at_ms: None,
+        window_start_ms: start,
+        window_end_ms: end,
+        request: request.clone(),
+        summary: None,
+        artifact_dir: None,
+        columnar_path: None,
+        summary_path: None,
+        sample_size: None,
+        reliability_tier: None,
+        degraded: false,
+        error: None,
+    }
+}
+
+/// Persist a completed or failed research query job on the writer connection.
+pub fn persist_research_job(
+    db: &Database,
+    result: &RunJobResult,
+    request: &Value,
+    now_ms: f64,
+    error: Option<String>,
+) -> Result<(), QueryKernelError> {
+    let (start, end) = window_from_request(request);
+    let status = if error.is_some() {
+        "error"
+    } else {
+        result.status.as_str()
+    };
+    let record = ResearchQueryJobRecord {
+        id: result.job_id.clone(),
+        kind: result.kind.as_str().to_string(),
+        status: status.into(),
+        submitted_at_ms: now_ms,
+        started_at_ms: Some(now_ms),
+        finished_at_ms: Some(now_ms),
+        window_start_ms: start,
+        window_end_ms: end,
+        request: request.clone(),
+        summary: Some(result.artifact.summary.clone()),
+        artifact_dir: Path::new(&result.artifact.columnar_path)
+            .parent()
+            .map(|p| p.to_string_lossy().to_string()),
+        columnar_path: Some(result.artifact.columnar_path.clone()),
+        summary_path: Some(result.artifact.summary_path.clone()),
+        sample_size: Some(result.meta.sample_size as i64),
+        reliability_tier: Some(format!("{:?}", result.meta.reliability_tier).to_ascii_lowercase()),
+        degraded: result.meta.degraded,
+        error,
+    };
+    db.upsert_research_query_job(&record)?;
+    Ok(())
+}
+
+fn window_from_request(request: &Value) -> (Option<f64>, Option<f64>) {
+    (
+        request.get("startMs").and_then(|v| v.as_f64()),
+        request.get("endMs").and_then(|v| v.as_f64()),
+    )
+}
+
+/// Allocate a research query job id (`rq-<uuid>`).
+pub fn new_research_job_id() -> String {
+    format!("rq-{}", Uuid::new_v4())
+}
+
+/// Empty handle used when persist-on-error has no artifact.
+pub fn failed_research_job_result(job_id: String, kind: QueryKind) -> RunJobResult {
+    let mut meta = QueryResultMeta::new(0, 0, 0);
+    meta.degraded = true;
+    RunJobResult {
+        job_id,
+        status: "error".into(),
+        kind,
+        artifact: ArtifactHandle {
+            columnar_path: String::new(),
+            summary_path: String::new(),
+            summary: serde_json::json!({}),
+        },
+        meta,
+        trust_level: TrustLevel::L0,
+        mutation_authority: false,
+        order_authority: false,
+    }
+}
+
+/// Run a query, write artifacts, and persist the job row (writable DB, tests / CLI).
+///
+/// The MCP tool inserts `queued` first, computes on the read pool via
+/// [`execute_research_job`], then persists `completed` so the returned handle
+/// is populated. A separate poll operator is out of scope for M3c.
+pub fn run_job(
+    db: &Database,
+    kind: QueryKind,
+    request: &Value,
+    artifact_dir: &Path,
+    now_ms: f64,
+) -> Result<RunJobResult, QueryKernelError> {
+    let job_id = new_research_job_id();
+    db.upsert_research_query_job(&queued_research_job_record(&job_id, kind, request, now_ms))?;
+    match execute_research_job(db, kind, request, artifact_dir, now_ms, &job_id) {
+        Ok(result) => {
+            persist_research_job(db, &result, request, now_ms, None)?;
+            Ok(result)
+        }
+        Err(e) => {
+            let failed = failed_research_job_result(job_id, kind);
+            let _ = persist_research_job(db, &failed, request, now_ms, Some(e.to_string()));
+            Err(e)
+        }
+    }
+}
+
 /// Cite Journal Frames for hypothesis / research fires (`frame_ref` join).
+///
+/// Rootless outcome rows are not attributed to NQ. Returns at most
+/// [`HYPOTHESIS_EVIDENCE_WINDOW_CAP`] windows; the bool is `true` when the
+/// input was truncated.
 pub fn journal_backed_evidence_windows(
     db: &Database,
     rows: &[HypothesisSignalOutcomeRow],
-) -> Result<Vec<JournalBackedEvidenceWindow>, QueryKernelError> {
-    let mut out = Vec::with_capacity(rows.len());
-    for row in rows {
-        let root = row.root_symbol.as_deref().unwrap_or("NQ");
-        let second = journal_frame_second_from_ts(row.fired_at_ms);
-        let frames = if let Some(second) = second {
-            db.list_journal_frames_for_capsule(root, second, second)?
-        } else {
-            Vec::new()
+) -> Result<(Vec<JournalBackedEvidenceWindow>, bool), QueryKernelError> {
+    let truncated = rows.len() > HYPOTHESIS_EVIDENCE_WINDOW_CAP;
+    let slice = if truncated {
+        &rows[..HYPOTHESIS_EVIDENCE_WINDOW_CAP]
+    } else {
+        rows
+    };
+    if slice.is_empty() {
+        return Ok((Vec::new(), truncated));
+    }
+
+    let mut by_root: BTreeMap<String, (i64, i64)> = BTreeMap::new();
+    for row in slice {
+        let Some(root) = row
+            .root_symbol
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
         };
-        let frame = frames.first();
+        let Some(second) = journal_frame_second_from_ts(row.fired_at_ms) else {
+            continue;
+        };
+        let entry = by_root.entry(root.to_string()).or_insert((second, second));
+        entry.0 = entry.0.min(second);
+        entry.1 = entry.1.max(second);
+    }
+
+    let mut frames: Vec<JournalFrameRecord> = Vec::new();
+    for (root, (lo, hi)) in &by_root {
+        frames.extend(db.list_journal_frames_for_capsule(root, *lo, *hi)?);
+    }
+    let mut meta_by_key: BTreeMap<(String, i64), (String, String)> = BTreeMap::new();
+    for frame in &frames {
+        meta_by_key.insert(
+            (frame.root_symbol.clone(), frame.frame_second),
+            (frame.trading_day.clone(), frame.session_type.clone()),
+        );
+    }
+
+    let mut out = Vec::with_capacity(slice.len());
+    for row in slice {
+        let root = row
+            .root_symbol
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let second = journal_frame_second_from_ts(row.fired_at_ms);
+        let Some(root) = root else {
+            out.push(JournalBackedEvidenceWindow {
+                fired_at_ms: row.fired_at_ms,
+                frame_ref: FrameRef {
+                    journal_frame_second: second,
+                    root_symbol: None,
+                },
+                journal_backed: false,
+                trading_day: None,
+                session_type: None,
+            });
+            continue;
+        };
+        let Some(second) = second else {
+            out.push(JournalBackedEvidenceWindow {
+                fired_at_ms: row.fired_at_ms,
+                frame_ref: FrameRef {
+                    journal_frame_second: None,
+                    root_symbol: Some(root.to_string()),
+                },
+                journal_backed: false,
+                trading_day: None,
+                session_type: None,
+            });
+            continue;
+        };
+        let meta = meta_by_key.get(&(root.to_string(), second));
         out.push(JournalBackedEvidenceWindow {
             fired_at_ms: row.fired_at_ms,
             frame_ref: FrameRef {
-                journal_frame_second: second,
+                journal_frame_second: Some(second),
                 root_symbol: Some(root.to_string()),
             },
-            journal_backed: frame.is_some(),
-            trading_day: frame.map(|f| f.trading_day.clone()),
-            session_type: frame.map(|f| f.session_type.clone()),
+            journal_backed: meta.is_some(),
+            trading_day: meta.map(|(day, _)| day.clone()),
+            session_type: meta.map(|(_, session)| session.clone()),
         });
     }
-    Ok(out)
+    Ok((out, truncated))
 }
 
 /// L0 envelope fields shared by MCP tool responses.
@@ -1679,7 +1985,7 @@ mod tests {
             id: Some("pos-flagship".into()),
             record_kind: Some(LEVELS_ONLY_RECORD_KIND.into()),
             completeness: Some(LEVELS_ONLY_RECORD_KIND.into()),
-            trading_day: Some(FLAGSHIP_TRADING_DAY.into()),
+            trading_day: None,
             captured_at_ms: Some(as_of_ms),
             as_of_ms: Some(as_of_ms),
             derived_levels: Some(levels),
@@ -1832,7 +2138,9 @@ mod tests {
         assert!((fwd.forward_return_points - FLAGSHIP_FORWARD).abs() < 1e-9);
         assert_eq!(fwd.tick_count, 3);
         assert_eq!(fwd.direction, "short");
+        assert!(!fwd.truncated);
         assert_eq!(result.predicate_coverage.len(), 5);
+        assert_eq!(m.positioning_id.as_deref(), Some("pos-flagship"));
     }
 
     #[test]
@@ -2130,13 +2438,316 @@ mod tests {
             exit_price: None,
             outcome_quality: "verified".into(),
         };
-        let windows = journal_backed_evidence_windows(&db, &[row]).expect("windows");
+        let (windows, truncated) = journal_backed_evidence_windows(&db, &[row]).expect("windows");
+        assert!(!truncated);
         assert_eq!(windows.len(), 1);
         assert!(windows[0].journal_backed);
         assert_eq!(
             windows[0].frame_ref.journal_frame_second,
             journal_frame_second_from_ts(FLAGSHIP_CLOCK_MS)
         );
+        assert_eq!(windows[0].frame_ref.root_symbol.as_deref(), Some("NQ"));
         assert_eq!(windows[0].session_type.as_deref(), Some("RTH"));
+    }
+
+    fn outcome_row(fired_at_ms: f64, root: Option<&str>) -> HypothesisSignalOutcomeRow {
+        HypothesisSignalOutcomeRow {
+            signal_id: format!("sig-{fired_at_ms}"),
+            setup_id: "hyp_test_v1".into(),
+            setup_name: Some("test".into()),
+            session_date: FLAGSHIP_TRADING_DAY.into(),
+            session_type: Some("RTH".into()),
+            day_type: None,
+            rvol_bucket_at_fire: None,
+            fired_at_ms,
+            fired_price: FLAGSHIP_NQ_PRICE,
+            target_price: None,
+            stop_price: None,
+            outcome: "target_hit".into(),
+            max_favorable_excursion: Some(10.0),
+            max_adverse_excursion: Some(1.0),
+            r_result: Some(1.0),
+            time_to_outcome_ms: Some(1_000.0),
+            root_symbol: root.map(str::to_string),
+            contract_symbol: None,
+            direction: Some("long".into()),
+            entry_price: Some(FLAGSHIP_NQ_PRICE),
+            risk_points: Some(8.0),
+            exit_price: None,
+            outcome_quality: "verified".into(),
+        }
+    }
+
+    #[test]
+    fn rootless_evidence_windows_are_not_attributed_to_nq() {
+        let db = test_db();
+        seed_flagship_frames(&db);
+        let (windows, truncated) =
+            journal_backed_evidence_windows(&db, &[outcome_row(FLAGSHIP_CLOCK_MS, None)])
+                .expect("windows");
+        assert!(!truncated);
+        assert_eq!(windows.len(), 1);
+        assert!(!windows[0].journal_backed);
+        assert_eq!(windows[0].frame_ref.root_symbol, None);
+    }
+
+    #[test]
+    fn evidence_windows_are_hard_capped() {
+        let db = test_db();
+        seed_flagship_frames(&db);
+        let rows: Vec<_> = (0..=HYPOTHESIS_EVIDENCE_WINDOW_CAP)
+            .map(|i| outcome_row(FLAGSHIP_CLOCK_MS + i as f64, Some("NQ")))
+            .collect();
+        assert_eq!(rows.len(), HYPOTHESIS_EVIDENCE_WINDOW_CAP + 1);
+        let (windows, truncated) = journal_backed_evidence_windows(&db, &rows).expect("windows");
+        assert!(truncated);
+        assert_eq!(windows.len(), HYPOTHESIS_EVIDENCE_WINDOW_CAP);
+    }
+
+    #[test]
+    fn exists_predicate_is_available_when_the_field_is_absent() {
+        let db = test_db();
+        let clock = FLAGSHIP_CLOCK_MS;
+        db.insert_journal_frames(&[frame(
+            clock,
+            "ES",
+            "RTH",
+            serde_json::json!({ "sessionDelta": -1.0, "rootSymbol": "ES" }),
+        )])
+        .expect("frames");
+        db.insert_raw_tick_with_contract(
+            clock + 1_000.0,
+            FLAGSHIP_ES_PRICE,
+            1.0,
+            FLAGSHIP_ES_PRICE - 0.25,
+            FLAGSHIP_ES_PRICE + 0.25,
+            true,
+            FLAGSHIP_TRADING_DAY,
+            Some("ES"),
+            Some("ESH24.CME"),
+        )
+        .expect("tick");
+        let result = query_episodes(
+            &db,
+            &QueryEpisodesRequest {
+                window: QueryWindow {
+                    start_ms: Some(clock),
+                    end_ms: Some(clock + 1_000.0),
+                    session_type: Some("RTH".into()),
+                    symbols: None,
+                },
+                predicates: vec![CatalogPredicate {
+                    id: Some("hasLastPrice".into()),
+                    symbol: Some("ES".into()),
+                    field: FIELD_LAST_PRICE.into(),
+                    op: PredicateOp::Exists,
+                    value: None,
+                    path: None,
+                    tolerance_ticks: None,
+                    event_type: None,
+                }],
+                forward_direction: Some("short".into()),
+            },
+        )
+        .expect("episodes");
+        assert!(
+            result.matches.is_empty(),
+            "absent lastPrice must not match Exists"
+        );
+        assert_eq!(result.predicate_coverage[0].available_seconds, 1);
+        assert_eq!(result.predicate_coverage[0].missing_seconds, 0);
+        assert!(
+            !result.meta.degraded,
+            "Exists on an absent field is available=false-match, not unavailable"
+        );
+    }
+
+    #[test]
+    fn unknown_session_type_is_rejected() {
+        let db = test_db();
+        let err = query_episodes(
+            &db,
+            &QueryEpisodesRequest {
+                window: QueryWindow {
+                    start_ms: Some(FLAGSHIP_CLOCK_MS),
+                    end_ms: Some(FLAGSHIP_CLOCK_MS + 1_000.0),
+                    session_type: Some("Overnight".into()),
+                    symbols: None,
+                },
+                predicates: flagship_episode_predicates(),
+                forward_direction: None,
+            },
+        )
+        .unwrap_err();
+        match err {
+            QueryKernelError::Invalid(msg) => {
+                assert!(
+                    msg.contains("RTH") && msg.contains("Globex"),
+                    "rejection must name allowed session types, got {msg}"
+                );
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stale_positioning_is_applied_and_degraded() {
+        let db = test_db();
+        let clock = FLAGSHIP_CLOCK_MS;
+        db.insert_journal_frames(&[
+            frame(clock, "ES", "RTH", matching_es_payload()),
+            frame(clock, "NQ", "RTH", matching_nq_payload()),
+        ])
+        .expect("frames");
+        seed_positioning(&db, clock - POSITIONING_STALE_MS - 1.0);
+        db.insert_raw_tick_with_contract(
+            clock + 1_000.0,
+            FLAGSHIP_ES_PRICE - 1.0,
+            1.0,
+            FLAGSHIP_ES_PRICE - 1.25,
+            FLAGSHIP_ES_PRICE - 0.75,
+            false,
+            FLAGSHIP_TRADING_DAY,
+            Some("ES"),
+            Some("ESH24.CME"),
+        )
+        .expect("tick");
+        let result = query_episodes(&db, &flagship_request(clock, clock + 1_000.0, "RTH"))
+            .expect("episodes");
+        assert_eq!(result.matches.len(), FLAGSHIP_MATCHING_SECONDS);
+        assert_eq!(
+            result.matches[0].positioning_id.as_deref(),
+            Some("pos-flagship")
+        );
+        assert!(result.meta.degraded);
+        assert!(result
+            .meta
+            .notes
+            .iter()
+            .any(|n| n.to_ascii_lowercase().contains("older than")));
+    }
+
+    #[test]
+    fn query_raw_scans_all_requested_roots_and_applies_session_scope() {
+        let db = test_db();
+        seed_flagship_frames(&db);
+        let nq_only = query_raw(
+            &db,
+            &QueryRawRequest {
+                window: QueryWindow {
+                    start_ms: Some(FLAGSHIP_CLOCK_MS),
+                    end_ms: Some(FLAGSHIP_CLOCK_MS + 2_000.0),
+                    session_type: Some("RTH".into()),
+                    symbols: Some(vec!["NQ".into()]),
+                },
+                source: "journal_frames".into(),
+                limit: Some(QUERY_RAW_MAX_ROWS),
+            },
+        )
+        .expect("nq");
+        assert_eq!(nq_only.rows.len(), 2);
+        assert!(nq_only
+            .rows
+            .iter()
+            .all(|r| r.root_symbol.as_deref() == Some("NQ")));
+
+        let both = query_raw(
+            &db,
+            &QueryRawRequest {
+                window: QueryWindow {
+                    start_ms: Some(FLAGSHIP_CLOCK_MS),
+                    end_ms: Some(FLAGSHIP_CLOCK_MS + 2_000.0),
+                    session_type: Some("RTH".into()),
+                    symbols: Some(vec!["NQ".into(), "ES".into()]),
+                },
+                source: "journal_frames".into(),
+                limit: Some(QUERY_RAW_MAX_ROWS),
+            },
+        )
+        .expect("both");
+        assert_eq!(both.rows.len(), 4);
+
+        let globex_tick_ms = FLAGSHIP_CLOCK_MS - 8.0 * 3_600_000.0;
+        db.insert_raw_tick_with_contract(
+            globex_tick_ms,
+            FLAGSHIP_ES_PRICE,
+            1.0,
+            FLAGSHIP_ES_PRICE - 0.25,
+            FLAGSHIP_ES_PRICE + 0.25,
+            true,
+            FLAGSHIP_TRADING_DAY,
+            Some("ES"),
+            Some("ESH24.CME"),
+        )
+        .expect("globex tick");
+        let globex_as_rth = query_raw(
+            &db,
+            &QueryRawRequest {
+                window: QueryWindow {
+                    start_ms: Some(globex_tick_ms),
+                    end_ms: Some(globex_tick_ms + 60_000.0),
+                    session_type: Some("RTH".into()),
+                    symbols: Some(vec!["ES".into()]),
+                },
+                source: "ticks".into(),
+                limit: Some(QUERY_RAW_MAX_ROWS),
+            },
+        )
+        .expect("globex-as-rth");
+        assert!(
+            globex_as_rth.rows.is_empty(),
+            "Globex-clock ticks must be excluded when sessionType=RTH"
+        );
+        let rth_ticks = query_raw(
+            &db,
+            &QueryRawRequest {
+                window: QueryWindow {
+                    start_ms: Some(FLAGSHIP_CLOCK_MS),
+                    end_ms: Some(FLAGSHIP_CLOCK_MS + 4_000.0),
+                    session_type: Some("RTH".into()),
+                    symbols: Some(vec!["ES".into()]),
+                },
+                source: "ticks".into(),
+                limit: Some(QUERY_RAW_MAX_ROWS),
+            },
+        )
+        .expect("rth ticks");
+        assert_eq!(rth_ticks.rows.len(), 3);
+    }
+
+    #[test]
+    fn forward_mfe_mae_sets_truncated_when_tick_cap_is_hit() {
+        let db = test_db();
+        let clock = FLAGSHIP_CLOCK_MS;
+        db.insert_journal_frames(&[
+            frame(clock, "ES", "RTH", matching_es_payload()),
+            frame(clock, "NQ", "RTH", matching_nq_payload()),
+        ])
+        .expect("frames");
+        seed_positioning(&db, clock);
+        let mut ticks = Vec::with_capacity(QUERY_FORWARD_TICK_CAP + 2);
+        for i in 0..(QUERY_FORWARD_TICK_CAP + 2) {
+            let ts = clock + 1.0 + i as f64;
+            ticks.push((
+                ts,
+                FLAGSHIP_ES_PRICE - 0.25,
+                1.0,
+                FLAGSHIP_ES_PRICE - 0.50,
+                FLAGSHIP_ES_PRICE,
+                false,
+                FLAGSHIP_TRADING_DAY.to_string(),
+                "ES".to_string(),
+                "ESH24.CME".to_string(),
+            ));
+        }
+        db.insert_raw_ticks_batch(&ticks).expect("tick cap fixture");
+        let result = query_episodes(&db, &flagship_request(clock, clock + 1_000.0, "RTH"))
+            .expect("episodes");
+        assert_eq!(result.matches.len(), 1);
+        let fwd = result.matches[0].forward.as_ref().expect("forward");
+        assert!(fwd.truncated);
+        assert_eq!(fwd.tick_count, QUERY_FORWARD_TICK_CAP);
+        assert!(result.meta.degraded);
+        assert!(result.meta.notes.iter().any(|n| n.contains("truncated")));
     }
 }

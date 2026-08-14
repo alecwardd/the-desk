@@ -395,9 +395,12 @@ impl TheDeskMcp {
             ),
             fields: params.fields.unwrap_or_default(),
         };
-        let db = self.db.lock().map_err(|_| lock_error())?;
-        let result = the_desk_backend::research::query_kernel::query_series(&db, &req)
-            .map_err(query_kernel_error)?;
+        let result = self
+            .with_read_db(move |db| {
+                the_desk_backend::research::query_kernel::query_series(db, &req)
+                    .map_err(query_kernel_error)
+            })
+            .await?;
         Ok(text_result(merge_l0(
             serde_json::to_value(&result).unwrap_or_default(),
         )))
@@ -421,9 +424,12 @@ impl TheDeskMcp {
             predicates,
             forward_direction: params.forward_direction,
         };
-        let db = self.db.lock().map_err(|_| lock_error())?;
-        let result = the_desk_backend::research::query_kernel::query_episodes(&db, &req)
-            .map_err(query_kernel_error)?;
+        let result = self
+            .with_read_db(move |db| {
+                the_desk_backend::research::query_kernel::query_episodes(db, &req)
+                    .map_err(query_kernel_error)
+            })
+            .await?;
         Ok(text_result(merge_l0(
             serde_json::to_value(&result).unwrap_or_default(),
         )))
@@ -446,9 +452,12 @@ impl TheDeskMcp {
             source: params.source.unwrap_or_else(|| "journal_frames".into()),
             limit: params.limit.map(|n| n as usize),
         };
-        let db = self.db.lock().map_err(|_| lock_error())?;
-        let result = the_desk_backend::research::query_kernel::query_raw(&db, &req)
-            .map_err(query_kernel_error)?;
+        let result = self
+            .with_read_db(move |db| {
+                the_desk_backend::research::query_kernel::query_raw(db, &req)
+                    .map_err(query_kernel_error)
+            })
+            .await?;
         Ok(text_result(merge_l0(
             serde_json::to_value(&result).unwrap_or_default(),
         )))
@@ -509,21 +518,63 @@ impl TheDeskMcp {
                 .unwrap_or_default()
             }
         };
-        let artifact_dir =
-            the_desk_backend::research::query_kernel::default_research_artifact_dir();
+        let job_id = the_desk_backend::research::query_kernel::new_research_job_id();
         let now_ms = chrono::Utc::now().timestamp_millis() as f64;
-        let db = self.db.lock().map_err(|_| lock_error())?;
-        let result = the_desk_backend::research::query_kernel::run_job(
-            &db,
-            kind,
-            &request,
-            &artifact_dir,
-            now_ms,
-        )
-        .map_err(query_kernel_error)?;
-        Ok(text_result(merge_l0(
-            serde_json::to_value(&result).unwrap_or_default(),
-        )))
+        {
+            let db = self.db.lock().map_err(|_| lock_error())?;
+            db.upsert_research_query_job(
+                &the_desk_backend::research::query_kernel::queued_research_job_record(
+                    &job_id, kind, &request, now_ms,
+                ),
+            )
+            .map_err(db_error)?;
+        }
+        let artifact_dir = self.research_artifact_dir.clone();
+        let request_for_exec = request.clone();
+        let job_id_for_exec = job_id.clone();
+        let exec = self
+            .with_read_db(move |db| {
+                the_desk_backend::research::query_kernel::execute_research_job(
+                    db,
+                    kind,
+                    &request_for_exec,
+                    &artifact_dir,
+                    now_ms,
+                    &job_id_for_exec,
+                )
+                .map_err(query_kernel_error)
+            })
+            .await;
+        match exec {
+            Ok(result) => {
+                {
+                    let db = self.db.lock().map_err(|_| lock_error())?;
+                    the_desk_backend::research::query_kernel::persist_research_job(
+                        &db, &result, &request, now_ms, None,
+                    )
+                    .map_err(query_kernel_error)?;
+                }
+                Ok(text_result(merge_l0(
+                    serde_json::to_value(&result).unwrap_or_default(),
+                )))
+            }
+            Err(e) => {
+                if let Ok(db) = self.db.lock() {
+                    let failed =
+                        the_desk_backend::research::query_kernel::failed_research_job_result(
+                            job_id, kind,
+                        );
+                    let _ = the_desk_backend::research::query_kernel::persist_research_job(
+                        &db,
+                        &failed,
+                        &request,
+                        now_ms,
+                        Some(e.to_string()),
+                    );
+                }
+                Err(e)
+            }
+        }
     }
 }
 

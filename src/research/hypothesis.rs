@@ -642,8 +642,9 @@ pub fn summarize_hypothesis_run(
     let rows = db
         .list_hypothesis_signal_outcomes(setup_id, job_id, Some(&scope))
         .map_err(|e| e.to_string())?;
-    let evidence_windows = super::query_kernel::journal_backed_evidence_windows(db, &rows)
-        .map_err(|e| e.to_string())?;
+    let (evidence_windows, evidence_truncated) =
+        super::query_kernel::journal_backed_evidence_windows(db, &rows)
+            .map_err(|e| e.to_string())?;
     summarize_rows(
         setup_id,
         job_id,
@@ -651,6 +652,7 @@ pub fn summarize_hypothesis_run(
         rows,
         run_engine_version,
         evidence_windows,
+        evidence_truncated,
     )
 }
 
@@ -661,6 +663,7 @@ fn summarize_rows(
     rows: Vec<HypothesisSignalOutcomeRow>,
     engine_version: serde_json::Value,
     evidence_windows: Vec<super::query_kernel::JournalBackedEvidenceWindow>,
+    evidence_truncated: bool,
 ) -> Result<HypothesisRunSummary, String> {
     let r_points = r_points(setup);
     let total = rows.len();
@@ -760,6 +763,12 @@ fn summarize_rows(
             "over_firing: {signals_per_active_session:.1} signals per active session \
              ({total} signals over {active_session_count} sessions, threshold {CHATTY_SIGNALS_PER_SESSION:.0}) \
              — likely re-firing on a sticky state flag rather than a discrete entry; tighten conditions or raise duplicateSuppressionMs."
+        ));
+    }
+    if evidence_truncated {
+        warnings.push(format!(
+            "evidence_windows truncated at {} (use query_episodes / run_job for bulk journal-backed windows)",
+            super::query_kernel::HYPOTHESIS_EVIDENCE_WINDOW_CAP
         ));
     }
 
@@ -1070,6 +1079,7 @@ mod tests {
             rows_over_sessions(&["2026-01-05", "2026-01-06"], 6),
             current_engine_version(),
             Vec::new(),
+            false,
         )
         .unwrap();
         assert_eq!(chatty.active_session_count, 2);
@@ -1085,6 +1095,7 @@ mod tests {
             rows_over_sessions(&["2026-01-05", "2026-01-06"], 2),
             current_engine_version(),
             Vec::new(),
+            false,
         )
         .unwrap();
         assert!(!calm.chatty);

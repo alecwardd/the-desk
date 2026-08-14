@@ -10,6 +10,7 @@
 //! here reaches order placement.
 
 pub mod capsule;
+pub mod cold_frames;
 pub mod config;
 pub mod health;
 pub mod host;
@@ -23,6 +24,10 @@ pub mod source;
 pub use crate::catalog::EngineMode;
 pub use capsule::{
     capsule_window_bounds, CAPSULE_AFTER_MS, CAPSULE_LOOKBACK_MS, CAPSULE_RING_STEP_MS,
+};
+pub use cold_frames::{
+    default_cold_frames_dir, ColdFrameError, ColdFrameStore, FrameStoreKind, JournalFrameRead,
+    COLD_FRAMES_FORMAT, COLD_FRAMES_ZSTD_LEVEL,
 };
 pub use config::{default_engine_database_path, load_engine_bind_addr, ENGINE_DEFAULT_BIND};
 pub use health::{EngineHealth, FeedStallState};

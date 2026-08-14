@@ -16,8 +16,9 @@ use std::time::Duration;
 
 use the_desk_backend::db::Database;
 use the_desk_backend::engine::{
-    default_engine_database_path, load_engine_bind_addr, EngineSocketServer, FileProvider,
-    MarketRouter, RouterRoot, SourceProvider, SourceProviderKind, ENGINE_DEFAULT_BIND,
+    default_cold_frames_dir, default_engine_database_path, load_engine_bind_addr, ColdFrameStore,
+    EngineSocketServer, FileProvider, MarketRouter, RouterRoot, SourceProvider, SourceProviderKind,
+    ENGINE_DEFAULT_BIND,
 };
 use the_desk_backend::feed::{load_feed_config, resolve_contract_metadata};
 use the_desk_backend::observability::{init_logging, load_logging_config};
@@ -110,6 +111,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         SourceProviderKind::File,
         "external",
     ));
+    router.set_cold_frame_store(ColdFrameStore::new(default_cold_frames_dir()));
     router.set_contract_metadata(
         RouterRoot::Nq,
         resolve_contract_metadata(&{

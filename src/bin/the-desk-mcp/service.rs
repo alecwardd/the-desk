@@ -141,6 +141,7 @@ impl TheDeskMcp {
             market_router,
             research_artifact_dir:
                 the_desk_backend::research::query_kernel::default_research_artifact_dir(),
+            cold_frames_dir: the_desk_backend::engine::default_cold_frames_dir(),
         }
     }
 

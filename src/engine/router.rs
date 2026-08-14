@@ -25,6 +25,7 @@ use super::capsule::{
     compact_capsule_sample, event_may_open_capsule, should_open_capsule, snapshot_session_type,
     CapsuleRing, PendingCapsule,
 };
+use super::cold_frames::ColdFrameStore;
 
 use super::health::{EngineHealth, FeedStallState};
 use super::host::{EngineHost, IngestOutcome};
@@ -56,6 +57,9 @@ pub struct MarketRouter {
     journal_second_clock: Mutex<BTreeMap<i64, f64>>,
     capsule_rings: Mutex<BTreeMap<RouterRoot, CapsuleRing>>,
     pending_capsules: Mutex<Vec<PendingCapsule>>,
+    /// Optional SIL-M3d cold dump target. `None` in unit tests that only
+    /// exercise the SQLite hot window.
+    cold_frames: Mutex<Option<ColdFrameStore>>,
 }
 
 impl MarketRouter {
@@ -81,6 +85,7 @@ impl MarketRouter {
             journal_second_clock: Mutex::new(BTreeMap::new()),
             capsule_rings: Mutex::new(BTreeMap::new()),
             pending_capsules: Mutex::new(Vec::new()),
+            cold_frames: Mutex::new(None),
         }
     }
 
@@ -123,6 +128,7 @@ impl MarketRouter {
             journal_second_clock: Mutex::new(BTreeMap::new()),
             capsule_rings: Mutex::new(BTreeMap::new()),
             pending_capsules: Mutex::new(Vec::new()),
+            cold_frames: Mutex::new(None),
         }
     }
 
@@ -152,6 +158,13 @@ impl MarketRouter {
     /// Queue Journal Frames / transition rows. Off when the host has no journal sink.
     pub fn set_journal_enabled(&self, enabled: bool) {
         self.journal_enabled.store(enabled, Ordering::Release);
+    }
+
+    /// Attach the SIL-M3d cold dump store. Hot SQLite writes continue regardless.
+    pub fn set_cold_frame_store(&self, store: ColdFrameStore) {
+        if let Ok(mut slot) = self.cold_frames.lock() {
+            *slot = Some(store);
+        }
     }
 
     pub fn set_contract_metadata(&self, root: RouterRoot, metadata: ContractMetadata) {
@@ -502,6 +515,19 @@ impl MarketRouter {
             .unwrap_or_default();
         match persist_journal_observation(db, &frames, &events) {
             Ok(mut stats) => {
+                if let Ok(slot) = self.cold_frames.lock() {
+                    if let Some(store) = slot.as_ref() {
+                        match store.upsert_frames(&frames) {
+                            Ok(n) => stats.cold_frames_written = n,
+                            Err(err) => {
+                                self.restore_pending_frames(frames);
+                                return Err(DbError::InvalidQuery(format!(
+                                    "cold Journal Frame dump: {err}"
+                                )));
+                            }
+                        }
+                    }
+                }
                 let clock = self.clock_ms().unwrap_or(0.0);
                 if clock > 0.0 {
                     if let Err(err) = db.expire_event_lifecycles(clock, EVENT_LIFECYCLE_TTL_MS) {
@@ -721,17 +747,21 @@ impl MarketRouter {
         frames: Vec<JournalFrameRecord>,
         events: Vec<(RouterRoot, MarketEvent)>,
     ) {
+        self.restore_pending_frames(frames);
+        if let Ok(mut pending) = self.pending_journal_events.lock() {
+            let mut restored = events;
+            restored.append(&mut *pending);
+            *pending = restored;
+        }
+    }
+
+    fn restore_pending_frames(&self, frames: Vec<JournalFrameRecord>) {
         if let Ok(mut pending) = self.pending_journal_frames.lock() {
             for frame in frames {
                 if let Ok(root) = RouterRoot::parse(&frame.root_symbol) {
                     pending.entry((frame.frame_second, root)).or_insert(frame);
                 }
             }
-        }
-        if let Ok(mut pending) = self.pending_journal_events.lock() {
-            let mut restored = events;
-            restored.append(&mut *pending);
-            *pending = restored;
         }
     }
 

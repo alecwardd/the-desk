@@ -81,6 +81,8 @@ pub(crate) struct QuerySeriesParams {
     pub(crate) session_type: Option<String>,
     pub(crate) symbols: Option<Vec<String>>,
     pub(crate) fields: Option<Vec<String>>,
+    /// `hot` (SQLite window, default) | `cold` (session-partitioned dumps).
+    pub(crate) store: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -92,6 +94,8 @@ pub(crate) struct QueryEpisodesParams {
     pub(crate) symbols: Option<Vec<String>>,
     pub(crate) predicates: Option<Vec<CatalogPredicateParams>>,
     pub(crate) forward_direction: Option<String>,
+    /// `hot` (SQLite window, default) | `cold` (session-partitioned dumps).
+    pub(crate) store: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -104,6 +108,8 @@ pub(crate) struct QueryRawParams {
     /// `journal_frames` | `events` | `ticks`.
     pub(crate) source: Option<String>,
     pub(crate) limit: Option<u64>,
+    /// `hot` (SQLite window, default) | `cold` (session-partitioned dumps).
+    pub(crate) store: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -120,6 +126,8 @@ pub(crate) struct RunJobParams {
     pub(crate) forward_direction: Option<String>,
     pub(crate) source: Option<String>,
     pub(crate) limit: Option<u64>,
+    /// `hot` (SQLite window, default) | `cold` (session-partitioned dumps).
+    pub(crate) store: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]

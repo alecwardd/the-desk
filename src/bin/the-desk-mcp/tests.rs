@@ -2010,6 +2010,7 @@ async fn query_episodes_flagship_is_expressible_and_l0() {
                 symbols: Some(vec!["NQ".into(), "ES".into()]),
                 predicates: Some(predicates),
                 forward_direction: Some("short".into()),
+                store: None,
             }))
             .await
             .expect("query_episodes"),
@@ -2188,6 +2189,95 @@ async fn run_job_returns_artifact_handle_not_rows() {
     );
     assert!(out.get("points").is_none());
     assert_eq!(out["meta"]["n"], 1);
+}
+
+#[tokio::test]
+async fn query_series_store_cold_keeps_l0_and_rejects_unknown_store() {
+    use the_desk_backend::db::JournalFrameRecord;
+    use the_desk_backend::engine::ColdFrameStore;
+
+    let mut server = test_server_with_sil();
+    let cold_dir = tempfile::tempdir().expect("cold");
+    server.cold_frames_dir = cold_dir.path().to_path_buf();
+    let clock = 1_704_207_600_000.0;
+    let second = the_desk_backend::db::journal_frame_second_from_ts(clock).unwrap();
+    let frame = JournalFrameRecord {
+        clock_ms: clock,
+        frame_second: second,
+        root_symbol: "NQ".into(),
+        session_type: "RTH".into(),
+        session_segment: "None".into(),
+        trading_day: "2024-01-02".into(),
+        payload: serde_json::json!({
+            "lastPrice": 20000.0,
+            "rootSymbol": "NQ",
+            "sessionType": "RTH"
+        }),
+    };
+    ColdFrameStore::new(cold_dir.path())
+        .upsert_frames(&[frame])
+        .expect("cold upsert");
+
+    let cold = parse_text_tool_result(
+        server
+            .query_series(Parameters(QuerySeriesParams {
+                start_ms: Some(clock),
+                end_ms: Some(clock + 1_000.0),
+                session_type: Some("RTH".into()),
+                symbols: Some(vec!["NQ".into()]),
+                fields: Some(vec!["market.location_structure.lastPrice".into()]),
+                store: Some("cold".into()),
+            }))
+            .await
+            .expect("query_series store=cold"),
+    );
+    assert_eq!(cold["trustLevel"], "L0");
+    assert_eq!(cold["mutationAuthority"], false);
+    assert_eq!(cold["orderAuthority"], false);
+    assert_eq!(cold["meta"]["n"], 1);
+    assert_eq!(cold["meta"]["reliabilityTier"], "insufficient");
+    assert!(
+        cold["meta"]["notes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|n| n.as_str().unwrap_or("").contains("cold")),
+        "cold path must note the store without changing L0 fields: {cold}"
+    );
+
+    let hot = parse_text_tool_result(
+        server
+            .query_series(Parameters(QuerySeriesParams {
+                start_ms: Some(clock),
+                end_ms: Some(clock + 1_000.0),
+                session_type: Some("RTH".into()),
+                symbols: Some(vec!["NQ".into()]),
+                fields: Some(vec!["market.location_structure.lastPrice".into()]),
+                store: None,
+            }))
+            .await
+            .expect("query_series default hot"),
+    );
+    assert_eq!(
+        hot["meta"]["n"], 0,
+        "default hot path must not silently read cold dumps"
+    );
+
+    let err = server
+        .query_series(Parameters(QuerySeriesParams {
+            start_ms: Some(clock),
+            end_ms: Some(clock + 1_000.0),
+            session_type: Some("RTH".into()),
+            symbols: Some(vec!["NQ".into()]),
+            fields: Some(vec!["market.location_structure.lastPrice".into()]),
+            store: Some("duckdb".into()),
+        }))
+        .await
+        .expect_err("unknown store");
+    assert!(
+        err.to_string().contains("hot or cold"),
+        "unknown store must fail closed, got {err}"
+    );
 }
 
 #[tokio::test]

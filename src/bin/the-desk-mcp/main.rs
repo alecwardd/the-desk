@@ -193,6 +193,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         db_path.to_string_lossy().to_string(),
         Arc::clone(&runtime_events),
     );
+    server
+        .market_router
+        .set_cold_frame_store(the_desk_backend::engine::ColdFrameStore::new(
+            server.cold_frames_dir.clone(),
+        ));
     spawn_runtime_event_pruner(Arc::clone(&server.runtime_events), Arc::clone(&server.db));
     spawn_attention_periodic_pulse(
         Arc::clone(&server.pipelines),

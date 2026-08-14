@@ -447,6 +447,8 @@ pub struct TheDeskMcp {
     pub(crate) market_router: std::sync::Arc<the_desk_backend::engine::MarketRouter>,
     /// Directory for `run_job` columnar artifacts (tests override to a TempDir).
     pub(crate) research_artifact_dir: PathBuf,
+    /// SIL-M3d cold Journal Frame dump root (tests override to a TempDir).
+    pub(crate) cold_frames_dir: PathBuf,
 }
 
 #[derive(Debug)]

@@ -107,19 +107,17 @@ fn main() {
         eprintln!("failed to create temp dir {}: {e}", root.display());
         process::exit(1);
     }
-    let db_path = root.join("bench.db");
-    let hive_path = root.join("journal-frames");
-    let db = match Database::open(db_path.to_string_lossy().as_ref()) {
-        Ok(db) => db,
-        Err(e) => {
-            eprintln!("open bench db: {e}");
-            process::exit(1);
-        }
-    };
-    let (dataset, hive) = if args.golden_only {
-        let hive = ColdFrameStore::new(&hive_path);
+    let (db, hive, dataset) = if args.golden_only {
+        let db = match Database::open(root.join("bench.db").to_string_lossy().as_ref()) {
+            Ok(db) => db,
+            Err(e) => {
+                eprintln!("open bench db: {e}");
+                process::exit(1);
+            }
+        };
+        let hive = ColdFrameStore::new(root.join("journal-frames"));
         match seed_golden_fixture(&db, &hive) {
-            Ok(ds) => (ds, hive),
+            Ok(ds) => (db, hive, ds),
             Err(e) => {
                 eprintln!("golden fixture: {e}");
                 process::exit(1);
@@ -132,7 +130,15 @@ fn main() {
                 "generating {days} RTH day(s) of 1 Hz NQ+ES Journal Frames in {}",
                 root.display()
             );
+            let db_path = root.join(format!("bench-{days}.db"));
             let hive = ColdFrameStore::new(root.join(format!("journal-frames-{days}")));
+            let db = match Database::open(db_path.to_string_lossy().as_ref()) {
+                Ok(db) => db,
+                Err(e) => {
+                    eprintln!("open bench db: {e}");
+                    process::exit(1);
+                }
+            };
             let t0 = Instant::now();
             match generate_rth_dataset(&db, &hive, days) {
                 Ok(ds) => {
@@ -142,7 +148,7 @@ fn main() {
                         ds.planted_matches,
                         t0.elapsed().as_secs_f64()
                     );
-                    generated = Some((ds, hive));
+                    generated = Some((db, hive, ds));
                     break;
                 }
                 Err(e) => {
@@ -151,7 +157,7 @@ fn main() {
             }
         }
         match generated {
-            Some(pair) => pair,
+            Some(triple) => triple,
             None => {
                 eprintln!("could not generate a synthetic dataset");
                 process::exit(1);

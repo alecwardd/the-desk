@@ -218,8 +218,9 @@ table, (C) DuckDB `read_json` of the M3d JSONL.zst hive when compiled with
 
 Measured verdict: **DEFER DuckDB**. Path B p95 was 34 ms over 10 RTH days /
 486k 1 Hz NQ+ES frames vs an owner SLO of p95 ≤ 2–3 s. Path C (`read_json` of
-JSONL.zst, not Parquet) agreed on match fingerprint at golden and 10-day
-scale (~520 ms on the 10-day corpus) and is slower than Path B. See
+the full unpruned JSONL.zst hive, not Parquet) agreed on match fingerprint at
+golden and 10-day scale (~520 ms on the 10-day corpus). That number is a
+lower bound on DuckDB in this layout, not a ceiling on DuckDB. See
 [docs/decision-log.md](../decision-log.md) SIL-M3e. Do not convert the hive to
 Parquet. Do not add DuckDB to `the-desk-mcp`.
 

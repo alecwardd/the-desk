@@ -52,6 +52,10 @@ pub const BENCH_ES_PRICE: f64 = 5_750.0;
 pub const BENCH_NQ_PRICE: f64 = 20_000.0;
 /// Dense side-table name. Not part of the live schema / migrations.
 pub const DENSE_TABLE: &str = "eq_bench_dense";
+/// SQL/DuckDB four-predicate candidate cap. Path A applies
+/// [`QUERY_EPISODES_MAX_MATCHES`] *after* all five predicates (including
+/// near-Positioning). Hitting this cap is an error, not a silent truncate.
+pub const EQ_BENCH_SQL_CANDIDATE_CAP: usize = 50_000;
 
 /// Errors from the three-path harness.
 #[derive(Debug, Error)]
@@ -394,9 +398,52 @@ pub fn seed_golden_fixture(
     })
 }
 
+fn journal_frames_count(db: &Database) -> Result<i64, EpisodeBenchError> {
+    Ok(db
+        .sqlite_connection()
+        .query_row("SELECT COUNT(1) FROM journal_frames", [], |row| row.get(0))?)
+}
+
+fn hive_has_frame_partitions(hive: &ColdFrameStore) -> Result<bool, EpisodeBenchError> {
+    let root = hive.root();
+    if !root.exists() {
+        return Ok(false);
+    }
+    for ent in std::fs::read_dir(root)? {
+        let ent = ent?;
+        if ent.file_type()?.is_dir()
+            && ent
+                .file_name()
+                .to_string_lossy()
+                .starts_with("trading_day=")
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Restores SQLite pragmas if generation returns or panics.
+struct BenchPragmaRestore<'a> {
+    conn: &'a rusqlite::Connection,
+    synchronous: i64,
+    temp_store: i64,
+}
+
+impl Drop for BenchPragmaRestore<'_> {
+    fn drop(&mut self) {
+        let _ = self.conn.execute_batch(&format!(
+            "PRAGMA synchronous={}; PRAGMA temp_store={};",
+            self.synchronous, self.temp_store
+        ));
+    }
+}
+
 /// Generate 1 Hz NQ+ES RTH Journal Frames into a temp SQLite + M3d hive.
 ///
 /// Does not commit the dataset. Does not require a Sierra `.scid` feed.
+/// Refuses a populated `journal_frames` table or an existing hive partition
+/// tree — point this at a fresh temp database and hive.
 pub fn generate_rth_dataset(
     db: &Database,
     hive: &ColdFrameStore,
@@ -407,9 +454,26 @@ pub fn generate_rth_dataset(
             "rth_days must be at least 1".into(),
         ));
     }
-    db.sqlite_connection().execute_batch(
-        "PRAGMA synchronous=OFF; PRAGMA temp_store=MEMORY; DELETE FROM journal_frames;",
-    )?;
+    if journal_frames_count(db)? != 0 {
+        return Err(EpisodeBenchError::Invalid(
+            "point the bench at a fresh temp database / hive (journal_frames is not empty)".into(),
+        ));
+    }
+    if hive_has_frame_partitions(hive)? {
+        return Err(EpisodeBenchError::Invalid(
+            "point the bench at a fresh temp database / hive (cold hive already has partitions)"
+                .into(),
+        ));
+    }
+    let conn = db.sqlite_connection();
+    let previous_sync: i64 = conn.query_row("PRAGMA synchronous", [], |row| row.get(0))?;
+    let previous_temp: i64 = conn.query_row("PRAGMA temp_store", [], |row| row.get(0))?;
+    conn.execute_batch("PRAGMA synchronous=OFF; PRAGMA temp_store=MEMORY;")?;
+    let _pragma_restore = BenchPragmaRestore {
+        conn,
+        synchronous: previous_sync,
+        temp_store: previous_temp,
+    };
     let days = rth_weekdays(2024, 1, 8, rth_days);
     let start_ms = rth_open_ms(days[0]);
     let end_ms = rth_last_second_ms(*days.last().expect("days"));
@@ -662,7 +726,6 @@ pub fn path_b(
         ));
     }
 
-    let positioning = db.list_positioning_records_covering_window(start_ms, end_ms)?;
     let mut stmt = conn.prepare(&format!(
         "SELECT frame_second, clock_ms, es_last_price
          FROM {DENSE_TABLE}
@@ -683,7 +746,7 @@ pub fn path_b(
             end_ms,
             session_type,
             FLAGSHIP_SELLER_AGGRESSION_SESSION_DELTA,
-            QUERY_EPISODES_MAX_MATCHES as i64
+            EQ_BENCH_SQL_CANDIDATE_CAP as i64
         ],
         |row| {
             Ok((
@@ -693,10 +756,32 @@ pub fn path_b(
             ))
         },
     )?;
+    let candidates: Vec<(i64, f64, Option<f64>)> = candidates.collect::<Result<_, _>>()?;
+    let seconds = seconds_after_positioning(db, start_ms, end_ms, candidates)?;
+    let n = seconds.len();
+    Ok((seconds, n, reliability_tier(n)))
+}
 
+/// Apply the fifth flagship predicate (near Positioning) then the Path A match cap.
+///
+/// Four-predicate SQL/DuckDB must not use [`QUERY_EPISODES_MAX_MATCHES`] as
+/// LIMIT — that would drop later seconds that only fail the SQL predicates'
+/// Positioning filter.
+fn seconds_after_positioning(
+    db: &Database,
+    start_ms: f64,
+    end_ms: f64,
+    candidates: Vec<(i64, f64, Option<f64>)>,
+) -> Result<Vec<i64>, EpisodeBenchError> {
+    if candidates.len() >= EQ_BENCH_SQL_CANDIDATE_CAP {
+        return Err(EpisodeBenchError::Invalid(format!(
+            "four-predicate candidate cap ({EQ_BENCH_SQL_CANDIDATE_CAP}) hit; \
+             Path B/C would disagree with Path A's post-filter match cap"
+        )));
+    }
+    let positioning = db.list_positioning_records_covering_window(start_ms, end_ms)?;
     let mut seconds = Vec::new();
-    for row in candidates {
-        let (frame_second, clock_ms, es_last) = row?;
+    for (frame_second, clock_ms, es_last) in candidates {
         let Some(price) = es_last else {
             continue;
         };
@@ -707,10 +792,12 @@ pub fn path_b(
             continue;
         }
         seconds.push(frame_second);
+        if seconds.len() >= QUERY_EPISODES_MAX_MATCHES {
+            break;
+        }
     }
     seconds.sort_unstable();
-    let n = seconds.len();
-    Ok((seconds, n, reliability_tier(n)))
+    Ok(seconds)
 }
 
 /// Path C: DuckDB over the M3d JSONL.zst hive. Feature-gated.
@@ -773,25 +860,7 @@ fn path_c_duckdb(
         }
     };
 
-    let positioning = db
-        .list_positioning_records_covering_window(start_ms, end_ms)
-        .map_err(EpisodeBenchError::Db)?;
-    let mut seconds = Vec::new();
-    for (frame_second, clock_ms, es_last) in rows {
-        let Some(price) = es_last else {
-            continue;
-        };
-        let Some(pos) = select_positioning(&positioning, clock_ms) else {
-            continue;
-        };
-        if !es_near_positioning(price, &positioning_level_prices(pos)) {
-            continue;
-        }
-        seconds.push(frame_second);
-    }
-    seconds.sort_unstable();
-    seconds.dedup();
-    seconds.truncate(QUERY_EPISODES_MAX_MATCHES);
+    let seconds = seconds_after_positioning(db, start_ms, end_ms, rows)?;
     Ok((seconds, PathCAvailability::Ran))
 }
 
@@ -911,7 +980,7 @@ fn duckdb_flagship_sql(es_files_sql: &str, nq_files_sql: &str, zstd: bool) -> St
          ORDER BY clock_ms ASC, frame_second ASC
          LIMIT {limit}",
         delta = FLAGSHIP_SELLER_AGGRESSION_SESSION_DELTA,
-        limit = QUERY_EPISODES_MAX_MATCHES,
+        limit = EQ_BENCH_SQL_CANDIDATE_CAP,
     )
 }
 
@@ -1495,5 +1564,84 @@ mod tests {
         let (seconds, n, _) = path_b(&db, clock, clock + 1.0, "RTH").expect("b");
         assert!(seconds.is_empty());
         assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn path_b_applies_match_cap_after_positioning() {
+        let (_file, db) = test_db();
+        let base = 1_704_207_600_000.0;
+        let day = "2024-01-02";
+        let far = BENCH_ES_PRICE + 250.0;
+        let mut frames = Vec::with_capacity((QUERY_EPISODES_MAX_MATCHES + 1) * 2);
+        for i in 0..QUERY_EPISODES_MAX_MATCHES {
+            let clock = base + (i as f64) * 1_000.0;
+            frames.push(frame(
+                clock,
+                "ES",
+                day,
+                es_payload(far, -500.0, true, Some(true)),
+            ));
+            frames.push(frame(clock, "NQ", day, nq_payload(50.0)));
+        }
+        let match_clock = base + (QUERY_EPISODES_MAX_MATCHES as f64) * 1_000.0;
+        frames.push(frame(
+            match_clock,
+            "ES",
+            day,
+            es_payload(BENCH_ES_PRICE, -500.0, true, Some(true)),
+        ));
+        frames.push(frame(match_clock, "NQ", day, nq_payload(50.0)));
+        db.insert_journal_frames(&frames).expect("frames");
+        seed_flagship_positioning(&db, base).expect("pos");
+        rebuild_dense_projection(&db).expect("dense");
+        let req = flagship_request(base, match_clock + 500.0, "RTH");
+        let a = path_a(&db, &req, true).expect("a");
+        let (b_seconds, b_n, _) = path_b(&db, base, match_clock + 500.0, "RTH").expect("b");
+        let planted = journal_frame_second_from_ts(match_clock).expect("second");
+        assert_eq!(a.meta.n, 1, "Path A must keep the near-Positioning second");
+        assert_eq!(
+            b_n, 1,
+            "Path B must not LIMIT four-predicate candidates at 500"
+        );
+        assert_eq!(seconds_from_result(&a), vec![planted]);
+        assert_eq!(b_seconds, vec![planted]);
+    }
+
+    #[test]
+    fn generate_rth_dataset_refuses_populated_journal_frames() {
+        let (_file, db) = test_db();
+        let hive_dir = TempDir::new().expect("hive");
+        let hive = ColdFrameStore::new(hive_dir.path());
+        db.insert_journal_frames(&[frame(
+            1_704_207_600_000.0,
+            "ES",
+            "2024-01-02",
+            es_payload(BENCH_ES_PRICE, -50.0, false, None),
+        )])
+        .expect("frame");
+        let err = generate_rth_dataset(&db, &hive, 1).unwrap_err();
+        assert!(
+            err.to_string().contains("journal_frames is not empty"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn generate_rth_dataset_refuses_populated_hive() {
+        let (_file, db) = test_db();
+        let hive_dir = TempDir::new().expect("hive");
+        let hive = ColdFrameStore::new(hive_dir.path());
+        hive.upsert_frames(&[frame(
+            1_704_207_600_000.0,
+            "NQ",
+            "2024-01-02",
+            nq_payload(-20.0),
+        )])
+        .expect("hive");
+        let err = generate_rth_dataset(&db, &hive, 1).unwrap_err();
+        assert!(
+            err.to_string().contains("cold hive already has partitions"),
+            "{err}"
+        );
     }
 }

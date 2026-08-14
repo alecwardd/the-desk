@@ -798,13 +798,13 @@ Golden Path C (4 frames, 5 iters): p50 **38.2 ms**, p95 **39.2 ms**. Fixture-sca
 - **Machine:** linux x86_64, `availableParallelism` 4, ~16 GiB RAM (Cursor Cloud)
 - **90-day / 1-year:** **not in this environment** (not faked)
 
-**SLO comparison:** Path B p95 **34 ms** is inside **p95 ≤ 3000 ms over ~2 weeks**. Path B is typed SQLite columns (`eq_bench_dense`), not a hand-built columnar engine. Path A (~80 s p95) is the JSON-blob status quo — slow, but the owner bar is Path B, not Path A. Path C at this scale is ~0.5 s — slower than B, faster than A, and not a reason to adopt DuckDB.
+**SLO comparison:** Path B p95 **34 ms** is inside **p95 ≤ 3000 ms over ~2 weeks**. Path B is typed SQLite columns (`eq_bench_dense`), not a hand-built columnar engine. Path A (~80 s p95) is the JSON-blob status quo — slow, but the owner bar is Path B, not Path A. Path C measured DuckDB `read_json` over the **full unpruned** M3d JSONL.zst hive (not Apache Parquet, no partition pruning, no columnar scan). That 10-day sample was ~0.5 s — slower than B, faster than A. It is a lower bound on DuckDB in this layout, **not a ceiling on DuckDB**, and not a reason to adopt DuckDB. Adoption was gated on Path B missing the SLO; Path B did not.
 
 **Path C toolchain (genuine attempt; ran here; still DEFER):** `duckdb` 1.10505 bundled, Cargo feature `duckdb-bench` **off by default**. Default `cc`/clang failed (`#include <memory>` not found under `--target=x86_64-unknown-linux-gnu`). Link needs `CXX=g++ CC=gcc RUSTFLAGS="-C link-arg=-L/usr/lib/gcc/x86_64-linux-gnu/13"` (rust-lld cannot find `libstdc++` without gcc's lib dir). `.github/workflows/rust.yml` stays feature-off (`windows-latest` must not require DuckDB / libduckdb). Path C is not a silent no-op: it is compile-gated, documented, and was executed on this Cloud image.
 
 This note does not adopt DuckDB in MCP/engine, does not convert the M3d hive to Parquet, does not stop `depth_events` as hot store (#14), does not add DOM cluster Base Detectors (#22), Feature-IR (#18–#21), Vs3dProvider (#16), ACSIL (#23), `get_capsule`, a 250 ms forever-store, a tenth kernel operator / `run_job` poll tool, new specialty market tools, new `config.toml` knobs, or raise the Trust Ceiling.
 
-**Consequences:** Keep SQLite as the Episode Query store. Revisit DuckDB if a 90-day / 1-year corpus exists and Path B p95 misses 10 s, or if a future Path B rewrite becomes a hand-rolled columnar engine.
+**Consequences:** Keep SQLite as the Episode Query store. Revisit DuckDB if a 90-day / 1-year corpus exists and Path B p95 misses 10 s, or if a future Path B rewrite becomes a hand-rolled columnar engine. A later revisit may also measure DuckDB over a pruned columnar layout; this ticket did not convert the M3d hive to Parquet and did not claim a ceiling on DuckDB.
 
 ---
 

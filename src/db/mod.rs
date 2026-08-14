@@ -754,6 +754,32 @@ pub struct HistoricalJobRunUpdate<'a> {
     pub finished_at_ms: Option<f64>,
 }
 
+/// Durable `run_job` row for the SIL research query kernel (Trust Level L0).
+///
+/// Artifact files on disk are the bulk payload; this row is the cross-process
+/// handle. It does not mutate playbook, risk, journal, memory, or orders.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResearchQueryJobRecord {
+    pub id: String,
+    pub kind: String,
+    pub status: String,
+    pub submitted_at_ms: f64,
+    pub started_at_ms: Option<f64>,
+    pub finished_at_ms: Option<f64>,
+    pub window_start_ms: Option<f64>,
+    pub window_end_ms: Option<f64>,
+    pub request: serde_json::Value,
+    pub summary: Option<serde_json::Value>,
+    pub artifact_dir: Option<String>,
+    pub columnar_path: Option<String>,
+    pub summary_path: Option<String>,
+    pub sample_size: Option<i64>,
+    pub reliability_tier: Option<String>,
+    pub degraded: bool,
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResearchHypothesisRecord {
@@ -1056,6 +1082,45 @@ pub fn journal_frame_second_from_ts(timestamp_ms: f64) -> Option<i64> {
     } else {
         None
     }
+}
+
+fn map_journal_frame_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JournalFrameRecord> {
+    let payload: String = row.get(6)?;
+    let value = serde_json::from_str::<serde_json::Value>(&payload)
+        .unwrap_or_else(|_| serde_json::json!({}));
+    Ok(JournalFrameRecord {
+        clock_ms: row.get(0)?,
+        frame_second: row.get(1)?,
+        root_symbol: row.get(2)?,
+        session_type: row.get(3)?,
+        session_segment: row.get(4)?,
+        trading_day: row.get(5)?,
+        payload: value,
+    })
+}
+
+fn map_research_query_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ResearchQueryJobRecord> {
+    let request_str: String = row.get(8)?;
+    let summary_str: Option<String> = row.get(9)?;
+    Ok(ResearchQueryJobRecord {
+        id: row.get(0)?,
+        kind: row.get(1)?,
+        status: row.get(2)?,
+        submitted_at_ms: row.get(3)?,
+        started_at_ms: row.get(4)?,
+        finished_at_ms: row.get(5)?,
+        window_start_ms: row.get(6)?,
+        window_end_ms: row.get(7)?,
+        request: serde_json::from_str(&request_str).unwrap_or_else(|_| serde_json::json!({})),
+        summary: summary_str.and_then(|s| serde_json::from_str(&s).ok()),
+        artifact_dir: row.get(10)?,
+        columnar_path: row.get(11)?,
+        summary_path: row.get(12)?,
+        sample_size: row.get(13)?,
+        reliability_tier: row.get(14)?,
+        degraded: row.get::<_, i64>(15)? != 0,
+        error: row.get(16)?,
+    })
 }
 
 const MARKET_EVENT_LIST_COLUMNS: &str = "timestamp_ms, event_type, level_name, price, direction, sequence_num, metadata_json,
@@ -1708,6 +1773,9 @@ impl Database {
         }
         if version < 36 {
             self.migrate_v36()?;
+        }
+        if version < 37 {
+            self.migrate_v37()?;
         }
 
         Ok(())
@@ -3373,6 +3441,40 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_market_events_identity
               ON market_events(identity_id);
             UPDATE schema_version SET version = 36;
+            ",
+        )?;
+        Ok(())
+    }
+
+    /// V37: SIL-M3c research query jobs (artifact handles for `run_job`).
+    ///
+    /// Index is created in the same batch as the table (`IF NOT EXISTS`) so a
+    /// partial checkout that already created the table still gets the index.
+    fn migrate_v37(&self) -> Result<(), DbError> {
+        self.conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS research_query_jobs (
+              id TEXT PRIMARY KEY,
+              kind TEXT NOT NULL,
+              status TEXT NOT NULL,
+              submitted_at_ms REAL NOT NULL,
+              started_at_ms REAL NULL,
+              finished_at_ms REAL NULL,
+              window_start_ms REAL NULL,
+              window_end_ms REAL NULL,
+              request_json TEXT NOT NULL,
+              summary_json TEXT NULL,
+              artifact_dir TEXT NULL,
+              columnar_path TEXT NULL,
+              summary_path TEXT NULL,
+              sample_size INTEGER NULL,
+              reliability_tier TEXT NULL,
+              degraded INTEGER NOT NULL DEFAULT 0,
+              error_text TEXT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_research_query_jobs_status
+              ON research_query_jobs(status, submitted_at_ms DESC);
+            UPDATE schema_version SET version = 37;
             ",
         )?;
         Ok(())
@@ -7199,20 +7301,111 @@ impl Database {
              FROM journal_frames
              ORDER BY clock_ms ASC, root_symbol ASC",
         )?;
-        let rows = stmt.query_map([], |row| {
-            let payload: String = row.get(6)?;
-            let value = serde_json::from_str::<serde_json::Value>(&payload)
-                .unwrap_or_else(|_| serde_json::json!({}));
-            Ok(JournalFrameRecord {
-                clock_ms: row.get(0)?,
-                frame_second: row.get(1)?,
-                root_symbol: row.get(2)?,
-                session_type: row.get(3)?,
-                session_segment: row.get(4)?,
-                trading_day: row.get(5)?,
-                payload: value,
-            })
-        })?;
+        let rows = stmt.query_map([], map_journal_frame_row)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Journal Frames whose `clock_ms` falls in `[start_ms, end_ms]` (inclusive).
+    ///
+    /// Optional `root_symbol` / `session_type` filters are exact matches.
+    /// `limit` caps rows returned; use [`Self::count_journal_frames_in_window`]
+    /// to detect truncation. Results are oldest-first.
+    pub fn list_journal_frames_in_window(
+        &self,
+        start_ms: f64,
+        end_ms: f64,
+        root_symbol: Option<&str>,
+        session_type: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<JournalFrameRecord>, DbError> {
+        let limit = limit.max(1) as i64;
+        let mut sql = String::from(
+            "SELECT clock_ms, frame_second, root_symbol, session_type, session_segment, trading_day, payload
+             FROM journal_frames
+             WHERE clock_ms >= ?1 AND clock_ms <= ?2",
+        );
+        if root_symbol.is_some() {
+            sql.push_str(" AND root_symbol = ?3");
+        }
+        if session_type.is_some() {
+            if root_symbol.is_some() {
+                sql.push_str(" AND session_type = ?4");
+            } else {
+                sql.push_str(" AND session_type = ?3");
+            }
+        }
+        sql.push_str(" ORDER BY clock_ms ASC, root_symbol ASC LIMIT ");
+        sql.push_str(&limit.to_string());
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = match (root_symbol, session_type) {
+            (Some(root), Some(session)) => stmt
+                .query_map(
+                    params![start_ms, end_ms, root, session],
+                    map_journal_frame_row,
+                )?
+                .collect::<Result<Vec<_>, _>>()?,
+            (Some(root), None) => stmt
+                .query_map(params![start_ms, end_ms, root], map_journal_frame_row)?
+                .collect::<Result<Vec<_>, _>>()?,
+            (None, Some(session)) => stmt
+                .query_map(params![start_ms, end_ms, session], map_journal_frame_row)?
+                .collect::<Result<Vec<_>, _>>()?,
+            (None, None) => stmt
+                .query_map(params![start_ms, end_ms], map_journal_frame_row)?
+                .collect::<Result<Vec<_>, _>>()?,
+        };
+        Ok(rows)
+    }
+
+    /// Count Journal Frames in `[start_ms, end_ms]` with the same filters as
+    /// [`Self::list_journal_frames_in_window`].
+    pub fn count_journal_frames_in_window(
+        &self,
+        start_ms: f64,
+        end_ms: f64,
+        root_symbol: Option<&str>,
+        session_type: Option<&str>,
+    ) -> Result<i64, DbError> {
+        let mut sql = String::from(
+            "SELECT COUNT(1) FROM journal_frames WHERE clock_ms >= ?1 AND clock_ms <= ?2",
+        );
+        if root_symbol.is_some() {
+            sql.push_str(" AND root_symbol = ?3");
+        }
+        if session_type.is_some() {
+            if root_symbol.is_some() {
+                sql.push_str(" AND session_type = ?4");
+            } else {
+                sql.push_str(" AND session_type = ?3");
+            }
+        }
+        let mut stmt = self.conn.prepare(&sql)?;
+        let count = match (root_symbol, session_type) {
+            (Some(root), Some(session)) => {
+                stmt.query_row(params![start_ms, end_ms, root, session], |r| r.get(0))?
+            }
+            (Some(root), None) => stmt.query_row(params![start_ms, end_ms, root], |r| r.get(0))?,
+            (None, Some(session)) => {
+                stmt.query_row(params![start_ms, end_ms, session], |r| r.get(0))?
+            }
+            (None, None) => stmt.query_row(params![start_ms, end_ms], |r| r.get(0))?,
+        };
+        Ok(count)
+    }
+
+    /// Distinct `session_type` labels present in the window (for mixed-scope detection).
+    pub fn list_journal_session_types_in_window(
+        &self,
+        start_ms: f64,
+        end_ms: f64,
+    ) -> Result<Vec<String>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT session_type FROM journal_frames
+             WHERE clock_ms >= ?1 AND clock_ms <= ?2
+             ORDER BY session_type ASC",
+        )?;
+        let rows = stmt.query_map(params![start_ms, end_ms], |row| row.get::<_, String>(0))?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
@@ -7534,20 +7727,7 @@ impl Database {
         )?;
         let rows = stmt.query_map(
             params![root_symbol, start_frame_second, end_frame_second],
-            |row| {
-                let payload: String = row.get(6)?;
-                let value = serde_json::from_str::<serde_json::Value>(&payload)
-                    .unwrap_or_else(|_| serde_json::json!({}));
-                Ok(JournalFrameRecord {
-                    clock_ms: row.get(0)?,
-                    frame_second: row.get(1)?,
-                    root_symbol: row.get(2)?,
-                    session_type: row.get(3)?,
-                    session_segment: row.get(4)?,
-                    trading_day: row.get(5)?,
-                    payload: value,
-                })
-            },
+            map_journal_frame_row,
         )?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
@@ -8026,6 +8206,67 @@ impl Database {
                 .collect::<Result<Vec<_>, _>>()?,
             (None, None) => stmt
                 .query_map([], map_listed_market_event_row)?
+                .collect::<Result<Vec<_>, _>>()?,
+        };
+        Ok(rows)
+    }
+
+    /// Occurrence rows in `[start_ms, end_ms]` oldest-first (research query kernel).
+    ///
+    /// Unlike [`Self::list_recent_market_events`], this does not collapse to
+    /// latest-per-dedup and does not reverse to newest-first.
+    pub fn list_market_events_in_window(
+        &self,
+        start_ms: f64,
+        end_ms: f64,
+        root_symbol: Option<&str>,
+        event_type: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<serde_json::Value>, DbError> {
+        let limit = limit.max(1);
+        let mut sql = format!(
+            "SELECT {MARKET_EVENT_LIST_COLUMNS}
+             FROM market_events
+             WHERE timestamp_ms >= ?1 AND timestamp_ms <= ?2"
+        );
+        if root_symbol.is_some() {
+            sql.push_str(" AND root_symbol = ?3");
+        }
+        if event_type.is_some() {
+            if root_symbol.is_some() {
+                sql.push_str(" AND event_type = ?4");
+            } else {
+                sql.push_str(" AND event_type = ?3");
+            }
+        }
+        sql.push_str(" ORDER BY timestamp_ms ASC, COALESCE(root_symbol, '') ASC LIMIT ");
+        sql.push_str(&limit.to_string());
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = match (root_symbol, event_type) {
+            (Some(root), Some(etype)) => stmt
+                .query_map(
+                    rusqlite::params![start_ms, end_ms, root, etype],
+                    map_listed_market_event_row,
+                )?
+                .collect::<Result<Vec<_>, _>>()?,
+            (Some(root), None) => stmt
+                .query_map(
+                    rusqlite::params![start_ms, end_ms, root],
+                    map_listed_market_event_row,
+                )?
+                .collect::<Result<Vec<_>, _>>()?,
+            (None, Some(etype)) => stmt
+                .query_map(
+                    rusqlite::params![start_ms, end_ms, etype],
+                    map_listed_market_event_row,
+                )?
+                .collect::<Result<Vec<_>, _>>()?,
+            (None, None) => stmt
+                .query_map(
+                    rusqlite::params![start_ms, end_ms],
+                    map_listed_market_event_row,
+                )?
                 .collect::<Result<Vec<_>, _>>()?,
         };
         Ok(rows)
@@ -11463,6 +11704,76 @@ impl Database {
         Ok(())
     }
 
+    /// Persist a SIL research query job handle (`run_job`). Trust Level L0 —
+    /// does not mutate workflow-verb state.
+    pub fn upsert_research_query_job(&self, job: &ResearchQueryJobRecord) -> Result<(), DbError> {
+        self.conn.execute(
+            "INSERT INTO research_query_jobs (
+                id, kind, status, submitted_at_ms, started_at_ms, finished_at_ms,
+                window_start_ms, window_end_ms, request_json, summary_json,
+                artifact_dir, columnar_path, summary_path, sample_size,
+                reliability_tier, degraded, error_text
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+             ON CONFLICT(id) DO UPDATE SET
+                status = excluded.status,
+                started_at_ms = excluded.started_at_ms,
+                finished_at_ms = excluded.finished_at_ms,
+                window_start_ms = excluded.window_start_ms,
+                window_end_ms = excluded.window_end_ms,
+                request_json = excluded.request_json,
+                summary_json = excluded.summary_json,
+                artifact_dir = excluded.artifact_dir,
+                columnar_path = excluded.columnar_path,
+                summary_path = excluded.summary_path,
+                sample_size = excluded.sample_size,
+                reliability_tier = excluded.reliability_tier,
+                degraded = excluded.degraded,
+                error_text = excluded.error_text",
+            params![
+                job.id,
+                job.kind,
+                job.status,
+                job.submitted_at_ms,
+                job.started_at_ms,
+                job.finished_at_ms,
+                job.window_start_ms,
+                job.window_end_ms,
+                serde_json::to_string(&job.request)?,
+                job.summary
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()?,
+                job.artifact_dir,
+                job.columnar_path,
+                job.summary_path,
+                job.sample_size,
+                job.reliability_tier,
+                i64::from(job.degraded),
+                job.error,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Load a research query job by id.
+    pub fn get_research_query_job(
+        &self,
+        id: &str,
+    ) -> Result<Option<ResearchQueryJobRecord>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, kind, status, submitted_at_ms, started_at_ms, finished_at_ms,
+                    window_start_ms, window_end_ms, request_json, summary_json,
+                    artifact_dir, columnar_path, summary_path, sample_size,
+                    reliability_tier, degraded, error_text
+             FROM research_query_jobs WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query(params![id])?;
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+        Ok(Some(map_research_query_job_row(row)?))
+    }
+
     pub fn update_historical_job_run(
         &self,
         id: &str,
@@ -13231,7 +13542,10 @@ mod tests {
                 |r| r.get(0),
             )
             .expect("version");
-        assert!(version >= 36, "schema v36 identity index, got {version}");
+        assert!(
+            version >= 37,
+            "schema v37 research query jobs, got {version}"
+        );
         let identity_idx: i64 = db
             .conn
             .query_row(
@@ -13242,6 +13556,26 @@ mod tests {
             )
             .expect("identity idx");
         assert_eq!(identity_idx, 1);
+        let jobs_table: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(1) FROM sqlite_master
+                  WHERE type='table' AND name='research_query_jobs'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("jobs table");
+        assert_eq!(jobs_table, 1);
+        let jobs_idx: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(1) FROM sqlite_master
+                  WHERE type='index' AND name='idx_research_query_jobs_status'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("jobs idx");
+        assert_eq!(jobs_idx, 1);
     }
 
     fn sample_capsule_record(

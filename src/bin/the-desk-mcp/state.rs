@@ -139,6 +139,20 @@ pub(crate) fn schemars_optional_loose_object(_: &mut SchemaGenerator) -> Schema 
     })
 }
 
+/// Predicate `value` may be a number, bool, string, or object (e.g. Positioning source).
+pub(crate) fn schemars_json_value(_: &mut SchemaGenerator) -> Schema {
+    json_schema!({
+        "anyOf": [
+            { "type": "null" },
+            { "type": "boolean" },
+            { "type": "number" },
+            { "type": "string" },
+            { "type": "array" },
+            { "type": "object", "additionalProperties": true }
+        ]
+    })
+}
+
 /// Atomics updated by SCID / `.depth` poll tasks for diagnostics and coherent `dataAgeMs` without extra DB locks.
 #[derive(Clone)]
 pub struct McpFeedRuntimeState {

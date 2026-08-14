@@ -97,6 +97,9 @@ pub struct HypothesisRunSummary {
     pub engine_version: serde_json::Value,
     pub gate: GateDecision,
     pub warnings: Vec<String>,
+    /// Journal Frame windows for each fire (`frame_ref`). Empty when no frames exist.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_windows: Vec<super::query_kernel::JournalBackedEvidenceWindow>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -639,7 +642,16 @@ pub fn summarize_hypothesis_run(
     let rows = db
         .list_hypothesis_signal_outcomes(setup_id, job_id, Some(&scope))
         .map_err(|e| e.to_string())?;
-    summarize_rows(setup_id, job_id, &setup, rows, run_engine_version)
+    let evidence_windows = super::query_kernel::journal_backed_evidence_windows(db, &rows)
+        .map_err(|e| e.to_string())?;
+    summarize_rows(
+        setup_id,
+        job_id,
+        &setup,
+        rows,
+        run_engine_version,
+        evidence_windows,
+    )
 }
 
 fn summarize_rows(
@@ -648,6 +660,7 @@ fn summarize_rows(
     setup: &SetupDefinition,
     rows: Vec<HypothesisSignalOutcomeRow>,
     engine_version: serde_json::Value,
+    evidence_windows: Vec<super::query_kernel::JournalBackedEvidenceWindow>,
 ) -> Result<HypothesisRunSummary, String> {
     let r_points = r_points(setup);
     let total = rows.len();
@@ -771,6 +784,7 @@ fn summarize_rows(
         engine_version,
         gate,
         warnings,
+        evidence_windows,
     })
 }
 
@@ -1055,6 +1069,7 @@ mod tests {
             &setup,
             rows_over_sessions(&["2026-01-05", "2026-01-06"], 6),
             current_engine_version(),
+            Vec::new(),
         )
         .unwrap();
         assert_eq!(chatty.active_session_count, 2);
@@ -1069,6 +1084,7 @@ mod tests {
             &setup,
             rows_over_sessions(&["2026-01-05", "2026-01-06"], 2),
             current_engine_version(),
+            Vec::new(),
         )
         .unwrap();
         assert!(!calm.chatty);

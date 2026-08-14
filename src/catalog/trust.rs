@@ -41,6 +41,10 @@ pub const KERNEL_READ_QUERY_TOOLS: &[&str] = &[
     "search_catalog",
     "get_state",
     "get_events",
+    "query_series",
+    "query_episodes",
+    "query_raw",
+    "run_job",
 ];
 
 /// Build the capability map for kernel read/query tools (all L0, no mutation).
@@ -94,6 +98,11 @@ pub fn tool_name_implies_mutation(name: &str) -> bool {
     if MUTATION_EXACT.contains(&name) {
         return true;
     }
+    // SIL-M3c `run_job` is a Trust Level L0 query operator: it writes research
+    // artifacts only and must not be classified as a workflow-verb mutation.
+    if name == "run_job" {
+        return false;
+    }
     MUTATION_PREFIXES.iter().any(|p| name.starts_with(p))
 }
 
@@ -126,6 +135,11 @@ mod tests {
         assert!(!tool_name_implies_mutation("get_state"));
         assert!(!tool_name_implies_mutation("get_events"));
         assert!(!tool_name_implies_mutation("describe_environment"));
+        assert!(!tool_name_implies_mutation("query_series"));
+        assert!(!tool_name_implies_mutation("query_episodes"));
+        assert!(!tool_name_implies_mutation("query_raw"));
+        assert!(!tool_name_implies_mutation("run_job"));
+        assert!(tool_name_implies_mutation("run_backtest"));
         assert!(!tool_name_implies_mutation("evaluate_playbook"));
         assert!(!tool_name_implies_mutation("get_market_snapshot"));
     }

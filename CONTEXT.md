@@ -16,7 +16,7 @@ exactly in code, docs, ADRs, and agent copy. Do not invent synonyms.
 | **frame_ref** | Join from an Event to the Journal Frame that produced it: `(journal_frame_second, root_symbol)`. Always present on `get_events` rows (nulls when unknown — never silently omitted). The serialized `get_events` field is `frameRef`. |
 | **DOM-family** | Event types Capsules key off: `stop_run`, `iceberg_reload`, `pull_intent`, `book_velocity_regime_shift` (registry may extend). Capsules are mandatory for these types. |
 | **Capsule** | High-resolution dump around a salient Event (~30s before → ~60s after) from a rolling ~250 ms in-memory ring. Mandatory for DOM-family events. Joinable to the triggering Event (`trigger_identity_id`) and surrounding Journal Frames (`[start_frame_second, end_frame_second] × root_symbol`). Completeness is `pending` / `complete` / `incomplete` (incomplete + degraded if the session/feed ends before the after-window). **Not** trader-memory markdown files. The forever journal stays 1 Hz — the ring is never persisted as a 250 ms table. |
-| **Episode Query** | Conjunctive historical query over catalog fields with forward returns / MFE/MAE (later research kernel). |
+| **Episode Query** | Conjunctive historical query over Desk Catalog fields across NQ+ES Journal Frames / events, with tick-driven forward returns / MFE/MAE (`query_episodes`). Missing detector or vendor fields fail closed (empty/degraded + provenance) — they are never invented. |
 | **Positioning** | Dealer/options domain with four record kinds: position-grid, by-strike, Slice, Levels-Only Record. Manual Levels-Only Records are written via the `positioning_entry` workflow verb (same schema a later capture adapter will use). No live Vs3dProvider yet. |
 | **Slice** | Price-indexed greek values plus Desk-derived levels at capture time (Positioning record kind). |
 | **Levels-Only Record** | First-class manual Positioning path (ToS-denial steady state and historical backlog). Written via `positioning_entry`; completeness `levels_only` is not a fallback. Provenance is manual/as-of — never live vendor data. |
@@ -36,13 +36,20 @@ exactly in code, docs, ADRs, and agent copy. Do not invent synonyms.
 |------|------|-----------|
 | **R0** | Orientation | `get_state` |
 | **R1** | State | `get_state` |
-| **R2** | Evidence | later `query_*` operators |
-| **R3** | Raw (hard caps) | later `query_raw` |
+| **R2** | Evidence | `query_series`, `query_episodes` |
+| **R3** | Raw (hard caps) | `query_raw` (use `run_job` for bulk artifacts) |
 
 ## Read-kernel operators (behind `[sil].catalog_discovery`)
 
-`describe_environment`, `describe_domain`, `search_catalog`, `get_state`, `get_events`.
+`describe_environment`, `describe_domain`, `search_catalog`, `get_state`, `get_events`, `query_series`, `query_episodes`, `query_raw`, `run_job`.
 
 Default-off keeps the 122-tool surface unchanged. Orientation specialty getters
 (`get_session_context`, `get_market_snapshot`) shim to `get_state` when the flag
 is on (`deprecated: true` + `suggestedReplacementOperator`).
+
+`query_*` / `run_job` are Trust Level **L0**: they cannot mutate workflow-verb
+state or place orders. Unbounded windows are rejected. Every result carries
+sample-size `N` and `reliabilityTier` (AGENT.md Research Sample Size Policy).
+`run_job` returns a job id + artifact handle (columnar path + summary), never a
+token flood. Capsules are joinable evidence and are not required for Episode
+Query to be expressible.

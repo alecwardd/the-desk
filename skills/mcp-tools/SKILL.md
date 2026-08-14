@@ -31,7 +31,7 @@ Before deep historical analysis, call `get_research_summary` once — if session
 
 ### Catalog discovery (SIL — optional)
 
-When `[sil].catalog_discovery = true` in `~/.the-desk/config.toml`, five kernel
+When `[sil].catalog_discovery = true` in `~/.the-desk/config.toml`, nine kernel
 operators appear (Trust Level L0 — read/query, no mutation/order authority):
 
 1. `describe_environment` — catalogVersion, Trust Ceiling (L3), domain list, Positioning stub status.
@@ -39,6 +39,10 @@ operators appear (Trust Level L0 — read/query, no mutation/order authority):
 3. `search_catalog` — text search over field ids / names / descriptions.
 4. `get_state` — StateEnvelope (`values` + per-domain `provenance` + `degraded`; resolution R0|R1 only). MarketRouter v0: `symbols=["NQ","ES"]` returns both roots in one envelope.
 5. `get_events` — formalized event rows (lifecycle, severity, dedup identity, `frameRef` to the producing Journal Frame, `capsuleRef` on DOM-family rows). Trust Level L0.
+6. `query_series` — R2 time series of catalog fields from 1 Hz Journal Frames. Requires `startMs`/`endMs`.
+7. `query_episodes` — R2 Episode Query: conjunctive catalog predicates across NQ+ES Journal Frames / events, tick-driven MFE/MAE (not a fill simulator). Flagship five-predicate query is expressible; missing detector/vendor fields fail closed.
+8. `query_raw` — R3 hard-capped raw read (`journal_frames` / `events` / `ticks`). Unbounded windows are rejected.
+9. `run_job` — run series/episodes/raw as a job; returns job id + artifact handle (columnar path + summary), never a token flood. Not a workflow-verb mutation.
 
 Default off keeps the **122 MCP tools** surface unchanged. Artifacts:
 [docs/mcp/desk-catalog-v0.json](../../docs/mcp/desk-catalog-v0.json).
@@ -121,6 +125,7 @@ This is the canonical "potential trade" flow — keep state in the system, not i
 - `compare_sessions` — analog sessions by multi-dimensional similarity.
 - `get_session_history`, `get_research_summary` — past sessions, statistical briefing.
 - Outcomes: `query_signal_outcome_distribution` / `_conditional` / `_excursions`, `get_signal_performance`, `get_setup_performance_matrix`, `validate_signal_outcome_integrity`.
+- With SIL on: `query_episodes` for conjunctive catalog predicates + tick-driven MFE/MAE; `query_series` for Journal Frame time series; `query_raw` for hard-capped raw rows; `run_job` when the result must be an artifact handle instead of tokens. Cite `N` and `reliabilityTier`. Your backtest shows / your rules say — never buy/sell advice.
 - Respect the Research Sample Size Policy in AGENT.md — always report N.
 
 ### Backtests and hypothesis promotion
@@ -166,7 +171,8 @@ This is the canonical "potential trade" flow — keep state in the system, not i
 
 > **SIL-M0 / Catalog v0 / M1b:** **no new specialty market tools** (`tools/market.rs`)
 > without a Desk Catalog entry — **no catalog entry → no new market tool**.
-> Kernel operators (`describe_*`, `search_catalog`, `get_state`, `get_events`)
+> Kernel operators (`describe_*`, `search_catalog`, `get_state`, `get_events`,
+> `query_series`, `query_episodes`, `query_raw`, `run_job`)
 > are behind `[sil].catalog_discovery`, not specialty market tools.
 > Do not delete existing tools under this policy. Do not re-bless
 > `docs/mcp/sil-m0-tool-telemetry-baseline.json` unless the orientation-chain

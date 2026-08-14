@@ -3,6 +3,7 @@ pub mod hypothesis;
 pub mod ib_campaign;
 pub mod idea034_bucket_stats;
 pub mod nine_am_continuation;
+pub mod query_kernel;
 
 use crate::db::{Database, SessionScopeFilter};
 use crate::depth::DomSummary;

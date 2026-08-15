@@ -1328,6 +1328,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    // ~1s `.depth` poll: reconstruct book, persist compact DOM snapshots/features,
+    // publish `domSummary`. SIL-M3f: does not bulk-append SQLite `depth_events`.
     if latest_depth_reader()?.is_some() {
         let pipelines_depth = Arc::clone(&server.pipelines);
         let db_depth = Arc::clone(&server.db);

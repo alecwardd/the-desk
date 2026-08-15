@@ -133,8 +133,9 @@ pub struct StorageConfig {
     /// Whether to auto-archive at session close.
     #[serde(default)]
     pub auto_archive: bool,
-    /// Days to keep DOM `depth_events` in SQLite. Default: 7. The `.depth` source
-    /// files remain the durable record, so older depth rows are re-ingestable.
+    /// Days to keep leftover DOM `depth_events` in SQLite. Default: 7.
+    /// Live ingest no longer writes this table (SIL-M3f); the `.depth` files
+    /// remain the durable record. Retention applies when pruning existing DBs.
     #[serde(default = "default_depth_retention_days")]
     pub depth_retention_days: u32,
     /// Days to keep `pipeline_snapshots` in SQLite. Default: 14.

@@ -124,10 +124,10 @@ Usage:
 Options:
   --status                  Print raw tick coverage, snapshot tables, and storage settings.
   --archive                 Archive raw_ticks older than the cutoff (also prunes depth + snapshots).
-  --maintain                Archive raw_ticks + prune depth_events + prune snapshots. Use with --vacuum.
+  --maintain                Archive raw_ticks + prune leftover depth_events + prune snapshots. Use with --vacuum.
   --vacuum                  Compact SQLite after archiving. Requires free disk space near current DB size.
-  --prune-depth             Delete depth_events older than the depth cutoff (the .depth files remain
-                            the durable source, so pruned rows are re-ingestable). Chunked + WAL-bounded.
+  --prune-depth             Delete leftover depth_events older than the depth cutoff (the .depth files remain
+                            the durable source). Live ingest no longer writes this table (SIL-M3f). Chunked + WAL-bounded.
   --prune-snapshots         Delete old pipeline/dom/dom_feature snapshots past configured retention.
   --backup                  Create a verified full backup in the configured [backup] directory.
                             Uses desk-<UTC timestamp>.db naming and keeps unarchived history.
@@ -427,7 +427,8 @@ fn depth_prune_threshold_rowid(
     Ok(Some(lo))
 }
 
-/// Delete `depth_events` older than `cutoff` in bounded chunks, by rowid.
+/// Delete leftover `depth_events` older than `cutoff` in bounded chunks, by rowid.
+/// SIL-M3f: live ingest no longer writes this table; this is for existing DBs.
 ///
 /// We resolve the retention cutoff to a rowid boundary (see
 /// [`depth_prune_threshold_rowid`]) and then delete `rowid < threshold` in batches,

@@ -18,7 +18,9 @@ use the_desk_backend::db::{
 };
 use the_desk_backend::db::{PriorDayReference, SessionSummary, SignalOutcome};
 #[allow(unused_imports)]
-use the_desk_backend::depth::{DepthBook, DepthReader};
+use the_desk_backend::depth::{
+    DepthBook, DepthReader, DepthRecord, ScanControl as DepthScanControl,
+};
 #[allow(unused_imports)]
 use the_desk_backend::feed::scid_reader::ScidReader;
 #[allow(unused_imports)]
@@ -3213,6 +3215,254 @@ fn depth_shrink_recovery_preserves_previous_book_when_fragment_has_no_clear() {
             .map(|level| level.quantity),
         Some(5)
     );
+}
+
+fn sample_depth_persist_work(records: Vec<DepthRecord>) -> DepthPersistWork {
+    let mut book = DepthBook::default();
+    for record in &records {
+        book.apply(record);
+    }
+    let last = records.last().expect("records");
+    let source_file = "NQ.depth".to_string();
+    let snapshot = book.snapshot(&source_file, last.timestamp_ms, 10);
+    let feature = default_depth_feature_snapshot(
+        &snapshot,
+        &source_file,
+        &records,
+        (last.timestamp_ms - 60_000.0).max(0.0),
+        last.timestamp_ms,
+    );
+    DepthPersistWork {
+        source_file,
+        trading_day: session_date_from_timestamp_ms(last.timestamp_ms),
+        last_record_timestamp_ms: last.timestamp_ms,
+        records,
+        snapshot,
+        feature,
+        batch_id: 7,
+    }
+}
+
+#[test]
+fn apply_depth_persist_work_does_not_insert_depth_events() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("NQ.depth");
+    write_test_depth_file(
+        &path,
+        &[
+            (unix_ms_to_sc_depth(1_000), 1, 0, 0, 0.0, 0),
+            (unix_ms_to_sc_depth(1_100), 2, 0, 1, 21000.0, 10),
+            (unix_ms_to_sc_depth(1_200), 3, 0, 1, 21000.25, 12),
+            (unix_ms_to_sc_depth(1_300), 6, 0, 0, 21000.0, 0),
+        ],
+    );
+    let reader = DepthReader::new(&path, 1.0);
+    let mut state = DepthPollWorkerState {
+        active_path: Some(path.clone()),
+        offset: reader.data_start_offset(),
+        batch_id: 7,
+        book: DepthBook::default(),
+    };
+    let mut new_records = Vec::new();
+    reader
+        .scan_new_records(&mut state.offset, |record| {
+            state.book.apply(&record);
+            new_records.push(record);
+            Ok(DepthScanControl::Continue)
+        })
+        .expect("scan fixture depth");
+    assert!(
+        new_records.len() > 1,
+        "fixture poll must have bulk rows, got {}",
+        new_records.len()
+    );
+
+    let server = test_server();
+    let work = sample_depth_persist_work(new_records);
+    apply_depth_persist_work(
+        &server.db,
+        &server.pipelines,
+        &server.last_bid,
+        &server.last_ask,
+        work,
+        server.feed_runtime.as_ref(),
+    );
+
+    let db = server.db.lock().expect("db lock");
+    assert_eq!(
+        db.count_depth_events().expect("count depth_events"),
+        0,
+        "hot persist must not bulk-append depth_events"
+    );
+    let features = db
+        .query_dom_feature_snapshots(Some(0.0), Some(10_000.0), 10)
+        .expect("feature snapshots");
+    assert_eq!(
+        features.len(),
+        1,
+        "compact dom_feature_snapshots must write"
+    );
+    assert!(
+        db.get_dom_snapshot_near(1_300.0)
+            .expect("snapshot near")
+            .is_some(),
+        "compact dom_snapshots must write"
+    );
+    drop(db);
+
+    let summary = server
+        .pipelines
+        .lock()
+        .expect("pipelines")
+        .snapshot(21000.0, 21000.25)
+        .dom_summary;
+    assert!(
+        summary.is_some(),
+        "poll persist must still publish domSummary into pipelines"
+    );
+}
+
+#[test]
+fn count_depth_records_from_reader_reads_fixture_not_sqlite() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("NQ.depth");
+    write_test_depth_file(
+        &path,
+        &[
+            (unix_ms_to_sc_depth(1_000), 1, 0, 0, 0.0, 0),
+            (unix_ms_to_sc_depth(1_100), 2, 0, 1, 21000.0, 10),
+            (unix_ms_to_sc_depth(1_200), 3, 0, 1, 21000.25, 12),
+            (unix_ms_to_sc_depth(1_300), 6, 0, 0, 21000.0, 0),
+        ],
+    );
+    let reader = DepthReader::new(&path, 1.0);
+    let count = count_depth_records_from_reader(&reader, 1_000.0, 1_400.0, None, None)
+        .expect("count from .depth");
+    assert!(
+        count >= 3,
+        "fixture .depth must yield book records, got {count}"
+    );
+
+    let db = Database::open(":memory:").expect("db");
+    assert_eq!(db.count_depth_events().expect("empty table"), 0);
+}
+
+#[test]
+fn explain_book_reaction_payload_grounds_when_depth_events_empty() {
+    let db = Database::open(":memory:").expect("db");
+    assert_eq!(db.count_depth_events().expect("empty"), 0);
+
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("NQ.depth");
+    write_test_depth_file(
+        &path,
+        &[
+            (unix_ms_to_sc_depth(1_000), 1, 0, 0, 0.0, 0),
+            (unix_ms_to_sc_depth(1_100), 2, 0, 1, 21000.0, 10),
+            (unix_ms_to_sc_depth(1_200), 3, 0, 1, 21000.25, 12),
+        ],
+    );
+    let reader = DepthReader::new(&path, 1.0);
+    let depth_event_count =
+        count_depth_records_from_reader(&reader, 1_000.0, 1_400.0, None, None).expect("count");
+    assert!(depth_event_count > 0);
+
+    let feature_payload = serde_json::json!({
+        "domSummary": {
+            "bidPullRate": 0.62,
+            "askPullRate": 0.18,
+            "pullStackBias": 28.0,
+            "liquidityBias": "bid_support"
+        },
+        "activity": {
+            "recordCount": depth_event_count,
+            "topPullLevels": [{
+                "price": 21000.0,
+                "side": "bid",
+                "estimatedPulledQuantity": 10.0
+            }],
+            "topStackLevels": [{
+                "price": 20999.75,
+                "side": "bid",
+                "stackedQuantity": 8.0
+            }]
+        }
+    });
+    let payload = build_book_reaction_payload(BookReactionInputs {
+        timestamp_ms: 1_200.0,
+        start_time_ms: 1_000.0,
+        end_time_ms: 1_400.0,
+        price: Some(21000.0),
+        radius_ticks: Some(6),
+        feature_payload,
+        depth_event_count,
+        depth_source: "depth_file",
+        ticks: Vec::new(),
+    });
+    let explanation = payload["explanation"].as_str().expect("explanation");
+    assert!(
+        explanation.contains("Bids pulled"),
+        "expected grounded pull-rate narrative, got {explanation}"
+    );
+    assert!(
+        explanation.contains("depth records in window"),
+        "expected .depth density narrative, got {explanation}"
+    );
+    assert_eq!(payload["depthSource"], "depth_file");
+    assert_eq!(payload["depthEventCount"], depth_event_count);
+    assert_eq!(payload["liquidityBias"], "bid_support");
+}
+
+#[tokio::test]
+async fn explain_book_reaction_uses_feature_snapshot_when_depth_events_empty() {
+    let server = test_server();
+    {
+        let db = server.db.lock().expect("db lock");
+        assert_eq!(db.count_depth_events().expect("empty"), 0);
+        let payload = serde_json::json!({
+            "domSummary": {
+                "bidPullRate": 0.7,
+                "askPullRate": 0.2,
+                "pullStackBias": 40.0,
+                "liquidityBias": "bid_support"
+            },
+            "activity": {
+                "recordCount": 48,
+                "topPullLevels": [{
+                    "price": 21000.0,
+                    "side": "bid",
+                    "estimatedPulledQuantity": 15.0
+                }],
+                "topStackLevels": []
+            }
+        });
+        db.insert_dom_feature_snapshot("NQ.depth", 1_200.0, "2026-03-05", &payload)
+            .expect("insert feature");
+    }
+
+    let result = server
+        .explain_book_reaction(Parameters(ExplainBookReactionParams {
+            timestamp_ms: Some(1_200.0),
+            price: Some(21000.0),
+            start_time_ms: Some(1_000.0),
+            end_time_ms: Some(1_400.0),
+            radius_ticks: Some(6),
+        }))
+        .await
+        .expect("tool call");
+    let json = parse_text_tool_result(result);
+    let explanation = json["explanation"].as_str().expect("explanation");
+    assert!(
+        explanation.contains("Bids pulled"),
+        "tool must not silently return empty book activity, got {explanation}"
+    );
+    let depth_source = json["depthSource"].as_str().expect("depthSource");
+    assert!(
+        depth_source == "dom_feature_activity" || depth_source == "depth_file",
+        "expected snapshot or .depth source, got {depth_source}"
+    );
+    assert!(json["depthEventCount"].as_u64().unwrap_or(0) > 0);
+    assert_eq!(json["liquidityBias"], "bid_support");
 }
 
 #[test]

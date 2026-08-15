@@ -11,12 +11,12 @@ use the_desk_backend::attention::AttentionPulseKind;
 use the_desk_backend::backfill;
 use the_desk_backend::backup::{self, SkipReason, StartupBackupReport};
 use the_desk_backend::db::{
-    Database, HistoricalJobRun, SessionScopeFilter, SetupPerformanceSortBy, TradeRecord,
-    RESEARCH_DISTRIBUTION_METRICS,
+    Database, HistoricalJobRun, RawTickRecord, SessionScopeFilter, SetupPerformanceSortBy,
+    TradeRecord, RESEARCH_DISTRIBUTION_METRICS,
 };
 use the_desk_backend::depth::{
     aggregate_trade_volume_by_level, build_dom_feature_snapshot, DepthReader, DomFeatureSnapshot,
-    DomSummary, PullStackActivitySummary,
+    DomSummary, PullStackActivitySummary, ScanControl as DepthScanControl,
 };
 use the_desk_backend::feed::load_feed_config;
 use the_desk_backend::feed::scid_reader::{ScanControl as ScidScanControl, ScidReader};
@@ -698,16 +698,265 @@ pub(crate) fn validate_time_window(start_time_ms: f64, end_time_ms: f64) -> Resu
     Ok(())
 }
 
+/// Cap for book-reaction depth-record counts (matches the former SQLite LIMIT).
+pub(crate) const BOOK_REACTION_DEPTH_RECORD_CAP: usize = 200;
+
 pub(crate) fn depth_reader_for_timestamp(timestamp_ms: f64) -> Result<DepthReader, McpError> {
+    optional_depth_reader_for_timestamp(timestamp_ms)?.ok_or_else(|| {
+        invalid_params_error(format!(
+            "No Sierra .depth file found for timestamp {timestamp_ms}"
+        ))
+    })
+}
+
+pub(crate) fn optional_depth_reader_for_timestamp(
+    timestamp_ms: f64,
+) -> Result<Option<DepthReader>, McpError> {
     let config = load_feed_config();
-    let path = DepthReader::find_file_for_timestamp(&config, timestamp_ms)
-        .map_err(db_error)?
-        .ok_or_else(|| {
-            invalid_params_error(format!(
-                "No Sierra .depth file found for timestamp {timestamp_ms}"
-            ))
-        })?;
-    Ok(DepthReader::new(path, config.price_scale))
+    let path = DepthReader::find_file_for_timestamp(&config, timestamp_ms).map_err(db_error)?;
+    Ok(path.map(|path| DepthReader::new(path, config.price_scale)))
+}
+
+/// Count `.depth` records in `[start_ms, end_ms)` matching an optional price band.
+/// Caps at [`BOOK_REACTION_DEPTH_RECORD_CAP`] so the explanation stays bounded.
+pub(crate) fn count_depth_records_from_reader(
+    reader: &DepthReader,
+    start_ms: f64,
+    end_ms: f64,
+    price_low: Option<f64>,
+    price_high: Option<f64>,
+) -> Result<usize, McpError> {
+    let mut count = 0usize;
+    reader
+        .scan_range(Some(start_ms), Some(end_ms), |record| {
+            let in_low = price_low.is_none_or(|low| record.price >= low);
+            let in_high = price_high.is_none_or(|high| record.price <= high);
+            if in_low && in_high {
+                count += 1;
+                if count >= BOOK_REACTION_DEPTH_RECORD_CAP {
+                    return Ok(DepthScanControl::Stop);
+                }
+            }
+            Ok(DepthScanControl::Continue)
+        })
+        .map_err(db_error)?;
+    Ok(count)
+}
+
+pub(crate) fn depth_event_count_from_feature_activity(
+    feature_payload: &serde_json::Value,
+) -> usize {
+    feature_payload
+        .get("activity")
+        .and_then(|activity| activity.get("recordCount"))
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0) as usize
+}
+
+/// Resolve a book-reaction depth count without SQLite `depth_events`.
+/// Prefers `DepthReader`; falls back to compact feature `activity.recordCount`.
+pub(crate) fn resolve_book_reaction_depth_count(
+    start_ms: f64,
+    end_ms: f64,
+    price_low: Option<f64>,
+    price_high: Option<f64>,
+    feature_payload: &serde_json::Value,
+) -> Result<(usize, &'static str), McpError> {
+    if let Some(reader) = optional_depth_reader_for_timestamp(start_ms)? {
+        let count =
+            count_depth_records_from_reader(&reader, start_ms, end_ms, price_low, price_high)?;
+        return Ok((count, "depth_file"));
+    }
+    let from_activity = depth_event_count_from_feature_activity(feature_payload);
+    if from_activity > 0 {
+        Ok((from_activity, "dom_feature_activity"))
+    } else {
+        Ok((0, "none"))
+    }
+}
+
+pub(crate) struct BookReactionInputs {
+    pub timestamp_ms: f64,
+    pub start_time_ms: f64,
+    pub end_time_ms: f64,
+    pub price: Option<f64>,
+    pub radius_ticks: Option<u64>,
+    pub feature_payload: serde_json::Value,
+    pub depth_event_count: usize,
+    pub depth_source: &'static str,
+    pub ticks: Vec<RawTickRecord>,
+}
+
+/// Grounded book-reaction payload from compact DOM summaries, `.depth` (or
+/// snapshot activity) counts, and executed tape. Does not read SQLite
+/// `depth_events`.
+pub(crate) fn build_book_reaction_payload(inputs: BookReactionInputs) -> serde_json::Value {
+    let BookReactionInputs {
+        timestamp_ms,
+        start_time_ms,
+        end_time_ms,
+        price,
+        radius_ticks,
+        feature_payload,
+        depth_event_count,
+        depth_source,
+        ticks,
+    } = inputs;
+
+    let dom_summary = feature_payload
+        .get("domSummary")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let bid_pull_rate = dom_summary
+        .get("bidPullRate")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let ask_pull_rate = dom_summary
+        .get("askPullRate")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let pull_stack_bias = dom_summary
+        .get("pullStackBias")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let net_delta: f64 = ticks
+        .iter()
+        .map(|tick| {
+            if tick.is_buy {
+                tick.volume
+            } else {
+                -tick.volume
+            }
+        })
+        .sum();
+
+    let liquidity_bias = dom_summary
+        .get("liquidityBias")
+        .and_then(|v| v.as_str())
+        .unwrap_or("balanced");
+    let total_volume: f64 = ticks.iter().map(|t| t.volume).sum();
+
+    let top_pull = feature_payload
+        .get("activity")
+        .and_then(|a| a.get("topPullLevels"))
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+        .cloned();
+    let top_stack = feature_payload
+        .get("activity")
+        .and_then(|a| a.get("topStackLevels"))
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+        .cloned();
+
+    let mut parts = Vec::new();
+
+    let bid_pct = (bid_pull_rate * 100.0).round();
+    let ask_pct = (ask_pull_rate * 100.0).round();
+    if (bid_pull_rate - ask_pull_rate).abs() > 0.1 {
+        if bid_pull_rate > ask_pull_rate {
+            parts.push(format!(
+                "Bids pulled at {bid_pct:.0}% rate vs asks at {ask_pct:.0}% — bid-side liquidity was being withdrawn faster."
+            ));
+        } else {
+            parts.push(format!(
+                "Asks pulled at {ask_pct:.0}% rate vs bids at {bid_pct:.0}% — offer-side liquidity was being withdrawn faster."
+            ));
+        }
+    } else {
+        parts.push(format!(
+            "Pull rates roughly balanced (bids {bid_pct:.0}%, asks {ask_pct:.0}%)."
+        ));
+    }
+
+    if let Some(ref pull) = top_pull {
+        let pull_price = pull.get("price").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let qty = pull
+            .get("estimatedPulledQuantity")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        let side = pull
+            .get("side")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        if qty > 0.0 {
+            parts.push(format!(
+                "Top pull level: {pull_price:.2} ({side} side, {qty:.0} contracts pulled)."
+            ));
+        }
+    }
+
+    if let Some(ref stack) = top_stack {
+        let stack_price = stack.get("price").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let qty = stack
+            .get("stackedQuantity")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        let side = stack
+            .get("side")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        if qty > 0.0 {
+            parts.push(format!(
+                "Top stack level: {stack_price:.2} ({side} side, {qty:.0} contracts stacked)."
+            ));
+        }
+    }
+
+    if net_delta.abs() > 0.0 {
+        let direction = if net_delta > 0.0 {
+            "buyer-led"
+        } else {
+            "seller-led"
+        };
+        parts.push(format!(
+            "Net delta {net_delta:+.0} over {total_volume:.0} volume — tape was {direction}."
+        ));
+    }
+
+    if depth_event_count > 0 {
+        parts.push(format!(
+            "{depth_event_count} depth records in window — {} book activity.",
+            if depth_event_count > 100 {
+                "heavy"
+            } else if depth_event_count > 30 {
+                "moderate"
+            } else {
+                "light"
+            }
+        ));
+    }
+
+    let overall = if pull_stack_bias > 0.0 && net_delta >= 0.0 {
+        "Book and tape aligned supportive: bid-side liquidity held up while tape stayed neutral-to-positive."
+    } else if pull_stack_bias < 0.0 && net_delta <= 0.0 {
+        "Book and tape aligned defensive: offers held better than bids while tape skewed seller-led."
+    } else if pull_stack_bias > 0.0 && net_delta < 0.0 {
+        "Book was supportive but tape disagreed — bids were stacking while sellers dominated the tape. Potential absorption."
+    } else if pull_stack_bias < 0.0 && net_delta > 0.0 {
+        "Book was fragile but tape was buying — offers were pulling while buyers lifted aggressively. Potential breakout setup."
+    } else {
+        "Liquidity stayed relatively balanced — the reaction looks more tape-driven than book-driven."
+    };
+    parts.push(overall.to_string());
+
+    serde_json::json!({
+        "timestampMs": timestamp_ms,
+        "window": { "startTimeMs": start_time_ms, "endTimeMs": end_time_ms },
+        "priceFocus": { "price": price, "radiusTicks": radius_ticks },
+        "domFeature": feature_payload,
+        "depthEventCount": depth_event_count,
+        "depthSource": depth_source,
+        "tapeTickCount": ticks.len(),
+        "totalVolume": total_volume,
+        "netDelta": net_delta,
+        "pullRates": { "bid": bid_pull_rate, "ask": ask_pull_rate },
+        "pullStackBias": pull_stack_bias,
+        "liquidityBias": liquidity_bias,
+        "topPullLevel": top_pull,
+        "topStackLevel": top_stack,
+        "explanation": parts.join(" "),
+    })
 }
 
 pub(crate) fn aggregate_window_trades(

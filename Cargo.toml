@@ -11,6 +11,15 @@ description = "Local-first MCP intelligence backend for AI agents over determini
 repository = "https://github.com/alecwardd/the-desk"
 publish = false
 
+[features]
+default = []
+# SIL-M3e Path C only. Off by default so `cargo test` / `cargo clippy --all-targets`
+# / `the-desk-mcp` never require libduckdb, a bundled DuckDB build, or network.
+# Bundled build on this Cloud image: CXX=g++ and
+# RUSTFLAGS="-C link-arg=-L/usr/lib/gcc/x86_64-linux-gnu/13" (clang lacks
+# <memory> under cc-rs's --target; rust-lld needs gcc's libstdc++ dir).
+duckdb-bench = ["dep:duckdb"]
+
 [dependencies]
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
@@ -31,6 +40,7 @@ tracing-subscriber = { version = "0.3.23", features = ["json", "env-filter", "fm
 tracing-appender = "0.2.5"
 sha2 = "0.11.0"
 arc-swap = "1"
+duckdb = { version = "1.3", optional = true, features = ["bundled"] }
 
 [dev-dependencies]
 tempfile = "3"

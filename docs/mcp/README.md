@@ -209,6 +209,21 @@ Envelope fields, Trust Level L0, window/session/`N`/reliability contracts are
 unchanged. Events and ticks stay on SQLite; `query_raw` + `store=cold` +
 `source=events|ticks` fails closed. Unknown store labels fail closed.
 
+## SIL-M3e Episode Query benchmark (DuckDB deferred)
+
+Not an MCP tool. `cargo run --release --bin the-desk-eq-bench` times the
+flagship Episode Query on (A) SQLite JSON blobs, (B) a rebuildable dense side
+table, (C) DuckDB `read_json` of the M3d JSONL.zst hive when compiled with
+`--features duckdb-bench` (off by default; CI must not require DuckDB).
+
+Measured verdict: **DEFER DuckDB**. Path B p95 was 34 ms over 10 RTH days /
+486k 1 Hz NQ+ES frames vs an owner SLO of p95 ≤ 2–3 s. Path C (`read_json` of
+the full unpruned JSONL.zst hive, not Parquet) agreed on match fingerprint at
+golden and 10-day scale (~520 ms on the 10-day corpus). That number is a
+lower bound on DuckDB in this layout, not a ceiling on DuckDB. See
+[docs/decision-log.md](../decision-log.md) SIL-M3e. Do not convert the hive to
+Parquet. Do not add DuckDB to `the-desk-mcp`.
+
 ## SIL-M2a engine extract + embedded fallback
 
 - Default `[sil].engine_mode = "embedded"`: MCP owns ingest (today's topology /

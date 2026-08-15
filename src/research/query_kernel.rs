@@ -285,6 +285,24 @@ pub struct QueryEpisodesRequest {
     pub forward_direction: Option<String>,
 }
 
+/// Options for Episode Query. Live MCP / [`query_episodes`] keep product window caps.
+///
+/// `enforce_product_window_cap = false` is SIL-M3e SLO-scan only — it does not
+/// change the MCP/`run_job` contract (still 7 calendar days).
+#[derive(Debug, Clone, Copy)]
+pub struct QueryEpisodesOpts {
+    /// When false, skip [`QUERY_EPISODES_MAX_WINDOW_MS`] so a bench can scan ~2 weeks of 1 Hz frames.
+    pub enforce_product_window_cap: bool,
+}
+
+impl Default for QueryEpisodesOpts {
+    fn default() -> Self {
+        Self {
+            enforce_product_window_cap: true,
+        }
+    }
+}
+
 /// `query_raw` request (R3, hard-capped).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -563,6 +581,15 @@ pub fn validate_window(
     start_ms: Option<f64>,
     end_ms: Option<f64>,
 ) -> Result<(f64, f64), QueryKernelError> {
+    validate_window_ex(kind, start_ms, end_ms, true)
+}
+
+fn validate_window_ex(
+    kind: QueryKind,
+    start_ms: Option<f64>,
+    end_ms: Option<f64>,
+    enforce_cap: bool,
+) -> Result<(f64, f64), QueryKernelError> {
     let (Some(start), Some(end)) = (start_ms, end_ms) else {
         return Err(QueryKernelError::UnboundedWindow);
     };
@@ -572,14 +599,16 @@ pub fn validate_window(
     if end <= start {
         return Err(QueryKernelError::InvertedWindow);
     }
-    let span = end - start;
-    let cap = kind.max_window_ms();
-    if span > cap {
-        return Err(QueryKernelError::WindowTooLarge {
-            kind: kind.as_str(),
-            requested_ms: span,
-            cap_ms: cap,
-        });
+    if enforce_cap {
+        let span = end - start;
+        let cap = kind.max_window_ms();
+        if span > cap {
+            return Err(QueryKernelError::WindowTooLarge {
+                kind: kind.as_str(),
+                requested_ms: span,
+                cap_ms: cap,
+            });
+        }
     }
     Ok((start, end))
 }
@@ -1154,8 +1183,22 @@ pub fn query_episodes_with(
     frame_src: JournalFrameRead<'_>,
     req: &QueryEpisodesRequest,
 ) -> Result<QueryEpisodesResult, QueryKernelError> {
-    let (start, end) =
-        validate_window(QueryKind::Episodes, req.window.start_ms, req.window.end_ms)?;
+    query_episodes_with_opts(db, frame_src, req, QueryEpisodesOpts::default())
+}
+
+/// Episode Query with explicit store + window-cap policy (SIL-M3e SLO scan).
+pub fn query_episodes_with_opts(
+    db: &Database,
+    frame_src: JournalFrameRead<'_>,
+    req: &QueryEpisodesRequest,
+    opts: QueryEpisodesOpts,
+) -> Result<QueryEpisodesResult, QueryKernelError> {
+    let (start, end) = validate_window_ex(
+        QueryKind::Episodes,
+        req.window.start_ms,
+        req.window.end_ms,
+        opts.enforce_product_window_cap,
+    )?;
     if req.predicates.is_empty() {
         return Err(QueryKernelError::Invalid(
             "query_episodes requires at least one catalog predicate".into(),

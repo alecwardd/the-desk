@@ -1,4 +1,5 @@
 pub mod context_frame;
+pub mod episode_query_bench;
 pub mod hypothesis;
 pub mod ib_campaign;
 pub mod idea034_bucket_stats;

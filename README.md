@@ -21,7 +21,7 @@ Rules engine + guardrails
 SQLite state and research store
         |
         v
-MCP server (121 structured tools)
+MCP server (123 structured tools)
         |
         v
 AI agents in Cursor

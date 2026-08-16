@@ -27,6 +27,14 @@ pub struct FeatureRegistryParams {
     pub catalog_field_ids: Option<Vec<String>>,
     #[serde(alias = "event_types")]
     pub event_types: Option<Vec<String>>,
+    /// Catalog unit label (`count`, `ticks`, `enumLabel`, …). Defaults to `count`.
+    pub unit: Option<String>,
+    #[serde(alias = "session_scope")]
+    pub session_scope: Option<String>,
+    /// Catalog freshness label. Defaults to `liveTickAnchored`.
+    pub freshness: Option<String>,
+    #[serde(alias = "cost_hint")]
+    pub cost_hint: Option<String>,
     #[serde(alias = "rust_module")]
     pub rust_module: Option<String>,
     pub source: Option<String>,

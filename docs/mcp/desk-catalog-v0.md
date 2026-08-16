@@ -275,6 +275,6 @@ Governance waist for **Base Detectors**: schema, provenance, and promotion (`can
 | `detector.absorption` | `flow` | active | true | absorption_detected, absorption_confirmed, absorption_invalidated |
 | `detector.pinch` | `flow` | active | true | pinch_detected |
 | `detector.rebid_reoffer` | `response` | active | true | acceleration_zone_created, acceleration_zone_held |
-| `detector.structure` | `location_structure` | active | true | ib_formed, or_formed, ib_mid_test, ib_extension_hit, new_session_high, new_session_low, dnp_cross, day_type_change, poor_high_detected, poor_low_detected, excess_high_detected, excess_low_detected, or5_mid_retest, rvol_spike |
+| `detector.structure` | `location_structure` | active | true | day_type_change, dnp_cross, dnp_test, dnva_high_test, dnva_low_test, excess_high_detected, excess_low_detected, ib_extension_hit, ib_formed, ib_high_test, ib_low_test, ib_mid_test, ib_reentry, ib_reentry_full_traverse, ib_reentry_hit_mid, new_session_high, new_session_low, or5_mid_retest, or_formed, overnight_high_test, overnight_low_test, poc_test, poor_high_detected, poor_low_detected, prior_close_test, prior_day_high_test, prior_day_low_test, prior_poc_test, prior_vah_test, prior_val_test, rvol_at_ib_close, rvol_spike, vah_test, val_test, vwap_1sd_lower_test, vwap_1sd_upper_test, vwap_2sd_lower_test, vwap_2sd_upper_test, vwap_test |
 | `detector.trade_size` | `flow` | active | true | large_trade_cluster |
 

@@ -899,6 +899,120 @@ fn specialty_market_tools_require_catalog_allowlist_entry() {
     );
 }
 
+/// Pinned non-detector specialty market tools. A new live market tool must be
+/// added here **or** to `DETECTOR_SPECIALTY_TOOLS` (with an active registry id).
+const NON_DETECTOR_MARKET_TOOLS: &[&str] = &[
+    "check_delta_confirmation",
+    "get_context_frame",
+    "get_day_type",
+    "get_delta_at_price",
+    "get_delta_profile",
+    "get_footprint",
+    "get_footprint_window",
+    "get_imbalances",
+    "get_key_levels",
+    "get_market_snapshot",
+    "get_or5_status",
+    "get_proximity_report",
+    "get_rvol",
+    "get_session_context",
+    "get_session_inventory",
+    "get_session_summary",
+    "get_snapshot_at",
+    "get_tape_pace",
+    "get_tpo_detail",
+    "get_tpo_profile",
+];
+
+#[test]
+fn detector_specialty_tools_partition_live_market_router() {
+    let live: std::collections::BTreeSet<String> = TheDeskMcp::market_router()
+        .list_all()
+        .into_iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    let detector: std::collections::BTreeSet<String> =
+        the_desk_backend::catalog::DETECTOR_SPECIALTY_TOOLS
+            .iter()
+            .map(|(tool, _)| (*tool).to_string())
+            .collect();
+    let non_detector: std::collections::BTreeSet<String> = NON_DETECTOR_MARKET_TOOLS
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    assert!(
+        NON_DETECTOR_MARKET_TOOLS.windows(2).all(|w| w[0] < w[1]),
+        "NON_DETECTOR_MARKET_TOOLS must stay sorted"
+    );
+    assert!(
+        detector.is_disjoint(&non_detector),
+        "a market tool cannot be both detector-backed and pinned non-detector"
+    );
+    let classified: std::collections::BTreeSet<String> =
+        detector.union(&non_detector).cloned().collect();
+    assert_eq!(
+        live, classified,
+        "every live market tool must be classified as detector-backed \
+         (DETECTOR_SPECIALTY_TOOLS + active Feature Registry id) or pinned \
+         non-detector (NON_DETECTOR_MARKET_TOOLS). No catalog/registry entry \
+         → no new detector tool."
+    );
+    let catalog = the_desk_backend::catalog::build_catalog();
+    for (tool, id) in the_desk_backend::catalog::DETECTOR_SPECIALTY_TOOLS {
+        assert!(
+            live.contains(*tool),
+            "{tool} must be on the live market router"
+        );
+        let detector = catalog
+            .base_detectors
+            .iter()
+            .find(|d| d.id == *id)
+            .unwrap_or_else(|| panic!("{id} must be a shipped Base Detector"));
+        assert_eq!(
+            detector.promotion_state,
+            the_desk_backend::catalog::PromotionState::Active,
+            "{id} must be active before {tool} can exist"
+        );
+        assert!(the_desk_backend::catalog::concept_has_catalog_or_registry_entry(&catalog, id));
+    }
+}
+
+#[test]
+fn builtin_feature_event_types_are_in_the_canonical_emitted_set() {
+    let mut canonical: std::collections::BTreeSet<String> = RESEARCH_EVENT_TYPES
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    for name in RESEARCH_LEVEL_TEST_NAMES {
+        canonical.insert(format!("{name}_test"));
+    }
+    // EventDetector emits current-session VA/POC tests and prior_* aliases
+    // that the research query allowlist names differently.
+    for name in [
+        "vah",
+        "val",
+        "poc",
+        "prior_close",
+        "prior_vah",
+        "prior_val",
+        "prior_poc",
+    ] {
+        canonical.insert(format!("{name}_test"));
+    }
+    canonical.insert("rvol_at_ib_close".into());
+    let catalog = the_desk_backend::catalog::build_catalog();
+    for detector in &catalog.base_detectors {
+        for event in &detector.schema.event_types {
+            assert!(
+                canonical.contains(event),
+                "{} lists event type `{event}` which is not in RESEARCH_EVENT_TYPES, \
+                 RESEARCH_LEVEL_TEST_NAMES-derived `_test` names, or EventDetector aliases",
+                detector.id
+            );
+        }
+    }
+}
+
 #[test]
 fn discovery_tools_absent_from_default_router() {
     let names: std::collections::BTreeSet<_> = TheDeskMcp::tool_router()
@@ -1064,6 +1178,8 @@ async fn discovery_tools_return_metadata_only() {
         .any(|h| h["id"] == "detector.pinch" && h["promotionState"] == "active"));
     assert_eq!(env["featureRegistry"]["humanGated"], true);
     assert_eq!(env["featureRegistry"]["writeVerb"], "feature_registry");
+    assert_eq!(env["featureRegistry"]["discoveryEnabled"], true);
+    assert_eq!(env["featureRegistry"]["readRequiresCatalogDiscovery"], true);
 }
 
 #[tokio::test]
@@ -1091,6 +1207,15 @@ async fn feature_registry_register_and_promote_is_human_gated() {
     assert_eq!(registered["mutationAuthority"], true);
     assert_eq!(registered["orderAuthority"], false);
     assert_eq!(registered["readOperator"], "search_catalog");
+    assert_eq!(registered["discoveryEnabled"], true);
+    assert_eq!(registered["readRequiresCatalogDiscovery"], true);
+    assert_eq!(registered["feature"]["schema"]["unit"], "count");
+    assert_eq!(registered["feature"]["schema"]["sessionScope"], "session");
+    assert_eq!(
+        registered["feature"]["schema"]["freshness"],
+        "liveTickAnchored"
+    );
+    assert_eq!(registered["feature"]["schema"]["costHint"], "R1");
 
     let missing_gate = server
         .feature_registry(Parameters(
@@ -1179,6 +1304,83 @@ async fn feature_registry_register_and_promote_is_human_gated() {
         ))
         .await;
     assert!(builtin.is_err(), "shipped absorption must stay immutable");
+}
+
+#[tokio::test]
+async fn feature_registry_register_accepts_schema_enums_and_rejects_unknown() {
+    let server = test_server_with_sil();
+    let registered = parse_text_tool_result(
+        server
+            .feature_registry(Parameters(
+                the_desk_backend::mcp::feature_registry::FeatureRegistryParams {
+                    action: Some("register".into()),
+                    feature_id: Some("detector.schema_enums".into()),
+                    name: Some("schema_enums".into()),
+                    description: Some("Candidate with explicit schema enums.".into()),
+                    domain_id: Some("location_structure".into()),
+                    event_types: Some(vec!["schema_enums_detected".into()]),
+                    rust_module: Some("unwired".into()),
+                    kind: Some("baseDetector".into()),
+                    unit: Some("ticks".into()),
+                    session_scope: Some("rth".into()),
+                    freshness: Some("sessionScoped".into()),
+                    cost_hint: Some("R2".into()),
+                    ..Default::default()
+                },
+            ))
+            .await
+            .expect("register schema enums"),
+    );
+    assert_eq!(registered["feature"]["schema"]["unit"], "ticks");
+    assert_eq!(registered["feature"]["schema"]["sessionScope"], "rth");
+    assert_eq!(
+        registered["feature"]["schema"]["freshness"],
+        "sessionScoped"
+    );
+    assert_eq!(registered["feature"]["schema"]["costHint"], "R2");
+
+    let unknown = server
+        .feature_registry(Parameters(
+            the_desk_backend::mcp::feature_registry::FeatureRegistryParams {
+                action: Some("register".into()),
+                feature_id: Some("detector.bad_unit".into()),
+                name: Some("bad_unit".into()),
+                description: Some("Unknown unit must fail closed.".into()),
+                domain_id: Some("flow".into()),
+                event_types: Some(vec!["bad_unit_detected".into()]),
+                rust_module: Some("unwired".into()),
+                unit: Some("furlongs".into()),
+                ..Default::default()
+            },
+        ))
+        .await;
+    assert!(unknown.is_err(), "unknown unit must be rejected");
+}
+
+#[tokio::test]
+async fn feature_registry_reports_discovery_disabled_when_sil_off() {
+    let server = test_server();
+    assert!(!server.sil_config.catalog_discovery);
+    let registered = parse_text_tool_result(
+        server
+            .feature_registry(Parameters(
+                the_desk_backend::mcp::feature_registry::FeatureRegistryParams {
+                    action: Some("register".into()),
+                    feature_id: Some("detector.default_surface".into()),
+                    name: Some("default_surface".into()),
+                    description: Some("Write verb stays on the default surface.".into()),
+                    domain_id: Some("flow".into()),
+                    event_types: Some(vec!["default_surface_detected".into()]),
+                    rust_module: Some("unwired".into()),
+                    ..Default::default()
+                },
+            ))
+            .await
+            .expect("register on default surface"),
+    );
+    assert_eq!(registered["discoveryEnabled"], false);
+    assert_eq!(registered["readRequiresCatalogDiscovery"], true);
+    assert_eq!(registered["readOperator"], "search_catalog");
 }
 
 #[tokio::test]

@@ -73,7 +73,10 @@ guarantees the two lists can never diverge.
 > Catalog entry. Specialty market tools are the `market` domain router
 > (`tools/market.rs`). The rule is **no catalog entry → no new market tool**
 > (allowlist in `docs/mcp/desk-catalog-v0.json`). New detector concepts also need a
-> Feature Registry entry (`feature_registry` write verb; discovery via `search_catalog`).
+> Feature Registry entry (`feature_registry` write verb; discovery via `search_catalog`
+> when `[sil].catalog_discovery = true`). The write verb is always on the default
+> surface; reading descriptors back requires the discovery flag (same pattern as
+> `positioning_entry` / `get_state`).
 > Workflow domains (playbook /
 > risk / journal / memory / research / admin) and SIL kernel operators
 > (`describe_*` / `search_catalog` / `get_state` / `get_events` /
@@ -111,8 +114,9 @@ guarantees the two lists can never diverge.
      match the SIL-M0 freeze set.
    - `specialty_market_tools_require_catalog_allowlist_entry` — market tools ⊆
      Catalog v0 specialty allowlist.
-   - detector specialty tools must cite an active Feature Registry id
-     (`detector_specialty_tools_require_active_registry_entry`).
+   - `detector_specialty_tools_partition_live_market_router` — every live market
+     tool is classified as detector-backed (must cite an active Feature Registry
+     id) or pinned non-detector; an unclassified addition fails the build.
    - `desk_catalog_docs_are_current` — `desk-catalog-v0.json` / `.md` match
      `build_catalog()`.
 

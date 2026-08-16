@@ -30,7 +30,7 @@ impl TheDeskMcp {
         description = "Describe the Desk Catalog environment: catalogVersion, Trust Ceiling (L3), domain list, Positioning stub status, and specialty-market-tool policy. Returns catalog metadata only — never live market data. Enable via [sil].catalog_discovery in config.toml. Trust Level L0 (read/query)."
     )]
     pub(crate) async fn describe_environment(&self) -> Result<CallToolResult, McpError> {
-        let catalog = catalog_with_registry_overlay(self);
+        let catalog = catalog_with_registry_overlay(self)?;
         let mut out = describe_environment(&catalog, self.sil_config.catalog_discovery);
         if let Some(obj) = out.as_object_mut() {
             obj.insert("trustLevel".into(), serde_json::json!(TrustLevel::L0));
@@ -59,7 +59,7 @@ impl TheDeskMcp {
             .ok_or_else(|| {
                 invalid_params_error("describe_domain requires `domain` (catalog domain id)")
             })?;
-        let catalog = catalog_with_registry_overlay(self);
+        let catalog = catalog_with_registry_overlay(self)?;
         match describe_domain(&catalog, domain_id) {
             Some(mut out) => {
                 if let Some(obj) = out.as_object_mut() {
@@ -90,7 +90,7 @@ impl TheDeskMcp {
         Parameters(params): Parameters<SearchCatalogParams>,
     ) -> Result<CallToolResult, McpError> {
         let query = params.query.unwrap_or_default();
-        let catalog = catalog_with_registry_overlay(self);
+        let catalog = catalog_with_registry_overlay(self)?;
         let hits = search_catalog(&catalog, &query);
         let feature_hits = search_features(&catalog, &query);
         Ok(text_result(serde_json::json!({
@@ -1079,12 +1079,10 @@ fn merge_l0(mut value: serde_json::Value) -> serde_json::Value {
 }
 
 /// Desk Catalog plus Feature Registry overlay rows (discovery only).
-fn catalog_with_registry_overlay(server: &TheDeskMcp) -> the_desk_backend::catalog::DeskCatalog {
-    let overlay = server
-        .db
-        .lock()
-        .ok()
-        .and_then(|db| db.list_feature_registry().ok())
-        .unwrap_or_default();
-    build_catalog_with_overlay(overlay)
+fn catalog_with_registry_overlay(
+    server: &TheDeskMcp,
+) -> Result<the_desk_backend::catalog::DeskCatalog, McpError> {
+    let db = server.db.lock().map_err(|_| lock_error())?;
+    let overlay = db.list_feature_registry().map_err(db_error)?;
+    Ok(build_catalog_with_overlay(overlay))
 }

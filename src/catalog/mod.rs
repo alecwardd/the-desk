@@ -131,6 +131,13 @@ pub fn build_catalog_with_overlay(overlay: Vec<FeatureDescriptor>) -> DeskCatalo
 
 /// Environment metadata for `describe_environment` (no live values).
 pub fn describe_environment(catalog: &DeskCatalog, discovery_enabled: bool) -> serde_json::Value {
+    let mut feature_registry = feature_registry_environment(catalog);
+    if let Some(obj) = feature_registry.as_object_mut() {
+        obj.insert(
+            "discoveryEnabled".into(),
+            serde_json::json!(discovery_enabled),
+        );
+    }
     serde_json::json!({
         "catalogVersion": catalog.catalog_version,
         "trustCeiling": catalog.trust_ceiling,
@@ -154,7 +161,7 @@ pub fn describe_environment(catalog: &DeskCatalog, discovery_enabled: bool) -> s
         },
         "specialtyMarketToolsPolicy": "no_catalog_or_registry_entry_no_new_market_tool",
         "specialtyMarketToolCount": catalog.specialty_market_tools.len(),
-        "featureRegistry": feature_registry_environment(catalog),
+        "featureRegistry": feature_registry,
         "marketRouter": {
             "roots": ["NQ", "ES"],
             "oneClock": true,
@@ -590,6 +597,10 @@ mod tests {
         let env = describe_environment(&cat, true);
         assert_eq!(env["featureRegistry"]["humanGated"], true);
         assert_eq!(env["featureRegistry"]["writeVerb"], "feature_registry");
+        assert_eq!(env["featureRegistry"]["discoveryEnabled"], true);
+        assert_eq!(env["featureRegistry"]["readRequiresCatalogDiscovery"], true);
+        let env_off = describe_environment(&cat, false);
+        assert_eq!(env_off["featureRegistry"]["discoveryEnabled"], false);
         assert_eq!(
             env["specialtyMarketToolsPolicy"],
             "no_catalog_or_registry_entry_no_new_market_tool"
@@ -607,5 +618,9 @@ mod tests {
         assert!(hits.iter().any(|h| h.id == "detector.pinch"));
         let hits = crate::catalog::search_features(&cat, "base detector");
         assert!(hits.len() >= 2);
+        let reentry = crate::catalog::search_features(&cat, "ib_reentry");
+        assert!(reentry.iter().any(|h| h.id == "detector.structure"));
+        let poc_test = crate::catalog::search_features(&cat, "poc_test");
+        assert!(poc_test.iter().any(|h| h.id == "detector.structure"));
     }
 }

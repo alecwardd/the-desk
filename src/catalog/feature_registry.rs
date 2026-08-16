@@ -498,6 +498,52 @@ fn shipped_detector(
     }
 }
 
+/// EventDetector `event_type` values governed by `detector.structure`.
+///
+/// `{level}_test` names match the levels array in `pipelines::event_detector`.
+/// IB extension emit keys (`ib_ext_*_hit`) persist as `ib_extension_hit`.
+const STRUCTURE_EVENT_TYPES: &[&str] = &[
+    "day_type_change",
+    "dnp_cross",
+    "dnp_test",
+    "dnva_high_test",
+    "dnva_low_test",
+    "excess_high_detected",
+    "excess_low_detected",
+    "ib_extension_hit",
+    "ib_formed",
+    "ib_high_test",
+    "ib_low_test",
+    "ib_mid_test",
+    "ib_reentry",
+    "ib_reentry_full_traverse",
+    "ib_reentry_hit_mid",
+    "new_session_high",
+    "new_session_low",
+    "or5_mid_retest",
+    "or_formed",
+    "overnight_high_test",
+    "overnight_low_test",
+    "poc_test",
+    "poor_high_detected",
+    "poor_low_detected",
+    "prior_close_test",
+    "prior_day_high_test",
+    "prior_day_low_test",
+    "prior_poc_test",
+    "prior_vah_test",
+    "prior_val_test",
+    "rvol_at_ib_close",
+    "rvol_spike",
+    "vah_test",
+    "val_test",
+    "vwap_1sd_lower_test",
+    "vwap_1sd_upper_test",
+    "vwap_2sd_lower_test",
+    "vwap_2sd_upper_test",
+    "vwap_test",
+];
+
 /// Shipped Base Detectors — registered `active` without changing pipeline math.
 pub fn builtin_base_detectors() -> Vec<FeatureDescriptor> {
     vec![
@@ -605,22 +651,7 @@ pub fn builtin_base_detectors() -> Vec<FeatureDescriptor> {
                     "market.location_structure.excessLow",
                     "market.volatility.rvolRatio",
                 ],
-                &[
-                    "ib_formed",
-                    "or_formed",
-                    "ib_mid_test",
-                    "ib_extension_hit",
-                    "new_session_high",
-                    "new_session_low",
-                    "dnp_cross",
-                    "day_type_change",
-                    "poor_high_detected",
-                    "poor_low_detected",
-                    "excess_high_detected",
-                    "excess_low_detected",
-                    "or5_mid_retest",
-                    "rvol_spike",
-                ],
+                STRUCTURE_EVENT_TYPES,
                 Unit::EnumLabel,
                 SessionScope::Rth,
                 FreshnessSemantics::SessionScoped,
@@ -657,6 +688,7 @@ pub fn feature_registry_environment(catalog: &DeskCatalog) -> serde_json::Value 
         "featureIr": false,
         "newSpecialtyToolPolicy": "no_catalog_or_registry_entry_no_new_market_tool",
         "readOperator": "search_catalog",
+        "readRequiresCatalogDiscovery": true,
     })
 }
 
@@ -731,6 +763,46 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn structure_event_types_cover_event_detector_output() {
+        assert!(STRUCTURE_EVENT_TYPES.windows(2).all(|w| w[0] < w[1]));
+        let unique: BTreeSet<_> = STRUCTURE_EVENT_TYPES.iter().copied().collect();
+        assert_eq!(unique.len(), STRUCTURE_EVENT_TYPES.len());
+        let structure = builtin_base_detectors()
+            .into_iter()
+            .find(|d| d.id == "detector.structure")
+            .expect("structure");
+        let listed: BTreeSet<_> = structure
+            .schema
+            .event_types
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        for event in STRUCTURE_EVENT_TYPES {
+            assert!(
+                listed.contains(*event),
+                "detector.structure missing event type {event}"
+            );
+        }
+        for required in [
+            "ib_reentry",
+            "ib_reentry_hit_mid",
+            "ib_reentry_full_traverse",
+            "rvol_at_ib_close",
+            "poc_test",
+            "ib_high_test",
+            "prior_day_high_test",
+            "vah_test",
+        ] {
+            assert!(
+                listed.contains(required),
+                "detector.structure must list {required}"
+            );
+        }
+        assert!(!listed.contains("ib_ext_0.5x_high_hit"));
+        assert!(listed.contains("ib_extension_hit"));
     }
 
     #[test]

@@ -7,7 +7,7 @@ exactly in code, docs, ADRs, and agent copy. Do not invent synonyms.
 |------|---------|
 | **Trust Level** | Capability property of a tool on the MCP surface. Read/query kernel operators run at **L0** and cannot carry mutation or order authority. |
 | **Trust Ceiling** | System-wide maximum Trust Level. Stays at **L3** (drafts proposals; the human executes). Raising it requires a new ADR. |
-| **Base Detector** | Stateful Rust detector (absorption, pinch, …). Math stays in reviewed Rust; schema, provenance, and promotion (`candidate` → `shadow` → `active`, human-gated) are Feature Registry–governed. Discovery rides `search_catalog` / catalog descriptors. The write verb is `feature_registry`. |
+| **Base Detector** | Stateful Rust detector (absorption, pinch, …). Math stays in reviewed Rust; schema, provenance, and promotion (`candidate` → `shadow` → `active`, human-gated) are Feature Registry–governed. Discovery rides `search_catalog` / catalog descriptors when `[sil].catalog_discovery` is on. The write verb is `feature_registry`. |
 | **Derived Feature** | Declared Feature-IR program over catalog fields using funded Operator Families. |
 | **Feature-IR** | Typed intermediate representation for Derived Features (later milestones). |
 | **Operator Family** | One of the funded Feature-IR operator classes (cross-symbol, session percentiles, dwell/time-since, event sequences, historical baselines). |

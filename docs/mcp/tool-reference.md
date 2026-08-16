@@ -432,7 +432,7 @@ Compare current session structure against similar historical sessions. Uses mult
 
 ### `feature_registry`
 
-Typed workflow verb for the Feature Registry lifecycle. action=register accepts a Base Detector descriptor (schema + provenance) at promotion=candidate. action=promote moves candidate → shadow or shadow → active and requires traderConfirmation (human gate). Shipped detectors (absorption, pinch, …) are already active and cannot be overwritten. Discovery rides search_catalog / catalog descriptors — this is not a specialty getter and does not implement detector math. Trust Ceiling stays L3; no order authority. Your playbook / your rules say how to use a registered descriptor.
+Typed workflow verb for the Feature Registry lifecycle. action=register accepts a Base Detector descriptor (schema + provenance) at promotion=candidate. Schema fields catalogFieldIds, eventTypes, unit, sessionScope, freshness, and costHint are accepted on register (unknown labels rejected; omitted unit/scope/freshness/cost default to count/session/liveTickAnchored/R1). action=promote moves candidate → shadow or shadow → active and requires traderConfirmation (human gate). Shipped detectors (absorption, pinch, …) are already active and cannot be overwritten. Reading descriptors back requires [sil].catalog_discovery = true so search_catalog / describe_environment / describe_domain are on the router — this is not a specialty getter and does not implement detector math. Trust Ceiling stays L3; no order authority. Your playbook / your rules say how to use a registered descriptor.
 
 ### `get_backfill_status`
 

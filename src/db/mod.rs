@@ -1,4 +1,4 @@
-use crate::catalog::PositioningRecord;
+use crate::catalog::{FeatureDescriptor, PositioningRecord};
 use crate::depth::DepthRecord;
 use crate::memory::{
     AgentInsightQuery, AgentInsightRecord, BehavioralPatternQuery, BehavioralPatternRecord,
@@ -1786,6 +1786,9 @@ impl Database {
         if version < 38 {
             self.migrate_v38()?;
         }
+        if version < 39 {
+            self.migrate_v39()?;
+        }
 
         Ok(())
     }
@@ -3504,6 +3507,28 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_market_events_ts
               ON market_events(timestamp_ms);
             UPDATE schema_version SET version = 38;
+            ",
+        )?;
+        Ok(())
+    }
+
+    /// V39: SIL-M5a Feature Registry overlay (registered Base Detector descriptors
+    /// and human-gated promotion state). Shipped builtins live in the catalog;
+    /// this table holds non-builtin candidates / promotions only.
+    fn migrate_v39(&self) -> Result<(), DbError> {
+        self.conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS feature_registry (
+              id TEXT PRIMARY KEY,
+              kind TEXT NOT NULL,
+              promotion_state TEXT NOT NULL,
+              payload TEXT NOT NULL,
+              created_at_ms REAL NOT NULL,
+              updated_at_ms REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_feature_registry_state
+              ON feature_registry(promotion_state, updated_at_ms DESC);
+            UPDATE schema_version SET version = 39;
             ",
         )?;
         Ok(())
@@ -7921,6 +7946,69 @@ impl Database {
         params: impl rusqlite::Params,
     ) -> Result<Option<PositioningRecord>, DbError> {
         let payload: Option<String> = match self.conn.query_row(sql, params, |r| r.get(0)) {
+            Ok(v) => Some(v),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(err) => return Err(err.into()),
+        };
+        match payload {
+            None => Ok(None),
+            Some(raw) => Ok(Some(serde_json::from_str(&raw)?)),
+        }
+    }
+
+    /// Persist a Feature Registry overlay row (non-builtin Base Detector descriptors).
+    pub fn upsert_feature_registry(
+        &self,
+        descriptor: &FeatureDescriptor,
+        now_ms: f64,
+    ) -> Result<(), DbError> {
+        if descriptor.builtin {
+            return Err(DbError::InvalidQuery(
+                "shipped builtin Base Detectors are catalog-defined and are not persisted".into(),
+            ));
+        }
+        let payload = serde_json::to_string(descriptor)?;
+        self.conn.execute(
+            "INSERT INTO feature_registry (
+                id, kind, promotion_state, payload, created_at_ms, updated_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(id) DO UPDATE SET
+                kind = excluded.kind,
+                promotion_state = excluded.promotion_state,
+                payload = excluded.payload,
+                updated_at_ms = excluded.updated_at_ms",
+            params![
+                descriptor.id,
+                descriptor.kind.as_str(),
+                descriptor.promotion_state.as_str(),
+                payload,
+                now_ms,
+                now_ms,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Overlay rows for catalog discovery (builtins are compiled in).
+    pub fn list_feature_registry(&self) -> Result<Vec<FeatureDescriptor>, DbError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT payload FROM feature_registry ORDER BY id ASC")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for payload in rows {
+            out.push(serde_json::from_str(&payload?)?);
+        }
+        Ok(out)
+    }
+
+    /// One overlay descriptor by id.
+    pub fn get_feature_registry(&self, id: &str) -> Result<Option<FeatureDescriptor>, DbError> {
+        let payload: Option<String> = match self.conn.query_row(
+            "SELECT payload FROM feature_registry WHERE id = ?1",
+            params![id],
+            |r| r.get(0),
+        ) {
             Ok(v) => Some(v),
             Err(rusqlite::Error::QueryReturnedNoRows) => None,
             Err(err) => return Err(err.into()),
@@ -13809,8 +13897,8 @@ mod tests {
             )
             .expect("version");
         assert!(
-            version >= 38,
-            "schema v38 market_events timestamp index, got {version}"
+            version >= 39,
+            "schema v39 feature_registry overlay, got {version}"
         );
         let identity_idx: i64 = db
             .conn
@@ -13852,6 +13940,16 @@ mod tests {
             )
             .expect("events ts idx");
         assert_eq!(events_ts_idx, 1);
+        let feature_registry: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(1) FROM sqlite_master
+                  WHERE type='table' AND name='feature_registry'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("feature_registry table");
+        assert_eq!(feature_registry, 1);
     }
 
     fn sample_capsule_record(

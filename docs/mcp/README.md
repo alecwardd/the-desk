@@ -8,7 +8,7 @@ connecting to it.
 - **Binary:** `the-desk-mcp` (default run target)
 - **Transport:** stdio (`rmcp` crate). stdout is protocol-only; logs go to
   stderr/file (enforced by the `mcp_stdio` integration test).
-- **Tool surface:** 122 MCP tools in 9 domains. The exhaustive, generated catalog is
+- **Tool surface:** 123 MCP tools in 9 domains. The exhaustive, generated catalog is
   [tool-reference.md](tool-reference.md). Scenario routing for agents is
   [skills/mcp-tools/SKILL.md](../../skills/mcp-tools/SKILL.md).
 
@@ -35,7 +35,7 @@ src/bin/the-desk-mcp/
     ├── risk.rs      # Risk, account, sizing, session bookends (9)
     ├── journal.rs   # Trade entries, fills, journal, reviews (12)
     ├── memory.rs    # Insights, patterns, follow-ups, briefings, positioning_entry (13)
-    ├── research.rs  # Hypotheses, backtests, statistical queries (23)
+    ├── research.rs  # Hypotheses, backtests, feature_registry, statistical queries (24)
     └── admin.rs     # Feed health, ingestion, rollover, integrity, backups (12)
 ```
 
@@ -69,10 +69,15 @@ guarantees the two lists can never diverge.
 
 ## How to Add a Tool
 
-> **SIL-M0 / Catalog v0 / M1b:** **no new specialty market tools** without a Desk
+> **SIL-M0 / Catalog v0 / M1b / M5a:** **no new specialty market tools** without a Desk
 > Catalog entry. Specialty market tools are the `market` domain router
 > (`tools/market.rs`). The rule is **no catalog entry → no new market tool**
-> (allowlist in `docs/mcp/desk-catalog-v0.json`). Workflow domains (playbook /
+> (allowlist in `docs/mcp/desk-catalog-v0.json`). New detector concepts also need a
+> Feature Registry entry (`feature_registry` write verb; discovery via `search_catalog`
+> when `[sil].catalog_discovery = true`). The write verb is always on the default
+> surface; reading descriptors back requires the discovery flag (same pattern as
+> `positioning_entry` / `get_state`).
+> Workflow domains (playbook /
 > risk / journal / memory / research / admin) and SIL kernel operators
 > (`describe_*` / `search_catalog` / `get_state` / `get_events` /
 > `query_series` / `query_episodes` / `query_raw` / `run_job`, behind
@@ -83,7 +88,7 @@ guarantees the two lists can never diverge.
    `tools/mod.rs`, `service.rs`'s combiner, and `docs.rs`'s `tool_domains()`).
    Exception: SIL kernel operators live in `tools/discovery.rs` and are
    wired only via `tool_router_with_sil` when `[sil].catalog_discovery` is on —
-   they stay out of the default `tool_domains()` registry so the 122-tool
+   they stay out of the default `tool_domains()` registry so the 123-tool
    surface remains unchanged when the flag is off.
 2. Add the parameter struct to `params.rs` deriving
    `Deserialize + JsonSchema + Default` with `#[serde(rename_all = "camelCase")]`.
@@ -109,6 +114,9 @@ guarantees the two lists can never diverge.
      match the SIL-M0 freeze set.
    - `specialty_market_tools_require_catalog_allowlist_entry` — market tools ⊆
      Catalog v0 specialty allowlist.
+   - `detector_specialty_tools_partition_live_market_router` — every live market
+     tool is classified as detector-backed (must cite an active Feature Registry
+     id) or pinned non-detector; an unclassified addition fails the build.
    - `desk_catalog_docs_are_current` — `desk-catalog-v0.json` / `.md` match
      `build_catalog()`.
 
@@ -126,7 +134,7 @@ Slice / first-class Levels-Only Records via `positioning_entry`; no live provide
   `search_catalog`, `get_state` (StateEnvelope, R0|R1), `get_events` (identity
   rows), `query_series`, `query_episodes`, `query_raw`, `run_job` (artifact
   handle) — registered only when `[sil].catalog_discovery = true` in
-  `~/.the-desk/config.toml`. Default off → 122-tool surface unchanged.
+  `~/.the-desk/config.toml`. Default off → 123-tool surface unchanged.
   Trust Level L0 (no mutation / order authority). Unbounded query windows are
   rejected. See [CONTEXT.md](../../CONTEXT.md).
 
@@ -181,7 +189,7 @@ With `[sil].catalog_discovery = true`:
 
 Every result includes `N` and `reliabilityTier`. Missing detector/vendor
 fields fail closed. These operators stay out of `tool_domains()` so the
-generated 122-tool reference is unchanged when the flag is off.
+generated 123-tool reference is unchanged when the flag is off.
 
 ## SIL-M3d cold session-partitioned frames
 

@@ -1879,5 +1879,224 @@
       "summary": "First-class Positioning record carrying only derived levels (flip, walls, BALANCE / UPSIDE / DOWNSIDE TEST) — manual-entry unit, ToS-denial steady state, and historical backlog path (ADR-025). Written via positioning_entry."
     }
   ],
-  "positioningProvider": null
+  "positioningProvider": null,
+  "baseDetectors": [
+    {
+      "id": "detector.absorption",
+      "name": "absorption",
+      "kind": "baseDetector",
+      "description": "Base Detector: absorption / exhaustion / delta-divergence (reviewed Rust). Schema, provenance, and promotion are registry-governed. Math lives in pipelines::absorption — this registration does not change behavior.",
+      "domainId": "flow",
+      "schema": {
+        "catalogFieldIds": [
+          "market.flow.absorptionEventCount",
+          "market.flow.confirmedAbsorptionEventCount",
+          "market.flow.confirmedExhaustionEventCount",
+          "market.flow.confirmedDeltaDivergenceEventCount",
+          "market.flow.hasRecentConfirmedAbsorption",
+          "market.flow.hasRecentInvalidatedAbsorption",
+          "market.flow.hasRecentConfirmedExhaustion",
+          "market.flow.recentConfirmedAbsorptionPrice",
+          "market.flow.recentConfirmedAbsorptionDirection",
+          "market.flow.recentConfirmedAbsorptionAgeMs",
+          "market.flow.recentConfirmedAbsorptionDistanceTicks",
+          "market.flow.recentInvalidatedAbsorptionPrice",
+          "market.flow.recentInvalidatedAbsorptionDirection",
+          "market.flow.recentInvalidatedAbsorptionAgeMs",
+          "market.flow.recentInvalidatedAbsorptionDistanceTicks",
+          "market.flow.recentConfirmedExhaustionPrice",
+          "market.flow.recentConfirmedExhaustionDirection",
+          "market.flow.recentConfirmedExhaustionAgeMs"
+        ],
+        "eventTypes": [
+          "absorption_detected",
+          "absorption_confirmed",
+          "absorption_invalidated"
+        ],
+        "unit": "count",
+        "sessionScope": "session",
+        "freshness": "liveTickAnchored",
+        "costHint": "R1"
+      },
+      "provenance": {
+        "source": "rust_pipeline",
+        "rustModule": "pipelines::absorption",
+        "mathTier": "tier1_reviewed_rust",
+        "behaviorChange": false
+      },
+      "promotionState": "active",
+      "builtin": true
+    },
+    {
+      "id": "detector.pinch",
+      "name": "pinch",
+      "kind": "baseDetector",
+      "description": "Base Detector: delta-momentum pinch (reviewed Rust). Schema, provenance, and promotion are registry-governed. Math lives in pipelines::pinch — this registration does not change behavior.",
+      "domainId": "flow",
+      "schema": {
+        "catalogFieldIds": [
+          "market.flow.pinchEventCount"
+        ],
+        "eventTypes": [
+          "pinch_detected"
+        ],
+        "unit": "count",
+        "sessionScope": "session",
+        "freshness": "liveTickAnchored",
+        "costHint": "R1"
+      },
+      "provenance": {
+        "source": "rust_pipeline",
+        "rustModule": "pipelines::pinch",
+        "mathTier": "tier1_reviewed_rust",
+        "behaviorChange": false
+      },
+      "promotionState": "active",
+      "builtin": true
+    },
+    {
+      "id": "detector.rebid_reoffer",
+      "name": "rebid_reoffer",
+      "kind": "baseDetector",
+      "description": "Base Detector: rebid/reoffer acceleration zones (reviewed Rust). Schema, provenance, and promotion are registry-governed. Math lives in pipelines::rebid_reoffer — this registration does not change behavior.",
+      "domainId": "response",
+      "schema": {
+        "catalogFieldIds": [
+          "market.response.activeZoneCount",
+          "market.response.rebidZoneNear",
+          "market.response.reofferZoneNear",
+          "market.response.rebidZoneRetested",
+          "market.response.reofferZoneRetested",
+          "market.response.rebidZoneHeld",
+          "market.response.reofferZoneHeld",
+          "market.response.nearestZoneDirection",
+          "market.response.nearestZoneStatus",
+          "market.response.nearestZoneDistanceTicks",
+          "market.response.rebidZoneLow",
+          "market.response.rebidZoneHigh",
+          "market.response.reofferZoneLow",
+          "market.response.reofferZoneHigh"
+        ],
+        "eventTypes": [
+          "acceleration_zone_created",
+          "acceleration_zone_held"
+        ],
+        "unit": "count",
+        "sessionScope": "session",
+        "freshness": "liveTickAnchored",
+        "costHint": "R1"
+      },
+      "provenance": {
+        "source": "rust_pipeline",
+        "rustModule": "pipelines::rebid_reoffer",
+        "mathTier": "tier1_reviewed_rust",
+        "behaviorChange": false
+      },
+      "promotionState": "active",
+      "builtin": true
+    },
+    {
+      "id": "detector.structure",
+      "name": "structure",
+      "kind": "baseDetector",
+      "description": "Base Detector: structural EventDetector (IB/OR/OR5, day type, poor/excess, level tests, rvol_spike). Schema, provenance, and promotion are registry-governed. Math lives in pipelines::event_detector — this registration does not change behavior.",
+      "domainId": "location_structure",
+      "schema": {
+        "catalogFieldIds": [
+          "market.location_structure.dayType",
+          "market.location_structure.ibHigh",
+          "market.location_structure.ibLow",
+          "market.location_structure.orHigh",
+          "market.location_structure.orLow",
+          "market.location_structure.or5High",
+          "market.location_structure.or5Low",
+          "market.location_structure.poorHigh",
+          "market.location_structure.poorLow",
+          "market.location_structure.excessHigh",
+          "market.location_structure.excessLow",
+          "market.volatility.rvolRatio"
+        ],
+        "eventTypes": [
+          "day_type_change",
+          "dnp_cross",
+          "dnp_test",
+          "dnva_high_test",
+          "dnva_low_test",
+          "excess_high_detected",
+          "excess_low_detected",
+          "ib_extension_hit",
+          "ib_formed",
+          "ib_high_test",
+          "ib_low_test",
+          "ib_mid_test",
+          "ib_reentry",
+          "ib_reentry_full_traverse",
+          "ib_reentry_hit_mid",
+          "new_session_high",
+          "new_session_low",
+          "or5_mid_retest",
+          "or_formed",
+          "overnight_high_test",
+          "overnight_low_test",
+          "poc_test",
+          "poor_high_detected",
+          "poor_low_detected",
+          "prior_close_test",
+          "prior_day_high_test",
+          "prior_day_low_test",
+          "prior_poc_test",
+          "prior_vah_test",
+          "prior_val_test",
+          "rvol_at_ib_close",
+          "rvol_spike",
+          "vah_test",
+          "val_test",
+          "vwap_1sd_lower_test",
+          "vwap_1sd_upper_test",
+          "vwap_2sd_lower_test",
+          "vwap_2sd_upper_test",
+          "vwap_test"
+        ],
+        "unit": "enumLabel",
+        "sessionScope": "rth",
+        "freshness": "sessionScoped",
+        "costHint": "R1"
+      },
+      "provenance": {
+        "source": "rust_pipeline",
+        "rustModule": "pipelines::event_detector",
+        "mathTier": "tier1_reviewed_rust",
+        "behaviorChange": false
+      },
+      "promotionState": "active",
+      "builtin": true
+    },
+    {
+      "id": "detector.trade_size",
+      "name": "trade_size",
+      "kind": "baseDetector",
+      "description": "Base Detector: trade-size distribution / large-trade cluster (reviewed Rust). Schema, provenance, and promotion are registry-governed. Math lives in pipelines::trade_size — this registration does not change behavior.",
+      "domainId": "flow",
+      "schema": {
+        "catalogFieldIds": [
+          "market.flow.avgTradeSize"
+        ],
+        "eventTypes": [
+          "large_trade_cluster"
+        ],
+        "unit": "contracts",
+        "sessionScope": "session",
+        "freshness": "liveTickAnchored",
+        "costHint": "R1"
+      },
+      "provenance": {
+        "source": "rust_pipeline",
+        "rustModule": "pipelines::trade_size",
+        "mathTier": "tier1_reviewed_rust",
+        "behaviorChange": false
+      },
+      "promotionState": "active",
+      "builtin": true
+    }
+  ]
 }

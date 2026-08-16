@@ -34,7 +34,7 @@ flowchart TB
         PIPE["14 pipelines + rules engine"]
         DB[("SQLite data.db (derived cache)")]
         BK["Startup VACUUM INTO backup"]
-        TOOLS["122 MCP tools (stdio)"]
+        TOOLS["123 MCP tools (stdio)"]
         WARM --> PIPE
         TAIL --> PIPE
         DLOOP --> PIPE

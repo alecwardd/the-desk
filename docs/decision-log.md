@@ -831,6 +831,27 @@ This note does not adopt DuckDB, convert M3d hive JSONL.zst to Parquet, add `get
 
 ---
 
+### Decision note: SIL-M5a Feature Registry + Base Detector registration
+
+**Date:** 2026-08-16
+**Status:** Decided (implements [alecwardd/the-desk#18](https://github.com/alecwardd/the-desk/issues/18); Part of #2)
+
+**Context:** Catalog v0 and the read kernel exist. Journal Frames, Capsules, and the research operators are in place. Adding a market concept still meant a specialty tool and no governed promotion path. Spec (#2) user stories 47–48 require Base Detectors to be registry-governed for schema, provenance, and promotion (`candidate` → `shadow` → `active`, human-gated) while Tier 1 math stays reviewed Rust.
+
+**Decision:**
+
+1. **Feature Registry** is the governance waist for **Base Detectors** (and a place for later Derived Features). A descriptor carries schema (catalog field ids + event types + unit/scope/freshness/cost), provenance (`rust_pipeline` / rust module / `tier1_reviewed_rust`), and promotion state. M5a does **not** implement Feature-IR, codegen, the leg engine, or DOM cluster detectors.
+2. **Shipped detectors are registered `active` with `behaviorChange=false`:** absorption, pinch, rebid/reoffer, trade-size, and structure (`EventDetector`). Pipeline math is unchanged. DOM-family types (`stop_run`, `iceberg_reload`, `pull_intent`, `book_velocity_regime_shift`) are **not** registered here (#22).
+3. **Human gate:** `feature_registry` is a typed research-domain workflow verb (`register` | `promote`). Register always starts at `candidate`. Promote allows only `candidate` → `shadow` and `shadow` → `active`, and requires non-empty `traderConfirmation`. Skip-state and builtin overwrite are rejected. Overlay rows persist in SQLite `feature_registry` (schema v39). Builtins stay catalog-defined and are not persisted.
+4. **Discovery rides the existing kernel:** `search_catalog` returns `featureHits`; `describe_environment` / `describe_domain` expose registry metadata. Those read operators stay behind `[sil].catalog_discovery` (default off). The write verb `feature_registry` is on the always-on research router and reports `discoveryEnabled` so a stock config cannot pretend `search_catalog` is present. No specialty getter, no tenth kernel operator. Trust Ceiling stays **L3**. `feature_registry` has mutation authority for registry rows only — no order authority. Read/query kernel operators remain Trust Level **L0** and cannot mutate the registry. Overlay reads fail closed (lock / DB errors propagate); they do not silently drop registered descriptors.
+5. **No catalog/registry entry → no new tool** is enforced for new detector concepts: the live market router is partitioned into pinned non-detector tools plus `DETECTOR_SPECIALTY_TOOLS`. Detector-backed tools (`get_absorption_events`, `get_pinch_events`, `get_rebid_reoffer_zones`, `get_trade_size_profile`) must cite an active registry id; an unclassified market tool fails `cargo test --bin the-desk-mcp`. An unregistered concept such as `detector.iceberg_reload` cannot add a specialty market tool.
+
+This note does not implement Feature-IR / Operator Families (#19), registry codegen (#20), the leg engine (#21), DOM cluster Base Detectors (#22), ACSIL (#23), Vs3dProvider (#16), DuckDB, Parquet conversion, `get_capsule`, a 250 ms forever-store, a tenth kernel operator / `run_job` poll tool, new specialty market tools, or raising the Trust Ceiling.
+
+**Consequences:** Existing absorption/pinch (and other shipped) detectors are discoverable as Base Detectors. New detector concepts must enter the registry before they can grow a specialty tool. Promotion cannot silently reach the live coaching path.
+
+---
+
 ### Decision note: SIL-P-VS-a Levels-Only Record path
 
 **Date:** 2026-08-13

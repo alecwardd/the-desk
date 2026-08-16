@@ -16,7 +16,7 @@ use super::envelope::TrustLevel;
 pub struct ToolCapability {
     pub trust_level: TrustLevel,
     /// When true, the tool may mutate workflow-verb state (risk, playbook,
-    /// journal, memory, hypothesis, positioning entry, trade idea, …).
+    /// journal, memory, hypothesis, feature registry, positioning entry, trade idea, …).
     pub mutation_authority: bool,
     /// When true, the tool may reach order placement / modification state.
     /// Must remain false at every Trust Level while Trust Ceiling is L3.
@@ -94,6 +94,7 @@ pub fn tool_name_implies_mutation(name: &str) -> bool {
         "record_trade_result",
         "update_attention_signal_status",
         "positioning_entry",
+        "feature_registry",
     ];
     if MUTATION_EXACT.contains(&name) {
         return true;
@@ -132,6 +133,7 @@ mod tests {
         assert!(tool_name_implies_mutation("mark_trade_idea_confirmed"));
         assert!(tool_name_implies_mutation("backfill_history"));
         assert!(tool_name_implies_mutation("positioning_entry"));
+        assert!(tool_name_implies_mutation("feature_registry"));
         assert!(!tool_name_implies_mutation("get_state"));
         assert!(!tool_name_implies_mutation("get_events"));
         assert!(!tool_name_implies_mutation("describe_environment"));

@@ -82,6 +82,27 @@ pub fn render_catalog_markdown(catalog: &DeskCatalog) -> String {
         out.push_str(&format!("- `{tool}`\n"));
     }
     out.push('\n');
+
+    out.push_str("## Feature Registry (Base Detectors)\n\n");
+    out.push_str(
+        "Governance waist for **Base Detectors**: schema, provenance, and promotion \
+         (`candidate` → `shadow` → `active`, human-gated). Discovery rides \
+         `search_catalog` / catalog descriptors — no specialty getter. \
+         The write verb is `feature_registry`. Tier 1 math stays reviewed Rust; \
+         this catalog does not implement Feature-IR, codegen, or new detector math.\n\n",
+    );
+    out.push_str("| Id | Domain | Promotion | Builtin | Event types |\n|---|---|---|---|---|\n");
+    for detector in &catalog.base_detectors {
+        out.push_str(&format!(
+            "| `{}` | `{}` | {} | {} | {} |\n",
+            detector.id,
+            detector.domain_id,
+            detector.promotion_state,
+            detector.builtin,
+            detector.schema.event_types.join(", ")
+        ));
+    }
+    out.push('\n');
     out
 }
 

@@ -128,7 +128,7 @@ Module: `src/bin/the-desk-mcp/tools/dom.rs`
 
 ### `explain_book_reaction`
 
-Explanation-oriented delayed DOM read around a timestamp or level. Grounds the interpretation in persisted DOM feature snapshots (and Journal Frame `domSummary` when present), Sierra `.depth` reconstruction, and executed tape. Does not read SQLite `depth_events`. DOM data has ~1s polling lag from Sierra.
+Explanation-oriented delayed DOM read around a timestamp or level. Grounds the interpretation in persisted `dom_feature_snapshots`, Sierra `.depth` reconstruction, and executed tape. Does not read SQLite `depth_events` or Journal Frames. DOM data has ~1s polling lag from Sierra.
 
 ### `get_dom_regime_summary`
 

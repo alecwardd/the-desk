@@ -403,7 +403,7 @@ impl TheDeskMcp {
     }
 
     #[tool(
-        description = "Explanation-oriented delayed DOM read around a timestamp or level. Grounds the interpretation in persisted DOM feature snapshots (and Journal Frame `domSummary` when present), Sierra `.depth` reconstruction, and executed tape. Does not read SQLite `depth_events`. DOM data has ~1s polling lag from Sierra."
+        description = "Explanation-oriented delayed DOM read around a timestamp or level. Grounds the interpretation in persisted `dom_feature_snapshots`, Sierra `.depth` reconstruction, and executed tape. Does not read SQLite `depth_events` or Journal Frames. DOM data has ~1s polling lag from Sierra."
     )]
     pub(crate) async fn explain_book_reaction(
         &self,
@@ -455,13 +455,18 @@ impl TheDeskMcp {
             .map_err(|e| db_error(format!("Explain book reaction task failed: {e}")))??
         };
 
-        let (depth_event_count, depth_source) = resolve_book_reaction_depth_count(
-            start_time_ms,
-            end_time_ms,
-            price_low,
-            price_high,
-            &feature_payload,
-        )?;
+        let feature_for_count = feature_payload.clone();
+        let (depth_event_count, depth_source) = tokio::task::spawn_blocking(move || {
+            resolve_book_reaction_depth_count(
+                start_time_ms,
+                end_time_ms,
+                price_low,
+                price_high,
+                &feature_for_count,
+            )
+        })
+        .await
+        .map_err(|e| db_error(format!("Explain book reaction depth count failed: {e}")))??;
 
         Ok(text_result(build_book_reaction_payload(
             BookReactionInputs {

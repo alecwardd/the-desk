@@ -701,6 +701,11 @@ pub(crate) fn validate_time_window(start_time_ms: f64, end_time_ms: f64) -> Resu
 /// Cap for book-reaction depth-record counts (matches the former SQLite LIMIT).
 pub(crate) const BOOK_REACTION_DEPTH_RECORD_CAP: usize = 200;
 
+/// Stop scanning after this many in-window records, including those outside
+/// the price band, so a narrow band cannot force a full-window walk.
+pub(crate) const BOOK_REACTION_DEPTH_SCAN_CAP: usize =
+    BOOK_REACTION_DEPTH_RECORD_CAP.saturating_mul(50);
+
 pub(crate) fn depth_reader_for_timestamp(timestamp_ms: f64) -> Result<DepthReader, McpError> {
     optional_depth_reader_for_timestamp(timestamp_ms)?.ok_or_else(|| {
         invalid_params_error(format!(
@@ -718,7 +723,8 @@ pub(crate) fn optional_depth_reader_for_timestamp(
 }
 
 /// Count `.depth` records in `[start_ms, end_ms)` matching an optional price band.
-/// Caps at [`BOOK_REACTION_DEPTH_RECORD_CAP`] so the explanation stays bounded.
+/// Caps matching records at [`BOOK_REACTION_DEPTH_RECORD_CAP`] and inspected
+/// in-window records at [`BOOK_REACTION_DEPTH_SCAN_CAP`].
 pub(crate) fn count_depth_records_from_reader(
     reader: &DepthReader,
     start_ms: f64,
@@ -726,16 +732,41 @@ pub(crate) fn count_depth_records_from_reader(
     price_low: Option<f64>,
     price_high: Option<f64>,
 ) -> Result<usize, McpError> {
+    count_depth_records_bounded(
+        reader,
+        start_ms,
+        end_ms,
+        price_low,
+        price_high,
+        BOOK_REACTION_DEPTH_RECORD_CAP,
+        BOOK_REACTION_DEPTH_SCAN_CAP,
+    )
+}
+
+pub(crate) fn count_depth_records_bounded(
+    reader: &DepthReader,
+    start_ms: f64,
+    end_ms: f64,
+    price_low: Option<f64>,
+    price_high: Option<f64>,
+    match_cap: usize,
+    scan_cap: usize,
+) -> Result<usize, McpError> {
     let mut count = 0usize;
+    let mut scanned = 0usize;
     reader
         .scan_range(Some(start_ms), Some(end_ms), |record| {
+            scanned += 1;
             let in_low = price_low.is_none_or(|low| record.price >= low);
             let in_high = price_high.is_none_or(|high| record.price <= high);
             if in_low && in_high {
                 count += 1;
-                if count >= BOOK_REACTION_DEPTH_RECORD_CAP {
+                if count >= match_cap {
                     return Ok(DepthScanControl::Stop);
                 }
+            }
+            if scanned >= scan_cap {
+                return Ok(DepthScanControl::Stop);
             }
             Ok(DepthScanControl::Continue)
         })
@@ -753,8 +784,57 @@ pub(crate) fn depth_event_count_from_feature_activity(
         .unwrap_or(0) as usize
 }
 
+fn half_open_windows_overlap(a_start: f64, a_end: f64, b_start: f64, b_end: f64) -> bool {
+    a_start.is_finite()
+        && a_end.is_finite()
+        && b_start.is_finite()
+        && b_end.is_finite()
+        && a_end > a_start
+        && b_end > b_start
+        && a_start < b_end
+        && b_start < a_end
+}
+
+pub(crate) fn depth_reader_covers_window(reader: &DepthReader, start_ms: f64, end_ms: f64) -> bool {
+    reader
+        .time_bounds()
+        .ok()
+        .is_some_and(|(first_ms, last_ms)| first_ms < end_ms && last_ms >= start_ms)
+}
+
+/// Compact-feature `activity.recordCount` is only used when that snapshot's own
+/// window overlaps the requested `[start_ms, end_ms)`.
+pub(crate) fn feature_activity_depth_count(
+    feature_payload: &serde_json::Value,
+    start_ms: f64,
+    end_ms: f64,
+) -> (usize, &'static str) {
+    let Some(activity) = feature_payload.get("activity") else {
+        return (0, "none");
+    };
+    let Some(act_start) = activity.get("startTimeMs").and_then(|v| v.as_f64()) else {
+        return (0, "none");
+    };
+    let Some(act_end) = activity.get("endTimeMs").and_then(|v| v.as_f64()) else {
+        return (0, "none");
+    };
+    if !half_open_windows_overlap(act_start, act_end, start_ms, end_ms) {
+        return (0, "none");
+    }
+    let from_activity = depth_event_count_from_feature_activity(feature_payload);
+    if from_activity > 0 {
+        (from_activity, "dom_feature_activity")
+    } else {
+        (0, "none")
+    }
+}
+
 /// Resolve a book-reaction depth count without SQLite `depth_events`.
-/// Prefers `DepthReader`; falls back to compact feature `activity.recordCount`.
+///
+/// Prefers an overlapping `.depth` file with a non-zero in-window count.
+/// Otherwise uses compact feature `activity.recordCount` only when that
+/// snapshot window overlaps the request. A nearest-file miss or a zero
+/// scan does not report `depth_file`.
 pub(crate) fn resolve_book_reaction_depth_count(
     start_ms: f64,
     end_ms: f64,
@@ -762,17 +842,39 @@ pub(crate) fn resolve_book_reaction_depth_count(
     price_high: Option<f64>,
     feature_payload: &serde_json::Value,
 ) -> Result<(usize, &'static str), McpError> {
-    if let Some(reader) = optional_depth_reader_for_timestamp(start_ms)? {
-        let count =
-            count_depth_records_from_reader(&reader, start_ms, end_ms, price_low, price_high)?;
-        return Ok((count, "depth_file"));
+    let reader = optional_depth_reader_for_timestamp(start_ms)?;
+    resolve_book_reaction_depth_count_from(
+        reader.as_ref(),
+        start_ms,
+        end_ms,
+        price_low,
+        price_high,
+        feature_payload,
+    )
+}
+
+pub(crate) fn resolve_book_reaction_depth_count_from(
+    reader: Option<&DepthReader>,
+    start_ms: f64,
+    end_ms: f64,
+    price_low: Option<f64>,
+    price_high: Option<f64>,
+    feature_payload: &serde_json::Value,
+) -> Result<(usize, &'static str), McpError> {
+    if let Some(reader) = reader {
+        if depth_reader_covers_window(reader, start_ms, end_ms) {
+            let count =
+                count_depth_records_from_reader(reader, start_ms, end_ms, price_low, price_high)?;
+            if count > 0 {
+                return Ok((count, "depth_file"));
+            }
+        }
     }
-    let from_activity = depth_event_count_from_feature_activity(feature_payload);
-    if from_activity > 0 {
-        Ok((from_activity, "dom_feature_activity"))
-    } else {
-        Ok((0, "none"))
-    }
+    Ok(feature_activity_depth_count(
+        feature_payload,
+        start_ms,
+        end_ms,
+    ))
 }
 
 pub(crate) struct BookReactionInputs {
@@ -915,16 +1017,22 @@ pub(crate) fn build_book_reaction_payload(inputs: BookReactionInputs) -> serde_j
     }
 
     if depth_event_count > 0 {
-        parts.push(format!(
-            "{depth_event_count} depth records in window — {} book activity.",
-            if depth_event_count > 100 {
-                "heavy"
-            } else if depth_event_count > 30 {
-                "moderate"
-            } else {
-                "light"
-            }
-        ));
+        let density = if depth_event_count > 100 {
+            "heavy"
+        } else if depth_event_count > 30 {
+            "moderate"
+        } else {
+            "light"
+        };
+        match depth_source {
+            "depth_file" => parts.push(format!(
+                "{depth_event_count} depth records in window — {density} book activity."
+            )),
+            "dom_feature_activity" => parts.push(format!(
+                "{depth_event_count} depth records in overlapping compact DOM feature snapshot — {density} book activity."
+            )),
+            _ => {}
+        }
     }
 
     let overall = if pull_stack_bias > 0.0 && net_delta >= 0.0 {

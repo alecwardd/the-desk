@@ -96,8 +96,7 @@ On launch (`src/bin/the-desk-mcp/main.rs`), in background tasks (off the stdio p
    - `.scid` tail loop → `raw_ticks`, `market_events`, periodic feature snapshots, rules
      analysis passes, and session-boundary finalization (RTH close → `session_summaries`,
      `prior_day_levels`).
-   - `.depth` poll loop → `depth_events` (DOM). *This is the table that grows fastest;*
-     bound it with `depth_retention_days` (see the runbook).
+   - `.depth` poll loop → reconstruct book, persist compact `dom_snapshots` / `dom_feature_snapshots`, publish `domSummary` into pipelines (Journal Frames / Capsules). **Does not bulk-append `depth_events`** (SIL-M3f). Durable DOM is the Sierra `.depth` file. Leftover `depth_events` on existing DBs can still be pruned (`depth_retention_days`; see the runbook). VACUUM is ops-track, not part of ingest.
    - A stall watchdog + boundary-cache prewarm.
 
 **It does NOT archive, prune, or compact anything** — that is exclusively
@@ -112,7 +111,7 @@ Run outside market hours, with the MCP server stopped:
 | Command | Effect |
 | --- | --- |
 | `--status` | Report raw-tick + depth coverage and storage settings (read-only; fast). |
-| `--maintain [--cutoff DATE]` | Archive `raw_ticks` older than `warm_retention_days` to zstd cold storage **and** prune `depth_events` older than `depth_retention_days`. Used by the weekly task. |
+| `--maintain [--cutoff DATE]` | Archive `raw_ticks` older than `warm_retention_days` to zstd cold storage **and** prune leftover `depth_events` older than `depth_retention_days` on existing DBs. Used by the weekly task. Live ingest no longer writes `depth_events`. |
 | `--prune-depth [--depth-cutoff DATE]` | Just the depth prune (chunked, WAL-bounded). |
 | `--compact-into PATH` | `VACUUM INTO` a compacted copy (the only step that shrinks the file) + verify it. |
 | `--vacuum` | In-place compaction (needs ~DB-size free; avoid on a near-full drive — use `--compact-into` to a roomy drive instead). |

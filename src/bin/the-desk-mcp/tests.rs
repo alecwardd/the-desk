@@ -18,7 +18,9 @@ use the_desk_backend::db::{
 };
 use the_desk_backend::db::{PriorDayReference, SessionSummary, SignalOutcome};
 #[allow(unused_imports)]
-use the_desk_backend::depth::{DepthBook, DepthReader};
+use the_desk_backend::depth::{
+    DepthBook, DepthReader, DepthRecord, ScanControl as DepthScanControl,
+};
 #[allow(unused_imports)]
 use the_desk_backend::feed::scid_reader::ScidReader;
 #[allow(unused_imports)]
@@ -3213,6 +3215,447 @@ fn depth_shrink_recovery_preserves_previous_book_when_fragment_has_no_clear() {
             .map(|level| level.quantity),
         Some(5)
     );
+}
+
+fn sample_depth_persist_work(records: Vec<DepthRecord>) -> DepthPersistWork {
+    let mut book = DepthBook::default();
+    for record in &records {
+        book.apply(record);
+    }
+    let last = records.last().expect("records");
+    let source_file = "NQ.depth".to_string();
+    let snapshot = book.snapshot(&source_file, last.timestamp_ms, 10);
+    let feature = default_depth_feature_snapshot(
+        &snapshot,
+        &source_file,
+        &records,
+        (last.timestamp_ms - 60_000.0).max(0.0),
+        last.timestamp_ms,
+    );
+    DepthPersistWork {
+        source_file,
+        trading_day: session_date_from_timestamp_ms(last.timestamp_ms),
+        last_record_timestamp_ms: last.timestamp_ms,
+        records,
+        snapshot,
+        feature,
+        batch_id: 7,
+    }
+}
+
+#[test]
+fn apply_depth_persist_work_does_not_insert_depth_events() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("NQ.depth");
+    write_test_depth_file(
+        &path,
+        &[
+            (unix_ms_to_sc_depth(1_000), 1, 0, 0, 0.0, 0),
+            (unix_ms_to_sc_depth(1_100), 2, 0, 1, 21000.0, 10),
+            (unix_ms_to_sc_depth(1_200), 3, 0, 1, 21000.25, 12),
+            (unix_ms_to_sc_depth(1_300), 6, 0, 0, 21000.0, 0),
+        ],
+    );
+    let reader = DepthReader::new(&path, 1.0);
+    let mut state = DepthPollWorkerState {
+        active_path: Some(path.clone()),
+        offset: reader.data_start_offset(),
+        batch_id: 7,
+        book: DepthBook::default(),
+    };
+    let mut new_records = Vec::new();
+    reader
+        .scan_new_records(&mut state.offset, |record| {
+            state.book.apply(&record);
+            new_records.push(record);
+            Ok(DepthScanControl::Continue)
+        })
+        .expect("scan fixture depth");
+    assert!(
+        new_records.len() > 1,
+        "fixture poll must have bulk rows, got {}",
+        new_records.len()
+    );
+
+    let server = test_server();
+    let work = sample_depth_persist_work(new_records);
+    apply_depth_persist_work(
+        &server.db,
+        &server.pipelines,
+        &server.last_bid,
+        &server.last_ask,
+        work,
+        server.feed_runtime.as_ref(),
+    );
+
+    let db = server.db.lock().expect("db lock");
+    assert_eq!(
+        db.count_depth_events().expect("count depth_events"),
+        0,
+        "hot persist must not bulk-append depth_events"
+    );
+    let features = db
+        .query_dom_feature_snapshots(Some(0.0), Some(10_000.0), 10)
+        .expect("feature snapshots");
+    assert_eq!(
+        features.len(),
+        1,
+        "compact dom_feature_snapshots must write"
+    );
+    assert!(
+        db.get_dom_snapshot_near(1_300.0)
+            .expect("snapshot near")
+            .is_some(),
+        "compact dom_snapshots must write"
+    );
+    drop(db);
+
+    let summary = server
+        .pipelines
+        .lock()
+        .expect("pipelines")
+        .snapshot(21000.0, 21000.25)
+        .dom_summary;
+    assert!(
+        summary.is_some(),
+        "poll persist must still publish domSummary into pipelines"
+    );
+}
+
+#[test]
+fn count_depth_records_from_reader_reads_fixture_not_sqlite() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("NQ.depth");
+    write_test_depth_file(
+        &path,
+        &[
+            (unix_ms_to_sc_depth(1_000), 1, 0, 0, 0.0, 0),
+            (unix_ms_to_sc_depth(1_100), 2, 0, 1, 21000.0, 10),
+            (unix_ms_to_sc_depth(1_200), 3, 0, 1, 21000.25, 12),
+            (unix_ms_to_sc_depth(1_300), 6, 0, 0, 21000.0, 0),
+        ],
+    );
+    let reader = DepthReader::new(&path, 1.0);
+    let count = count_depth_records_from_reader(&reader, 1_000.0, 1_400.0, None, None)
+        .expect("count from .depth");
+    assert!(
+        count >= 3,
+        "fixture .depth must yield book records, got {count}"
+    );
+}
+
+#[test]
+fn count_depth_records_from_reader_filters_price_band() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("NQ.depth");
+    write_test_depth_file(
+        &path,
+        &[
+            (unix_ms_to_sc_depth(1_000), 1, 0, 0, 0.0, 0),
+            (unix_ms_to_sc_depth(1_100), 2, 0, 1, 21000.0, 10),
+            (unix_ms_to_sc_depth(1_200), 3, 0, 1, 21000.25, 12),
+            (unix_ms_to_sc_depth(1_300), 2, 0, 1, 21001.0, 8),
+        ],
+    );
+    let reader = DepthReader::new(&path, 1.0);
+    let in_band =
+        count_depth_records_from_reader(&reader, 1_000.0, 1_400.0, Some(20999.75), Some(21000.25))
+            .expect("banded count");
+    assert_eq!(
+        in_band, 2,
+        "band must count 21000.00 and 21000.25, not the clear or 21001.00"
+    );
+    let unfiltered = count_depth_records_from_reader(&reader, 1_000.0, 1_400.0, None, None)
+        .expect("unfiltered count");
+    assert_eq!(unfiltered, 4);
+}
+
+#[test]
+fn count_depth_records_from_reader_caps_matching_records() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("NQ.depth");
+    let extra = 5;
+    let mut records = Vec::with_capacity(BOOK_REACTION_DEPTH_RECORD_CAP + extra);
+    for i in 0..(BOOK_REACTION_DEPTH_RECORD_CAP + extra) {
+        records.push((unix_ms_to_sc_depth(1_000 + i as i64), 2, 0, 1, 21000.0, 10));
+    }
+    write_test_depth_file(&path, &records);
+    let reader = DepthReader::new(&path, 1.0);
+    let count = count_depth_records_from_reader(&reader, 1_000.0, 2_000.0, None, None)
+        .expect("capped count");
+    assert_eq!(count, BOOK_REACTION_DEPTH_RECORD_CAP);
+}
+
+#[test]
+fn count_depth_records_bounded_stops_after_scan_cap() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("NQ.depth");
+    write_test_depth_file(
+        &path,
+        &[
+            (unix_ms_to_sc_depth(1_000), 2, 0, 1, 19999.0, 1),
+            (unix_ms_to_sc_depth(1_010), 2, 0, 1, 19999.0, 1),
+            (unix_ms_to_sc_depth(1_020), 2, 0, 1, 19999.0, 1),
+            (unix_ms_to_sc_depth(1_030), 2, 0, 1, 19999.0, 1),
+            (unix_ms_to_sc_depth(1_040), 2, 0, 1, 19999.0, 1),
+            (unix_ms_to_sc_depth(1_050), 2, 0, 1, 21000.0, 10),
+            (unix_ms_to_sc_depth(1_060), 2, 0, 1, 21000.0, 10),
+        ],
+    );
+    let reader = DepthReader::new(&path, 1.0);
+    let stopped = count_depth_records_bounded(
+        &reader,
+        1_000.0,
+        1_100.0,
+        Some(20999.75),
+        Some(21000.25),
+        BOOK_REACTION_DEPTH_RECORD_CAP,
+        5,
+    )
+    .expect("scan-capped count");
+    assert_eq!(
+        stopped, 0,
+        "inspect cap must stop before later in-band records"
+    );
+    let reached = count_depth_records_bounded(
+        &reader,
+        1_000.0,
+        1_100.0,
+        Some(20999.75),
+        Some(21000.25),
+        BOOK_REACTION_DEPTH_RECORD_CAP,
+        20,
+    )
+    .expect("uncapped inspect");
+    assert_eq!(reached, 2);
+}
+
+#[test]
+fn feature_activity_depth_count_requires_overlapping_window() {
+    let overlapping = serde_json::json!({
+        "activity": {
+            "recordCount": 48,
+            "startTimeMs": 1_000.0,
+            "endTimeMs": 1_400.0
+        }
+    });
+    assert_eq!(
+        feature_activity_depth_count(&overlapping, 1_000.0, 1_400.0),
+        (48, "dom_feature_activity")
+    );
+
+    let far = serde_json::json!({
+        "activity": {
+            "recordCount": 48,
+            "startTimeMs": 1_700_000_000_000.0,
+            "endTimeMs": 1_700_000_060_000.0
+        }
+    });
+    assert_eq!(
+        feature_activity_depth_count(&far, 1_000.0, 1_400.0),
+        (0, "none")
+    );
+
+    let missing_window = serde_json::json!({
+        "activity": { "recordCount": 48 }
+    });
+    assert_eq!(
+        feature_activity_depth_count(&missing_window, 1_000.0, 1_400.0),
+        (0, "none")
+    );
+}
+
+#[test]
+fn resolve_book_reaction_falls_through_when_depth_file_misses_window() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("NQ.depth");
+    write_test_depth_file(
+        &path,
+        &[
+            (unix_ms_to_sc_depth(1_000), 2, 0, 1, 21000.0, 10),
+            (unix_ms_to_sc_depth(1_200), 3, 0, 1, 21000.25, 12),
+        ],
+    );
+    let reader = DepthReader::new(&path, 1.0);
+    let overlapping_activity = serde_json::json!({
+        "activity": {
+            "recordCount": 48,
+            "startTimeMs": 50_000.0,
+            "endTimeMs": 51_000.0
+        }
+    });
+    let (count, source) = resolve_book_reaction_depth_count_from(
+        Some(&reader),
+        50_000.0,
+        51_000.0,
+        None,
+        None,
+        &overlapping_activity,
+    )
+    .expect("resolve");
+    assert_eq!(source, "dom_feature_activity");
+    assert_eq!(count, 48);
+}
+
+#[test]
+fn resolve_book_reaction_falls_through_when_in_band_count_is_zero() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("NQ.depth");
+    write_test_depth_file(
+        &path,
+        &[
+            (unix_ms_to_sc_depth(1_000), 1, 0, 0, 0.0, 0),
+            (unix_ms_to_sc_depth(1_100), 2, 0, 1, 19999.0, 10),
+        ],
+    );
+    let reader = DepthReader::new(&path, 1.0);
+    let overlapping_activity = serde_json::json!({
+        "activity": {
+            "recordCount": 48,
+            "startTimeMs": 1_000.0,
+            "endTimeMs": 1_400.0
+        }
+    });
+    let (count, source) = resolve_book_reaction_depth_count_from(
+        Some(&reader),
+        1_000.0,
+        1_400.0,
+        Some(20999.75),
+        Some(21000.25),
+        &overlapping_activity,
+    )
+    .expect("resolve");
+    assert_eq!(source, "dom_feature_activity");
+    assert_eq!(count, 48);
+}
+
+#[test]
+fn explain_book_reaction_payload_grounds_when_depth_events_empty() {
+    let db = Database::open(":memory:").expect("db");
+    assert_eq!(db.count_depth_events().expect("empty"), 0);
+
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("NQ.depth");
+    write_test_depth_file(
+        &path,
+        &[
+            (unix_ms_to_sc_depth(1_000), 1, 0, 0, 0.0, 0),
+            (unix_ms_to_sc_depth(1_100), 2, 0, 1, 21000.0, 10),
+            (unix_ms_to_sc_depth(1_200), 3, 0, 1, 21000.25, 12),
+        ],
+    );
+    let reader = DepthReader::new(&path, 1.0);
+    let depth_event_count =
+        count_depth_records_from_reader(&reader, 1_000.0, 1_400.0, None, None).expect("count");
+    assert!(depth_event_count > 0);
+
+    let feature_payload = serde_json::json!({
+        "domSummary": {
+            "bidPullRate": 0.62,
+            "askPullRate": 0.18,
+            "pullStackBias": 28.0,
+            "liquidityBias": "bid_support"
+        },
+        "activity": {
+            "recordCount": depth_event_count,
+            "topPullLevels": [{
+                "price": 21000.0,
+                "side": "bid",
+                "estimatedPulledQuantity": 10.0
+            }],
+            "topStackLevels": [{
+                "price": 20999.75,
+                "side": "bid",
+                "stackedQuantity": 8.0
+            }]
+        }
+    });
+    let payload = build_book_reaction_payload(BookReactionInputs {
+        timestamp_ms: 1_200.0,
+        start_time_ms: 1_000.0,
+        end_time_ms: 1_400.0,
+        price: Some(21000.0),
+        radius_ticks: Some(6),
+        feature_payload,
+        depth_event_count,
+        depth_source: "depth_file",
+        ticks: Vec::new(),
+    });
+    let explanation = payload["explanation"].as_str().expect("explanation");
+    assert!(
+        explanation.contains("Bids pulled"),
+        "expected grounded pull-rate narrative, got {explanation}"
+    );
+    assert!(
+        explanation.contains("depth records in window"),
+        "expected .depth density narrative, got {explanation}"
+    );
+    assert_eq!(payload["depthSource"], "depth_file");
+    assert_eq!(payload["depthEventCount"], depth_event_count);
+    assert_eq!(payload["liquidityBias"], "bid_support");
+}
+
+#[tokio::test]
+async fn explain_book_reaction_uses_feature_snapshot_when_depth_events_empty() {
+    let server = test_server();
+    {
+        let db = server.db.lock().expect("db lock");
+        assert_eq!(db.count_depth_events().expect("empty"), 0);
+        let payload = serde_json::json!({
+            "domSummary": {
+                "bidPullRate": 0.7,
+                "askPullRate": 0.2,
+                "pullStackBias": 40.0,
+                "liquidityBias": "bid_support"
+            },
+            "activity": {
+                "recordCount": 48,
+                "startTimeMs": 1_000.0,
+                "endTimeMs": 1_400.0,
+                "topPullLevels": [{
+                    "price": 21000.0,
+                    "side": "bid",
+                    "estimatedPulledQuantity": 15.0
+                }],
+                "topStackLevels": []
+            }
+        });
+        db.insert_dom_feature_snapshot("NQ.depth", 1_200.0, "2026-03-05", &payload)
+            .expect("insert feature");
+    }
+
+    let result = server
+        .explain_book_reaction(Parameters(ExplainBookReactionParams {
+            timestamp_ms: Some(1_200.0),
+            price: Some(21000.0),
+            start_time_ms: Some(1_000.0),
+            end_time_ms: Some(1_400.0),
+            radius_ticks: Some(6),
+        }))
+        .await
+        .expect("tool call");
+    let json = parse_text_tool_result(result);
+    let explanation = json["explanation"].as_str().expect("explanation");
+    assert!(
+        explanation.contains("Bids pulled"),
+        "tool must not silently return empty book activity, got {explanation}"
+    );
+    let depth_source = json["depthSource"].as_str().expect("depthSource");
+    assert!(
+        depth_source == "dom_feature_activity" || depth_source == "depth_file",
+        "expected snapshot or .depth source, got {depth_source}"
+    );
+    if depth_source == "dom_feature_activity" {
+        assert_eq!(json["depthEventCount"], 48);
+        let explanation = json["explanation"].as_str().expect("explanation");
+        assert!(
+            explanation.contains("overlapping compact DOM feature snapshot"),
+            "activity fallback must not claim an in-window .depth count, got {explanation}"
+        );
+    } else {
+        assert!(json["depthEventCount"].as_u64().unwrap_or(0) > 0);
+    }
+    assert_eq!(json["liquidityBias"], "bid_support");
 }
 
 #[test]

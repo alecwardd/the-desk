@@ -1078,10 +1078,22 @@ pub(crate) fn persist_feature_state_after_dom_summary(
     }
 }
 
+/// SIL-M3f: SQLite `depth_events` is not the live hot store. The Sierra `.depth`
+/// file is durable; compact `dom_snapshots` / `dom_feature_snapshots` plus Journal
+/// Frames and Capsules carry live DOM research. Named constant (not a
+/// `config.toml` knob) so the persist path cannot silently grow that table again.
+pub(crate) const DEPTH_EVENTS_HOT_PATH_INSERTS: bool = false;
+const _: () = assert!(
+    !DEPTH_EVENTS_HOT_PATH_INSERTS,
+    "SIL-M3f: do not re-enable bulk depth_events hot inserts"
+);
+
 #[derive(Debug, Default)]
 pub(crate) struct DepthPollWorkerState {
     pub(crate) active_path: Option<std::path::PathBuf>,
     pub(crate) offset: u64,
+    /// Leftover from when poll cycles bulk-inserted `depth_events`. No longer
+    /// advanced; compact snapshots do not use batch ids.
     pub(crate) batch_id: i64,
     pub(crate) book: DepthBook,
 }
@@ -1091,6 +1103,8 @@ pub(crate) struct DepthPersistWork {
     pub(crate) source_file: String,
     pub(crate) trading_day: String,
     pub(crate) last_record_timestamp_ms: f64,
+    /// Records from this poll cycle, used to build the compact feature snapshot.
+    /// SIL-M3f: not written to SQLite `depth_events` on the hot persist path.
     pub(crate) records: Vec<the_desk_backend::depth::DepthRecord>,
     pub(crate) snapshot: the_desk_backend::depth::DomSnapshot,
     pub(crate) feature: DomFeatureSnapshot,
@@ -1278,13 +1292,10 @@ pub(crate) fn apply_depth_persist_work(
     mut work: DepthPersistWork,
     feed_rt: &McpFeedRuntimeState,
 ) -> i64 {
-    let mut next_batch_id = work.batch_id;
-    if let Ok(mut d) = db.lock() {
-        if let Ok(next_batch) =
-            d.insert_depth_events_batch(&work.source_file, &work.records, work.batch_id)
-        {
-            next_batch_id = next_batch;
-        }
+    // SIL-M3f: `work.records` is the former bulk-insert payload. Count it so
+    // the field stays live, then persist only compact snapshots below.
+    let _depth_events_not_persisted = work.records.len();
+    if let Ok(d) = db.lock() {
         let snapshot_json = serde_json::to_value(&work.snapshot).unwrap_or_default();
         let _ = d.insert_dom_snapshot(
             &work.source_file,
@@ -1345,7 +1356,7 @@ pub(crate) fn apply_depth_persist_work(
         tick_ms_to_bits(work.feature.timestamp_ms),
         Ordering::Release,
     );
-    next_batch_id
+    work.batch_id
 }
 
 #[derive(Debug, Clone, Copy)]

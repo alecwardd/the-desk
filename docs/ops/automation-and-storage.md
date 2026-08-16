@@ -4,7 +4,7 @@ This runbook covers The Desk's local Windows ops automation: Sierra Chart lifecy
 
 > **See also:** [System Data Flow](../architecture/data-flow.md) — how Sierra Chart, the MCP server, agents, and this maintenance tooling fit together (who writes what, what server startup/shutdown triggers, and the on/off automation question). **Long maintenance jobs (the one-time depth reclaim) should run as a Windows Scheduled Task or in your own terminal — NOT from inside an agent session**, because an agent session restart kills its child processes and relaunches the MCP server (the `data.db` writer), which then contends. `scripts\ops\Run-Depth-Reclaim-Task.ps1` is the autonomous worker for the one-time reclaim.
 
-> **What actually consumes the disk:** the dominant table is **`depth_events`** (DOM depth ingested from Sierra `.depth` files), not `raw_ticks`. It reached 3.6 B rows / ~600 GB before any retention existed. `raw_ticks` is comparatively tiny (~1.75 M rows). The real reclaim and ongoing upkeep both hinge on **pruning `depth_events`** (`depth_retention_days`, default 7); the `.depth` files in `T:\SierraChart\Data\MarketDepthData` are the durable, re-ingestable source.
+> **What actually consumes the disk:** historically the dominant table was **`depth_events`** (DOM depth copied from Sierra `.depth` files into SQLite). It reached 3.6 B rows / ~600 GB before any retention existed. **SIL-M3f stopped live bulk appends** — the ~1s `.depth` poll still reconstructs the book and writes compact `dom_snapshots` / `dom_feature_snapshots` plus pipeline `domSummary` (Journal Frames / Capsules). `raw_ticks` is comparatively tiny (~1.75 M rows). Existing DBs can still **prune leftover `depth_events`** (`depth_retention_days`, default 7) with `--prune-depth` / `--maintain`. The `.depth` files in `T:\SierraChart\Data\MarketDepthData` are the durable source. Weekend VACUUM / `--compact-into` reclaims freelist pages and is **ops-track** — not required to stop the writes.
 
 ## Timezone note
 
@@ -35,7 +35,7 @@ All tasks are registered under `\TheDesk\` by `scripts\ops\Register-DeskTasks.ps
 | `Engine Watchdog` | Logon and every 4 minutes | same | Interactive user | SIL-M2a: starts `the-desk-engine` if down so ingest covers Globex overnight when `[sil].engine_mode=external`. See `docs/ops/engine-lifecycle.md`. |
 | `Sierra Weekend Close` | Friday 16:10 | Friday 17:10 | Interactive user | Calls `CloseMainWindow()`, waits up to 60 seconds, then force-kills Sierra if it has not exited. |
 | `Friday Data Readiness` | Friday 16:20 | Friday 17:20 | `SYSTEM` | Runs `Invoke-FridayDataReadiness.ps1`: Sierra/SCID idle check, `the-desk-storage --status`, prints operator-gated catch-up MCP/CLI commands, writes `weekend-readiness-YYYYMMDD.json`. Does **not** ingest/backfill unless the operator runs those commands. |
-| `Weekly Storage Archive` | Saturday 09:00 + hourly for 10h | Saturday 10:00 + hourly | `SYSTEM`, highest privileges | Saturday storage maintenance (name retained). Runs `the-desk-storage --maintain`: archives old `raw_ticks` + prunes `depth_events`. **Exit 2** if MCP is up (deferred marker). Success marker on completion. Passes `--abort-if-mcp` when the binary advertises it. |
+| `Weekly Storage Archive` | Saturday 09:00 + hourly for 10h | Saturday 10:00 + hourly | `SYSTEM`, highest privileges | Saturday storage maintenance (name retained). Runs `the-desk-storage --maintain`: archives old `raw_ticks` + prunes leftover `depth_events` on existing DBs. **Exit 2** if MCP is up (deferred marker). Success marker on completion. Passes `--abort-if-mcp` when the binary advertises it. Live ingest no longer grows `depth_events` (SIL-M3f). |
 | `Sunday Pre-Open Readiness` | Sunday 16:40 | Sunday 17:40 | `SYSTEM` | `Invoke-DeskHealthCheck.ps1 -Mode SundayPreOpen` — fails if last successful maintenance marker is missing/stale before Globex. |
 | `Sierra Sunday Open` | Sunday 16:50 | Sunday 17:50 | Interactive user | Starts Sierra about 10 minutes before Globex opens. |
 | `Storage Health Check` | Every 6 hours | Every 6 hours | `SYSTEM` | `Invoke-DeskHealthCheck.ps1 -Mode Daily` — T:/X: free space, task presence, maintenance/backup age, optional storage `--status`. Logs to `X:\TheDesk\logs\health-*.log`. |
@@ -108,7 +108,7 @@ Markers / manifests:
 warm_retention_days = 30      # raw_ticks kept hot in SQLite
 cold_archive_dir = "X:\\TheDesk\\archive"
 auto_archive = true           # vestigial (runtime ignores it; the scheduled task is the real automation)
-depth_retention_days = 7      # DOM depth_events kept hot; older pruned (re-ingestable from .depth)
+depth_retention_days = 7      # leftover depth_events prune window; live ingest no longer writes this table (SIL-M3f)
 
 [backup]
 enabled = true                # set false only during a one-time reclaim
@@ -206,7 +206,7 @@ During DB work the script stops only `the-desk-mcp`. Sierra Chart may keep runni
 1. Mounts `X:` as NTFS `DeskArchive`.
 2. Moves existing cold archives from `T:\TheDesk\archive` to `X:\TheDesk\archive`.
 3. Runs `the-desk-storage --status` to catch archive filename collisions.
-4. Runs `the-desk-storage --maintain --cutoff <ET-derived cutoff>` — archives old `raw_ticks` **and prunes `depth_events`** to `depth_retention_days`. On a first run with years of accumulated DOM depth this is the slow step: a chunked, WAL-bounded delete of billions of rows that can take **several hours** (~150–200 K rows/s). It is safe to leave running; the WAL is checkpointed so it cannot fill T:.
+4. Runs `the-desk-storage --maintain --cutoff <ET-derived cutoff>` — archives old `raw_ticks` **and prunes leftover `depth_events`** to `depth_retention_days` on existing DBs (SIL-M3f stopped live appends; this step is for rows already in the table). On a first run with years of accumulated DOM depth this is the slow step: a chunked, WAL-bounded delete of billions of rows that can take **several hours** (~150–200 K rows/s). It is safe to leave running; the WAL is checkpointed so it cannot fill T:. Reclaiming the freed pages (`--compact-into` / `--vacuum`) is a separate ops-track step — not required to stop live writes.
 5. Runs `the-desk-storage --compact-into X:\TheDesk\state\data_compacted.db` — only now does the file shrink (delete moves pages to the freelist; `VACUUM INTO` copies just the live rows).
 6. Verifies the compacted copy: SQLite integrity, required tables, `session_summaries > 0`, row-count parity, and no `raw_ticks` older than the warm cutoff.
 7. Re-checks that `the-desk-mcp` is stopped and `data.db` is unlocked immediately before swapping.
@@ -217,11 +217,11 @@ Logs are written to `X:\TheDesk\logs`; pre-format logs temporarily start under `
 
 ## Recovery Story
 
-The reclaim deletes old `raw_ticks` from SQLite only after monthly zstd archives are written and verified. Pruned `depth_events` are deleted outright (no zst archive) because the Sierra `.depth` files already hold the same data far more compactly. The computed/research tables stay in the compacted SQLite DB. If old data is needed again, recover it from:
+The reclaim deletes old `raw_ticks` from SQLite only after monthly zstd archives are written and verified. Leftover `depth_events` (from before SIL-M3f stopped live appends) are deleted outright (no zst archive) because the Sierra `.depth` files already hold the same data far more compactly. The computed/research tables stay in the compacted SQLite DB. If old data is needed again, recover it from:
 
 - `X:\TheDesk\archive\raw_ticks_*.csv.zst` for archived raw-tick SQLite rows.
 - Sierra Chart `.scid` files in `T:\SierraChart\Data` for raw-tick replay/backfill.
-- Sierra Chart `.depth` files in `T:\SierraChart\Data\MarketDepthData` (~92 GB) to re-ingest pruned DOM `depth_events`.
+- Sierra Chart `.depth` files in `T:\SierraChart\Data\MarketDepthData` (~92 GB) to reconstruct DOM via `DepthReader` (do not re-ingest into `depth_events`; that table is no longer the hot store).
 
 The Desk reads `.scid`/`.depth`; it does not alter Sierra's recording files.
 

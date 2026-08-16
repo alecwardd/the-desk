@@ -30,7 +30,7 @@ directly, not the database.
 But "the DB is just a cache" is only half true. Split `data.db` into three categories:
 
 1. **Authoritative external source** — Sierra `.scid` / `.depth`. Raw market data; safe as long as Sierra records.
-2. **Rebuildable derived market data** — `raw_ticks`, `depth_events`, `market_events`, `session_summaries`, `prior_day_levels`, snapshots, backtest `signal_outcomes`, SQLite **Journal Frames** (hot window) and session-partitioned **cold** Journal Frame dumps (`~/.the-desk/journal-frames`, JSONL.zst). Regenerable from the files via re-ingest / `backfill_history` / replay / MarketRouter persist. DuckDB is not required for the cold path and is **not adopted** as a query engine (SIL-M3e: Path B dense SQLite columns met the two-week Episode Query SLO; `the-desk-eq-bench` is the repeatable harness).
+2. **Rebuildable derived market data** — `raw_ticks`, `market_events`, `session_summaries`, `prior_day_levels`, compact `dom_snapshots` / `dom_feature_snapshots`, backtest `signal_outcomes`, SQLite **Journal Frames** (hot window) and session-partitioned **cold** Journal Frame dumps (`~/.the-desk/journal-frames`, JSONL.zst). Regenerable from the files via re-ingest / `backfill_history` / replay / MarketRouter persist. DuckDB is not required for the cold path and is **not adopted** as a query engine (SIL-M3e: Path B dense SQLite columns met the two-week Episode Query SLO; `the-desk-eq-bench` is the repeatable harness). SQLite `depth_events` is **not** a live ingest target (SIL-M3f); leftover rows on existing DBs can still be pruned.
 3. **Durable local state** — `risk_config`, `setups`, `research_hypotheses`, journal/trade records, memory, account/risk state. **NOT** regenerable from `.scid`/`.depth`; it survives *only* via the `[backup]` snapshots (on `X:`) and seeded reference DBs. Treat it like any database you must back up — a DB wipe loses it.
 
 ---
@@ -42,7 +42,7 @@ But "the DB is just a cache" is only half true. Split `data.db` into three categ
 | Path | Contents | Notes |
 | --- | --- | --- |
 | `T:\SierraChart\Data\<SYMBOL>.scid` | Every trade tick (40-byte records: time, price, volume, bid/ask) | The raw feed. Requires **Intraday Data Storage Time Unit = 1 Tick** in Sierra (see [sierra-chart-settings.md](sierra-chart-settings.md)). |
-| `T:\SierraChart\Data\MarketDepthData\<SYMBOL>.depth` | DOM order-book events | ~92 GB and growing; the durable source behind `depth_events`. |
+| `T:\SierraChart\Data\MarketDepthData\<SYMBOL>.depth` | DOM order-book events | ~92 GB and growing; the durable DOM source. Reconstruct with `DepthReader`; compact snapshots / Journal Frames / Capsules carry live research. |
 
 Recorded symbols (since 2026-06-23): **NQ, MNQ, ES, MES** (see [multi-instrument-flow-architecture.md](multi-instrument-flow-architecture.md)).
 
@@ -53,7 +53,7 @@ Full schema is in `src/db/mod.rs`. The tables you actually care about for backte
 | Table | What it holds | Populated by | Retention |
 | --- | --- | --- | --- |
 | `raw_ticks` | Ticks ingested from `.scid` | MCP live tail + `ingest_raw_ticks_from_scid` (**not** `backfill_history` — that replays pipelines without persisting raw ticks) | `warm_retention_days` (30); older archived to `X:\TheDesk\archive\*.csv.zst` |
-| `depth_events` | DOM events ingested from `.depth` | MCP depth loop | `depth_retention_days` (7); `.depth` files are the durable copy |
+| `depth_events` | Leftover DOM event rows from before SIL-M3f (not live-ingested) | historical only; live poll no longer appends | prune with `--prune-depth` / `depth_retention_days` (7); `.depth` files are the durable copy. VACUUM is ops-track, not required to stop writes. |
 | `market_events` | Structured events (level tests, extensions, day-type changes) detected during processing | EventDetector | retained |
 | `session_summaries` | Per-RTH-session computed summary (delta, DNVA, day type, IB range) | RTH-close finalization | retained (small, valuable) — RVOL curves + research baselines |
 | `prior_day_levels` / `_v22` | Prior-day H/L/C, VA, POC, DNVA | session finalization | retained |
@@ -160,7 +160,7 @@ A worked, idea-specific example (IDEA-000 / IDEA-012, with full JSON) lives in
 Historical tools need the relevant data persisted first — and *which* ingest depends on the query:
 - **Event / session research** (`query_event_frequency`, `query_conditional`, distributions): run `backfill_history` for the window.
 - **Raw tick queries** (`query_ticks`): run `get_raw_tick_ingest_gaps`, then `ingest_raw_ticks_from_scid` — `backfill_history` does **not** persist raw ticks.
-- **DOM research** (`query_dom_*`): depends on persisted `dom_feature_snapshots` coverage, not ordinary `.scid` backfill.
+- **DOM research** (`query_dom_*`, `explain_book_reaction`, Episode Query `domSummary.*`): compact `dom_feature_snapshots` / Journal Frames / Capsules, plus Sierra `.depth` reconstruction. Not SQLite `depth_events` (SIL-M3f stopped live appends).
 
 Always check `get_research_summary` first for the baseline sample size.
 
@@ -170,7 +170,7 @@ Always check `get_research_summary` first for the baseline sample size.
 
 - **Rebuild + restart after any rules change** (`target_alt`), or the live binary rejects new fields. Bump `RULES_ENGINE_SCHEMA_VERSION` so cached stats invalidate.
 - **Never backtest against the live `data.db`** for heavy runs — isolate (§4.0). It both contends with the live writer and bloats the DB.
-- **`depth_events` grows fastest.** It's the DOM table; bounded by `depth_retention_days`. The `.depth` files are the re-ingestable source. (This is what ballooned the DB to 629 GB; see the [ops & storage runbook](ops/automation-and-storage.md).)
+- **`depth_events` is not the live hot store (SIL-M3f).** It historically ballooned the DB to 629 GB. Live `.depth` poll persist writes compact `dom_snapshots` / `dom_feature_snapshots` and publishes `domSummary` into pipelines / Journal Frames; it does **not** bulk-append `depth_events`. The `.depth` files remain the durable source. Existing DBs can still prune leftover rows (`the-desk-storage --prune-depth` / `--maintain`). Weekend VACUUM / `--compact-into` is ops-track — not required to stop the writes. See the [ops & storage runbook](ops/automation-and-storage.md).
 - **Files are truth for *market data*; trader/control state is not rebuildable.** Market-data tables rebuild from `.scid`/`.depth` (re-ingest / backfill / replay), but `setups`, `research_hypotheses`, journal/trades, risk config, memory, and account state survive *only* via the `[backup]` snapshots (on `X:`). Back them up — a DB wipe is not harmless.
 - **Schema is in `src/db/mod.rs`**; the generated tool catalog is `docs/mcp/tool-reference.md` (regenerate with `--write-tool-docs` after tool changes).
 

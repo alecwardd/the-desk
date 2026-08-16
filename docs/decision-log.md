@@ -802,9 +802,32 @@ Golden Path C (4 frames, 5 iters): p50 **38.2 ms**, p95 **39.2 ms**. Fixture-sca
 
 **Path C toolchain (genuine attempt; ran here; still DEFER):** `duckdb` 1.10505 bundled, Cargo feature `duckdb-bench` **off by default**. Default `cc`/clang failed (`#include <memory>` not found under `--target=x86_64-unknown-linux-gnu`). Link needs `CXX=g++ CC=gcc RUSTFLAGS="-C link-arg=-L/usr/lib/gcc/x86_64-linux-gnu/13"` (rust-lld cannot find `libstdc++` without gcc's lib dir). `.github/workflows/rust.yml` stays feature-off (`windows-latest` must not require DuckDB / libduckdb). Path C is not a silent no-op: it is compile-gated, documented, and was executed on this Cloud image.
 
-This note does not adopt DuckDB in MCP/engine, does not convert the M3d hive to Parquet, does not stop `depth_events` as hot store (#14), does not add DOM cluster Base Detectors (#22), Feature-IR (#18–#21), Vs3dProvider (#16), ACSIL (#23), `get_capsule`, a 250 ms forever-store, a tenth kernel operator / `run_job` poll tool, new specialty market tools, new `config.toml` knobs, or raise the Trust Ceiling.
+This note does not adopt DuckDB in MCP/engine, does not convert the M3d hive to Parquet, does not add DOM cluster Base Detectors (#22), Feature-IR (#18–#21), Vs3dProvider (#16), ACSIL (#23), `get_capsule`, a 250 ms forever-store, a tenth kernel operator / `run_job` poll tool, new specialty market tools, new `config.toml` knobs, or raise the Trust Ceiling. Stopping `depth_events` as hot store is SIL-M3f (#14).
 
 **Consequences:** Keep SQLite as the Episode Query store. Revisit DuckDB if a 90-day / 1-year corpus exists and Path B p95 misses 10 s, or if a future Path B rewrite becomes a hand-rolled columnar engine. A later revisit may also measure DuckDB over a pruned columnar layout; this ticket did not convert the M3d hive to Parquet and did not claim a ceiling on DuckDB.
+
+---
+
+### Decision note: SIL-M3f Stop `depth_events` as hot store
+
+**Date:** 2026-08-15
+**Status:** Decided (implements [alecwardd/the-desk#14](https://github.com/alecwardd/the-desk/issues/14); Part of #2)
+
+**Context:** Live `.depth` poll persist used to bulk-append every depth record into SQLite `depth_events`. That table historically ballooned to billions of rows / hundreds of GB. Journal Frames (1 Hz `domSummary`), Capsules (forensic dumps around DOM-family Events), compact `dom_snapshots` / `dom_feature_snapshots`, and `DepthReader` reconstruction from Sierra `.depth` files already carry live DOM research. Spec (#2) target: transactional core toward roughly **2–5 GB**. DuckDB stays **deferred** (SIL-M3e).
+
+**Decision:**
+
+1. **Stop bulk hot-path inserts.** `apply_depth_persist_work` no longer calls `Database::insert_depth_events_batch`. Named constant `DEPTH_EVENTS_HOT_PATH_INSERTS = false` (not a `config.toml` knob). A live poll cycle must not insert a row per depth record into SQLite.
+2. **Keep the ~1s `.depth` poll.** Reconstruct the book, persist compact `dom_snapshots` + `dom_feature_snapshots`, and publish `domSummary` into pipelines so 1 Hz Journal Frames and Capsules still see DOM.
+3. **Durable source is Sierra `.depth`.** Ladder / pull-stack tools (`get_dom_snapshot_at`, `get_pull_stack_activity`, `get_liquidity_behavior_at_level`) already reconstruct via `DepthReader`. `get_dom_window` / `get_dom_tape_context_at` keep compact snapshots with `.depth` fallback. `explain_book_reaction` is rerouted to `DepthReader` (and compact feature `activity.recordCount` when the `.depth` file does not overlap the window or the in-band scan is empty) — it does not read SQLite `depth_events`.
+4. **Research kernel unchanged.** `query_raw` sources remain `journal_frames | events | ticks`. Flagship DOM predicate is `domSummary.bidReplenishing` on Journal Frames. No fourth `query_raw` source for depth events. Capsules stay a rolling ~250 ms in-memory ring with persisted dumps around DOM-family Events — not a 250 ms SQLite forever-store. No `get_capsule` tool.
+5. **Schema may remain.** Existing DBs can still prune leftover `depth_events` via `the-desk-storage --prune-depth` / `--maintain` and `depth_retention_days = 7`. **VACUUM / `--compact-into` is ops-track** (and #24 backup integrity) — not required to close this ticket, not a CI step, not an acceptance step. Do not DROP TABLE + VACUUM a production-sized table here.
+
+**Migration notes:** Anyone still expecting `depth_events` as the live hot store should read `.depth` files, compact DOM snapshots, Journal Frames, and Capsules instead. Leftover rows are safe to prune; reclaiming freelist pages is a separate weekend ops action.
+
+This note does not adopt DuckDB, convert M3d hive JSONL.zst to Parquet, add `get_capsule`, persist the 250 ms Capsule ring, add DOM cluster Base Detectors (#22), Feature-IR (#18–#21), Vs3dProvider (#16), ACSIL (#23), raise the Trust Ceiling above L3, add a tenth kernel operator / `run_job` poll tool, or require weekend VACUUM.
+
+**Consequences:** Live DOM intelligence continues without growing a 600 GB table. Ops prune remains available for leftover rows.
 
 ---
 

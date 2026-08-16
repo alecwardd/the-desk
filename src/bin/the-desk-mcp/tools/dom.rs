@@ -403,7 +403,7 @@ impl TheDeskMcp {
     }
 
     #[tool(
-        description = "Explanation-oriented delayed DOM read around a timestamp or level. Grounds the interpretation in persisted DOM summaries, nearby depth events, and executed tape. DOM data has ~1s polling lag from Sierra."
+        description = "Explanation-oriented delayed DOM read around a timestamp or level. Grounds the interpretation in persisted `dom_feature_snapshots`, Sierra `.depth` reconstruction, and executed tape. Does not read SQLite `depth_events` or Journal Frames. DOM data has ~1s polling lag from Sierra."
     )]
     pub(crate) async fn explain_book_reaction(
         &self,
@@ -420,18 +420,10 @@ impl TheDeskMcp {
         let price_low = params.price.map(|price| price - radius_ticks * 0.25);
         let price_high = params.price.map(|price| price + radius_ticks * 0.25);
 
-        let (feature, depth_events, ticks) = {
+        let (feature, ticks) = {
             let db = self.db.lock().map_err(|_| lock_error())?;
             (
                 db.get_dom_feature_near(target_time_ms).map_err(db_error)?,
-                db.query_depth_events(
-                    Some(start_time_ms),
-                    Some(end_time_ms),
-                    price_low,
-                    price_high,
-                    200,
-                )
-                .map_err(db_error)?,
                 db.query_ticks_filtered(
                     Some(start_time_ms),
                     Some(end_time_ms),
@@ -463,170 +455,32 @@ impl TheDeskMcp {
             .map_err(|e| db_error(format!("Explain book reaction task failed: {e}")))??
         };
 
-        let dom_summary = feature_payload
-            .get("domSummary")
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!({}));
-        let bid_pull_rate = dom_summary
-            .get("bidPullRate")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0);
-        let ask_pull_rate = dom_summary
-            .get("askPullRate")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0);
-        let pull_stack_bias = dom_summary
-            .get("pullStackBias")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0);
-        let net_delta: f64 = ticks
-            .iter()
-            .map(|tick| {
-                if tick.is_buy {
-                    tick.volume
-                } else {
-                    -tick.volume
-                }
-            })
-            .sum();
+        let feature_for_count = feature_payload.clone();
+        let (depth_event_count, depth_source) = tokio::task::spawn_blocking(move || {
+            resolve_book_reaction_depth_count(
+                start_time_ms,
+                end_time_ms,
+                price_low,
+                price_high,
+                &feature_for_count,
+            )
+        })
+        .await
+        .map_err(|e| db_error(format!("Explain book reaction depth count failed: {e}")))??;
 
-        let liquidity_bias = dom_summary
-            .get("liquidityBias")
-            .and_then(|v| v.as_str())
-            .unwrap_or("balanced");
-        let total_volume: f64 = ticks.iter().map(|t| t.volume).sum();
-
-        // Extract top pull/stack prices from activity for narrative
-        let top_pull = feature_payload
-            .get("activity")
-            .and_then(|a| a.get("topPullLevels"))
-            .and_then(|v| v.as_array())
-            .and_then(|arr| arr.first())
-            .cloned();
-        let top_stack = feature_payload
-            .get("activity")
-            .and_then(|a| a.get("topStackLevels"))
-            .and_then(|v| v.as_array())
-            .and_then(|arr| arr.first())
-            .cloned();
-
-        // Build magnitude-aware narrative
-        let mut parts = Vec::new();
-
-        // Pull rate comparison with actual numbers
-        let bid_pct = (bid_pull_rate * 100.0).round();
-        let ask_pct = (ask_pull_rate * 100.0).round();
-        if (bid_pull_rate - ask_pull_rate).abs() > 0.1 {
-            if bid_pull_rate > ask_pull_rate {
-                parts.push(format!(
-                    "Bids pulled at {bid_pct:.0}% rate vs asks at {ask_pct:.0}% — bid-side liquidity was being withdrawn faster."
-                ));
-            } else {
-                parts.push(format!(
-                    "Asks pulled at {ask_pct:.0}% rate vs bids at {bid_pct:.0}% — offer-side liquidity was being withdrawn faster."
-                ));
-            }
-        } else {
-            parts.push(format!(
-                "Pull rates roughly balanced (bids {bid_pct:.0}%, asks {ask_pct:.0}%)."
-            ));
-        }
-
-        // Top pull level with price
-        if let Some(ref pull) = top_pull {
-            let price = pull.get("price").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let qty = pull
-                .get("estimatedPulledQuantity")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.0);
-            let side = pull
-                .get("side")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            if qty > 0.0 {
-                parts.push(format!(
-                    "Top pull level: {price:.2} ({side} side, {qty:.0} contracts pulled)."
-                ));
-            }
-        }
-
-        // Top stack level with price
-        if let Some(ref stack) = top_stack {
-            let price = stack.get("price").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let qty = stack
-                .get("stackedQuantity")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.0);
-            let side = stack
-                .get("side")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            if qty > 0.0 {
-                parts.push(format!(
-                    "Top stack level: {price:.2} ({side} side, {qty:.0} contracts stacked)."
-                ));
-            }
-        }
-
-        // Net delta context
-        if net_delta.abs() > 0.0 {
-            let direction = if net_delta > 0.0 {
-                "buyer-led"
-            } else {
-                "seller-led"
-            };
-            parts.push(format!(
-                "Net delta {net_delta:+.0} over {total_volume:.0} volume — tape was {direction}."
-            ));
-        }
-
-        // Depth event density
-        if !depth_events.is_empty() {
-            parts.push(format!(
-                "{} depth events in window — {} book activity.",
-                depth_events.len(),
-                if depth_events.len() > 100 {
-                    "heavy"
-                } else if depth_events.len() > 30 {
-                    "moderate"
-                } else {
-                    "light"
-                }
-            ));
-        }
-
-        // Overall read combining book + tape
-        let overall = if pull_stack_bias > 0.0 && net_delta >= 0.0 {
-            "Book and tape aligned supportive: bid-side liquidity held up while tape stayed neutral-to-positive."
-        } else if pull_stack_bias < 0.0 && net_delta <= 0.0 {
-            "Book and tape aligned defensive: offers held better than bids while tape skewed seller-led."
-        } else if pull_stack_bias > 0.0 && net_delta < 0.0 {
-            "Book was supportive but tape disagreed — bids were stacking while sellers dominated the tape. Potential absorption."
-        } else if pull_stack_bias < 0.0 && net_delta > 0.0 {
-            "Book was fragile but tape was buying — offers were pulling while buyers lifted aggressively. Potential breakout setup."
-        } else {
-            "Liquidity stayed relatively balanced — the reaction looks more tape-driven than book-driven."
-        };
-        parts.push(overall.to_string());
-
-        let explanation = parts.join(" ");
-
-        Ok(text_result(serde_json::json!({
-            "timestampMs": target_time_ms,
-            "window": { "startTimeMs": start_time_ms, "endTimeMs": end_time_ms },
-            "priceFocus": { "price": params.price, "radiusTicks": params.radius_ticks },
-            "domFeature": feature_payload,
-            "depthEventCount": depth_events.len(),
-            "tapeTickCount": ticks.len(),
-            "totalVolume": total_volume,
-            "netDelta": net_delta,
-            "pullRates": { "bid": bid_pull_rate, "ask": ask_pull_rate },
-            "pullStackBias": pull_stack_bias,
-            "liquidityBias": liquidity_bias,
-            "topPullLevel": top_pull,
-            "topStackLevel": top_stack,
-            "explanation": explanation,
-        })))
+        Ok(text_result(build_book_reaction_payload(
+            BookReactionInputs {
+                timestamp_ms: target_time_ms,
+                start_time_ms,
+                end_time_ms,
+                price: params.price,
+                radius_ticks: params.radius_ticks,
+                feature_payload,
+                depth_event_count,
+                depth_source,
+                ticks,
+            },
+        )))
     }
 
     #[tool(

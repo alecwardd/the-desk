@@ -2370,6 +2370,8 @@ impl Database {
     }
 
     /// V10: add depth/DOM storage tables for delayed DOM reconstruction.
+    /// SIL-M3f: `depth_events` is retained so existing DBs can prune leftover
+    /// rows; live ingest no longer bulk-appends it.
     fn migrate_v10(&self) -> Result<(), DbError> {
         self.conn.execute_batch(
             "
@@ -6943,6 +6945,11 @@ impl Database {
         Ok(())
     }
 
+    /// Insert leftover `depth_events` rows. **Non-hot-path** (SIL-M3f): live
+    /// `.depth` poll persist must not call this. Kept for unit tests and
+    /// leftover-table inspection of existing DBs. Durable DOM is the Sierra
+    /// `.depth` file; compact `dom_snapshots` / `dom_feature_snapshots` plus
+    /// Journal Frames and Capsules carry live research.
     pub fn insert_depth_events_batch(
         &mut self,
         source_file: &str,
@@ -8106,6 +8113,9 @@ impl Database {
         Ok(out)
     }
 
+    /// Query leftover `depth_events` rows. **Non-hot-path** (SIL-M3f): live and
+    /// recent DOM tools reconstruct from `.depth` / compact snapshots, not this
+    /// table. Kept for tests and leftover-table inspection.
     pub fn query_depth_events(
         &self,
         start_ms: Option<f64>,
@@ -8167,6 +8177,8 @@ impl Database {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// List leftover `depth_events` in a half-open time range. **Non-hot-path**
+    /// (SIL-M3f): not used by live DOM tools.
     pub fn list_depth_events_in_range(
         &self,
         start_ms: f64,
@@ -8210,6 +8222,8 @@ impl Database {
         Ok(out)
     }
 
+    /// Latest leftover `ClearBook` row at or before `timestamp_ms`.
+    /// **Non-hot-path** (SIL-M3f): live reconstruction uses `DepthReader`.
     pub fn latest_depth_clear_before(
         &self,
         source_file: &str,
@@ -8228,6 +8242,16 @@ impl Database {
         } else {
             Ok(None)
         }
+    }
+
+    /// Count leftover `depth_events` rows. **Non-hot-path** (SIL-M3f): live
+    /// persist no longer appends this table. Used by tests and leftover-table
+    /// inspection.
+    pub fn count_depth_events(&self) -> Result<i64, DbError> {
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM depth_events", [], |row| row.get(0))?;
+        Ok(count)
     }
 
     fn get_json_snapshot_near(

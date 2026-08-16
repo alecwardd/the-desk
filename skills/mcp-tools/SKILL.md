@@ -5,7 +5,7 @@ description: MCP tool routing for The Desk. USE WHEN any agent needs to decide w
 
 # MCP Tool Routing
 
-The Desk MCP server exposes **122 MCP tools in 9 domains**. This skill tells you *which* tool to call *when*. For the full catalog with every description, read [docs/mcp/tool-reference.md](../../docs/mcp/tool-reference.md) — it is generated from the compiled server and guarded by a test, so it is never stale.
+The Desk MCP server exposes **123 MCP tools in 9 domains**. This skill tells you *which* tool to call *when*. For the full catalog with every description, read [docs/mcp/tool-reference.md](../../docs/mcp/tool-reference.md) — it is generated from the compiled server and guarded by a test, so it is never stale.
 
 **Source layout:** each domain is a module in `src/bin/the-desk-mcp/tools/` (market, dom, options, playbook, risk, journal, memory, research, admin).
 
@@ -44,7 +44,7 @@ operators appear (Trust Level L0 — read/query, no mutation/order authority):
 8. `query_raw` — R3 hard-capped raw read (`journal_frames` / `events` / `ticks`). Unbounded windows are rejected. Optional `store=hot|cold` for `journal_frames` only (`events`/`ticks` on cold fail closed).
 9. `run_job` — run series/episodes/raw as a job; returns job id + artifact handle (columnar path + summary), never a token flood. Not a workflow-verb mutation. Optional `store=hot|cold` (same contracts).
 
-Default off keeps the **122 MCP tools** surface unchanged. Artifacts:
+Default off keeps the **123 MCP tools** surface unchanged. Artifacts:
 [docs/mcp/desk-catalog-v0.json](../../docs/mcp/desk-catalog-v0.json).
 Vocabulary: [CONTEXT.md](../../CONTEXT.md).
 
@@ -134,8 +134,9 @@ This is the canonical "potential trade" flow — keep state in the system, not i
 2. `run_backtest` → poll `get_backfill_status` → `summarize_hypothesis_run`.
 3. `get_backtest_results`, `compare_backtests` for stored runs.
 4. Promotion gate: `propose_draft_setup` → human confirmation → `activate_draft_setup`.
-5. `list_hypotheses` first so you never re-test a rejected idea; `set_hypothesis_lifecycle` to retire/reject.
-6. `cancel_backfill` for runaway jobs.
+5. Feature Registry (Base Detectors): discovery via `search_catalog` (`featureHits`). Lifecycle writes use `feature_registry` (`register` at candidate, `promote` candidate→shadow→active with `traderConfirmation`). Do not add a specialty getter.
+6. `list_hypotheses` first so you never re-test a rejected idea; `set_hypothesis_lifecycle` to retire/reject.
+7. `cancel_backfill` for runaway jobs.
 
 ### Options context
 
@@ -169,12 +170,14 @@ This is the canonical "potential trade" flow — keep state in the system, not i
 
 ## Adding or Changing Tools
 
-> **SIL-M0 / Catalog v0 / M1b:** **no new specialty market tools** (`tools/market.rs`)
-> without a Desk Catalog entry — **no catalog entry → no new market tool**.
-> Kernel operators (`describe_*`, `search_catalog`, `get_state`, `get_events`,
-> `query_series`, `query_episodes`, `query_raw`, `run_job`)
+> **SIL-M0 / Catalog v0 / M1b / M5a:** **no new specialty market tools** (`tools/market.rs`)
+> without a Desk Catalog entry **and** (for new detector concepts) a Feature Registry
+> entry — **no catalog entry → no new market tool** and **no registry entry → no new
+> detector tool**. Kernel operators (`describe_*`, `search_catalog`, `get_state`,
+> `get_events`, `query_series`, `query_episodes`, `query_raw`, `run_job`)
 > are behind `[sil].catalog_discovery`, not specialty market tools.
-> Do not delete existing tools under this policy. Do not re-bless
+> The Feature Registry write verb is `feature_registry` (research domain); discovery
+> rides `search_catalog`. Do not delete existing tools under this policy. Do not re-bless
 > `docs/mcp/sil-m0-tool-telemetry-baseline.json` unless the orientation-chain
 > contract itself changes.
 

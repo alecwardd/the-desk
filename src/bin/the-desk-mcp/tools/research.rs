@@ -5,8 +5,14 @@ use rmcp::{
 };
 use std::sync::atomic::Ordering;
 use the_desk_backend::backfill;
+use the_desk_backend::catalog::{
+    BaseDetectorRegistration, CostHint, DetectorSchema, FeatureKind, FeatureProvenance,
+    FeatureRegistry, FeatureRegistryError, FreshnessSemantics, HumanGate, PromotionState,
+    SessionScope, Unit, RUST_PIPELINE_SOURCE, TIER1_REVIEWED_RUST,
+};
 use the_desk_backend::feed::load_feed_config;
 use the_desk_backend::feed::scid_reader::ScidReader;
+use the_desk_backend::mcp::feature_registry::FeatureRegistryParams;
 use the_desk_backend::mcp::hypotheses::{
     ActivateDraftSetupParams, HypothesisRunParams, ListHypothesesParams, RegisterHypothesisParams,
     SetHypothesisLifecycleParams,
@@ -925,6 +931,124 @@ impl TheDeskMcp {
             } else {
                 "Statistical baselines established."
             },
+        })))
+    }
+
+    #[tool(
+        description = "Typed workflow verb for the Feature Registry lifecycle. action=register accepts a Base Detector descriptor (schema + provenance) at promotion=candidate. action=promote moves candidate → shadow or shadow → active and requires traderConfirmation (human gate). Shipped detectors (absorption, pinch, …) are already active and cannot be overwritten. Discovery rides search_catalog / catalog descriptors — this is not a specialty getter and does not implement detector math. Trust Ceiling stays L3; no order authority. Your playbook / your rules say how to use a registered descriptor."
+    )]
+    pub(crate) async fn feature_registry(
+        &self,
+        Parameters(params): Parameters<FeatureRegistryParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let action = params
+            .action
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                invalid_params_error("feature_registry requires action=register|promote")
+            })?;
+        let now_ms = chrono::Utc::now().timestamp_millis() as f64;
+        let overlay = {
+            let db = self.db.lock().map_err(|_| lock_error())?;
+            db.list_feature_registry().map_err(db_error)?
+        };
+        let mut registry = FeatureRegistry::with_overlay(overlay);
+        let descriptor = match action {
+            "register" => {
+                if let Some(kind_raw) = params
+                    .kind
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    match FeatureKind::parse(kind_raw) {
+                        Some(FeatureKind::BaseDetector) => {}
+                        Some(FeatureKind::DerivedFeature) => {
+                            return Err(invalid_params_error(
+                                FeatureRegistryError::DerivedFeatureNotAccepted.to_string(),
+                            ));
+                        }
+                        None => {
+                            return Err(invalid_params_error(format!(
+                                "unknown feature kind `{kind_raw}` (expected baseDetector)"
+                            )));
+                        }
+                    }
+                }
+                let input = BaseDetectorRegistration {
+                    id: params.feature_id.unwrap_or_default(),
+                    name: params.name.unwrap_or_default(),
+                    description: params.description.unwrap_or_default(),
+                    domain_id: params.domain_id.unwrap_or_default(),
+                    schema: DetectorSchema {
+                        catalog_field_ids: params.catalog_field_ids.unwrap_or_default(),
+                        event_types: params.event_types.unwrap_or_default(),
+                        unit: Unit::Count,
+                        session_scope: SessionScope::Session,
+                        freshness: FreshnessSemantics::LiveTickAnchored,
+                        cost_hint: CostHint::R1,
+                    },
+                    provenance: FeatureProvenance {
+                        source: params
+                            .source
+                            .filter(|s| !s.trim().is_empty())
+                            .unwrap_or_else(|| RUST_PIPELINE_SOURCE.to_string()),
+                        rust_module: params.rust_module.unwrap_or_default(),
+                        math_tier: TIER1_REVIEWED_RUST.to_string(),
+                        behavior_change: false,
+                    },
+                };
+                registry
+                    .register(input)
+                    .map_err(|e| invalid_params_error(e.to_string()))?
+            }
+            "promote" => {
+                let id = params
+                    .feature_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| invalid_params_error("promote requires featureId"))?;
+                let target_raw = params
+                    .target_state
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| {
+                        invalid_params_error("promote requires targetState=shadow|active")
+                    })?;
+                let target = PromotionState::parse(target_raw).ok_or_else(|| {
+                    invalid_params_error(format!(
+                        "unknown targetState `{target_raw}` (expected shadow or active)"
+                    ))
+                })?;
+                let gate = HumanGate::parse(params.trader_confirmation.as_deref().unwrap_or(""))
+                    .map_err(|e| invalid_params_error(e.to_string()))?;
+                registry
+                    .promote(id, target, gate)
+                    .map_err(|e| invalid_params_error(e.to_string()))?
+            }
+            other => {
+                return Err(invalid_params_error(format!(
+                    "unknown action `{other}` (expected register or promote)"
+                )));
+            }
+        };
+        {
+            let db = self.db.lock().map_err(|_| lock_error())?;
+            db.upsert_feature_registry(&descriptor, now_ms)
+                .map_err(db_error)?;
+        }
+        Ok(text_result(serde_json::json!({
+            "action": action,
+            "feature": descriptor,
+            "mutationAuthority": true,
+            "orderAuthority": false,
+            "trustCeiling": "L3",
+            "readOperator": "search_catalog",
+            "note": "Your playbook / your rules say how to use a registered Base Detector. Discovery rides search_catalog; this verb does not change detector math and does not place orders."
         })))
     }
 }

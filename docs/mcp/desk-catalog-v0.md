@@ -266,3 +266,15 @@ Catalog v0 enforces **no catalog entry → no new market tool**. The allowlist b
 - `get_tpo_profile`
 - `get_trade_size_profile`
 
+## Feature Registry (Base Detectors)
+
+Governance waist for **Base Detectors**: schema, provenance, and promotion (`candidate` → `shadow` → `active`, human-gated). Discovery rides `search_catalog` / catalog descriptors — no specialty getter. The write verb is `feature_registry`. Tier 1 math stays reviewed Rust; this catalog does not implement Feature-IR, codegen, or new detector math.
+
+| Id | Domain | Promotion | Builtin | Event types |
+|---|---|---|---|---|
+| `detector.absorption` | `flow` | active | true | absorption_detected, absorption_confirmed, absorption_invalidated |
+| `detector.pinch` | `flow` | active | true | pinch_detected |
+| `detector.rebid_reoffer` | `response` | active | true | acceleration_zone_created, acceleration_zone_held |
+| `detector.structure` | `location_structure` | active | true | ib_formed, or_formed, ib_mid_test, ib_extension_hit, new_session_high, new_session_low, dnp_cross, day_type_change, poor_high_detected, poor_low_detected, excess_high_detected, excess_low_detected, or5_mid_retest, rvol_spike |
+| `detector.trade_size` | `flow` | active | true | large_trade_cluster |
+

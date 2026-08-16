@@ -11,9 +11,10 @@ use rmcp::{
 };
 use the_desk_backend::catalog::{
     apply_positioning_slice, apply_token_budget, attach_capsule_refs, build_catalog,
-    build_state_envelope, collapse_events_latest_per_dedup, describe_domain, describe_environment,
-    kernel_event_from_db_row, kernel_event_from_market_event_scoped, merge_symbol_envelopes,
-    positioning_state_slice, search_catalog, state_envelope_json, EventsEnvelope, KernelEvent,
+    build_catalog_with_overlay, build_state_envelope, collapse_events_latest_per_dedup,
+    describe_domain, describe_environment, kernel_event_from_db_row,
+    kernel_event_from_market_event_scoped, merge_symbol_envelopes, positioning_state_slice,
+    search_catalog, search_features, state_envelope_json, EventsEnvelope, KernelEvent,
     PositioningStateSlice, ProvenanceSource, StateEnvelope, StateReadRequest, StateResolution,
     TrustLevel, KERNEL_READ_QUERY_TOOLS,
 };
@@ -29,7 +30,7 @@ impl TheDeskMcp {
         description = "Describe the Desk Catalog environment: catalogVersion, Trust Ceiling (L3), domain list, Positioning stub status, and specialty-market-tool policy. Returns catalog metadata only — never live market data. Enable via [sil].catalog_discovery in config.toml. Trust Level L0 (read/query)."
     )]
     pub(crate) async fn describe_environment(&self) -> Result<CallToolResult, McpError> {
-        let catalog = build_catalog();
+        let catalog = catalog_with_registry_overlay(self);
         let mut out = describe_environment(&catalog, self.sil_config.catalog_discovery);
         if let Some(obj) = out.as_object_mut() {
             obj.insert("trustLevel".into(), serde_json::json!(TrustLevel::L0));
@@ -58,7 +59,7 @@ impl TheDeskMcp {
             .ok_or_else(|| {
                 invalid_params_error("describe_domain requires `domain` (catalog domain id)")
             })?;
-        let catalog = build_catalog();
+        let catalog = catalog_with_registry_overlay(self);
         match describe_domain(&catalog, domain_id) {
             Some(mut out) => {
                 if let Some(obj) = out.as_object_mut() {
@@ -82,20 +83,23 @@ impl TheDeskMcp {
     }
 
     #[tool(
-        description = "Search the Desk Catalog by text across field ids, names, descriptions, and domains. Returns matching field descriptors with unit, session scope, freshness, and cost hint — metadata only, never live market data. Trust Level L0 (read/query)."
+        description = "Search the Desk Catalog by text across field ids, names, descriptions, domains, and Feature Registry Base Detectors (schema, provenance, promotion). Returns matching field descriptors plus featureHits — metadata only, never live market data. Trust Level L0 (read/query). No specialty getter: registered detectors are discoverable here."
     )]
     pub(crate) async fn search_catalog(
         &self,
         Parameters(params): Parameters<SearchCatalogParams>,
     ) -> Result<CallToolResult, McpError> {
         let query = params.query.unwrap_or_default();
-        let catalog = build_catalog();
+        let catalog = catalog_with_registry_overlay(self);
         let hits = search_catalog(&catalog, &query);
+        let feature_hits = search_features(&catalog, &query);
         Ok(text_result(serde_json::json!({
             "catalogVersion": catalog.catalog_version,
             "query": query,
             "hitCount": hits.len(),
             "hits": hits,
+            "featureHitCount": feature_hits.len(),
+            "featureHits": feature_hits,
             "metadataOnly": true,
             "trustLevel": TrustLevel::L0,
             "mutationAuthority": false,
@@ -1072,4 +1076,15 @@ fn merge_l0(mut value: serde_json::Value) -> serde_json::Value {
         obj.insert("orderAuthority".into(), serde_json::json!(false));
     }
     value
+}
+
+/// Desk Catalog plus Feature Registry overlay rows (discovery only).
+fn catalog_with_registry_overlay(server: &TheDeskMcp) -> the_desk_backend::catalog::DeskCatalog {
+    let overlay = server
+        .db
+        .lock()
+        .ok()
+        .and_then(|db| db.list_feature_registry().ok())
+        .unwrap_or_default();
+    build_catalog_with_overlay(overlay)
 }

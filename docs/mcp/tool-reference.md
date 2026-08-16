@@ -4,7 +4,7 @@
 > Regenerate with `cargo run --bin the-desk-mcp -- --write-tool-docs`.
 > The test `tool_reference_doc_is_current` fails when this file is stale.
 
-The Desk MCP server exposes **122 MCP tools** across **9 domains**. Each domain maps to a module under `src/bin/the-desk-mcp/tools/`. For scenario-based routing ("which tool do I call when…"), read `skills/mcp-tools/SKILL.md` first; this file is the exhaustive catalog.
+The Desk MCP server exposes **123 MCP tools** across **9 domains**. Each domain maps to a module under `src/bin/the-desk-mcp/tools/`. For scenario-based routing ("which tool do I call when…"), read `skills/mcp-tools/SKILL.md` first; this file is the exhaustive catalog.
 
 | Domain | Tools | Reach for it when… |
 |---|---|---|
@@ -15,7 +15,7 @@ The Desk MCP server exposes **122 MCP tools** across **9 domains**. Each domain 
 | [Risk](#risk) | 9 | sizing a trade, checking limits, or starting/ending a trading session |
 | [Journal](#journal) | 12 | recording or reviewing actual trades and journaling the session |
 | [Memory](#memory) | 13 | you want durable context about the trader, or to persist an insight worth remembering |
-| [Research](#research) | 23 | answering "how often" / "what happens after" questions or running and comparing backtests |
+| [Research](#research) | 24 | answering "how often" / "what happens after" questions or running and comparing backtests |
 | [Admin](#admin) | 12 | diagnosing data problems, backfilling history, or verifying feed and database health |
 
 ## Market
@@ -410,7 +410,7 @@ Supersede an older insight with a newer replacement insight ID.
 
 ## Research
 
-Historical research: hypotheses, backtests, and frequency/conditional/distribution queries over recorded sessions.
+Historical research: hypotheses, backtests, Feature Registry lifecycle (`feature_registry`), and frequency/conditional/distribution queries over recorded sessions.
 
 Module: `src/bin/the-desk-mcp/tools/research.rs`
 
@@ -429,6 +429,10 @@ Compare two or more backtest runs side-by-side. Pass run IDs to compare params, 
 ### `compare_sessions`
 
 Compare current session structure against similar historical sessions. Uses multi-dimensional similarity: IB range, day type, profile shape, balance state, RVOL ratio, session delta sign, single prints direction. Returns the most similar past sessions, outcomes, and research metadata including rows considered, result cap, and truncation status.
+
+### `feature_registry`
+
+Typed workflow verb for the Feature Registry lifecycle. action=register accepts a Base Detector descriptor (schema + provenance) at promotion=candidate. action=promote moves candidate → shadow or shadow → active and requires traderConfirmation (human gate). Shipped detectors (absorption, pinch, …) are already active and cannot be overwritten. Discovery rides search_catalog / catalog descriptors — this is not a specialty getter and does not implement detector math. Trust Ceiling stays L3; no order authority. Your playbook / your rules say how to use a registered descriptor.
 
 ### `get_backfill_status`
 

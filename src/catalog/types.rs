@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::feature_registry::FeatureDescriptor;
+
 /// Pinned Desk Catalog version string served in every discovery envelope.
 pub const CATALOG_VERSION: &str = "0.1.0";
 
@@ -162,4 +164,7 @@ pub struct DeskCatalog {
     pub positioning_record_kinds: Vec<PositioningRecordKind>,
     /// Always `None` in Catalog v0 — no live Positioning provider.
     pub positioning_provider: Option<String>,
+    /// Feature Registry Base Detectors (schema + provenance + promotion).
+    #[serde(default)]
+    pub base_detectors: Vec<FeatureDescriptor>,
 }

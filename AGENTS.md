@@ -37,7 +37,7 @@ already live in the README "Development" section — use those, don't duplicate 
   normally launched by Cursor via `.cursor/mcp.json` (template:
   `.cursor/mcp.example.json`). To exercise it manually, pipe newline-delimited
   JSON-RPC (`initialize` → `notifications/initialized` → `tools/call`) into the
-  built binary's stdin. It exposes 122 tools.
+  built binary's stdin. It exposes 123 tools.
 - **No live Sierra Chart `.scid` feed exists in cloud (it is Windows-only).** The
   server still starts and serves every tool; it logs `scid.file_missing` and
   live-market tools (`get_market_snapshot`, `get_session_context`) return

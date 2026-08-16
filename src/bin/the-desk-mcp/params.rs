@@ -22,7 +22,7 @@ pub(crate) struct DescribeDomainParams {
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SearchCatalogParams {
-    /// Free-text query over field ids, names, descriptions, and domains.
+    /// Free-text query over field ids, names, descriptions, domains, and Feature Registry Base Detectors.
     pub(crate) query: Option<String>,
 }
 

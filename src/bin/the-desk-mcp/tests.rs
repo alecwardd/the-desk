@@ -912,7 +912,7 @@ fn discovery_tools_absent_from_default_router() {
             "{tool} must be omitted from the default router when SIL discovery is off"
         );
     }
-    assert_eq!(names.len(), 122);
+    assert_eq!(names.len(), 123);
 }
 
 #[test]
@@ -932,7 +932,7 @@ fn discovery_tools_present_when_sil_flag_on() {
             "{tool} must appear when [sil].catalog_discovery = true"
         );
     }
-    assert_eq!(names.len(), 131);
+    assert_eq!(names.len(), 132);
 }
 
 #[test]
@@ -1049,6 +1049,136 @@ async fn discovery_tools_return_metadata_only() {
     );
     assert_eq!(hits["metadataOnly"], true);
     assert!(hits["hitCount"].as_u64().unwrap_or(0) >= 1);
+
+    let pinch = parse_text_tool_result(
+        server
+            .search_catalog(Parameters(SearchCatalogParams {
+                query: Some("pinch".into()),
+            }))
+            .await
+            .expect("search_catalog pinch"),
+    );
+    let feature_hits = pinch["featureHits"].as_array().expect("featureHits");
+    assert!(feature_hits
+        .iter()
+        .any(|h| h["id"] == "detector.pinch" && h["promotionState"] == "active"));
+    assert_eq!(env["featureRegistry"]["humanGated"], true);
+    assert_eq!(env["featureRegistry"]["writeVerb"], "feature_registry");
+}
+
+#[tokio::test]
+async fn feature_registry_register_and_promote_is_human_gated() {
+    let server = test_server_with_sil();
+    let registered = parse_text_tool_result(
+        server
+            .feature_registry(Parameters(
+                the_desk_backend::mcp::feature_registry::FeatureRegistryParams {
+                    action: Some("register".into()),
+                    feature_id: Some("detector.example_candidate".into()),
+                    name: Some("example_candidate".into()),
+                    description: Some("Schema-only Base Detector candidate.".into()),
+                    domain_id: Some("flow".into()),
+                    event_types: Some(vec!["example_candidate_detected".into()]),
+                    rust_module: Some("unwired".into()),
+                    kind: Some("baseDetector".into()),
+                    ..Default::default()
+                },
+            ))
+            .await
+            .expect("register"),
+    );
+    assert_eq!(registered["feature"]["promotionState"], "candidate");
+    assert_eq!(registered["mutationAuthority"], true);
+    assert_eq!(registered["orderAuthority"], false);
+    assert_eq!(registered["readOperator"], "search_catalog");
+
+    let missing_gate = server
+        .feature_registry(Parameters(
+            the_desk_backend::mcp::feature_registry::FeatureRegistryParams {
+                action: Some("promote".into()),
+                feature_id: Some("detector.example_candidate".into()),
+                target_state: Some("shadow".into()),
+                trader_confirmation: Some("".into()),
+                ..Default::default()
+            },
+        ))
+        .await;
+    assert!(missing_gate.is_err(), "empty traderConfirmation must fail");
+
+    let skip = server
+        .feature_registry(Parameters(
+            the_desk_backend::mcp::feature_registry::FeatureRegistryParams {
+                action: Some("promote".into()),
+                feature_id: Some("detector.example_candidate".into()),
+                target_state: Some("active".into()),
+                trader_confirmation: Some("skip is not allowed".into()),
+                ..Default::default()
+            },
+        ))
+        .await;
+    assert!(skip.is_err(), "candidate → active must fail");
+
+    let shadow = parse_text_tool_result(
+        server
+            .feature_registry(Parameters(
+                the_desk_backend::mcp::feature_registry::FeatureRegistryParams {
+                    action: Some("promote".into()),
+                    feature_id: Some("detector.example_candidate".into()),
+                    target_state: Some("shadow".into()),
+                    trader_confirmation: Some(
+                        "Your rules say this candidate may run in shadow.".into(),
+                    ),
+                    ..Default::default()
+                },
+            ))
+            .await
+            .expect("shadow"),
+    );
+    assert_eq!(shadow["feature"]["promotionState"], "shadow");
+
+    let active = parse_text_tool_result(
+        server
+            .feature_registry(Parameters(
+                the_desk_backend::mcp::feature_registry::FeatureRegistryParams {
+                    action: Some("promote".into()),
+                    feature_id: Some("detector.example_candidate".into()),
+                    target_state: Some("active".into()),
+                    trader_confirmation: Some(
+                        "Your playbook indicates this descriptor may be active.".into(),
+                    ),
+                    ..Default::default()
+                },
+            ))
+            .await
+            .expect("active"),
+    );
+    assert_eq!(active["feature"]["promotionState"], "active");
+
+    let hits = parse_text_tool_result(
+        server
+            .search_catalog(Parameters(SearchCatalogParams {
+                query: Some("example_candidate".into()),
+            }))
+            .await
+            .expect("search overlay"),
+    );
+    let feature_hits = hits["featureHits"].as_array().expect("featureHits");
+    assert!(feature_hits
+        .iter()
+        .any(|h| { h["id"] == "detector.example_candidate" && h["promotionState"] == "active" }));
+
+    let builtin = server
+        .feature_registry(Parameters(
+            the_desk_backend::mcp::feature_registry::FeatureRegistryParams {
+                action: Some("promote".into()),
+                feature_id: Some("detector.absorption".into()),
+                target_state: Some("shadow".into()),
+                trader_confirmation: Some("must not mutate shipped math".into()),
+                ..Default::default()
+            },
+        ))
+        .await;
+    assert!(builtin.is_err(), "shipped absorption must stay immutable");
 }
 
 #[tokio::test]

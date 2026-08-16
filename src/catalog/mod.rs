@@ -13,6 +13,7 @@ mod config;
 mod envelope;
 mod event_lifecycle;
 mod events_kernel;
+mod feature_registry;
 mod market_state_fields;
 mod positioning;
 mod positioning_record;
@@ -41,6 +42,14 @@ pub use events_kernel::{
     kernel_event_envelope_fields_present, kernel_event_from_db_row, kernel_event_from_market_event,
     kernel_event_from_market_event_scoped, kernel_event_from_persisted, CapsuleRef, EventsEnvelope,
     KernelEvent, COACHING_EVENT_FETCH_CAP, SEVERITY_PLACEHOLDER,
+};
+pub use feature_registry::{
+    apply_promotion, builtin_base_detectors, concept_has_catalog_or_registry_entry,
+    feature_registry_environment, search_features, specialty_tool_registry_id,
+    validate_registration, BaseDetectorRegistration, DetectorSchema, FeatureDescriptor,
+    FeatureKind, FeatureProvenance, FeatureRegistry, FeatureRegistryError, HumanGate,
+    PromotionState, DETECTOR_SPECIALTY_TOOLS, FEATURE_REGISTRY_WRITE_VERB, PROMOTION_STATES,
+    RUST_PIPELINE_SOURCE, TIER1_REVIEWED_RUST,
 };
 pub use positioning_record::{
     accept_levels_only_entry, apply_positioning_slice, empty_positioning_slice, evaluate_freshness,
@@ -95,6 +104,9 @@ pub fn build_catalog() -> DeskCatalog {
     domains.sort_by(|a, b| a.id.cmp(&b.id));
     fields.sort_by(|a, b| a.id.cmp(&b.id));
 
+    let mut base_detectors = builtin_base_detectors();
+    base_detectors.sort_by(|a, b| a.id.cmp(&b.id));
+
     DeskCatalog {
         catalog_version: CATALOG_VERSION.to_string(),
         trust_ceiling: TrustCeiling::L3,
@@ -103,7 +115,18 @@ pub fn build_catalog() -> DeskCatalog {
         fields,
         positioning_record_kinds: positioning.record_kinds,
         positioning_provider: None,
+        base_detectors,
     }
+}
+
+/// Catalog plus SQLite Feature Registry overlay (registered candidates / promotions).
+///
+/// Overlay rows cannot replace shipped builtins. Used by discovery operators so
+/// newly registered Base Detectors are searchable without a specialty getter.
+pub fn build_catalog_with_overlay(overlay: Vec<FeatureDescriptor>) -> DeskCatalog {
+    let mut catalog = build_catalog();
+    catalog.base_detectors = FeatureRegistry::with_overlay(overlay).into_descriptors();
+    catalog
 }
 
 /// Environment metadata for `describe_environment` (no live values).
@@ -129,8 +152,9 @@ pub fn describe_environment(catalog: &DeskCatalog, discovery_enabled: bool) -> s
             "writeVerb": "positioning_entry",
             "levelsOnlyFirstClass": true,
         },
-        "specialtyMarketToolsPolicy": "no_catalog_entry_no_new_market_tool",
+        "specialtyMarketToolsPolicy": "no_catalog_or_registry_entry_no_new_market_tool",
         "specialtyMarketToolCount": catalog.specialty_market_tools.len(),
+        "featureRegistry": feature_registry_environment(catalog),
         "marketRouter": {
             "roots": ["NQ", "ES"],
             "oneClock": true,
@@ -210,6 +234,18 @@ pub fn describe_domain(catalog: &DeskCatalog, domain_id: &str) -> Option<serde_j
                 serde_json::Value::String("event_triggered_only".into()),
             );
             obj.insert("trustLevel".into(), serde_json::json!(TrustLevel::L0));
+        }
+    }
+    let detectors: Vec<&FeatureDescriptor> = catalog
+        .base_detectors
+        .iter()
+        .filter(|d| d.domain_id == domain_id)
+        .collect();
+    if !detectors.is_empty() {
+        if let Some(obj) = out.as_object_mut() {
+            if let Ok(value) = serde_json::to_value(&detectors) {
+                obj.insert("baseDetectors".into(), value);
+            }
         }
     }
     Some(out)
@@ -538,5 +574,38 @@ mod tests {
         let cat = build_catalog();
         assert_eq!(cat.specialty_market_tools.len(), 24);
         assert!(cat.specialty_market_tools.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn catalog_includes_shipped_base_detectors() {
+        let cat = build_catalog();
+        assert!(cat.base_detectors.len() >= 2);
+        assert!(cat
+            .base_detectors
+            .iter()
+            .any(|d| d.id == "detector.absorption"
+                && d.promotion_state == crate::catalog::PromotionState::Active));
+        assert!(cat.base_detectors.iter().any(|d| d.id == "detector.pinch"
+            && d.promotion_state == crate::catalog::PromotionState::Active));
+        let env = describe_environment(&cat, true);
+        assert_eq!(env["featureRegistry"]["humanGated"], true);
+        assert_eq!(env["featureRegistry"]["writeVerb"], "feature_registry");
+        assert_eq!(
+            env["specialtyMarketToolsPolicy"],
+            "no_catalog_or_registry_entry_no_new_market_tool"
+        );
+        let flow = describe_domain(&cat, "flow").expect("flow");
+        let detectors = flow["baseDetectors"].as_array().expect("baseDetectors");
+        assert!(detectors.iter().any(|d| d["id"] == "detector.absorption"));
+        assert!(detectors.iter().any(|d| d["id"] == "detector.pinch"));
+    }
+
+    #[test]
+    fn search_features_finds_pinch_without_a_specialty_getter() {
+        let cat = build_catalog();
+        let hits = crate::catalog::search_features(&cat, "pinch");
+        assert!(hits.iter().any(|h| h.id == "detector.pinch"));
+        let hits = crate::catalog::search_features(&cat, "base detector");
+        assert!(hits.len() >= 2);
     }
 }

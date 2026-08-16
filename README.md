@@ -34,7 +34,7 @@ AI agents in Cursor
 5. **Rules engine** evaluates typed playbook conditions and risk gates before any agent synthesis
 6. **SQLite** stores raw ticks, computed state, session summaries, market events, signal outcomes, and playbook signals
 7. **Research query engine** answers frequency, conditional probability, and distribution questions over historical data
-8. **MCP server** exposes 122 MCP tools that any Cursor agent can call for market context, feed diagnostics, setup lifecycle state, and historical research
+8. **MCP server** exposes 123 MCP tools that any Cursor agent can call for market context, feed diagnostics, setup lifecycle state, and historical research
 9. **Specialized subagents** (market structure, order flow, levels, performance) access domain-specific tools and report to the orchestrator
 10. **The trader chats with agents** in Cursor who reference live (1-5s delayed) market data and historical statistics
 

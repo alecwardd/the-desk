@@ -1,4 +1,4 @@
-use crate::catalog::{FeatureDescriptor, PositioningRecord};
+use crate::catalog::{FeatureDescriptor, FeatureIrFrame, PositioningRecord};
 use crate::depth::DepthRecord;
 use crate::memory::{
     AgentInsightQuery, AgentInsightRecord, BehavioralPatternQuery, BehavioralPatternRecord,
@@ -1170,6 +1170,19 @@ pub struct JournalFrameRecord {
     pub session_segment: String,
     pub trading_day: String,
     pub payload: serde_json::Value,
+}
+
+impl From<&JournalFrameRecord> for FeatureIrFrame {
+    fn from(row: &JournalFrameRecord) -> Self {
+        FeatureIrFrame {
+            clock_ms: row.clock_ms,
+            frame_second: row.frame_second,
+            root_symbol: row.root_symbol.clone(),
+            session_type: row.session_type.clone(),
+            trading_day: row.trading_day.clone(),
+            payload: row.payload.clone(),
+        }
+    }
 }
 
 /// `get_state(as_of=…)` lookup: co-recorded frames at one clock second.

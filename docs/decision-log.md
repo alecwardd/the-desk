@@ -852,6 +852,27 @@ This note does not implement Feature-IR / Operator Families (#19), registry code
 
 ---
 
+### Decision note: SIL-M5b Feature-IR + five Operator Families + shadow≡historical parity
+
+**Date:** 2026-08-16
+**Status:** Decided (implements [alecwardd/the-desk#19](https://github.com/alecwardd/the-desk/issues/19); Part of #2)
+
+**Context:** SIL-M5a registered shipped Base Detectors and the human-gated Feature Registry waist. Spec (#2) user stories 44–46 and 52 require Derived Features to be declared as data in a typed **Feature-IR** over catalog fields, using exactly five funded **Operator Families**, with live-shadow and historical evaluation sharing one descriptor so the two cannot diverge. Surface interpolation stays unfunded. Codegen emitters are a later ticket (#20).
+
+**Decision:**
+
+1. **Feature-IR** is a typed, non-Turing-complete program over Desk Catalog fields. It is for **Derived Features only**. Absorption, pinch, rebid/reoffer, trade-size, and structure math stay reviewed Rust Base Detectors and are not re-expressed in IR.
+2. **Exactly five funded Operator Families** (glossary names): Cross-symbol references; Session-distribution percentiles; Dwell / time-since-predicate; Event sequences (“A then B within T”); Historical baselines (including cross-session “versus the same time of day over N days”). Unfunded families — including surface lookup / interpolation — are rejected at declaration time with a typed error. Composition is a single funded family per program; predicates may name NQ/ES catalog fields. No unbounded recursion or user-declared loops.
+3. **New family = registry change proposal.** Adding a sixth family is a documented gate (`newOperatorFamilyGate=registry_change_proposal`), not an in-band extension. Positioning continues to precompute level fields at ingest; this ticket does not add a surface-lookup family.
+4. **One evaluator, two sources.** `evaluate_live_shadow` and `evaluate_historical` call the same `evaluate` over Journal Frames with `clock_ms <= asOf`. Historical loads persisted frames; live-shadow uses the in-memory frame sequence. Golden replay (`tests/session_replay_golden.rs`) blesses per-descriptor parity.
+5. **Registry waist unchanged in shape.** `feature_registry` accepts `kind=derivedFeature` with a `program` (ids `feature.<snake_id>`). Promotion remains human-gated `candidate` → `shadow` → `active`. Discovery still rides `search_catalog` when `[sil].catalog_discovery = true`. No specialty getter, no tenth kernel operator, no new market tools. Trust Ceiling stays **L3**.
+
+This note does not implement registry codegen / five emitters (#20), the leg engine (#21), DOM cluster Base Detectors (#22), ACSIL (#23), Vs3dProvider (#16), DuckDB, Parquet conversion, `get_capsule`, a 250 ms forever-store, a tenth kernel operator / `run_job` poll tool, new specialty market tools, or raising the Trust Ceiling.
+
+**Consequences:** A Derived Feature is declared once and evaluates identically live in shadow and historically over Journal Frames. IR expressive power cannot creep toward Turing-completeness without an explicit family-gate review.
+
+---
+
 ### Decision note: SIL-P-VS-a Levels-Only Record path
 
 **Date:** 2026-08-13

@@ -83,7 +83,7 @@ impl TheDeskMcp {
     }
 
     #[tool(
-        description = "Search the Desk Catalog by text across field ids, names, descriptions, domains, and Feature Registry Base Detectors (schema, provenance, promotion). Returns matching field descriptors plus featureHits — metadata only, never live market data. Trust Level L0 (read/query). No specialty getter: registered detectors are discoverable here."
+        description = "Search the Desk Catalog by text across field ids, names, descriptions, domains, and Feature Registry Base Detectors / Derived Features (schema, provenance, promotion, Feature-IR family). Returns matching field descriptors plus featureHits — metadata only, never live market data. Trust Level L0 (read/query). No specialty getter: registered detectors and derived features are discoverable here."
     )]
     pub(crate) async fn search_catalog(
         &self,

@@ -299,6 +299,9 @@ pub struct DeskCatalog {
     /// Feature Registry Base Detectors (schema + provenance + promotion).
     #[serde(default)]
     pub base_detectors: Vec<FeatureDescriptor>,
+    /// Feature Registry Derived Features (Feature-IR programs; SIL-M5b).
+    #[serde(default)]
+    pub derived_features: Vec<FeatureDescriptor>,
 }
 
 #[cfg(test)]

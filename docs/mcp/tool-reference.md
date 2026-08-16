@@ -410,7 +410,7 @@ Supersede an older insight with a newer replacement insight ID.
 
 ## Research
 
-Historical research: hypotheses, backtests, Feature Registry lifecycle (`feature_registry`), and frequency/conditional/distribution queries over recorded sessions.
+Historical research: hypotheses, backtests, Feature Registry lifecycle (`feature_registry` for Base Detectors and Derived Features), and frequency/conditional/distribution queries over recorded sessions.
 
 Module: `src/bin/the-desk-mcp/tools/research.rs`
 
@@ -432,7 +432,7 @@ Compare current session structure against similar historical sessions. Uses mult
 
 ### `feature_registry`
 
-Typed workflow verb for the Feature Registry lifecycle. action=register accepts a Base Detector descriptor (schema + provenance) at promotion=candidate. Schema fields catalogFieldIds, eventTypes, unit, sessionScope, freshness, and costHint are accepted on register (unknown labels rejected; omitted unit/scope/freshness/cost default to count/session/liveTickAnchored/R1). action=promote moves candidate → shadow or shadow → active and requires traderConfirmation (human gate). Shipped detectors (absorption, pinch, …) are already active and cannot be overwritten. Reading descriptors back requires [sil].catalog_discovery = true so search_catalog / describe_environment / describe_domain are on the router — this is not a specialty getter and does not implement detector math. Trust Ceiling stays L3; no order authority. Your playbook / your rules say how to use a registered descriptor.
+Typed workflow verb for the Feature Registry lifecycle. action=register accepts a Base Detector (kind=baseDetector, default) or a Derived Feature (kind=derivedFeature) at promotion=candidate. Derived Features require a Feature-IR `program` using only the five funded Operator Families (cross-symbol references, session-distribution percentiles, dwell/time-since-predicate, event sequences, historical baselines); unfunded families including surface lookup/interpolation are rejected at declaration time. Base Detector math stays reviewed Rust and is not re-expressed in Feature-IR. Schema fields catalogFieldIds, eventTypes, unit, sessionScope, freshness, and costHint are accepted on register (unknown labels rejected; omitted unit/scope/freshness/cost default to count/session/liveTickAnchored/R1). action=promote moves candidate → shadow or shadow → active and requires traderConfirmation (human gate). Shipped detectors (absorption, pinch, …) are already active and cannot be overwritten. Reading descriptors back requires [sil].catalog_discovery = true so search_catalog / describe_environment / describe_domain are on the router — this is not a specialty getter and does not implement detector math or codegen emitters. Trust Ceiling stays L3; no order authority. Your playbook / your rules say how to use a registered descriptor.
 
 ### `get_backfill_status`
 

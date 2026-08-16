@@ -13,6 +13,7 @@ mod config;
 mod envelope;
 mod event_lifecycle;
 mod events_kernel;
+mod feature_ir;
 mod feature_registry;
 mod market_state_fields;
 mod positioning;
@@ -43,13 +44,20 @@ pub use events_kernel::{
     kernel_event_from_market_event_scoped, kernel_event_from_persisted, CapsuleRef, EventsEnvelope,
     KernelEvent, COACHING_EVENT_FETCH_CAP, SEVERITY_PLACEHOLDER,
 };
+pub use feature_ir::{
+    declare_program, evaluate, evaluate_historical, evaluate_live_shadow, BaselineAggregator,
+    DwellMode, EventSelector, FeatureIrError, FeatureIrEvalPath, FeatureIrEvent, FeatureIrFrame,
+    FeatureIrProgram, FeatureIrStore, FeatureIrValue, FieldPredicate, OperatorFamily,
+    PercentileOutput, PredicateOp, DERIVED_FEATURE_MATH_TIER, FEATURE_IR_MODULE, FEATURE_IR_SOURCE,
+    FUNDED_OPERATOR_FAMILY_GLOSSARY, FUNDED_OPERATOR_FAMILY_LABELS, NEW_OPERATOR_FAMILY_GATE,
+};
 pub use feature_registry::{
     apply_promotion, builtin_base_detectors, concept_has_catalog_or_registry_entry,
     feature_registry_environment, search_features, specialty_tool_registry_id,
-    validate_registration, BaseDetectorRegistration, DetectorSchema, FeatureDescriptor,
-    FeatureKind, FeatureProvenance, FeatureRegistry, FeatureRegistryError, HumanGate,
-    PromotionState, DETECTOR_SPECIALTY_TOOLS, FEATURE_REGISTRY_WRITE_VERB, PROMOTION_STATES,
-    RUST_PIPELINE_SOURCE, TIER1_REVIEWED_RUST,
+    validate_derived_feature, validate_registration, BaseDetectorRegistration,
+    DerivedFeatureRegistration, DetectorSchema, FeatureDescriptor, FeatureKind, FeatureProvenance,
+    FeatureRegistry, FeatureRegistryError, HumanGate, PromotionState, DETECTOR_SPECIALTY_TOOLS,
+    FEATURE_REGISTRY_WRITE_VERB, PROMOTION_STATES, RUST_PIPELINE_SOURCE, TIER1_REVIEWED_RUST,
 };
 pub use positioning_record::{
     accept_levels_only_entry, apply_positioning_slice, empty_positioning_slice, evaluate_freshness,
@@ -116,6 +124,7 @@ pub fn build_catalog() -> DeskCatalog {
         positioning_record_kinds: positioning.record_kinds,
         positioning_provider: None,
         base_detectors,
+        derived_features: Vec::new(),
     }
 }
 
@@ -125,7 +134,9 @@ pub fn build_catalog() -> DeskCatalog {
 /// newly registered Base Detectors are searchable without a specialty getter.
 pub fn build_catalog_with_overlay(overlay: Vec<FeatureDescriptor>) -> DeskCatalog {
     let mut catalog = build_catalog();
-    catalog.base_detectors = FeatureRegistry::with_overlay(overlay).into_descriptors();
+    let registry = FeatureRegistry::with_overlay(overlay);
+    catalog.base_detectors = registry.base_detectors();
+    catalog.derived_features = registry.derived_features();
     catalog
 }
 
@@ -252,6 +263,18 @@ pub fn describe_domain(catalog: &DeskCatalog, domain_id: &str) -> Option<serde_j
         if let Some(obj) = out.as_object_mut() {
             if let Ok(value) = serde_json::to_value(&detectors) {
                 obj.insert("baseDetectors".into(), value);
+            }
+        }
+    }
+    let derived: Vec<&FeatureDescriptor> = catalog
+        .derived_features
+        .iter()
+        .filter(|d| d.domain_id == domain_id)
+        .collect();
+    if !derived.is_empty() {
+        if let Some(obj) = out.as_object_mut() {
+            if let Ok(value) = serde_json::to_value(&derived) {
+                obj.insert("derivedFeatures".into(), value);
             }
         }
     }
@@ -598,6 +621,12 @@ mod tests {
         assert_eq!(env["featureRegistry"]["humanGated"], true);
         assert_eq!(env["featureRegistry"]["writeVerb"], "feature_registry");
         assert_eq!(env["featureRegistry"]["discoveryEnabled"], true);
+        assert_eq!(env["featureRegistry"]["featureIr"], true);
+        assert_eq!(env["featureRegistry"]["codegen"], false);
+        assert_eq!(
+            env["featureRegistry"]["newOperatorFamilyGate"],
+            "registry_change_proposal"
+        );
         assert_eq!(env["featureRegistry"]["readRequiresCatalogDiscovery"], true);
         let env_off = describe_environment(&cat, false);
         assert_eq!(env_off["featureRegistry"]["discoveryEnabled"], false);

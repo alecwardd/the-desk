@@ -223,7 +223,7 @@ The MCP server (`src/bin/the-desk-mcp/`, domain modules under `tools/`) exposes 
 | Context | Primary tools |
 |---------|---------------|
 | **Live (current session)** | `get_market_snapshot`, `get_context_frame`, `get_session_context`, `get_tpo_profile`, `get_delta_profile`, `get_key_levels`, `get_tape_pace`, `get_footprint`, `get_or5_status`, `get_rvol`, `get_day_type`, `get_rebid_reoffer_zones`, `get_pinch_events`, `get_session_inventory`, `evaluate_playbook`, `get_setup_context`, `check_delta_confirmation`, `get_proximity_report`, `get_imbalances`, `get_absorption_events`, `get_trade_size_profile`, DOM tools |
-| **Historical (backfill data)** | `get_context_frame(timestampMs)`, `get_snapshot_at`, `get_footprint_window`, `query_ticks`, `get_session_history`, `get_research_summary`, `query_event_frequency`, `query_conditional`, `query_distribution`, `compare_sessions`, `get_setup_performance_matrix`, `query_signal_outcome_*`, `get_signal_performance`, `backfill_history`, `run_backtest`, `get_backfill_status`, `get_backtest_results`, `compare_backtests`, hypothesis promotion tools, `feature_registry` (Base Detector register/promote; `search_catalog` discovery requires `[sil].catalog_discovery`). With `[sil].catalog_discovery`: `query_series`, `query_episodes`, `query_raw`, `run_job` (Trust Level L0; unbounded windows rejected; results carry `N` + `reliabilityTier`; optional `store=hot` default or `store=cold` for session-partitioned Journal Frame dumps) |
+| **Historical (backfill data)** | `get_context_frame(timestampMs)`, `get_snapshot_at`, `get_footprint_window`, `query_ticks`, `get_session_history`, `get_research_summary`, `query_event_frequency`, `query_conditional`, `query_distribution`, `compare_sessions`, `get_setup_performance_matrix`, `query_signal_outcome_*`, `get_signal_performance`, `backfill_history`, `run_backtest`, `get_backfill_status`, `get_backtest_results`, `compare_backtests`, hypothesis promotion tools, `feature_registry` (Base Detector / Derived Feature register/promote; `search_catalog` discovery requires `[sil].catalog_discovery`). With `[sil].catalog_discovery`: `query_series`, `query_episodes`, `query_raw`, `run_job` (Trust Level L0; unbounded windows rejected; results carry `N` + `reliabilityTier`; optional `store=hot` default or `store=cold` for session-partitioned Journal Frame dumps) |
 
 **Data dependency:** Historical tools return empty or minimal data until `backfill_history` has populated the database. Call `get_research_summary` first to check session count; if low, run backfill before deep analysis.
 
@@ -296,7 +296,9 @@ $env:THE_DESK_BLESS_GOLDENS='1'; cargo test --test session_replay_golden
 `tests/session_replay_golden.rs` generates a deterministic two-session synthetic `.scid`
 fixture, replays it through `run_backfill_job_with_options`, and compares canonical
 outputs for core session/events, rules-enabled signals/outcomes, and non-monotonic
-timestamp handling against `tests/fixtures/session_replay/v1/*.json`.
+timestamp handling against `tests/fixtures/session_replay/v1/*.json`. The same harness
+blesses Feature-IR live-shadow ≡ historical parity over Journal Frames
+(`expected_feature_ir.json`).
 
 Use the ignored private regression test for real Sierra files that must not be committed:
 

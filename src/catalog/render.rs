@@ -83,13 +83,17 @@ pub fn render_catalog_markdown(catalog: &DeskCatalog) -> String {
     }
     out.push('\n');
 
-    out.push_str("## Feature Registry (Base Detectors)\n\n");
+    out.push_str("## Feature Registry (Base Detectors + Derived Features)\n\n");
     out.push_str(
-        "Governance waist for **Base Detectors**: schema, provenance, and promotion \
-         (`candidate` → `shadow` → `active`, human-gated). Discovery rides \
-         `search_catalog` / catalog descriptors — no specialty getter. \
-         The write verb is `feature_registry`. Tier 1 math stays reviewed Rust; \
-         this catalog does not implement Feature-IR, codegen, or new detector math.\n\n",
+        "Governance waist for **Base Detectors** and **Derived Features**: schema, provenance, \
+         and promotion (`candidate` → `shadow` → `active`, human-gated). Derived Features declare \
+         a Feature-IR program over catalog fields using exactly five funded Operator Families \
+         (Cross-symbol references, Session-distribution percentiles, Dwell / time-since-predicate, \
+         Event sequences, Historical baselines). Unfunded families (including surface lookup / \
+         interpolation) are rejected at declaration time. A new Operator Family requires a \
+         registry change proposal. Discovery rides `search_catalog` / catalog descriptors — \
+         no specialty getter. The write verb is `feature_registry`. Tier 1 Base Detector math \
+         stays reviewed Rust; this catalog does not implement codegen emitters (SIL-M5c).\n\n",
     );
     out.push_str("| Id | Domain | Promotion | Builtin | Event types |\n|---|---|---|---|---|\n");
     for detector in &catalog.base_detectors {

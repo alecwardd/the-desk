@@ -1,0 +1,48 @@
+{
+  "evalRoot": "NQ",
+  "fixtureVersion": 1,
+  "frameCount": 30,
+  "historicalFrameCount": 30,
+  "points": [
+    {
+      "asOfMs": 1772636404000.0,
+      "available": true,
+      "family": "crossSymbolReferences",
+      "id": "feature.es_last_price",
+      "n": 1,
+      "value": 5021.0
+    },
+    {
+      "asOfMs": 1772636404000.0,
+      "available": true,
+      "family": "sessionDistributionPercentiles",
+      "id": "feature.session_last_price_percentile",
+      "n": 5,
+      "value": 90.0
+    },
+    {
+      "asOfMs": 1772636404000.0,
+      "available": true,
+      "family": "dwellTimeSincePredicate",
+      "id": "feature.dwell_last_price",
+      "n": 5,
+      "value": 2000.0
+    },
+    {
+      "asOfMs": 1772636404000.0,
+      "available": true,
+      "family": "eventSequences",
+      "id": "feature.ib_formed_then_reentry",
+      "n": 2,
+      "value": 1.0
+    },
+    {
+      "asOfMs": 1772636404000.0,
+      "available": true,
+      "family": "historicalBaselines",
+      "id": "feature.last_price_vs_tod_baseline",
+      "n": 2,
+      "value": 15.0
+    }
+  ]
+}

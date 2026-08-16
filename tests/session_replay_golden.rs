@@ -12,7 +12,8 @@ use the_desk_backend::backfill::{
     run_backfill_job_with_options, BackfillJobParams, BackfillReplayOptions, HistoricalJobType,
 };
 use the_desk_backend::db::{
-    Database, PriorDayReference, ReplaySignalRecord, SessionSummary, SignalOutcome,
+    Database, JournalFrameRecord, PriorDayReference, ReplaySignalRecord, SessionSummary,
+    SignalOutcome,
 };
 use the_desk_backend::feed::scid_reader::{ScidReader, SCID_RECORD_SIZE};
 use the_desk_backend::feed::ContractMetadata;
@@ -41,6 +42,7 @@ const STRICT_NUMERIC_PATHS: &[&str] = &[
     "$.result.canonicalEventCount",
     "$.result.signalsFired",
     "$.result.nonMonotonicSkippedTicks",
+    "$.n",
 ];
 const STRICT_NUMERIC_SUFFIXES: &[&str] = &[
     ".timestampMs",
@@ -69,6 +71,11 @@ const STRICT_NUMERIC_SUFFIXES: &[&str] = &[
     ".timeToOutcomeMs",
     ".rvolBucketAtFire",
     ".signalsFired",
+    ".value",
+    ".asOfMs",
+    ".n",
+    ".frameCount",
+    ".historicalFrameCount",
 ];
 const DERIVED_NUMERIC_SUFFIXES: &[&str] = &[
     ".ibMid",
@@ -728,4 +735,154 @@ fn private_real_data_replay_matches_goldens() {
         let actual = run_core_replay(&scid_path, &replay_case);
         compare_or_bless(&expected_path, &actual);
     }
+}
+
+fn feature_ir_journal_frame(
+    clock_ms: f64,
+    root: &str,
+    trading_day: &str,
+    last_price: f64,
+) -> JournalFrameRecord {
+    JournalFrameRecord {
+        clock_ms,
+        frame_second: (clock_ms / 1000.0).floor() as i64,
+        root_symbol: root.to_string(),
+        session_type: "RTH".into(),
+        session_segment: "None".into(),
+        trading_day: trading_day.into(),
+        payload: json!({
+            "lastPrice": last_price,
+            "sessionType": "RTH",
+            "tradingDay": trading_day,
+        }),
+    }
+}
+
+#[test]
+fn derived_feature_live_shadow_matches_historical_over_journal_frames() {
+    use the_desk_backend::catalog::{
+        build_catalog, declare_program, evaluate_historical, evaluate_live_shadow, FeatureIrEvent,
+        FeatureIrFrame, FeatureIrStore,
+    };
+
+    let catalog = build_catalog();
+    let t_day0 = eastern_ms(2026, 3, 2, 10, 0);
+    let t_day1 = eastern_ms(2026, 3, 3, 10, 0);
+    let t_day2 = eastern_ms(2026, 3, 4, 10, 0);
+    let mut live_frames = Vec::new();
+    for (day, trading_day, base_px) in [
+        (t_day0, "2026-03-02", 21_000.0),
+        (t_day1, "2026-03-03", 21_010.0),
+        (t_day2, "2026-03-04", 21_020.0),
+    ] {
+        for i in 0..5 {
+            let clock = day + i as f64 * 1000.0;
+            let nq_px = base_px + i as f64;
+            let es_px = 5_000.0 + (base_px - 21_000.0) + i as f64 * 0.25;
+            live_frames.push(feature_ir_journal_frame(clock, "NQ", trading_day, nq_px));
+            let mut es = feature_ir_journal_frame(clock, "ES", trading_day, es_px);
+            es.frame_second = (clock / 1000.0).floor() as i64;
+            live_frames.push(es);
+        }
+    }
+    let events = vec![
+        FeatureIrEvent {
+            timestamp_ms: t_day2 + 1000.0,
+            event_type: "ib_formed".into(),
+            root_symbol: "NQ".into(),
+        },
+        FeatureIrEvent {
+            timestamp_ms: t_day2 + 2500.0,
+            event_type: "ib_reentry".into(),
+            root_symbol: "NQ".into(),
+        },
+    ];
+
+    let db = Database::open(":memory:").expect("db");
+    db.insert_journal_frames(&live_frames)
+        .expect("persist journal frames");
+    let historical_rows = db.list_journal_frames().expect("reload frames");
+    let historical_frames: Vec<FeatureIrFrame> = historical_rows.iter().map(Into::into).collect();
+    let live_ir_frames: Vec<FeatureIrFrame> = live_frames.iter().map(Into::into).collect();
+
+    let programs = [
+        (
+            "feature.es_last_price",
+            json!({"family":"crossSymbolReferences","symbol":"ES","field":"market.location_structure.lastPrice"}),
+        ),
+        (
+            "feature.session_last_price_percentile",
+            json!({"family":"sessionDistributionPercentiles","field":"market.location_structure.lastPrice"}),
+        ),
+        (
+            "feature.dwell_last_price",
+            json!({
+                "family":"dwellTimeSincePredicate",
+                "predicate":{"field":"market.location_structure.lastPrice","op":"gte","value":21022.0}
+            }),
+        ),
+        (
+            "feature.ib_formed_then_reentry",
+            json!({
+                "family":"eventSequences",
+                "first":{"eventType":"ib_formed"},
+                "then":{"eventType":"ib_reentry"},
+                "withinMs":2000.0
+            }),
+        ),
+        (
+            "feature.last_price_vs_tod_baseline",
+            json!({
+                "family":"historicalBaselines",
+                "field":"market.location_structure.lastPrice",
+                "lookbackDays":2,
+                "sameTimeOfDay":true
+            }),
+        ),
+    ];
+
+    let as_of = t_day2 + 4000.0;
+    let live_store = FeatureIrStore {
+        catalog: &catalog,
+        frames: &live_ir_frames,
+        events: &events,
+        eval_root: "NQ",
+    };
+    let hist_store = FeatureIrStore {
+        catalog: &catalog,
+        frames: &historical_frames,
+        events: &events,
+        eval_root: "NQ",
+    };
+
+    let mut points = Vec::new();
+    for (id, raw) in programs {
+        let program = declare_program(&raw, &catalog).expect(id);
+        let shadow = evaluate_live_shadow(&program, live_store, as_of).expect("shadow");
+        let historical = evaluate_historical(&program, hist_store, as_of).expect("historical");
+        assert_eq!(
+            shadow.value, historical.value,
+            "{id} live-shadow value must equal historical"
+        );
+        assert_eq!(shadow.n, historical.n, "{id} n");
+        assert_eq!(shadow.available, historical.available, "{id} available");
+        assert!(shadow.available, "{id} should resolve on the golden corpus");
+        points.push(json!({
+            "id": id,
+            "family": program.family().as_str(),
+            "asOfMs": as_of,
+            "n": shadow.n,
+            "value": shadow.value,
+            "available": shadow.available,
+        }));
+    }
+
+    let actual = json!({
+        "fixtureVersion": 1,
+        "evalRoot": "NQ",
+        "frameCount": live_frames.len(),
+        "historicalFrameCount": historical_frames.len(),
+        "points": points,
+    });
+    compare_or_bless(&fixture_dir().join("expected_feature_ir.json"), &actual);
 }

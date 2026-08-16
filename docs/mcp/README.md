@@ -73,7 +73,8 @@ guarantees the two lists can never diverge.
 > Catalog entry. Specialty market tools are the `market` domain router
 > (`tools/market.rs`). The rule is **no catalog entry → no new market tool**
 > (allowlist in `docs/mcp/desk-catalog-v0.json`). New detector concepts also need a
-> Feature Registry entry (`feature_registry` write verb; discovery via `search_catalog`
+> Feature Registry entry (`feature_registry` write verb; Base Detectors and Derived
+> Features with Feature-IR; discovery via `search_catalog`
 > when `[sil].catalog_discovery = true`). The write verb is always on the default
 > surface; reading descriptors back requires the discovery flag (same pattern as
 > `positioning_entry` / `get_state`).

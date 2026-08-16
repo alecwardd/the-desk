@@ -8,7 +8,8 @@
     "prior-day level interaction via seeded references",
     "core market event persistence",
     "rules-enabled playbook signal and outcome persistence",
-    "non-monotonic SCID timestamp skipping and warning behavior"
+    "non-monotonic SCID timestamp skipping and warning behavior",
+    "Derived Feature Feature-IR live-shadow ≡ historical over Journal Frames"
   ],
   "instrument": {
     "rootSymbol": "NQ",

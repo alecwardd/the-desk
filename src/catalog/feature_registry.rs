@@ -552,11 +552,13 @@ fn feature_matches(d: &FeatureDescriptor, q: &str) -> bool {
             .catalog_field_ids
             .iter()
             .any(|e| e.to_ascii_lowercase().contains(q))
-        || (q == "base detector" || q == "basedetector" || q == "detector")
-        || (q == "derived feature"
-            || q == "derivedfeature"
-            || q == "feature-ir"
-            || q == "featureir")
+        || (d.kind == FeatureKind::BaseDetector
+            && (q == "base detector" || q == "basedetector" || q == "detector"))
+        || (d.kind == FeatureKind::DerivedFeature
+            && (q == "derived feature"
+                || q == "derivedfeature"
+                || q == "feature-ir"
+                || q == "featureir"))
         || d.program.as_ref().is_some_and(|p| {
             p.family().as_str().to_ascii_lowercase().contains(q)
                 || p.family().glossary_name().to_ascii_lowercase().contains(q)
@@ -1266,9 +1268,25 @@ mod tests {
             .iter()
             .any(|d| d.id == "feature.session_last_price_percentile"));
         let hits = search_features(&full, "derived feature");
+        assert!(
+            hits.iter().all(|h| h.kind == FeatureKind::DerivedFeature),
+            "kind-literal `derived feature` must not return Base Detectors"
+        );
         assert!(hits
             .iter()
             .any(|h| h.id == "feature.session_last_price_percentile"));
+        let ir_hits = search_features(&full, "feature-ir");
+        assert!(ir_hits
+            .iter()
+            .all(|h| h.kind == FeatureKind::DerivedFeature));
+        let detector_hits = search_features(&full, "detector");
+        assert!(
+            detector_hits
+                .iter()
+                .all(|h| h.kind == FeatureKind::BaseDetector),
+            "kind-literal `detector` must not return Derived Features"
+        );
+        assert!(detector_hits.iter().any(|h| h.id == "detector.pinch"));
         let hits = search_features(&full, "sessionDistributionPercentiles");
         assert!(hits
             .iter()

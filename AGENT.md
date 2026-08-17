@@ -298,7 +298,9 @@ fixture, replays it through `run_backfill_job_with_options`, and compares canoni
 outputs for core session/events, rules-enabled signals/outcomes, and non-monotonic
 timestamp handling against `tests/fixtures/session_replay/v1/*.json`. The same harness
 blesses Feature-IR live-shadow ≡ historical parity over Journal Frames
-(`expected_feature_ir.json`).
+(`expected_feature_ir.json`): both path labels share one evaluator over supplied
+frame slices (in-memory vs SQLite round-trip). M5b evaluation is
+declaration-and-test-only — there is no runtime MCP/router caller.
 
 Use the ignored private regression test for real Sierra files that must not be committed:
 

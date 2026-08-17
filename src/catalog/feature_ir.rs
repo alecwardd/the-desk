@@ -12,6 +12,9 @@
 //!
 //! Live-shadow and historical evaluation share **one** evaluator over Journal
 //! Frames (`clock_ms <= asOf`). The path label does not change semantics.
+//! In M5b the evaluator is **declaration-and-test-only**: callers supply the
+//! frame slice (golden replay / unit tests). There is no runtime hook from the
+//! MCP router or the MarketRouter pending-frame buffer.
 
 use std::collections::BTreeSet;
 
@@ -106,6 +109,30 @@ impl OperatorFamily {
             Self::DwellTimeSincePredicate => "dwellTimeSincePredicate",
             Self::EventSequences => "eventSequences",
             Self::HistoricalBaselines => "historicalBaselines",
+        }
+    }
+
+    /// Exact top-level JSON keys accepted for this family (`family` plus variant fields).
+    ///
+    /// Unknown keys are rejected at parse time so a mistyped optional (for example
+    /// `sametimeofday`) cannot be silently dropped by serde.
+    pub fn allowed_program_keys(self) -> &'static [&'static str] {
+        match self {
+            Self::CrossSymbolReferences => &["family", "symbol", "field"],
+            Self::SessionDistributionPercentiles => {
+                &["family", "field", "symbol", "percentile", "output"]
+            }
+            Self::DwellTimeSincePredicate => &["family", "predicate", "mode"],
+            Self::EventSequences => &["family", "first", "then", "withinMs"],
+            Self::HistoricalBaselines => &[
+                "family",
+                "field",
+                "symbol",
+                "lookbackDays",
+                "sameTimeOfDay",
+                "aggregator",
+                "percentile",
+            ],
         }
     }
 
@@ -252,6 +279,12 @@ impl FeatureIrProgram {
         }
         let family = OperatorFamily::parse(family_raw)
             .ok_or_else(|| FeatureIrError::UnfundedOperatorFamily(family_raw.to_string()))?;
+        let allowed = family.allowed_program_keys();
+        for key in obj.keys() {
+            if !allowed.contains(&key.as_str()) {
+                return Err(FeatureIrError::UnknownProgramKey(key.clone()));
+            }
+        }
         let mut normalized = raw.clone();
         if let Some(map) = normalized.as_object_mut() {
             map.insert("family".into(), Value::String(family.as_str().into()));
@@ -277,6 +310,9 @@ impl FeatureIrProgram {
                     validate_root_symbol(sym)?;
                 }
                 resolve_catalog_field(catalog, field)?;
+                if percentile.is_some() && *output != PercentileOutput::Value {
+                    return Err(FeatureIrError::UnusedPercentileKey);
+                }
                 if *output == PercentileOutput::Value {
                     let p = percentile.unwrap_or(50.0);
                     if !(0.0..=100.0).contains(&p) || !p.is_finite() {
@@ -329,6 +365,9 @@ impl FeatureIrProgram {
                 if *lookback_days == 0 || *lookback_days > MAX_BASELINE_LOOKBACK_DAYS {
                     return Err(FeatureIrError::InvalidLookback);
                 }
+                if percentile.is_some() && *aggregator != BaselineAggregator::Percentile {
+                    return Err(FeatureIrError::UnusedPercentileKey);
+                }
                 if *aggregator == BaselineAggregator::Percentile {
                     let p = percentile.unwrap_or(50.0);
                     if !(0.0..=100.0).contains(&p) || !p.is_finite() {
@@ -351,6 +390,9 @@ pub enum PercentileOutput {
 }
 
 /// Dwell mode: continuous true duration, or time since last true.
+///
+/// `timeSince` is unavailable when the predicate never held in the visible
+/// session window (it must not return a wall-clock epoch as a duration).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum DwellMode {
@@ -480,6 +522,13 @@ pub enum FeatureIrError {
     InvalidPercentile,
     #[error("dwell / time-since-predicate requires a catalog field predicate")]
     InvalidPredicate,
+    #[error("unknown Feature-IR program key `{0}` (unknown labels rejected)")]
+    UnknownProgramKey(String),
+    #[error(
+        "percentile requires output=value (session-distribution percentiles) \
+         or aggregator=percentile (historical baselines)"
+    )]
+    UnusedPercentileKey,
 }
 
 /// Parse + validate a Derived Feature program at declaration time.
@@ -554,6 +603,8 @@ pub fn evaluate(
 }
 
 /// Live-shadow evaluation (same evaluator as historical).
+///
+/// Path is a label only. M5b has no runtime caller; tests supply the frame slice.
 pub fn evaluate_live_shadow(
     program: &FeatureIrProgram,
     store: FeatureIrStore<'_>,
@@ -562,7 +613,10 @@ pub fn evaluate_live_shadow(
     evaluate(program, store, as_of_ms, FeatureIrEvalPath::LiveShadow)
 }
 
-/// Historical evaluation over persisted Journal Frames (same evaluator as live-shadow).
+/// Historical evaluation over a caller-supplied Journal Frame slice (same evaluator as live-shadow).
+///
+/// Path is a label only. M5b has no runtime SQLite/MCP caller; golden replay
+/// constructs the slice from `list_journal_frames` in tests.
 pub fn evaluate_historical(
     program: &FeatureIrProgram,
     store: FeatureIrStore<'_>,
@@ -683,7 +737,10 @@ fn eval_dwell(
     let last_clock = as_of_frame.clock_ms.min(as_of_ms);
     let scalar = match mode {
         DwellMode::Dwell => dwell_ms(&truths, last_clock),
-        DwellMode::TimeSince => time_since_true_ms(&truths, last_clock),
+        DwellMode::TimeSince => match time_since_true_ms(&truths, last_clock) {
+            Some(ms) => ms,
+            None => return Ok(unavailable()),
+        },
     };
     Ok(ScalarN {
         scalar,
@@ -835,16 +892,15 @@ fn dwell_ms(truths: &[(f64, bool)], as_of_ms: f64) -> f64 {
     (as_of_ms - dwell_start).max(0.0)
 }
 
-fn time_since_true_ms(truths: &[(f64, bool)], as_of_ms: f64) -> f64 {
+fn time_since_true_ms(truths: &[(f64, bool)], as_of_ms: f64) -> Option<f64> {
     if truths.last().is_some_and(|(_, t)| *t) {
-        return 0.0;
+        return Some(0.0);
     }
     truths
         .iter()
         .rev()
         .find(|(_, ok)| *ok)
         .map(|(clock, _)| (as_of_ms - clock).max(0.0))
-        .unwrap_or(as_of_ms)
 }
 
 fn predicate_holds(op: PredicateOp, left: f64, right: Option<f64>) -> bool {
@@ -1336,5 +1392,116 @@ mod tests {
             evaluate_historical(&miss, s, t0 + 3000.0).unwrap().value,
             0.0
         );
+    }
+
+    #[test]
+    fn declare_rejects_unknown_program_keys() {
+        let cat = catalog();
+        let wrong_case = json!({
+            "family": "historicalBaselines",
+            "field": LAST_PRICE,
+            "lookbackDays": 5,
+            "sametimeofday": false
+        });
+        assert!(matches!(
+            declare_program(&wrong_case, &cat),
+            Err(FeatureIrError::UnknownProgramKey(k)) if k == "sametimeofday"
+        ));
+        let extra = json!({
+            "family": "crossSymbolReferences",
+            "symbol": "ES",
+            "field": LAST_PRICE,
+            "lookbackDays": 5
+        });
+        assert!(matches!(
+            declare_program(&extra, &cat),
+            Err(FeatureIrError::UnknownProgramKey(k)) if k == "lookbackDays"
+        ));
+    }
+
+    #[test]
+    fn declare_rejects_percentile_without_matching_output() {
+        let cat = catalog();
+        let rank_with_p = json!({
+            "family": "sessionDistributionPercentiles",
+            "field": LAST_PRICE,
+            "percentile": 95.0
+        });
+        assert!(matches!(
+            declare_program(&rank_with_p, &cat),
+            Err(FeatureIrError::UnusedPercentileKey)
+        ));
+        let value_ok = json!({
+            "family": "sessionDistributionPercentiles",
+            "field": LAST_PRICE,
+            "percentile": 95.0,
+            "output": "value"
+        });
+        declare_program(&value_ok, &cat).expect("percentile + output=value");
+    }
+
+    #[test]
+    fn time_since_never_true_is_unavailable() {
+        let cat = catalog();
+        let t0 = 1_772_636_400_000.0;
+        let frames: Vec<_> = (0..5)
+            .map(|i| {
+                frame(
+                    t0 + i as f64 * 1000.0,
+                    "NQ",
+                    "2026-03-04",
+                    "RTH",
+                    21_000.0 + i as f64,
+                )
+            })
+            .collect();
+        let program = declare_program(
+            &json!({
+                "family": "dwellTimeSincePredicate",
+                "mode": "timeSince",
+                "predicate": {"field": LAST_PRICE, "op": "lt", "value": 0.0}
+            }),
+            &cat,
+        )
+        .unwrap();
+        let events: Vec<FeatureIrEvent> = Vec::new();
+        let out =
+            evaluate_historical(&program, store(&cat, &frames, &events), t0 + 4000.0).unwrap();
+        assert!(
+            !out.available,
+            "never-true timeSince must not emit an epoch"
+        );
+        assert_eq!(out.value, 0.0);
+        assert_eq!(out.n, 0);
+        assert!(
+            out.value < 86_400_000.0,
+            "must not leak wall-clock epoch as a duration"
+        );
+    }
+
+    #[test]
+    fn time_since_after_last_true_is_elapsed_ms() {
+        let cat = catalog();
+        let t0 = 1_700_000_000_000.0;
+        let frames = vec![
+            frame(t0, "NQ", "2026-03-03", "RTH", 10.0),
+            frame(t0 + 1000.0, "NQ", "2026-03-03", "RTH", 20.0),
+            frame(t0 + 2000.0, "NQ", "2026-03-03", "RTH", 5.0),
+            frame(t0 + 3000.0, "NQ", "2026-03-03", "RTH", 6.0),
+        ];
+        let program = declare_program(
+            &json!({
+                "family": "dwellTimeSincePredicate",
+                "mode": "timeSince",
+                "predicate": {"field": LAST_PRICE, "op": "gte", "value": 15.0}
+            }),
+            &cat,
+        )
+        .unwrap();
+        let events: Vec<FeatureIrEvent> = Vec::new();
+        let out =
+            evaluate_historical(&program, store(&cat, &frames, &events), t0 + 3000.0).unwrap();
+        assert!(out.available);
+        assert!((out.value - 2000.0).abs() < 1e-9);
     }
 }

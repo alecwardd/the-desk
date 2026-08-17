@@ -1424,6 +1424,12 @@ async fn feature_registry_register_derived_feature_and_rejects_unfunded_family()
         "sessionDistributionPercentiles"
     );
     assert_eq!(registered["orderAuthority"], false);
+    assert!(
+        registered["note"]
+            .as_str()
+            .is_some_and(|n| n.contains("declaration-and-test-only")),
+        "agents must not present an active Derived Feature as producing values"
+    );
 
     let skip = server
         .feature_registry(Parameters(
@@ -1461,6 +1467,30 @@ async fn feature_registry_register_derived_feature_and_rejects_unfunded_family()
     assert!(
         surface.is_err(),
         "surface lookup must be rejected at declaration"
+    );
+
+    let unknown_key = server
+        .feature_registry(Parameters(
+            the_desk_backend::mcp::feature_registry::FeatureRegistryParams {
+                action: Some("register".into()),
+                feature_id: Some("feature.typo_baseline".into()),
+                name: Some("typo_baseline".into()),
+                description: Some("Wrong-case sameTimeOfDay must fail closed.".into()),
+                domain_id: Some("location_structure".into()),
+                kind: Some("derivedFeature".into()),
+                program: Some(serde_json::json!({
+                    "family": "historicalBaselines",
+                    "field": "market.location_structure.lastPrice",
+                    "lookbackDays": 5,
+                    "sametimeofday": false
+                })),
+                ..Default::default()
+            },
+        ))
+        .await;
+    assert!(
+        unknown_key.is_err(),
+        "unknown program keys must be rejected at declaration"
     );
 
     let missing_program = server

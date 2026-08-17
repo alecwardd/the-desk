@@ -647,6 +647,9 @@ mod tests {
         assert!(hits.iter().any(|h| h.id == "detector.pinch"));
         let hits = crate::catalog::search_features(&cat, "base detector");
         assert!(hits.len() >= 2);
+        assert!(hits
+            .iter()
+            .all(|h| h.kind == crate::catalog::FeatureKind::BaseDetector));
         let reentry = crate::catalog::search_features(&cat, "ib_reentry");
         assert!(reentry.iter().any(|h| h.id == "detector.structure"));
         let poc_test = crate::catalog::search_features(&cat, "poc_test");

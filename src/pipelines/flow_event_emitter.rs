@@ -15,7 +15,8 @@ pub struct FlowEventEmitter {
     prev_absorption_count: usize,
     prev_pinch_count: usize,
     prev_zone_count: usize,
-    prev_leg_event_count: usize,
+    /// High-watermark of [`LegProfilePipeline::event_seq`], not ring length.
+    prev_leg_event_seq: u64,
     /// (high, low) of zones we already emitted a "held" event for.
     prev_held_zones: Vec<(f64, f64)>,
     /// price_key -> last-known 21+ lot count, for large_trade_cluster detection.
@@ -44,7 +45,7 @@ impl FlowEventEmitter {
             prev_absorption_count: 0,
             prev_pinch_count: 0,
             prev_zone_count: 0,
-            prev_leg_event_count: 0,
+            prev_leg_event_seq: 0,
             prev_held_zones: Vec::new(),
             prev_large_trade_counts: HashMap::new(),
             last_event_ts: HashMap::new(),
@@ -56,7 +57,7 @@ impl FlowEventEmitter {
         self.prev_absorption_count = 0;
         self.prev_pinch_count = 0;
         self.prev_zone_count = 0;
-        self.prev_leg_event_count = 0;
+        self.prev_leg_event_seq = 0;
         self.prev_held_zones.clear();
         self.prev_large_trade_counts.clear();
         self.last_event_ts.clear();
@@ -69,7 +70,7 @@ impl FlowEventEmitter {
         self.prev_absorption_count = pipelines.absorption.recent_events().len();
         self.prev_pinch_count = pipelines.pinch.recent_events().len();
         self.prev_zone_count = pipelines.rebid_reoffer.all_zones().len();
-        self.prev_leg_event_count = pipelines.leg_profile.recent_events().len();
+        self.prev_leg_event_seq = pipelines.leg_profile.event_seq();
 
         self.prev_held_zones.clear();
         for zone in pipelines.rebid_reoffer.all_zones() {
@@ -262,9 +263,17 @@ impl FlowEventEmitter {
         let (session_type, session_segment, trading_day) =
             Self::event_context(timestamp_ms, session_date);
         let current = pipelines.leg_profile.recent_events();
-        let count = current.len();
-        if count > self.prev_leg_event_count {
-            for evt in current.iter().skip(self.prev_leg_event_count) {
+        let seq = pipelines.leg_profile.event_seq();
+        if seq < self.prev_leg_event_seq {
+            // Pipeline reset (Asia/RTH or session-kind flip) while the emitter
+            // still holds a high watermark.
+            self.prev_leg_event_seq = 0;
+        }
+        if seq > self.prev_leg_event_seq {
+            let newly = (seq - self.prev_leg_event_seq) as usize;
+            let emit_n = newly.min(current.len());
+            let skip = current.len().saturating_sub(emit_n);
+            for evt in current.iter().skip(skip) {
                 events.push(MarketEvent {
                     session_date: session_date.to_string(),
                     timestamp_ms: evt.timestamp_ms,
@@ -287,7 +296,7 @@ impl FlowEventEmitter {
                 });
             }
         }
-        self.prev_leg_event_count = count;
+        self.prev_leg_event_seq = seq;
     }
 
     /// Acceleration zone created / held events.
@@ -491,13 +500,98 @@ mod tests {
         assert!(events.iter().any(|e| e.event_type == "leg_started"));
         assert!(events.iter().any(|e| e.event_type == "leg_completed"));
         assert_eq!(
-            emitter.prev_leg_event_count,
-            pipelines.leg_profile.recent_events().len()
+            emitter.prev_leg_event_seq,
+            pipelines.leg_profile.event_seq()
         );
         let events2 = emitter.detect(&pipelines, 21_000.0, "2026-03-03", 21_008.0);
         assert!(events2
             .iter()
             .all(|e| e.event_type != "leg_started" && e.event_type != "leg_completed"));
+    }
+
+    fn pump_leg_oscillations(pipelines: &mut PipelineEngine, cycles: usize) -> f64 {
+        pipelines
+            .leg_profile
+            .on_trade(0.0, 21_000.0, 20.0, true, false);
+        pipelines
+            .leg_profile
+            .on_trade(5_000.0, 21_008.0, 20.0, true, false);
+        pipelines
+            .leg_profile
+            .on_trade(16_000.0, 21_016.0, 20.0, true, false);
+        let mut t = 16_000.0;
+        let mut high = true;
+        for _ in 0..cycles {
+            t += 16_000.0;
+            if high {
+                pipelines
+                    .leg_profile
+                    .on_trade(t, 21_008.0, 40.0, false, false);
+            } else {
+                pipelines
+                    .leg_profile
+                    .on_trade(t, 21_016.0, 40.0, true, false);
+            }
+            high = !high;
+        }
+        t
+    }
+
+    #[test]
+    fn detect_legs_still_emits_after_event_ring_saturates() {
+        let mut pipelines = PipelineEngine::new();
+        let t = pump_leg_oscillations(&mut pipelines, 40);
+        assert!(pipelines.leg_profile.event_seq() > 64);
+        assert_eq!(pipelines.leg_profile.recent_events().len(), 64);
+
+        let mut emitter = FlowEventEmitter::new();
+        let first = emitter.detect(&pipelines, t, "2026-03-03", 21_008.0);
+        assert!(first.iter().any(|e| e.event_type == "leg_started"));
+        let seq_after_first = pipelines.leg_profile.event_seq();
+
+        let t2 = t + 16_000.0;
+        pipelines
+            .leg_profile
+            .on_trade(t2, 21_016.0, 40.0, true, false);
+        let t3 = t2 + 16_000.0;
+        pipelines
+            .leg_profile
+            .on_trade(t3, 21_008.0, 40.0, false, false);
+        assert!(pipelines.leg_profile.event_seq() > seq_after_first);
+
+        let second = emitter.detect(&pipelines, t3, "2026-03-03", 21_008.0);
+        assert!(
+            second
+                .iter()
+                .any(|e| e.event_type == "leg_started" || e.event_type == "leg_completed"),
+            "new rotations after the ring saturates must still emit"
+        );
+        assert_eq!(
+            emitter.prev_leg_event_seq,
+            pipelines.leg_profile.event_seq()
+        );
+    }
+
+    #[test]
+    fn detect_legs_recovers_when_pipeline_resets_without_emitter_reset() {
+        let mut pipelines = PipelineEngine::new();
+        let t = pump_leg_oscillations(&mut pipelines, 2);
+        let mut emitter = FlowEventEmitter::new();
+        let _ = emitter.detect(&pipelines, t, "2026-03-03", 21_008.0);
+        assert!(emitter.prev_leg_event_seq > 0);
+
+        pipelines.leg_profile.reset();
+        pipelines
+            .leg_profile
+            .on_trade(0.0, 21_000.0, 20.0, true, false);
+        pipelines
+            .leg_profile
+            .on_trade(5_000.0, 21_008.0, 20.0, true, false);
+        pipelines
+            .leg_profile
+            .on_trade(16_000.0, 21_016.0, 20.0, true, false);
+        let recovered = emitter.detect(&pipelines, 16_000.0, "2026-03-03", 21_016.0);
+        assert!(recovered.iter().any(|e| e.event_type == "leg_started"));
     }
 
     #[test]

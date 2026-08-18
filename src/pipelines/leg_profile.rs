@@ -15,6 +15,16 @@
 //! reported only when the active rotation is mature (`active`). A new or
 //! unstable rotation is labeled `insufficient`.
 //!
+//! **Swing vs confirmation:** `legAnchorPrice` / `legAnchorTimeMs` / `legAgeMs`
+//! are the last confirmed swing extreme (price and the time that price last
+//! printed). Maturity still uses confirmation time (`start_ms`) so geometry
+//! does not publish during the 15s/40-contract gate.
+//!
+//! **Volume attribution:** prints from a rotation's own swing through its
+//! extreme belong to that leg. Counter-move prints after a new extreme (the
+//! pending map) transfer to the new rotation at confirmation — they are not
+//! left on the closing leg. Confirmation itself is booked to the new leg.
+//!
 //! False friends: [`crate::outcomes`] MFE/MAE "legs" and
 //! `research::ib_campaign` "confluence leg" are unrelated.
 
@@ -144,13 +154,31 @@ struct CompletedLeg {
 struct ActiveRotation {
     direction: Option<LegDirection>,
     is_overnight: bool,
+    /// Confirmation (or first-print) time — maturity gate only.
     start_ms: f64,
+    /// Time the swing extreme that anchored this rotation last printed.
+    anchor_ms: f64,
     anchor_price: f64,
     extreme_price: f64,
+    /// Time `extreme_price` last printed (becomes the next rotation's `anchor_ms`).
+    extreme_ms: f64,
     forming_high: f64,
     forming_low: f64,
     forming_high_ms: f64,
     forming_low_ms: f64,
+    volume: f64,
+    net_delta: f64,
+    volume_by_price: HashMap<i64, f64>,
+    delta_by_price: HashMap<i64, f64>,
+    /// Volume/delta after the current extreme; transferred to the next leg.
+    pending_volume: f64,
+    pending_net_delta: f64,
+    pending_volume_by_price: HashMap<i64, f64>,
+    pending_delta_by_price: HashMap<i64, f64>,
+}
+
+/// Counter-move maps stripped from a closing rotation and given to the next one.
+struct PendingMaps {
     volume: f64,
     net_delta: f64,
     volume_by_price: HashMap<i64, f64>,
@@ -164,6 +192,8 @@ pub struct LegProfilePipeline {
     active: Option<ActiveRotation>,
     completed: VecDeque<CompletedLeg>,
     events: VecDeque<LegProfileEvent>,
+    /// Monotonic lifecycle-event count for this segment (not the ring length).
+    event_seq: u64,
 }
 
 impl Default for LegProfilePipeline {
@@ -180,14 +210,24 @@ impl LegProfilePipeline {
             active: None,
             completed: VecDeque::new(),
             events: VecDeque::new(),
+            event_seq: 0,
         }
     }
 
-    /// Clear the active rotation, completed-leg ring, and event ring.
+    /// Clear the active rotation, completed-leg ring, event ring, and seq.
     pub fn reset(&mut self) {
         self.active = None;
         self.completed.clear();
         self.events.clear();
+        self.event_seq = 0;
+    }
+
+    /// Monotonic count of `leg_started` / `leg_completed` events this segment.
+    ///
+    /// Unlike [`Self::recent_events`] length, this keeps growing after the ring
+    /// saturates so [`crate::pipelines::FlowEventEmitter`] can detect new tails.
+    pub fn event_seq(&self) -> u64 {
+        self.event_seq
     }
 
     fn discretize(&self, price: f64) -> i64 {
@@ -265,8 +305,10 @@ impl LegProfilePipeline {
             direction: None,
             is_overnight,
             start_ms: timestamp_ms,
+            anchor_ms: timestamp_ms,
             anchor_price: price,
             extreme_price: price,
+            extreme_ms: timestamp_ms,
             forming_high: price,
             forming_low: price,
             forming_high_ms: timestamp_ms,
@@ -275,6 +317,10 @@ impl LegProfilePipeline {
             net_delta: 0.0,
             volume_by_price: HashMap::new(),
             delta_by_price: HashMap::new(),
+            pending_volume: 0.0,
+            pending_net_delta: 0.0,
+            pending_volume_by_price: HashMap::new(),
+            pending_delta_by_price: HashMap::new(),
         };
         Self::add_trade_to(&mut rotation, self.discretize(price), volume, is_buy);
         rotation
@@ -286,6 +332,54 @@ impl LegProfilePipeline {
         rotation.net_delta += signed;
         *rotation.volume_by_price.entry(key).or_insert(0.0) += volume;
         *rotation.delta_by_price.entry(key).or_insert(0.0) += signed;
+    }
+
+    fn add_pending_trade(rotation: &mut ActiveRotation, key: i64, volume: f64, is_buy: bool) {
+        let signed = if is_buy { volume } else { -volume };
+        rotation.pending_volume += volume;
+        rotation.pending_net_delta += signed;
+        *rotation.pending_volume_by_price.entry(key).or_insert(0.0) += volume;
+        *rotation.pending_delta_by_price.entry(key).or_insert(0.0) += signed;
+    }
+
+    fn clear_pending(rotation: &mut ActiveRotation) {
+        rotation.pending_volume = 0.0;
+        rotation.pending_net_delta = 0.0;
+        rotation.pending_volume_by_price.clear();
+        rotation.pending_delta_by_price.clear();
+    }
+
+    fn take_pending(rotation: &mut ActiveRotation) -> PendingMaps {
+        let volume_by_price = std::mem::take(&mut rotation.pending_volume_by_price);
+        let delta_by_price = std::mem::take(&mut rotation.pending_delta_by_price);
+        let volume = std::mem::replace(&mut rotation.pending_volume, 0.0);
+        let net_delta = std::mem::replace(&mut rotation.pending_net_delta, 0.0);
+
+        for (&key, &vol) in &volume_by_price {
+            if let Some(slot) = rotation.volume_by_price.get_mut(&key) {
+                *slot -= vol;
+                if *slot <= 1e-12 {
+                    rotation.volume_by_price.remove(&key);
+                }
+            }
+        }
+        for (&key, &delta) in &delta_by_price {
+            if let Some(slot) = rotation.delta_by_price.get_mut(&key) {
+                *slot -= delta;
+                if slot.abs() <= 1e-12 {
+                    rotation.delta_by_price.remove(&key);
+                }
+            }
+        }
+        rotation.volume = (rotation.volume - volume).max(0.0);
+        rotation.net_delta -= net_delta;
+
+        PendingMaps {
+            volume,
+            net_delta,
+            volume_by_price,
+            delta_by_price,
+        }
     }
 
     fn rotation_qualifies(rotation: &ActiveRotation, now_ms: f64) -> bool {
@@ -309,18 +403,21 @@ impl LegProfilePipeline {
         }
     }
 
-    fn extend_active(&mut self, _timestamp_ms: f64, price: f64, volume: f64, is_buy: bool) {
+    fn extend_active(&mut self, timestamp_ms: f64, price: f64, volume: f64, is_buy: bool) {
         let key = self.discretize(price);
         if let Some(active) = &mut self.active {
             Self::add_trade_to(active, key, volume, is_buy);
-            match active.direction {
-                Some(LegDirection::Up) if price >= active.extreme_price => {
-                    active.extreme_price = price;
-                }
-                Some(LegDirection::Down) if price <= active.extreme_price => {
-                    active.extreme_price = price;
-                }
-                _ => {}
+            let new_extreme = match active.direction {
+                Some(LegDirection::Up) if price >= active.extreme_price => true,
+                Some(LegDirection::Down) if price <= active.extreme_price => true,
+                _ => false,
+            };
+            if new_extreme {
+                active.extreme_price = price;
+                active.extreme_ms = timestamp_ms;
+                Self::clear_pending(active);
+            } else {
+                Self::add_pending_trade(active, key, volume, is_buy);
             }
         }
     }
@@ -359,15 +456,30 @@ impl LegProfilePipeline {
             return;
         }
         let up_is_latest = active.forming_high_ms >= active.forming_low_ms;
-        let (direction, anchor, extreme) = if up_is_latest {
-            (LegDirection::Up, active.forming_low, active.forming_high)
+        let (direction, anchor, extreme, anchor_ms, extreme_ms) = if up_is_latest {
+            (
+                LegDirection::Up,
+                active.forming_low,
+                active.forming_high,
+                active.forming_low_ms,
+                active.forming_high_ms,
+            )
         } else {
-            (LegDirection::Down, active.forming_high, active.forming_low)
+            (
+                LegDirection::Down,
+                active.forming_high,
+                active.forming_low,
+                active.forming_high_ms,
+                active.forming_low_ms,
+            )
         };
         if let Some(active) = self.active.as_mut() {
             active.direction = Some(direction);
             active.anchor_price = anchor;
+            active.anchor_ms = anchor_ms;
             active.extreme_price = extreme;
+            active.extreme_ms = extreme_ms;
+            Self::clear_pending(active);
         }
         self.push_event(timestamp_ms, EVENT_LEG_STARTED);
     }
@@ -380,13 +492,14 @@ impl LegProfilePipeline {
         is_buy: bool,
         is_overnight: bool,
     ) {
-        let Some(old) = self.active.take() else {
+        let Some(mut old) = self.active.take() else {
             return;
         };
+        let pending = Self::take_pending(&mut old);
         let direction = old
             .direction
             .expect("reversal requires a confirmed direction");
-        let age_ms = (timestamp_ms - old.start_ms).max(0.0);
+        let age_ms = (timestamp_ms - old.anchor_ms).max(0.0);
         let poc = volume_poc(self.tick_size, &old.volume_by_price);
         self.push_event_record(LegProfileEvent {
             timestamp_ms,
@@ -414,16 +527,22 @@ impl LegProfilePipeline {
             direction: Some(new_direction),
             is_overnight,
             start_ms: timestamp_ms,
+            anchor_ms: old.extreme_ms,
             anchor_price: old.extreme_price,
             extreme_price: price,
+            extreme_ms: timestamp_ms,
             forming_high: price.max(old.extreme_price),
             forming_low: price.min(old.extreme_price),
             forming_high_ms: timestamp_ms,
             forming_low_ms: timestamp_ms,
-            volume: 0.0,
-            net_delta: 0.0,
-            volume_by_price: HashMap::new(),
-            delta_by_price: HashMap::new(),
+            volume: pending.volume,
+            net_delta: pending.net_delta,
+            volume_by_price: pending.volume_by_price,
+            delta_by_price: pending.delta_by_price,
+            pending_volume: 0.0,
+            pending_net_delta: 0.0,
+            pending_volume_by_price: HashMap::new(),
+            pending_delta_by_price: HashMap::new(),
         };
         Self::add_trade_to(&mut next, self.discretize(price), volume, is_buy);
         self.active = Some(next);
@@ -437,7 +556,7 @@ impl LegProfilePipeline {
         let Some(direction) = active.direction else {
             return;
         };
-        let age_ms = (timestamp_ms - active.start_ms).max(0.0);
+        let age_ms = (timestamp_ms - active.anchor_ms).max(0.0);
         let poc = if Self::rotation_qualifies(active, timestamp_ms) {
             volume_poc(self.tick_size, &active.volume_by_price)
         } else {
@@ -457,6 +576,7 @@ impl LegProfilePipeline {
     }
 
     fn push_event_record(&mut self, event: LegProfileEvent) {
+        self.event_seq = self.event_seq.saturating_add(1);
         self.events.push_back(event);
         while self.events.len() > MAX_EVENTS {
             self.events.pop_front();
@@ -493,7 +613,7 @@ impl LegProfilePipeline {
             };
         };
 
-        let age_ms = (now_ms - active.start_ms).max(0.0);
+        let age_ms = (now_ms - active.anchor_ms).max(0.0);
         let mature = active.direction.is_some() && Self::rotation_qualifies(active, now_ms);
         let status = if mature {
             STATUS_ACTIVE
@@ -535,7 +655,7 @@ impl LegProfilePipeline {
         LegProfileSnapshot {
             status: status.to_string(),
             direction: active.direction.map(|d| d.as_str().to_string()),
-            anchor_time_ms: Some(active.start_ms),
+            anchor_time_ms: Some(active.anchor_ms),
             anchor_price: active.anchor_price,
             age_ms,
             volume: active.volume,
@@ -905,5 +1025,79 @@ mod tests {
         let s = snap(&p, 1_000.0);
         assert_eq!(s.anchor_price, 21_000.00);
         assert!(s.volume > 0.0);
+    }
+
+    #[test]
+    fn anchor_time_is_swing_extreme_not_confirmation() {
+        let mut p = LegProfilePipeline::new(NQ_TICK);
+        p.on_trade(0.0, 21_000.0, 10.0, true, false);
+        p.on_trade(5_000.0, 21_008.0, 50.0, true, false);
+        p.on_trade(16_000.0, 21_016.0, 10.0, true, false);
+        let before = snap(&p, 16_000.0);
+        assert_eq!(before.anchor_price, 21_000.0);
+        assert_eq!(before.anchor_time_ms, Some(0.0));
+        assert_eq!(before.age_ms, 16_000.0);
+
+        p.on_trade(20_000.0, 21_008.0, 8.0, false, false);
+        let after = snap(&p, 20_000.0);
+        assert_eq!(after.anchor_price, 21_016.0);
+        assert_eq!(
+            after.anchor_time_ms,
+            Some(16_000.0),
+            "anchor time is when 21016 last printed, not confirmation at 20000"
+        );
+        assert_eq!(after.age_ms, 4_000.0);
+        assert_eq!(after.status, STATUS_INSUFFICIENT);
+    }
+
+    #[test]
+    fn counter_move_volume_belongs_to_new_leg() {
+        let mut p = LegProfilePipeline::new(NQ_TICK);
+        p.on_trade(0.0, 21_000.0, 10.0, true, false);
+        p.on_trade(5_000.0, 21_008.0, 50.0, true, false);
+        p.on_trade(16_000.0, 21_016.0, 10.0, true, false);
+        // 16 ticks of counter-move — not yet a reversal; pending for the next leg.
+        p.on_trade(18_000.0, 21_012.0, 20.0, false, false);
+        p.on_trade(20_000.0, 21_008.0, 8.0, false, false);
+        let after = snap(&p, 20_000.0);
+        assert_eq!(after.last_direction.as_deref(), Some("up"));
+        assert_eq!(after.last_volume, 70.0);
+        assert_eq!(after.last_net_delta, 70.0);
+        assert_eq!(after.last_poc, 21_008.0);
+        assert_eq!(after.direction.as_deref(), Some("down"));
+        assert_eq!(after.volume, 28.0);
+        assert_eq!(after.net_delta, -28.0);
+    }
+
+    #[test]
+    fn event_seq_keeps_growing_after_ring_saturates() {
+        let mut p = LegProfilePipeline::new(NQ_TICK);
+        p.on_trade(0.0, 21_000.0, 20.0, true, false);
+        p.on_trade(5_000.0, 21_008.0, 20.0, true, false);
+        p.on_trade(16_000.0, 21_016.0, 20.0, true, false);
+        let mut t = 16_000.0;
+        let mut high = true;
+        for _ in 0..40 {
+            t += 16_000.0;
+            if high {
+                p.on_trade(t, 21_008.0, 40.0, false, false);
+            } else {
+                p.on_trade(t, 21_016.0, 40.0, true, false);
+            }
+            high = !high;
+        }
+        assert_eq!(p.recent_events().len(), MAX_EVENTS);
+        assert!(p.event_seq() > MAX_EVENTS as u64);
+        assert!(p.event_seq() > 80);
+    }
+
+    #[test]
+    fn reset_zeros_event_seq() {
+        let mut p = LegProfilePipeline::new(NQ_TICK);
+        up_then_reversal(&mut p);
+        assert!(p.event_seq() > 0);
+        p.reset();
+        assert_eq!(p.event_seq(), 0);
+        assert!(p.recent_events().is_empty());
     }
 }

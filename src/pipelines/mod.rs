@@ -448,16 +448,16 @@ pub struct MarketState {
     /// Confirmed swing direction of the active rotation (`up` / `down`) when known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub leg_direction: Option<String>,
-    /// Timestamp (ms) of the active-leg anchor (last confirmed swing).
+    /// Timestamp (ms) when the active-leg swing extreme last printed, not the later reversal-confirmation time.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub leg_anchor_time_ms: Option<f64>,
-    /// Price of the active-leg anchor (last confirmed swing). Zero when `none`.
+    /// Price of the active-leg swing extreme (last confirmed swing). Zero when `none`.
     pub leg_anchor_price: f64,
-    /// Age of the active rotation in milliseconds.
+    /// Milliseconds since the active-leg swing anchor (same instant as `leg_anchor_time_ms`).
     pub leg_age_ms: f64,
-    /// Traded volume accumulated in the active rotation.
+    /// Traded volume in the active rotation (swing through current extreme; counter-move prints transfer to the next leg at confirmation).
     pub leg_volume: f64,
-    /// Net delta (ask buys minus bid sells) accumulated in the active rotation.
+    /// Net delta (ask buys minus bid sells) in the active rotation (same attribution as `leg_volume`).
     pub leg_net_delta: f64,
     /// Volume point of control of the active leg. Zero when the rotation is `insufficient` or `none`.
     pub leg_poc: f64,
@@ -465,9 +465,9 @@ pub struct MarketState {
     pub leg_hvn: f64,
     /// Lowest-volume node of the active-leg map (excludes POC when more than one price traded).
     pub leg_lvn: f64,
-    /// Active-leg value area high (70% of leg volume, expand from volume POC like TPO VA).
+    /// Active-leg value area high (70% of leg volume, expand from volume POC among occupied prices).
     pub leg_va_high: f64,
-    /// Active-leg value area low (70% of leg volume, expand from volume POC like TPO VA).
+    /// Active-leg value area low (70% of leg volume, expand from volume POC among occupied prices).
     pub leg_va_low: f64,
     /// Price with the largest absolute delta in the active-leg delta profile (delta-profile control).
     pub leg_delta_poc: f64,
@@ -482,9 +482,9 @@ pub struct MarketState {
     /// Direction of the last completed rotation (`up` / `down`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_leg_direction: Option<String>,
-    /// Traded volume of the last completed rotation.
+    /// Traded volume of the last completed rotation (swing through that rotation's extreme; excludes the subsequent counter-move).
     pub last_leg_volume: f64,
-    /// Net delta of the last completed rotation.
+    /// Net delta of the last completed rotation (same attribution as `last_leg_volume`).
     pub last_leg_net_delta: f64,
     /// Volume POC of the last completed rotation.
     pub last_leg_poc: f64,

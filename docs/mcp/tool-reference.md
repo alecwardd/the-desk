@@ -522,7 +522,7 @@ Storage tier status: shows hot (current session), warm (SQLite ticks), and cold 
 
 ### `backfill_history`
 
-Queue a historical backfill job and return a job id. Processes past sessions through all 14 pipelines, detects market events, and persists session summaries without blocking the MCP server.
+Queue a historical backfill job and return a job id. Processes past sessions through all 15 pipelines, detects market events, and persists session summaries without blocking the MCP server.
 
 ### `create_database_backup`
 

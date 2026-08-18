@@ -135,6 +135,21 @@ impl FlowEventEmitter {
         );
     }
 
+    /// Depth-poll path: emit new DOM-family events only.
+    ///
+    /// Must not run the full [`Self::detect_into`] scan. A `.depth` poll that
+    /// advanced absorption / pinch / leg / zone / cluster watermarks would
+    /// steal those events from the tick loop.
+    pub fn detect_dom_into(
+        &mut self,
+        pipelines: &PipelineEngine,
+        timestamp_ms: f64,
+        session_date: &str,
+        events: &mut Vec<MarketEvent>,
+    ) {
+        self.detect_dom(events, pipelines, timestamp_ms, session_date);
+    }
+
     fn event_context(timestamp_ms: f64, session_date: &str) -> (String, String, String) {
         if let Some(ctx) = tick_time_context_from_timestamp_ms(timestamp_ms) {
             let session_type = match ctx.session_type {
@@ -793,5 +808,33 @@ mod tests {
         pipelines.on_dom_feature(&snap, &activity, ts);
         let recovered = emitter.detect(&pipelines, ts, "2024-01-02", 21_000.0);
         assert!(recovered.iter().any(|e| e.event_type == "pull_intent"));
+    }
+
+    #[test]
+    fn detect_dom_into_does_not_steal_other_watermarks() {
+        let mut pipelines = PipelineEngine::new();
+        let ts = 1_704_207_600_000.0;
+        let (snap, activity) = pull_heavy_book(ts);
+        pipelines.on_dom_feature(&snap, &activity, ts);
+
+        let mut emitter = FlowEventEmitter::new();
+        emitter.prev_absorption_count = 7;
+        emitter.prev_pinch_count = 3;
+        emitter.prev_leg_event_seq = 11;
+        emitter.prev_zone_count = 2;
+        let prev_large = emitter.prev_large_trade_counts.len();
+
+        let mut events = Vec::new();
+        emitter.detect_dom_into(&pipelines, ts, "2024-01-02", &mut events);
+        assert!(events.iter().any(|e| e.event_type == "pull_intent"));
+        assert_eq!(emitter.prev_absorption_count, 7);
+        assert_eq!(emitter.prev_pinch_count, 3);
+        assert_eq!(emitter.prev_leg_event_seq, 11);
+        assert_eq!(emitter.prev_zone_count, 2);
+        assert_eq!(emitter.prev_large_trade_counts.len(), prev_large);
+        assert_eq!(
+            emitter.prev_dom_event_seq,
+            pipelines.dom_cluster.event_seq()
+        );
     }
 }

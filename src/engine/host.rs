@@ -276,6 +276,8 @@ impl EngineHost {
     ///
     /// Used by the live `.depth` path so Capsule-mandatory types are noted
     /// without waiting for the next trade. Fail-closed when the book is empty.
+    /// Only [`FlowEventEmitter::detect_dom_into`] runs here — a full
+    /// [`FlowEventEmitter::detect_into`] would steal tick-loop watermarks.
     pub fn apply_dom_update(
         &self,
         snapshot: &crate::depth::DomSnapshot,
@@ -302,13 +304,7 @@ impl EngineHost {
             let market_snapshot = p.snapshot_at(bid, ask, timestamp_ms);
             let session_date = crate::session_date_from_timestamp_ms(timestamp_ms);
             if let Ok(mut fe) = self.flow_emitter.lock() {
-                fe.detect_into(
-                    &p,
-                    timestamp_ms,
-                    &session_date,
-                    market_snapshot.last_price,
-                    &mut event_buffer,
-                );
+                fe.detect_dom_into(&p, timestamp_ms, &session_date, &mut event_buffer);
             }
             market_snapshot
         };

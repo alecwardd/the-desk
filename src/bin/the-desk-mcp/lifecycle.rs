@@ -1389,38 +1389,42 @@ pub(crate) fn apply_depth_persist_work(
         );
     }
 
-    if let Ok(mut pl) = pipelines.lock() {
-        pl.on_dom_feature(
+    // Live `.depth` uses the same EngineHost seam as Capsule goldens
+    // (`MarketRouter::apply_dom_update` → `on_dom_feature` + `detect_dom_into`).
+    // Do not hold `pipelines` across that call (it locks the same mutex).
+    let mut dom_events = Vec::new();
+    if let Some(router) = market_router {
+        if let Some(out) = router.apply_dom_update(
+            coaching_root,
             &work.snapshot,
             &work.feature.activity,
             work.feature.timestamp_ms,
-        );
+        ) {
+            dom_events = out.new_events;
+        }
+    } else {
+        if let Ok(mut pl) = pipelines.lock() {
+            pl.on_dom_feature(
+                &work.snapshot,
+                &work.feature.activity,
+                work.feature.timestamp_ms,
+            );
+        }
+        if let (Ok(pl), Ok(mut fe)) = (pipelines.lock(), flow_emitter.lock()) {
+            let session_date = session_date_from_timestamp_ms(work.feature.timestamp_ms);
+            fe.detect_dom_into(
+                &pl,
+                work.feature.timestamp_ms,
+                &session_date,
+                &mut dom_events,
+            );
+        }
+    }
+    // Overlay the enriched narrative summary after the detector update.
+    if let Ok(mut pl) = pipelines.lock() {
         pl.set_dom_summary(Some(work.feature.dom_summary.clone()));
     }
-
-    let mut dom_events = Vec::new();
-    if let (Ok(pl), Ok(mut fe)) = (pipelines.lock(), flow_emitter.lock()) {
-        let session_date = session_date_from_timestamp_ms(work.feature.timestamp_ms);
-        let price = pl
-            .snapshot_for_detection(
-                work.snapshot.best_bid.unwrap_or(0.0),
-                work.snapshot.best_ask.unwrap_or(0.0),
-                work.feature.timestamp_ms,
-            )
-            .last_price;
-        fe.detect_into(
-            &pl,
-            work.feature.timestamp_ms,
-            &session_date,
-            price,
-            &mut dom_events,
-        );
-    }
     if !dom_events.is_empty() {
-        if let Some(router) = market_router {
-            router.note_transition_events(coaching_root, &dom_events);
-            router.queue_journal_frames();
-        }
         if let Ok(d) = db.lock() {
             let _ = d.insert_market_events_batch_scoped(Some(coaching_root.as_str()), &dom_events);
             if let Some(router) = market_router {

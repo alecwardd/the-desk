@@ -41,8 +41,12 @@ pub const VELOCITY_WINDOW_MS: f64 = 1_000.0;
 pub const VELOCITY_BASELINE_MS: f64 = 10_000.0;
 /// Fast regime: short rate ≥ this multiple of baseline (and the absolute floor).
 pub const VELOCITY_FAST_MULT: f64 = 2.5;
+/// Stay in fast until short rate falls below this multiple (hysteresis).
+pub const VELOCITY_FAST_EXIT_MULT: f64 = 1.8;
 /// Quiet regime: short rate ≤ this multiple of baseline.
 pub const VELOCITY_QUIET_MULT: f64 = 0.4;
+/// Stay in quiet until short rate rises above this multiple (hysteresis).
+pub const VELOCITY_QUIET_EXIT_MULT: f64 = 0.6;
 /// Absolute events/sec floor for "fast" so a dead book cannot spike on one print.
 pub const VELOCITY_FAST_ABS_PER_SEC: f64 = 30.0;
 /// Minimum baseline events/sec before a regime is classified.
@@ -72,6 +76,8 @@ pub const PULL_INTENT_EDGE: f64 = 0.15;
 pub const MIN_PULL_REMOVED: f64 = 25.0;
 /// Pull rate at or below this clears an open pull-intent.
 pub const PULL_INTENT_CLEAR_RATE: f64 = 0.35;
+/// Minimum dwell before an open pull-intent may flip sides.
+pub const PULL_INTENT_MIN_DWELL_MS: f64 = 2_000.0;
 
 /// Wire types — must match [`crate::catalog::DOM_FAMILY_EVENT_TYPES`].
 pub const EVENT_BOOK_VELOCITY_REGIME_SHIFT: &str = "book_velocity_regime_shift";
@@ -161,7 +167,8 @@ pub struct DomClusterPipeline {
     overnight: Option<bool>,
     last_price: f64,
     last_trade_is_buy: Option<bool>,
-    velocity_samples: VecDeque<(f64, u64)>,
+    last_trade_time_ms: Option<f64>,
+    velocity_samples: VecDeque<(f64, f64)>,
     velocity_regime: Option<VelocityRegime>,
     open_velocity_direction: Option<&'static str>,
     levels: HashMap<(char, i64), LevelWatch>,
@@ -174,6 +181,7 @@ pub struct DomClusterPipeline {
     stop_cluster_price: Option<f64>,
     stop_run_last_ts: Option<f64>,
     pull_intent_open: Option<&'static str>,
+    pull_intent_opened_ms: Option<f64>,
     pull_intent_rate: Option<f64>,
     mm_flow_status: Option<String>,
     mm_flow_score: Option<f64>,
@@ -195,6 +203,7 @@ impl DomClusterPipeline {
             overnight: None,
             last_price: 0.0,
             last_trade_is_buy: None,
+            last_trade_time_ms: None,
             velocity_samples: VecDeque::new(),
             velocity_regime: None,
             open_velocity_direction: None,
@@ -208,6 +217,7 @@ impl DomClusterPipeline {
             stop_cluster_price: None,
             stop_run_last_ts: None,
             pull_intent_open: None,
+            pull_intent_opened_ms: None,
             pull_intent_rate: None,
             mm_flow_status: None,
             mm_flow_score: None,
@@ -276,6 +286,7 @@ impl DomClusterPipeline {
         self.overnight = Some(is_overnight);
         self.last_price = price;
         self.last_trade_is_buy = Some(is_buy);
+        self.last_trade_time_ms = Some(timestamp_ms);
         self.trades.push_back((timestamp_ms, price));
         evict_older_than(&mut self.trades, timestamp_ms, STOP_RUN_WINDOW_MS * 2.0);
         if volume > 0.0 && self.book_present {
@@ -381,6 +392,7 @@ impl DomClusterPipeline {
             );
         }
         if let Some(side) = self.pull_intent_open.take() {
+            self.pull_intent_opened_ms = None;
             self.push_event(
                 timestamp_ms,
                 format!("{EVENT_PULL_INTENT}_invalidated"),
@@ -394,7 +406,9 @@ impl DomClusterPipeline {
 
     fn eval_velocity(&mut self, timestamp_ms: f64, activity: &PullStackActivitySummary) {
         let events = side_event_count(&activity.bid) + side_event_count(&activity.ask);
-        self.velocity_samples.push_back((timestamp_ms, events));
+        let window_secs = activity_window_secs(activity);
+        let rate = events as f64 / window_secs;
+        self.velocity_samples.push_back((timestamp_ms, rate));
         while self
             .velocity_samples
             .front()
@@ -411,13 +425,7 @@ impl DomClusterPipeline {
         if baseline < VELOCITY_MIN_BASELINE_PER_SEC {
             return;
         }
-        let next = if short >= VELOCITY_FAST_ABS_PER_SEC.max(baseline * VELOCITY_FAST_MULT) {
-            VelocityRegime::Fast
-        } else if short <= baseline * VELOCITY_QUIET_MULT {
-            VelocityRegime::Quiet
-        } else {
-            VelocityRegime::Normal
-        };
+        let next = classify_velocity_regime(self.velocity_regime, short, baseline);
         let prev = self.velocity_regime;
         self.velocity_regime = Some(next);
         if prev == Some(next) {
@@ -474,7 +482,8 @@ impl DomClusterPipeline {
                 (
                     l.price,
                     l.quantity as f64,
-                    last_trade_is_buy == Some(false) && prices_equal(l.price, last_trade_price),
+                    self.trade_at_level(timestamp_ms, last_trade_price, last_trade_is_buy, false)
+                        && prices_equal(l.price, last_trade_price),
                 )
             }),
         );
@@ -486,10 +495,26 @@ impl DomClusterPipeline {
                 (
                     l.price,
                     l.quantity as f64,
-                    last_trade_is_buy == Some(true) && prices_equal(l.price, last_trade_price),
+                    self.trade_at_level(timestamp_ms, last_trade_price, last_trade_is_buy, true)
+                        && prices_equal(l.price, last_trade_price),
                 )
             }),
         );
+    }
+
+    /// Last-print fill classification is only honoured inside [`RELOAD_WINDOW_MS`].
+    fn trade_at_level(
+        &self,
+        timestamp_ms: f64,
+        last_trade_price: f64,
+        last_trade_is_buy: Option<bool>,
+        want_buy: bool,
+    ) -> bool {
+        if last_trade_price <= 0.0 || last_trade_is_buy != Some(want_buy) {
+            return false;
+        }
+        self.last_trade_time_ms
+            .is_some_and(|ts| timestamp_ms - ts <= RELOAD_WINDOW_MS)
     }
 
     fn eval_pull_intent(&mut self, timestamp_ms: f64, activity: &PullStackActivitySummary) {
@@ -515,6 +540,7 @@ impl DomClusterPipeline {
         match (self.pull_intent_open, side) {
             (None, Some(s)) => {
                 self.pull_intent_open = Some(s);
+                self.pull_intent_opened_ms = Some(timestamp_ms);
                 self.pull_intent_rate = Some(rate);
                 self.push_event(
                     timestamp_ms,
@@ -536,6 +562,7 @@ impl DomClusterPipeline {
                 let open_rate = if open == "bid" { bid_rate } else { ask_rate };
                 if open_rate <= PULL_INTENT_CLEAR_RATE {
                     self.pull_intent_open = None;
+                    self.pull_intent_opened_ms = None;
                     self.pull_intent_rate = None;
                     self.push_event(
                         timestamp_ms,
@@ -550,6 +577,13 @@ impl DomClusterPipeline {
                 }
             }
             (Some(open), Some(s)) if open != s => {
+                let dwell_ok = self
+                    .pull_intent_opened_ms
+                    .is_none_or(|opened| timestamp_ms - opened >= PULL_INTENT_MIN_DWELL_MS);
+                if !dwell_ok {
+                    self.pull_intent_rate = Some(rate);
+                    return;
+                }
                 self.push_event(
                     timestamp_ms,
                     format!("{EVENT_PULL_INTENT}_invalidated"),
@@ -559,6 +593,7 @@ impl DomClusterPipeline {
                     serde_json::json!({ "side": open, "reason": "side_flip" }),
                 );
                 self.pull_intent_open = Some(s);
+                self.pull_intent_opened_ms = Some(timestamp_ms);
                 self.pull_intent_rate = Some(rate);
                 self.push_event(
                     timestamp_ms,
@@ -619,10 +654,10 @@ impl DomClusterPipeline {
         let dir: &'static str = if up { "up" } else { "down" };
         let cluster = if up { now.best_ask } else { now.best_bid };
         self.stop_run_last_ts = Some(timestamp_ms);
-        self.stop_cluster_price = cluster.or(Some(origin));
         if self.stop_run_open == Some(dir) {
             return;
         }
+        self.stop_cluster_price = cluster.or(Some(origin));
         if let Some(prev) = self.stop_run_open {
             self.push_event(
                 timestamp_ms,
@@ -842,30 +877,59 @@ fn prices_equal(a: f64, b: f64) -> bool {
     (a - b).abs() < NQ_TICK * 0.5
 }
 
-fn short_velocity(samples: &VecDeque<(f64, u64)>) -> Option<f64> {
-    rate_in_window(samples, VELOCITY_WINDOW_MS)
+fn short_velocity(samples: &VecDeque<(f64, f64)>) -> Option<f64> {
+    mean_rate_in_window(samples, VELOCITY_WINDOW_MS)
 }
 
-fn baseline_velocity(samples: &VecDeque<(f64, u64)>) -> Option<f64> {
-    rate_in_window(samples, VELOCITY_BASELINE_MS)
+fn baseline_velocity(samples: &VecDeque<(f64, f64)>) -> Option<f64> {
+    mean_rate_in_window(samples, VELOCITY_BASELINE_MS)
 }
 
-fn rate_in_window(samples: &VecDeque<(f64, u64)>, window_ms: f64) -> Option<f64> {
+/// Live `.depth` summaries are a rolling 60 s window, not a per-poll delta.
+/// Divide by that window so `bookVelocityPerSec` is an events/sec rate.
+fn activity_window_secs(activity: &PullStackActivitySummary) -> f64 {
+    let dt = activity.end_time_ms - activity.start_time_ms;
+    if dt.is_finite() && dt > 1.0 {
+        dt / 1_000.0
+    } else {
+        1.0
+    }
+}
+
+fn mean_rate_in_window(samples: &VecDeque<(f64, f64)>, window_ms: f64) -> Option<f64> {
     let last = samples.back()?.0;
-    let mut events = 0u64;
-    let mut first = last;
-    for (ts, n) in samples.iter().rev() {
+    let mut sum = 0.0;
+    let mut n = 0u32;
+    for (ts, rate) in samples.iter().rev() {
         if last - *ts > window_ms {
             break;
         }
-        events += n;
-        first = *ts;
+        sum += rate;
+        n += 1;
     }
-    let span = (last - first).max(1.0);
-    if events == 0 {
-        return Some(0.0);
+    if n == 0 {
+        None
+    } else {
+        Some(sum / f64::from(n))
     }
-    Some(events as f64 / (span / 1_000.0).max(window_ms / 1_000.0))
+}
+
+fn classify_velocity_regime(
+    prev: Option<VelocityRegime>,
+    short: f64,
+    baseline: f64,
+) -> VelocityRegime {
+    let enter_fast = short >= VELOCITY_FAST_ABS_PER_SEC.max(baseline * VELOCITY_FAST_MULT);
+    let stay_fast = short >= VELOCITY_FAST_ABS_PER_SEC.max(baseline * VELOCITY_FAST_EXIT_MULT);
+    let enter_quiet = short <= baseline * VELOCITY_QUIET_MULT;
+    let stay_quiet = short <= baseline * VELOCITY_QUIET_EXIT_MULT;
+    match prev {
+        Some(VelocityRegime::Fast) if stay_fast => VelocityRegime::Fast,
+        Some(VelocityRegime::Quiet) if stay_quiet && !enter_fast => VelocityRegime::Quiet,
+        _ if enter_fast => VelocityRegime::Fast,
+        _ if enter_quiet => VelocityRegime::Quiet,
+        _ => VelocityRegime::Normal,
+    }
 }
 
 fn depth_at(samples: &VecDeque<DepthSample>, ts: f64, ask_side: bool) -> Option<f64> {
@@ -929,9 +993,19 @@ mod tests {
     }
 
     fn snapshot_from_qty(ts: f64, bid_qty: u32, ask_qty: u32) -> crate::depth::DomSnapshot {
+        snapshot_book(ts, 21_000.0, bid_qty, 21_000.25, ask_qty)
+    }
+
+    fn snapshot_book(
+        ts: f64,
+        bid: f64,
+        bid_qty: u32,
+        ask: f64,
+        ask_qty: u32,
+    ) -> crate::depth::DomSnapshot {
         let mut book = DepthBook::default();
-        book.apply(&rec(ts, DepthCommand::AddBidLevel, 21_000.0, bid_qty));
-        book.apply(&rec(ts, DepthCommand::AddAskLevel, 21_000.25, ask_qty));
+        book.apply(&rec(ts, DepthCommand::AddBidLevel, bid, bid_qty));
+        book.apply(&rec(ts, DepthCommand::AddAskLevel, ask, ask_qty));
         book.snapshot("test.depth", ts, 10)
     }
 
@@ -982,6 +1056,26 @@ mod tests {
             estimated_filled_quantity: 5.0,
             estimated_pulled_quantity: 0.0,
         };
+        a
+    }
+
+    fn pull_heavy_ask() -> PullStackActivitySummary {
+        let mut a = pull_heavy_bid();
+        std::mem::swap(&mut a.bid, &mut a.ask);
+        a
+    }
+
+    fn activity_window(
+        start_ms: f64,
+        end_ms: f64,
+        events: u64,
+        pulled: f64,
+        removed: f64,
+        stacked: f64,
+    ) -> PullStackActivitySummary {
+        let mut a = activity(events, pulled, removed, stacked);
+        a.start_time_ms = start_ms;
+        a.end_time_ms = end_ms;
         a
     }
 
@@ -1275,5 +1369,194 @@ mod tests {
         assert_eq!(p.event_seq(), seq);
         assert!(p.recent_events().is_empty());
         assert!(!p.snapshot().book_present);
+    }
+
+    #[test]
+    fn overlapping_60s_activity_uses_window_rate_not_sum() {
+        let mut p = DomClusterPipeline::new();
+        let snap = snapshot_from_qty(RTH, 40, 40);
+        for i in 0..120 {
+            let ts = RTH + i as f64 * 1_000.0;
+            // 3000 events/side over a rolling 60s window → 100 events/sec, not 6000.
+            let act = activity_window(ts - 60_000.0, ts, 3_000, 0.0, 10.0, 10.0);
+            p.on_book_update(ts, &snap, &act, false, 21_000.0, Some(true));
+        }
+        let vel = p
+            .snapshot()
+            .book_velocity_per_sec
+            .expect("rate after overlapping polls");
+        assert!(
+            vel > 50.0 && vel < 200.0,
+            "expected ~100 events/sec from a 60s window, got {vel}"
+        );
+        assert_eq!(p.snapshot().book_velocity_regime.as_deref(), Some("normal"));
+        assert!(
+            p.recent_events()
+                .iter()
+                .all(|e| e.event_type != EVENT_BOOK_VELOCITY_REGIME_SHIFT
+                    || e.direction.as_deref() != Some("fast")),
+            "summing overlapping 60s totals must not classify as fast"
+        );
+    }
+
+    #[test]
+    fn classify_velocity_fast_and_quiet_hysteresis() {
+        let baseline = 40.0;
+        assert_eq!(
+            classify_velocity_regime(Some(VelocityRegime::Normal), 100.0, baseline),
+            VelocityRegime::Fast
+        );
+        assert_eq!(
+            classify_velocity_regime(Some(VelocityRegime::Fast), baseline * 2.1, baseline),
+            VelocityRegime::Fast,
+            "stay fast while short ≥ 1.8× baseline"
+        );
+        assert_eq!(
+            classify_velocity_regime(Some(VelocityRegime::Fast), baseline * 1.5, baseline),
+            VelocityRegime::Normal,
+            "exit fast when short < 1.8× baseline"
+        );
+        assert_eq!(
+            classify_velocity_regime(Some(VelocityRegime::Normal), baseline * 0.4, baseline),
+            VelocityRegime::Quiet
+        );
+        assert_eq!(
+            classify_velocity_regime(Some(VelocityRegime::Quiet), baseline * 0.5, baseline),
+            VelocityRegime::Quiet,
+            "stay quiet while short ≤ 0.6× baseline"
+        );
+        assert_eq!(
+            classify_velocity_regime(Some(VelocityRegime::Quiet), baseline * 0.7, baseline),
+            VelocityRegime::Normal,
+            "exit quiet when short > 0.6× baseline"
+        );
+    }
+
+    #[test]
+    fn pull_intent_does_not_flip_side_before_dwell() {
+        let mut p = DomClusterPipeline::new();
+        let snap = snapshot_from_qty(RTH, 10, 40);
+        p.on_book_update(RTH, &snap, &pull_heavy_bid(), false, 21_000.0, Some(false));
+        assert_eq!(p.snapshot().pull_intent_side.as_deref(), Some("bid"));
+
+        p.on_book_update(
+            RTH + 500.0,
+            &snap,
+            &pull_heavy_ask(),
+            false,
+            21_000.0,
+            Some(true),
+        );
+        assert_eq!(
+            p.snapshot().pull_intent_side.as_deref(),
+            Some("bid"),
+            "must not flip sides before {PULL_INTENT_MIN_DWELL_MS} ms"
+        );
+
+        p.on_book_update(
+            RTH + 2_500.0,
+            &snap,
+            &pull_heavy_ask(),
+            false,
+            21_000.0,
+            Some(true),
+        );
+        assert_eq!(p.snapshot().pull_intent_side.as_deref(), Some("ask"));
+        assert!(p.recent_events().iter().any(|e| e.event_type
+            == format!("{EVENT_PULL_INTENT}_invalidated")
+            && e.direction.as_deref() == Some("bid")));
+        assert!(
+            p.recent_events()
+                .iter()
+                .filter(
+                    |e| e.event_type == EVENT_PULL_INTENT && e.direction.as_deref() == Some("ask")
+                )
+                .count()
+                >= 1
+        );
+    }
+
+    #[test]
+    fn stop_cluster_price_latches_at_first_open() {
+        let mut p = DomClusterPipeline::new();
+        let t0 = RTH;
+        p.on_book_update(
+            t0,
+            &snapshot_book(t0, 21_000.0, 80, 21_000.25, 80),
+            &activity(4, 0.0, 0.0, 80.0),
+            false,
+            21_000.0,
+            Some(true),
+        );
+        p.on_trade(t0, 21_000.0, 10.0, true, false);
+        let mut first_cluster = None;
+        for i in 1..=12 {
+            let ts = t0 + i as f64 * 100.0;
+            let price = 21_000.0 + i as f64 * NQ_TICK;
+            p.on_trade(ts, price, 8.0, true, false);
+            let ask_qty = if i >= 6 { 20 } else { 80 };
+            p.on_book_update(
+                ts,
+                &snapshot_book(ts, price - NQ_TICK, 80, price, ask_qty),
+                &activity(8, 20.0, 40.0, 0.0),
+                false,
+                price,
+                Some(true),
+            );
+            if first_cluster.is_none() {
+                first_cluster = p.snapshot().stop_cluster_price;
+            }
+        }
+        let first = first_cluster.expect("stop-run must open");
+        let later = p
+            .snapshot()
+            .stop_cluster_price
+            .expect("stop-run stays open");
+        assert_eq!(
+            first, later,
+            "stopClusterPrice must latch at first open, not follow a moving ask"
+        );
+        assert!(p
+            .recent_events()
+            .iter()
+            .any(|e| e.event_type == EVENT_STOP_RUN));
+    }
+
+    #[test]
+    fn iceberg_reload_does_not_emit_when_same_side_print_is_stale() {
+        let mut p = DomClusterPipeline::new();
+        let t0 = RTH;
+        p.on_book_update(
+            t0,
+            &snapshot_from_qty(t0, 40, 50),
+            &activity(4, 0.0, 0.0, 50.0),
+            false,
+            21_000.0,
+            Some(false),
+        );
+        p.on_trade(t0, 21_000.0, 40.0, false, false);
+        let t_stale = t0 + 240_000.0;
+        p.on_book_update(
+            t_stale,
+            &snapshot_from_qty(t_stale, 10, 50),
+            &activity(4, 0.0, 30.0, 0.0),
+            false,
+            21_000.0,
+            Some(false),
+        );
+        p.on_book_update(
+            t_stale + 200.0,
+            &snapshot_from_qty(t_stale + 200.0, 50, 50),
+            &activity(4, 0.0, 0.0, 40.0),
+            false,
+            21_000.0,
+            Some(false),
+        );
+        assert!(
+            p.recent_events()
+                .iter()
+                .all(|e| e.event_type != EVENT_ICEBERG_RELOAD),
+            "same-side print older than RELOAD_WINDOW_MS must not infer iceberg"
+        );
     }
 }

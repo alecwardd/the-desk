@@ -12,8 +12,8 @@ use rmcp::{
 use the_desk_backend::catalog::{
     apply_positioning_slice, apply_token_budget, attach_capsule_refs, build_catalog_with_overlay,
     build_state_envelope, collapse_events_latest_per_dedup, describe_domain, describe_environment,
-    is_accepted_derived, kernel_event_from_db_row, kernel_event_from_market_event_scoped,
-    merge_eval_frames, merge_symbol_envelopes, positioning_state_slice, search_catalog,
+    kernel_event_from_db_row, kernel_event_from_market_event_scoped, merge_eval_frames,
+    merge_symbol_envelopes, positioning_state_slice, request_needs_derived_stamp, search_catalog,
     search_features, stamp_derived_feature_payload, state_envelope_json, EventsEnvelope,
     FeatureIrEvalPath, FeatureIrFrame, FeatureIrStore, KernelEvent, PositioningStateSlice,
     ProvenanceSource, StateEnvelope, StateReadRequest, StateResolution, TrustLevel,
@@ -170,7 +170,13 @@ impl TheDeskMcp {
 
         if include_multi {
             let as_of_ms = self.market_router.clock_ms().or(data_time).unwrap_or(0.0);
-            let (ir_frames, truncated) = load_live_feature_ir_frames(self, &catalog, as_of_ms)?;
+            let (ir_frames, truncated) = load_live_feature_ir_frames(
+                self,
+                &catalog,
+                as_of_ms,
+                params.fields.as_deref(),
+                params.domains.as_deref(),
+            )?;
             let mut by_root = std::collections::BTreeMap::new();
             for root in &requested_roots {
                 let snap = live_by_symbol.get(root);
@@ -244,8 +250,13 @@ impl TheDeskMcp {
                     if have != want {
                         if let Some(piece) = live_by_symbol.get(&want) {
                             let as_of_ms = piece.data_time.or(data_time).unwrap_or(0.0);
-                            let (ir_frames, truncated) =
-                                load_live_feature_ir_frames(self, &catalog, as_of_ms)?;
+                            let (ir_frames, truncated) = load_live_feature_ir_frames(
+                                self,
+                                &catalog,
+                                as_of_ms,
+                                params.fields.as_deref(),
+                                params.domains.as_deref(),
+                            )?;
                             let stamped = stamp_get_state_snapshot(
                                 &piece.snapshot,
                                 &catalog,
@@ -302,7 +313,13 @@ impl TheDeskMcp {
             .or_else(|| requested_roots.first().map(|r| r.as_str().to_string()))
             .unwrap_or_else(|| "NQ".into());
         let as_of_ms = data_time.unwrap_or(0.0);
-        let (ir_frames, truncated) = load_live_feature_ir_frames(self, &catalog, as_of_ms)?;
+        let (ir_frames, truncated) = load_live_feature_ir_frames(
+            self,
+            &catalog,
+            as_of_ms,
+            params.fields.as_deref(),
+            params.domains.as_deref(),
+        )?;
         let stamped = snapshot_owned.as_ref().map(|s| {
             stamp_get_state_snapshot(
                 s,
@@ -704,7 +721,14 @@ impl TheDeskMcp {
         };
         let (ir_frames, truncated) = {
             let db = self.db.lock().map_err(|_| lock_error())?;
-            load_feature_ir_eval_frames(&db, &[], catalog, ts)
+            load_feature_ir_eval_frames(
+                &db,
+                &[],
+                catalog,
+                ts,
+                params.fields.as_deref(),
+                params.domains.as_deref(),
+            )
         };
 
         let note_missing = "as_of Journal Frame unavailable; domains degraded — Your playbook indicates historical structure is incomplete";
@@ -1142,16 +1166,19 @@ fn snapshot_root_symbol(snapshot: Option<&serde_json::Value>) -> Option<&str> {
         .filter(|s| !s.is_empty())
 }
 
-/// Loads the Feature-IR eval window: bounded SQLite history concatenated with
-/// pending frames (pending wins on identity). Never `list_journal_frames()`.
-/// Skips the journal read when no accepted Derived Feature is codegen'd.
+/// Loads a Feature-IR eval window from SQLite (historical `as_of` path).
+///
+/// Never `list_journal_frames()`. Skips the journal read when the request
+/// cannot resolve a codegen field.
 fn load_feature_ir_eval_frames(
     db: &Database,
     pending: &[JournalFrameRecord],
     catalog: &the_desk_backend::catalog::DeskCatalog,
     as_of_ms: f64,
+    fields: Option<&[String]>,
+    domains: Option<&[String]>,
 ) -> (Vec<FeatureIrFrame>, bool) {
-    if !catalog.derived_features.iter().any(is_accepted_derived) {
+    if !request_needs_derived_stamp(catalog, fields, domains) {
         return (Vec::new(), false);
     }
     let (history, truncated) = db
@@ -1167,15 +1194,22 @@ fn load_live_feature_ir_frames(
     server: &TheDeskMcp,
     catalog: &the_desk_backend::catalog::DeskCatalog,
     as_of_ms: f64,
+    fields: Option<&[String]>,
+    domains: Option<&[String]>,
 ) -> Result<(Vec<FeatureIrFrame>, bool), McpError> {
-    if !catalog.derived_features.iter().any(is_accepted_derived) {
+    if !request_needs_derived_stamp(catalog, fields, domains) {
         return Ok((Vec::new(), false));
     }
     let pending = server.market_router.snapshot_pending_journal_frames();
-    let db = server.db.lock().map_err(|_| lock_error())?;
-    Ok(load_feature_ir_eval_frames(
-        &db, &pending, catalog, as_of_ms,
-    ))
+    {
+        let db = server.db.lock().map_err(|_| lock_error())?;
+        server
+            .market_router
+            .hydrate_feature_ir_eval_cache(&db, as_of_ms)
+            .map_err(db_error)?;
+    }
+    let merged = server.market_router.live_feature_ir_eval_window(&pending);
+    Ok((merged.frames, merged.truncated))
 }
 
 fn stamp_get_state_snapshot(

@@ -1180,7 +1180,7 @@ impl From<&JournalFrameRecord> for FeatureIrFrame {
             root_symbol: row.root_symbol.clone(),
             session_type: row.session_type.clone(),
             trading_day: row.trading_day.clone(),
-            payload: row.payload.clone(),
+            payload: std::sync::Arc::new(row.payload.clone()),
         }
     }
 }

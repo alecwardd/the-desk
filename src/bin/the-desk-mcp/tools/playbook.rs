@@ -77,10 +77,12 @@ impl TheDeskMcp {
                 .or(market.tape_last_trade_timestamp_ms)
                 .unwrap_or(0.0);
             match self.db.lock() {
-                Ok(db) => {
-                    let pending = self.market_router.snapshot_pending_journal_frames();
-                    catalog_field_values_for_snapshot(&db, &pending, market, as_of_ms)
-                }
+                Ok(db) => catalog_field_values_for_snapshot(
+                    &db,
+                    Some(&self.market_router),
+                    market,
+                    as_of_ms,
+                ),
                 Err(_) => HashMap::new(),
             }
         } else {

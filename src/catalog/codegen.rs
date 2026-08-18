@@ -131,6 +131,58 @@ pub fn is_codegen_field(field: &FieldDescriptor) -> bool {
     field.id.starts_with("feature.") || field.rust_field == "feature_ir"
 }
 
+/// Whether a `get_state` request needs the live Feature-IR window.
+///
+/// Unfiltered reads (no fields/domains) stamp every accepted Derived Feature.
+/// A fields or domains filter skips the window when it cannot resolve a codegen
+/// field — the feed path still hydrates when analysis / persist needs it.
+pub fn request_needs_derived_stamp(
+    catalog: &DeskCatalog,
+    fields: Option<&[String]>,
+    domains: Option<&[String]>,
+) -> bool {
+    if !catalog.derived_features.iter().any(is_accepted_derived) {
+        return false;
+    }
+    let codegen: Vec<&FieldDescriptor> = catalog
+        .fields
+        .iter()
+        .filter(|f| is_codegen_field(f))
+        .collect();
+    if codegen.is_empty() {
+        return false;
+    }
+    match (fields, domains) {
+        (None, None) => true,
+        (Some(fs), _) => {
+            let wanted: Vec<&str> = fs
+                .iter()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if wanted.is_empty() {
+                return true;
+            }
+            codegen
+                .iter()
+                .any(|f| wanted.iter().any(|q| *q == f.id || *q == f.name))
+        }
+        (None, Some(ds)) => {
+            let wanted: Vec<&str> = ds
+                .iter()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if wanted.is_empty() {
+                return true;
+            }
+            codegen
+                .iter()
+                .any(|f| wanted.iter().any(|d| *d == f.domain_id))
+        }
+    }
+}
+
 /// Named payload key for a Derived Feature (`derivedFeatures.<id>`).
 pub fn storage_payload_key(feature_id: &str) -> String {
     format!("{DERIVED_FEATURE_PAYLOAD_OBJECT}.{feature_id}")
@@ -386,6 +438,7 @@ mod tests {
     use crate::catalog::types::{CostHint, FreshnessSemantics, SessionScope, Unit};
     use crate::catalog::{build_catalog, build_catalog_with_overlay};
     use serde_json::json;
+    use std::sync::Arc;
 
     fn last_price_percentile() -> FeatureDescriptor {
         let catalog = build_catalog();
@@ -556,10 +609,10 @@ mod tests {
                 root_symbol: "NQ".into(),
                 session_type: "RTH".into(),
                 trading_day: "2026-03-03".into(),
-                payload: json!({ "lastPrice": 21_000.0 + i as f64 }),
+                payload: Arc::new(json!({ "lastPrice": 21_000.0 + i as f64 })),
             })
             .collect();
-        let mut payload = frames[4].payload.clone();
+        let mut payload = (*frames[4].payload).clone();
         let store = FeatureIrStore {
             catalog: &catalog,
             frames: &frames,

@@ -12,7 +12,7 @@
 //! or DuckDB. Default `store=hot` is the SQLite window. Events / ticks stay
 //! on SQLite even when frames are read from cold.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -22,10 +22,10 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::catalog::{
-    build_catalog, build_catalog_with_overlay, evaluate_accepted_feature, is_codegen_field,
-    read_storage_value, DeskCatalog, FeatureIrEvalPath, FeatureIrFrame, FeatureIrStore,
-    FieldDescriptor, FrameRef, PositioningRecord, TrustCeiling, TrustLevel, CATALOG_VERSION,
-    FEATURE_IR_EVAL_MAX_FRAMES,
+    build_catalog, build_catalog_with_overlay, evaluate_series, is_accepted_derived,
+    is_codegen_field, read_storage_value, DeskCatalog, FeatureIrEvalPath, FeatureIrFrame,
+    FeatureIrStore, FieldDescriptor, FrameRef, PositioningRecord, TrustCeiling, TrustLevel,
+    CATALOG_VERSION, FEATURE_IR_EVAL_MAX_FRAMES,
 };
 use crate::db::{
     journal_frame_second_from_ts, Database, DbError, HypothesisSignalOutcomeRow,
@@ -744,9 +744,9 @@ fn extract_or_derive_field(
     payload: &Value,
     field: &FieldDescriptor,
     path: Option<&str>,
-    catalog: &DeskCatalog,
+    _catalog: &DeskCatalog,
     frame: &JournalFrameRecord,
-    history: Option<&(Vec<FeatureIrFrame>, bool)>,
+    history: Option<&FeatureIrQueryHistory>,
 ) -> Option<Value> {
     if let Some(val) = extract_field_value(payload, field, path) {
         return Some(val);
@@ -754,23 +754,11 @@ fn extract_or_derive_field(
     if !is_codegen_field(field) {
         return None;
     }
-    let (frames, truncated) = history?;
-    let desc = catalog.derived_features.iter().find(|d| d.id == field.id)?;
-    evaluate_accepted_feature(
-        desc,
-        FeatureIrStore {
-            catalog,
-            frames,
-            events: &[],
-            eval_root: &frame.root_symbol,
-            window_truncated: *truncated,
-        },
-        frame.clock_ms,
-        FeatureIrEvalPath::Historical,
-    )
-    .ok()
-    .flatten()
-    .map(Value::from)
+    history?
+        .series
+        .get(&(frame.frame_second, frame.root_symbol.clone()))
+        .and_then(|m| m.get(&field.id).copied())
+        .map(Value::from)
 }
 
 fn catalog_for_frame_read(frames: JournalFrameRead<'_>) -> Result<DeskCatalog, QueryKernelError> {
@@ -780,21 +768,69 @@ fn catalog_for_frame_read(frames: JournalFrameRead<'_>) -> Result<DeskCatalog, Q
     }
 }
 
+struct FeatureIrQueryHistory {
+    series: HashMap<(i64, String), HashMap<String, f64>>,
+}
+
 fn derived_history(
     frames: JournalFrameRead<'_>,
     as_of_ms: f64,
     catalog: &DeskCatalog,
-) -> Option<(Vec<FeatureIrFrame>, bool)> {
+) -> Option<FeatureIrQueryHistory> {
     if !catalog.fields.iter().any(is_codegen_field) {
         return None;
     }
-    match frames {
+    let (ir_frames, truncated) = match frames {
         JournalFrameRead::Hot(db) => db
             .list_journal_frames_for_feature_ir(as_of_ms, FEATURE_IR_EVAL_MAX_FRAMES)
             .ok()
-            .map(|(rows, truncated)| (rows.iter().map(Into::into).collect(), truncated)),
-        JournalFrameRead::Cold(_) => None,
+            .map(|(rows, truncated)| {
+                let ir_frames: Vec<FeatureIrFrame> = rows.iter().map(Into::into).collect();
+                (ir_frames, truncated)
+            })?,
+        JournalFrameRead::Cold(_) => return None,
+    };
+    Some(FeatureIrQueryHistory {
+        series: derived_series_lookup(catalog, &ir_frames, truncated),
+    })
+}
+
+fn derived_series_lookup(
+    catalog: &DeskCatalog,
+    frames: &[FeatureIrFrame],
+    truncated: bool,
+) -> HashMap<(i64, String), HashMap<String, f64>> {
+    let mut out: HashMap<(i64, String), HashMap<String, f64>> = HashMap::new();
+    if frames.is_empty() {
+        return out;
     }
+    let store = FeatureIrStore {
+        catalog,
+        frames,
+        events: &[],
+        eval_root: "NQ",
+        window_truncated: truncated,
+    };
+    for desc in catalog
+        .derived_features
+        .iter()
+        .filter(|d| is_accepted_derived(d))
+    {
+        let Some(program) = desc.program.as_ref() else {
+            continue;
+        };
+        let Ok(series) = evaluate_series(program, store, FeatureIrEvalPath::Historical) else {
+            continue;
+        };
+        for (second, root, value) in series {
+            if value.available && value.value.is_finite() {
+                out.entry((second, root))
+                    .or_default()
+                    .insert(desc.id.clone(), value.value);
+            }
+        }
+    }
+    out
 }
 
 fn as_f64(value: &Value) -> Option<f64> {
@@ -844,7 +880,7 @@ fn eval_predicate(
     events: &[Value],
     positioning_levels: Option<&[f64]>,
     catalog: &DeskCatalog,
-    history: Option<&(Vec<FeatureIrFrame>, bool)>,
+    history: Option<&FeatureIrQueryHistory>,
 ) -> PredicateEval {
     if let Some(event_type) = pred
         .event_type

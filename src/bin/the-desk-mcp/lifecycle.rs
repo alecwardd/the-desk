@@ -12,12 +12,11 @@ use the_desk_backend::attention::{
 use the_desk_backend::backfill;
 use the_desk_backend::catalog::{
     build_catalog_with_overlay, catalog_field_values_from_eval, is_accepted_derived,
-    kernel_event_from_market_event_scoped, merge_eval_frames, FeatureIrEvalPath,
-    FEATURE_IR_EVAL_MAX_FRAMES,
+    kernel_event_from_market_event_scoped, FeatureIrEvalPath,
 };
 use the_desk_backend::db::{
-    AttentionSignalQuery, AttentionSignalRecord, Database, JournalFrameRecord, ReplaySignalRecord,
-    SessionScopeFilter, SetupRuntimeStateRecord, SignalOutcome,
+    AttentionSignalQuery, AttentionSignalRecord, Database, ReplaySignalRecord, SessionScopeFilter,
+    SetupRuntimeStateRecord, SignalOutcome,
 };
 use the_desk_backend::depth::{
     build_dom_feature_snapshot, build_dom_summary, enrich_dom_summary, DepthBook, DepthCommand,
@@ -338,7 +337,7 @@ pub(crate) fn persist_setup_evaluation(
 
 pub(crate) fn catalog_field_values_for_snapshot(
     db: &Database,
-    pending: &[JournalFrameRecord],
+    router: Option<&MarketRouter>,
     snapshot: &the_desk_backend::pipelines::MarketState,
     as_of_ms: f64,
 ) -> HashMap<String, f64> {
@@ -346,16 +345,13 @@ pub(crate) fn catalog_field_values_for_snapshot(
     if !overlay.iter().any(is_accepted_derived) {
         return HashMap::new();
     }
+    let Some(router) = router else {
+        return HashMap::new();
+    };
+    let _ = router.hydrate_feature_ir_eval_cache(db, as_of_ms);
     let catalog = build_catalog_with_overlay(overlay);
-    let (history, truncated) = db
-        .list_journal_frames_for_feature_ir(as_of_ms, FEATURE_IR_EVAL_MAX_FRAMES)
-        .unwrap_or_else(|_| (Vec::new(), false));
-    let merged = merge_eval_frames(
-        history.iter().map(Into::into).collect(),
-        truncated,
-        pending.iter().map(Into::into).collect(),
-        FEATURE_IR_EVAL_MAX_FRAMES,
-    );
+    let pending = router.snapshot_pending_journal_frames();
+    let merged = router.live_feature_ir_eval_window(&pending);
     let payload = serde_json::to_value(snapshot).unwrap_or_else(|_| serde_json::json!({}));
     let eval_root = if snapshot.root_symbol.trim().is_empty() {
         "NQ"
@@ -386,11 +382,8 @@ pub(crate) fn evaluate_setups_for_snapshot(
     market_router: Option<&MarketRouter>,
 ) {
     let (setups, risk_at_limit) = playbook_cache.snapshot();
-    let pending = market_router
-        .map(|router| router.snapshot_pending_journal_frames())
-        .unwrap_or_default();
     let catalog_values = match db.lock() {
-        Ok(d) => catalog_field_values_for_snapshot(&d, &pending, snapshot, evaluation_ts_ms),
+        Ok(d) => catalog_field_values_for_snapshot(&d, market_router, snapshot, evaluation_ts_ms),
         Err(_) => HashMap::new(),
     };
     let persist_items = if let Ok(mut r) = rules.lock() {

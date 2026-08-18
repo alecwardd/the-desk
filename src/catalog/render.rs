@@ -99,12 +99,18 @@ pub fn render_catalog_markdown(catalog: &DeskCatalog) -> String {
          `describe_domain`) — no specialty getter. Candidate and shadow stay in `featureHits` \
          only. Live-shadow and historical evaluation share one evaluator (`clock_ms <= asOf`) \
          capped at 57600 frames (~8 hours of 1 Hz NQ+ES). That eval cap is independent of the \
-         8192 live pending-journal drain. Live evaluation concatenates a bounded SQLite load \
-         with pending frames (pending wins on identity). Session-percentile \
+         8192 live pending-journal drain. Live persist / `get_state` / playbook evaluation \
+         hydrate a rolling in-memory window once and append on persist (pending wins on \
+         identity) instead of re-parsing SQLite on every call. Session-percentile \
          n and dwell fail closed when that bound would drop in-session frames, including when \
-         the truncation edge is another root. Historical loads \
+         the truncation edge is another root. Globex (~17h) exceeds the cap, so those families \
+         are unavailable for the rest of an overnight session once the mixed NQ+ES journal is \
+         longer than ~8 hours and the left edge still sits in that Globex session. Historical \
+         baselines fail closed whenever the window is truncated. Historical / research loads \
          use a newest-first LIMIT cap+1 sentinel — never `Database::list_journal_frames()`. \
-         Discovery rides `search_catalog` / catalog descriptors. The write verb is \
+         `query_series` / `query_episodes` evaluate unstamped Derived Features in one pass over \
+         that window. Catalog-field rules bindings are live-only (hypothesis backtests reject \
+         them). Discovery rides `search_catalog` / catalog descriptors. The write verb is \
          `feature_registry`. Tier 1 Base Detector math stays reviewed Rust.\n\n",
     );
     out.push_str("| Id | Domain | Promotion | Builtin | Event types |\n|---|---|---|---|---|\n");

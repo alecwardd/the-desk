@@ -19,7 +19,8 @@ use serde_json::Value;
 
 use crate::catalog::{
     build_catalog_with_overlay, is_accepted_derived, merge_eval_frames,
-    stamp_derived_feature_payload, FeatureIrEvalPath, FeatureIrStore, FEATURE_IR_EVAL_MAX_FRAMES,
+    stamp_derived_feature_payload, FeatureIrEvalCache, FeatureIrEvalPath, FeatureIrStore,
+    FEATURE_IR_EVAL_MAX_FRAMES,
 };
 use crate::db::{
     journal_frame_second_from_ts, Database, DbError, JournalAsOfSnapshot, JournalFrameRecord,
@@ -75,10 +76,28 @@ pub fn persist_journal_observation(
     frames: &[JournalFrameRecord],
     events: &[(RouterRoot, MarketEvent)],
 ) -> Result<JournalPersistStats, DbError> {
+    persist_journal_observation_with_cache(db, frames, events, None)
+}
+
+/// Persist Journal Frames, stamping Derived Features from `cache` when present.
+///
+/// Live `MarketRouter` passes the rolling eval window so persist does not
+/// re-parse up to [`FEATURE_IR_EVAL_MAX_FRAMES`] SQLite payloads on every drain.
+pub fn persist_journal_observation_with_cache(
+    db: &Database,
+    frames: &[JournalFrameRecord],
+    events: &[(RouterRoot, MarketEvent)],
+    mut cache: Option<&mut FeatureIrEvalCache>,
+) -> Result<JournalPersistStats, DbError> {
     let mut stats = JournalPersistStats::default();
     if !frames.is_empty() {
-        let stamped = stamp_frames_with_derived_features(db, frames)?;
+        let stamped = stamp_frames_with_derived_features(db, frames, cache.as_deref_mut())?;
         stats.frames_written = db.insert_journal_frames(&stamped)?;
+        if let Some(cache) = cache.as_mut() {
+            if cache.is_hydrated() {
+                cache.append_persisted(stamped.iter().map(Into::into));
+            }
+        }
         stats.frame_second = stamped.last().map(|f| f.frame_second);
     }
     stats.events_written = insert_transition_events(db, events)?;
@@ -96,6 +115,7 @@ pub fn journal_frames_as_of(
 fn stamp_frames_with_derived_features(
     db: &Database,
     frames: &[JournalFrameRecord],
+    cache: Option<&mut FeatureIrEvalCache>,
 ) -> Result<Vec<JournalFrameRecord>, DbError> {
     let overlay = db.list_feature_registry()?;
     if !overlay.iter().any(is_accepted_derived) {
@@ -106,14 +126,23 @@ fn stamp_frames_with_derived_features(
         .iter()
         .map(|frame| frame.clock_ms)
         .fold(0.0_f64, f64::max);
-    let (prior, truncated) =
-        db.list_journal_frames_for_feature_ir(as_of, FEATURE_IR_EVAL_MAX_FRAMES)?;
-    let merged = merge_eval_frames(
-        prior.iter().map(Into::into).collect(),
-        truncated,
-        frames.iter().map(Into::into).collect(),
-        FEATURE_IR_EVAL_MAX_FRAMES,
-    );
+    let merged = if let Some(cache) = cache {
+        if !cache.is_hydrated() {
+            let (rows, truncated) =
+                db.list_journal_frames_for_feature_ir(as_of, FEATURE_IR_EVAL_MAX_FRAMES)?;
+            cache.hydrate_from_frames(rows.iter().map(Into::into).collect(), truncated);
+        }
+        cache.merged_with_pending(frames.iter().map(Into::into).collect())
+    } else {
+        let (prior, truncated) =
+            db.list_journal_frames_for_feature_ir(as_of, FEATURE_IR_EVAL_MAX_FRAMES)?;
+        merge_eval_frames(
+            prior.iter().map(Into::into).collect(),
+            truncated,
+            frames.iter().map(Into::into).collect(),
+            FEATURE_IR_EVAL_MAX_FRAMES,
+        )
+    };
     let mut out = frames.to_vec();
     for frame in &mut out {
         let eval_root = frame.root_symbol.clone();

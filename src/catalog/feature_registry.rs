@@ -22,8 +22,8 @@ use thiserror::Error;
 use super::codegen::FEATURE_REGISTRY_CODEGEN;
 use super::feature_ir::{
     FeatureIrError, FeatureIrProgram, DERIVED_FEATURE_MATH_TIER, FEATURE_IR_EVAL_MAX_FRAMES,
-    FEATURE_IR_MODULE, FEATURE_IR_SOURCE, FUNDED_OPERATOR_FAMILY_GLOSSARY,
-    FUNDED_OPERATOR_FAMILY_LABELS, NEW_OPERATOR_FAMILY_GATE,
+    FEATURE_IR_EVAL_WINDOW_NOTE, FEATURE_IR_MODULE, FEATURE_IR_SOURCE,
+    FUNDED_OPERATOR_FAMILY_GLOSSARY, FUNDED_OPERATOR_FAMILY_LABELS, NEW_OPERATOR_FAMILY_GATE,
 };
 use super::types::{CostHint, DeskCatalog, FreshnessSemantics, SessionScope, Unit};
 
@@ -841,7 +841,7 @@ pub fn feature_registry_environment(catalog: &DeskCatalog) -> serde_json::Value 
         "codegen": FEATURE_REGISTRY_CODEGEN,
         "featureIr": true,
         "evalMaxFrames": FEATURE_IR_EVAL_MAX_FRAMES,
-        "evalWindowNote": "Live Feature-IR evaluation concatenates a bounded SQLite load (FEATURE_IR_EVAL_MAX_FRAMES = 57600, ~8 hours of 1 Hz NQ+ES) with the in-memory pending drain (PENDING_JOURNAL_MAX_FRAMES = 8192; pending wins on frame_second+root). Historical loads use a newest-first LIMIT cap+1 sentinel — never Database::list_journal_frames(). Session-percentile n and dwell fail closed when the as-of session is truncated by that bound, including when the truncation edge is another root.",
+        "evalWindowNote": FEATURE_IR_EVAL_WINDOW_NOTE,
         "operatorFamilies": FUNDED_OPERATOR_FAMILY_LABELS,
         "operatorFamilyGlossary": FUNDED_OPERATOR_FAMILY_GLOSSARY,
         "newOperatorFamilyGate": NEW_OPERATOR_FAMILY_GATE,

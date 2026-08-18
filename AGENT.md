@@ -304,7 +304,11 @@ Derived Feature onto the existing kernel (`get_state`, `journal_frames.payload`,
 `query_series` / `query_episodes`, catalog-field rules binding, `search_catalog`).
 Live pending frames drain at 8192 (`PENDING_JOURNAL_MAX_FRAMES`). Feature-IR
 evaluation is capped at 57600 frames (`FEATURE_IR_EVAL_MAX_FRAMES`, ~8 hours of
-1 Hz NQ+ES) and concatenates a bounded SQLite load with pending (pending wins).
+1 Hz NQ+ES). Live persist / `get_state` / playbook evaluation hydrate a rolling
+in-memory window once and append on persist (pending wins). Globex (~17h) and
+historical-baseline lookbacks longer than that cap fail closed. `query_series`
+evaluates unstamped Derived Features in one pass. Catalog-field rules bindings
+are live-only — `run_backtest` / hypothesis registration reject `CatalogField`.
 Historical Feature-IR loads use a bounded `LIMIT cap+1` sentinel — never
 `Database::list_journal_frames()`.
 

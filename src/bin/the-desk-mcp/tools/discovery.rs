@@ -239,11 +239,7 @@ impl TheDeskMcp {
         // Single-symbol (M1b shape): requested root must match the snapshot when known.
         if requested_roots.len() == 1 {
             let want = requested_roots[0];
-            if let Some(root) = snapshot_owned
-                .as_ref()
-                .and_then(|s| s.get("rootSymbol"))
-                .and_then(|v| v.as_str())
-            {
+            if let Some(root) = snapshot_root_symbol(snapshot_owned.as_ref()) {
                 if let Ok(have) = RouterRoot::parse(root) {
                     if have != want {
                         if let Some(piece) = live_by_symbol.get(&want) {
@@ -301,10 +297,7 @@ impl TheDeskMcp {
         }
 
         let fields = params.fields.clone();
-        let eval_root = snapshot_owned
-            .as_ref()
-            .and_then(|s| s.get("rootSymbol"))
-            .and_then(|v| v.as_str())
+        let eval_root = snapshot_root_symbol(snapshot_owned.as_ref())
             .map(|s| s.to_string())
             .or_else(|| requested_roots.first().map(|r| r.as_str().to_string()))
             .unwrap_or_else(|| "NQ".into());
@@ -1138,6 +1131,15 @@ fn catalog_with_registry_overlay(
     let db = server.db.lock().map_err(|_| lock_error())?;
     let overlay = db.list_feature_registry().map_err(db_error)?;
     Ok(build_catalog_with_overlay(overlay))
+}
+
+/// Non-empty `rootSymbol` on a live snapshot (empty string is treated as unknown).
+fn snapshot_root_symbol(snapshot: Option<&serde_json::Value>) -> Option<&str> {
+    snapshot
+        .and_then(|s| s.get("rootSymbol"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
 }
 
 /// Loads the Feature-IR eval window: bounded SQLite history concatenated with

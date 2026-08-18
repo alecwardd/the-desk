@@ -82,7 +82,7 @@ Your playbook / your rules say how to act on this context — the tools report s
 
 - `get_proximity_report` — which levels are near, sorted by distance.
 - `get_delta_at_price` + `check_delta_confirmation` — is delta supporting the trade direction at that level? (Required before entry per playbook doctrine.)
-- DOM behavior at the level: `get_liquidity_behavior_at_level`, `get_pull_stack_activity`, `explain_book_reaction`, `get_dom_window`, `get_dom_regime_summary`. Ladder / pull-stack reconstruct from Sierra `.depth` (`DepthReader`). Window / tape / book-reaction narrative uses compact `dom_feature_snapshots` (with `.depth` fallback). Research uses Journal Frame `domSummary` / Capsules — not SQLite `depth_events` (SIL-M3f stopped live appends).
+- DOM behavior at the level: `get_liquidity_behavior_at_level`, `get_pull_stack_activity`, `explain_book_reaction`, `get_dom_window`, `get_dom_regime_summary`. Ladder / pull-stack reconstruct from Sierra `.depth` (`DepthReader`). Window / tape / book-reaction narrative uses compact `dom_feature_snapshots` (with `.depth` fallback). Research uses Journal Frame `domSummary` / Capsules — not SQLite `depth_events` (SIL-M3f stopped live appends). DOM-cluster Base Detectors (`detector.stop_run`, `detector.iceberg_reload`, `detector.pull_intent`, `detector.book_velocity_regime_shift`, `detector.mm_flow`) are catalog-discoverable; compact fields ride `get_state`, events ride `get_events` / `get_attention_inbox` with `capsuleRef`. No specialty getter and no `get_capsule`.
 - Historical: `query_dom_reaction_at_levels`, `query_event_frequency` (e.g. `ib_extension_hit`), `query_conditional`.
 
 ### Setup and trade-idea lifecycle (potential trades)

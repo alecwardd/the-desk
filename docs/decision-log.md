@@ -914,6 +914,26 @@ This note does not implement the four dependent Derived Feature / setup rows, Fe
 
 ---
 
+### Decision note: SIL-M5e Tier-1 Base Detectors — DOM cluster
+
+**Date:** 2026-08-18
+**Status:** Decided (implements [alecwardd/the-desk#22](https://github.com/alecwardd/the-desk/issues/22); Part of #2)
+
+**Context:** SIL-M5d landed the leg-to-leg profile engine. Spec (#2) user story 12 and ADR-024 still needed reviewed-Rust Base Detectors for the DOM cluster so Capsule-mandatory types are emitted on the live/backfill path, not only from injected `stop_run` rows. Capsule policy (M3b / #10, M4 / #9) was already in place: `DOM_FAMILY_EVENT_TYPES` = `stop_run`, `iceberg_reload`, `pull_intent`, `book_velocity_regime_shift`; `requires_capsule` including `*_invalidated`; one Capsule per triggering `open`; 30s lookback / 60s after from a 250 ms in-memory ring. There is no 250 ms SQLite forever-store.
+
+**Decision:**
+
+1. **`DomClusterPipeline`** (`src/pipelines/dom_cluster.rs`) is a 16th incremental `PipelineEngine` member. Four named detectors emit Capsule-mandatory DOM-family types: book velocity → `book_velocity_regime_shift`; market-by-price iceberg/reload inference → `iceberg_reload`; stop-run (tape displacement + near-touch thinning) → `stop_run`; pull-intent (one-sided pull vs fill) → `pull_intent`. A fifth registry row, `detector.mm_flow`, is a compact composite over those four. It does **not** invent a fifth Capsule-mandatory type. Thinning vs thickening and stop-cluster maps are context for these detectors (compact `stopClusterPrice` / pull rate on `get_state`) — not a sixth detector family and not a specialty tool.
+2. **Market-by-price only.** `.depth` is MbP. Reload inference requires a fill-classified size drop then size return within 2s. Pull-then-repost is not an iceberg. No MBO, Databento, ConvexValue, or new depth file format. Compact `DomSummary` pull/stack/refill/bias/churn is reused. `depth_events` stays off the live hot path (SIL-M3f). Missing bid/ask fails closed (compact detector fields omitted; `domBookPresent=false`).
+3. **Capsules on the existing persist path.** Emissions go MarketEvent → `FlowEventEmitter` (monotonic `event_seq`, not ring length) → `note_transition_events` / persist so Capsules open the same way injected `stop_run` already did. Live `.depth` poll (`apply_depth_persist_work`) routes through `MarketRouter::apply_dom_update` so goldens and production share one seam; depth detection uses `detect_dom_into` only (it must not steal tick-loop watermarks). Backfill `detect_into` would emit if a book were fed. Research queries for DOM-family types are **live `.depth` only** — historical `.scid` backfill does not interleave a book. Pipeline reset keeps `event_seq` so the emitter recovers without an emitter reset. Session scope: full reset Asia/RTH; London keeps the Globex book; RTH and Globex never mix. Constants are frozen in-module (no `config.toml` knobs). NQ tick = 0.25.
+4. **Registry-governed, no specialty tool.** `detector.stop_run`, `detector.iceberg_reload`, `detector.pull_intent`, `detector.book_velocity_regime_shift`, and `detector.mm_flow` ship `kind=BaseDetector` / `source=rust_pipeline` / `math_tier=tier1_reviewed_rust` / `promotion=active` / `builtin=true` / `behaviorChange=false` / `program=None`. Compact fields ride `get_state` / catalog (`DelayedDepthOptional`). Reads of Capsules stay on `get_events` / `get_attention_inbox` (`capsuleRef`). `DETECTOR_SPECIALTY_TOOLS` stays the existing four. Surface stays **123 tools**. There is no `get_capsule` MCP tool.
+
+This note does not implement ACSIL (#23), Vs3dProvider (#16), SIL-OPS backups (#24), `get_leg_profile`, the four M5d Derived Feature rows, Feature-IR / a sixth Operator Family / a sixth codegen emitter, DuckDB, Parquet conversion, a 250 ms forever-store, `get_capsule`, or raising the Trust Ceiling. DOM-family events cannot skip Capsules.
+
+**Consequences:** Agents discover the DOM cluster via `search_catalog` and read compact fields on `get_state`. Detector-emitted DOM-family rows on `get_events` carry `capsuleRef`. MBO / Databento are not in the product.
+
+---
+
 ### Decision note: SIL-P-VS-a Levels-Only Record path
 
 **Date:** 2026-08-13

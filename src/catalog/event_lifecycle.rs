@@ -226,8 +226,8 @@ impl EventFamily {
 
 /// DOM-family event types Capsules key off.
 ///
-/// These types are not emitted by today's detectors (SIL-M5e). Tests inject
-/// synthetic rows. The registry may extend this list.
+/// SIL-M5e Base Detectors emit these types on the live/backfill path.
+/// Tests may still inject synthetic rows. The registry may extend this list.
 pub const DOM_FAMILY_EVENT_TYPES: &[&str] = &[
     "stop_run",
     "iceberg_reload",

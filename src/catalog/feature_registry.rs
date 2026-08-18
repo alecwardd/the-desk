@@ -739,6 +739,44 @@ pub fn builtin_base_detectors() -> Vec<FeatureDescriptor> {
             ),
         ),
         shipped_detector(
+            "detector.book_velocity_regime_shift",
+            "book_velocity_regime_shift",
+            "liquidity",
+            "Base Detector: book-update velocity regime shift (reviewed Rust). Schema, provenance, and promotion are registry-governed. Math lives in pipelines::dom_cluster. Emits Capsule-mandatory book_velocity_regime_shift. Compact regime fields ride get_state — no specialty getter.",
+            "pipelines::dom_cluster",
+            shipped_schema(
+                &[
+                    "market.liquidity.bookVelocityPerSec",
+                    "market.liquidity.bookVelocityRegime",
+                    "market.liquidity.domBookPresent",
+                ],
+                &["book_velocity_regime_shift"],
+                Unit::EnumLabel,
+                SessionScope::Session,
+                FreshnessSemantics::DelayedDepthOptional,
+                CostHint::R1,
+            ),
+        ),
+        shipped_detector(
+            "detector.iceberg_reload",
+            "iceberg_reload",
+            "liquidity",
+            "Base Detector: market-by-price iceberg/reload inference (reviewed Rust, not MBO). Schema, provenance, and promotion are registry-governed. Math lives in pipelines::dom_cluster. Emits Capsule-mandatory iceberg_reload. Compact last-reload fields ride get_state — no specialty getter.",
+            "pipelines::dom_cluster",
+            shipped_schema(
+                &[
+                    "market.liquidity.domBookPresent",
+                    "market.liquidity.icebergReloadPrice",
+                    "market.liquidity.icebergReloadSide",
+                ],
+                &["iceberg_reload"],
+                Unit::EnumLabel,
+                SessionScope::Session,
+                FreshnessSemantics::DelayedDepthOptional,
+                CostHint::R1,
+            ),
+        ),
+        shipped_detector(
             "detector.leg_to_leg",
             "leg_to_leg",
             "flow",
@@ -776,6 +814,25 @@ pub fn builtin_base_detectors() -> Vec<FeatureDescriptor> {
             ),
         ),
         shipped_detector(
+            "detector.mm_flow",
+            "mm_flow",
+            "liquidity",
+            "Base Detector: market-maker flow composite over book velocity, MbP reload, stop-run, and pull-intent (reviewed Rust). Schema, provenance, and promotion are registry-governed. Math lives in pipelines::dom_cluster. Compact mmFlowStatus / mmFlowScore ride get_state. Does not emit a fifth Capsule-mandatory event type. Discovery rides search_catalog — no specialty getter.",
+            "pipelines::dom_cluster",
+            shipped_schema(
+                &[
+                    "market.liquidity.domBookPresent",
+                    "market.liquidity.mmFlowScore",
+                    "market.liquidity.mmFlowStatus",
+                ],
+                &[],
+                Unit::EnumLabel,
+                SessionScope::Session,
+                FreshnessSemantics::DelayedDepthOptional,
+                CostHint::R1,
+            ),
+        ),
+        shipped_detector(
             "detector.pinch",
             "pinch",
             "flow",
@@ -787,6 +844,25 @@ pub fn builtin_base_detectors() -> Vec<FeatureDescriptor> {
                 Unit::Count,
                 SessionScope::Session,
                 FreshnessSemantics::LiveTickAnchored,
+                CostHint::R1,
+            ),
+        ),
+        shipped_detector(
+            "detector.pull_intent",
+            "pull_intent",
+            "liquidity",
+            "Base Detector: one-sided pull-intent from market-by-price pull vs fill classification (reviewed Rust). Schema, provenance, and promotion are registry-governed. Math lives in pipelines::dom_cluster. Emits Capsule-mandatory pull_intent. Compact side/rate fields ride get_state — no specialty getter.",
+            "pipelines::dom_cluster",
+            shipped_schema(
+                &[
+                    "market.liquidity.domBookPresent",
+                    "market.liquidity.pullIntentRate",
+                    "market.liquidity.pullIntentSide",
+                ],
+                &["pull_intent"],
+                Unit::EnumLabel,
+                SessionScope::Session,
+                FreshnessSemantics::DelayedDepthOptional,
                 CostHint::R1,
             ),
         ),
@@ -817,6 +893,25 @@ pub fn builtin_base_detectors() -> Vec<FeatureDescriptor> {
                 Unit::Count,
                 SessionScope::Session,
                 FreshnessSemantics::LiveTickAnchored,
+                CostHint::R1,
+            ),
+        ),
+        shipped_detector(
+            "detector.stop_run",
+            "stop_run",
+            "liquidity",
+            "Base Detector: stop-run detection from one-way tape displacement plus near-touch thinning (reviewed Rust). Schema, provenance, and promotion are registry-governed. Math lives in pipelines::dom_cluster. Emits Capsule-mandatory stop_run. Compact direction and stop-cluster price ride get_state — no specialty getter.",
+            "pipelines::dom_cluster",
+            shipped_schema(
+                &[
+                    "market.liquidity.domBookPresent",
+                    "market.liquidity.stopClusterPrice",
+                    "market.liquidity.stopRunDirection",
+                ],
+                &["stop_run"],
+                Unit::EnumLabel,
+                SessionScope::Session,
+                FreshnessSemantics::DelayedDepthOptional,
                 CostHint::R1,
             ),
         ),
@@ -1056,24 +1151,51 @@ mod tests {
     }
 
     #[test]
-    fn dom_cluster_detectors_are_not_registered_in_m5a() {
+    fn dom_cluster_detectors_are_builtin_active_and_capsule_mandatory() {
         let registry = FeatureRegistry::builtins();
+        let catalog = build_catalog();
         for ty in DOM_FAMILY_EVENT_TYPES {
             let id = format!("detector.{ty}");
+            let d = registry.get(&id).unwrap_or_else(|| panic!("{id}"));
+            assert_eq!(d.kind, FeatureKind::BaseDetector);
+            assert_eq!(d.promotion_state, PromotionState::Active);
+            assert!(d.builtin);
+            assert!(!d.provenance.behavior_change);
+            assert_eq!(d.provenance.source, RUST_PIPELINE_SOURCE);
+            assert_eq!(d.provenance.math_tier, TIER1_REVIEWED_RUST);
+            assert!(d.program.is_none());
+            assert!(d.schema.event_types.iter().any(|e| e == ty));
+            assert!(crate::catalog::requires_capsule(ty));
+            assert!(crate::catalog::is_dom_family_event_type(ty));
+            assert!(crate::catalog::requires_capsule(&format!(
+                "{ty}_invalidated"
+            )));
+            assert!(concept_has_catalog_or_registry_entry(&catalog, &id));
+            assert!(crate::catalog::search_features(&catalog, ty)
+                .iter()
+                .any(|h| h.id == id));
+        }
+        let mm = registry.get("detector.mm_flow").expect("detector.mm_flow");
+        assert_eq!(mm.kind, FeatureKind::BaseDetector);
+        assert_eq!(mm.promotion_state, PromotionState::Active);
+        assert!(mm.builtin);
+        assert!(!mm.provenance.behavior_change);
+        assert!(mm.program.is_none());
+        assert!(mm.schema.event_types.is_empty());
+        for event in &mm.schema.event_types {
             assert!(
-                registry.get(&id).is_none(),
-                "{id} is SIL-M5e and must not be a shipped Base Detector here"
+                !DOM_FAMILY_EVENT_TYPES.contains(&event.as_str()),
+                "mm_flow must not invent a fifth Capsule-mandatory type"
             );
         }
-        let catalog = build_catalog();
-        assert!(!concept_has_catalog_or_registry_entry(
+        assert!(concept_has_catalog_or_registry_entry(
             &catalog,
-            "detector.iceberg_reload"
+            "detector.mm_flow"
         ));
-        assert!(!concept_has_catalog_or_registry_entry(
-            &catalog,
-            "detector.stop_run"
-        ));
+        assert!(crate::catalog::search_features(&catalog, "mm_flow")
+            .iter()
+            .any(|h| h.id == "detector.mm_flow"));
+        assert_eq!(DETECTOR_SPECIALTY_TOOLS.len(), 4);
     }
 
     #[test]
@@ -1202,9 +1324,13 @@ mod tests {
     #[test]
     fn unregistered_concept_cannot_add_a_specialty_tool() {
         let catalog = build_catalog();
-        assert!(!concept_has_catalog_or_registry_entry(
+        assert!(concept_has_catalog_or_registry_entry(
             &catalog,
             "detector.iceberg_reload"
+        ));
+        assert!(!concept_has_catalog_or_registry_entry(
+            &catalog,
+            "detector.mbo_iceberg"
         ));
         assert!(concept_has_catalog_or_registry_entry(
             &catalog,

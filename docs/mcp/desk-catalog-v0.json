@@ -139,8 +139,19 @@
     {
       "id": "liquidity",
       "name": "Liquidity",
-      "summary": "Order-book / DOM liquidity summaries when depth context is available.",
+      "summary": "Order-book / DOM liquidity: compact book-velocity, MbP reload, stop-run, pull-intent, and MM-flow fields when depth context is available.",
       "fieldIds": [
+        "market.liquidity.domBookPresent",
+        "market.liquidity.bookVelocityRegime",
+        "market.liquidity.bookVelocityPerSec",
+        "market.liquidity.icebergReloadSide",
+        "market.liquidity.icebergReloadPrice",
+        "market.liquidity.stopRunDirection",
+        "market.liquidity.stopClusterPrice",
+        "market.liquidity.pullIntentSide",
+        "market.liquidity.pullIntentRate",
+        "market.liquidity.mmFlowStatus",
+        "market.liquidity.mmFlowScore",
         "market.liquidity.domSummary"
       ]
     },
@@ -1163,12 +1174,133 @@
       "costHint": "R0"
     },
     {
+      "id": "market.liquidity.bookVelocityPerSec",
+      "name": "bookVelocityPerSec",
+      "domainId": "liquidity",
+      "description": "Short-window book update rate (events/sec). Absent when the book is missing.",
+      "rustField": "book_velocity_per_sec",
+      "unit": "ratio",
+      "sessionScope": "session",
+      "freshness": "delayedDepthOptional",
+      "costHint": "R1"
+    },
+    {
+      "id": "market.liquidity.bookVelocityRegime",
+      "name": "bookVelocityRegime",
+      "domainId": "liquidity",
+      "description": "Book-update velocity regime: `quiet` / `normal` / `fast`. Absent when the book is missing.",
+      "rustField": "book_velocity_regime",
+      "unit": "enumLabel",
+      "sessionScope": "session",
+      "freshness": "delayedDepthOptional",
+      "costHint": "R1"
+    },
+    {
+      "id": "market.liquidity.domBookPresent",
+      "name": "domBookPresent",
+      "domainId": "liquidity",
+      "description": "True when a usable bid/ask book has been observed this session. Omitted when the book is missing (fail-closed).",
+      "rustField": "dom_book_present",
+      "unit": "bool",
+      "sessionScope": "session",
+      "freshness": "delayedDepthOptional",
+      "costHint": "R1"
+    },
+    {
       "id": "market.liquidity.domSummary",
       "name": "domSummary",
       "domainId": "liquidity",
       "description": "Compact delayed DOM summary when historical depth context is available.",
       "rustField": "dom_summary",
       "unit": "structuredBlob",
+      "sessionScope": "session",
+      "freshness": "delayedDepthOptional",
+      "costHint": "R1"
+    },
+    {
+      "id": "market.liquidity.icebergReloadPrice",
+      "name": "icebergReloadPrice",
+      "domainId": "liquidity",
+      "description": "Price of the most recent market-by-price reload inference.",
+      "rustField": "iceberg_reload_price",
+      "unit": "pricePoints",
+      "sessionScope": "session",
+      "freshness": "delayedDepthOptional",
+      "costHint": "R1"
+    },
+    {
+      "id": "market.liquidity.icebergReloadSide",
+      "name": "icebergReloadSide",
+      "domainId": "liquidity",
+      "description": "Side of the most recent market-by-price reload inference (`bid` / `ask`).",
+      "rustField": "iceberg_reload_side",
+      "unit": "enumLabel",
+      "sessionScope": "session",
+      "freshness": "delayedDepthOptional",
+      "costHint": "R1"
+    },
+    {
+      "id": "market.liquidity.mmFlowScore",
+      "name": "mmFlowScore",
+      "domainId": "liquidity",
+      "description": "Market-maker flow composite score in `[-1, 1]` (positive = bid-dominant).",
+      "rustField": "mm_flow_score",
+      "unit": "ratio",
+      "sessionScope": "session",
+      "freshness": "delayedDepthOptional",
+      "costHint": "R1"
+    },
+    {
+      "id": "market.liquidity.mmFlowStatus",
+      "name": "mmFlowStatus",
+      "domainId": "liquidity",
+      "description": "Market-maker flow composite status: `insufficient` / `none` / `bid_dominant` / `ask_dominant` / `mixed`.",
+      "rustField": "mm_flow_status",
+      "unit": "enumLabel",
+      "sessionScope": "session",
+      "freshness": "delayedDepthOptional",
+      "costHint": "R1"
+    },
+    {
+      "id": "market.liquidity.pullIntentRate",
+      "name": "pullIntentRate",
+      "domainId": "liquidity",
+      "description": "Pull rate on the intent side (0–1).",
+      "rustField": "pull_intent_rate",
+      "unit": "ratio",
+      "sessionScope": "session",
+      "freshness": "delayedDepthOptional",
+      "costHint": "R1"
+    },
+    {
+      "id": "market.liquidity.pullIntentSide",
+      "name": "pullIntentSide",
+      "domainId": "liquidity",
+      "description": "Side showing pull-intent (`bid` / `ask`).",
+      "rustField": "pull_intent_side",
+      "unit": "enumLabel",
+      "sessionScope": "session",
+      "freshness": "delayedDepthOptional",
+      "costHint": "R1"
+    },
+    {
+      "id": "market.liquidity.stopClusterPrice",
+      "name": "stopClusterPrice",
+      "domainId": "liquidity",
+      "description": "Compact stop-cluster marker: first thinned price of the open (or last) run.",
+      "rustField": "stop_cluster_price",
+      "unit": "pricePoints",
+      "sessionScope": "session",
+      "freshness": "delayedDepthOptional",
+      "costHint": "R1"
+    },
+    {
+      "id": "market.liquidity.stopRunDirection",
+      "name": "stopRunDirection",
+      "domainId": "liquidity",
+      "description": "Direction of an open stop-run (`up` / `down`).",
+      "rustField": "stop_run_direction",
+      "unit": "enumLabel",
       "sessionScope": "session",
       "freshness": "delayedDepthOptional",
       "costHint": "R1"
@@ -2180,6 +2312,64 @@
       "builtin": true
     },
     {
+      "id": "detector.book_velocity_regime_shift",
+      "name": "book_velocity_regime_shift",
+      "kind": "baseDetector",
+      "description": "Base Detector: book-update velocity regime shift (reviewed Rust). Schema, provenance, and promotion are registry-governed. Math lives in pipelines::dom_cluster. Emits Capsule-mandatory book_velocity_regime_shift. Compact regime fields ride get_state — no specialty getter.",
+      "domainId": "liquidity",
+      "schema": {
+        "catalogFieldIds": [
+          "market.liquidity.bookVelocityPerSec",
+          "market.liquidity.bookVelocityRegime",
+          "market.liquidity.domBookPresent"
+        ],
+        "eventTypes": [
+          "book_velocity_regime_shift"
+        ],
+        "unit": "enumLabel",
+        "sessionScope": "session",
+        "freshness": "delayedDepthOptional",
+        "costHint": "R1"
+      },
+      "provenance": {
+        "source": "rust_pipeline",
+        "rustModule": "pipelines::dom_cluster",
+        "mathTier": "tier1_reviewed_rust",
+        "behaviorChange": false
+      },
+      "promotionState": "active",
+      "builtin": true
+    },
+    {
+      "id": "detector.iceberg_reload",
+      "name": "iceberg_reload",
+      "kind": "baseDetector",
+      "description": "Base Detector: market-by-price iceberg/reload inference (reviewed Rust, not MBO). Schema, provenance, and promotion are registry-governed. Math lives in pipelines::dom_cluster. Emits Capsule-mandatory iceberg_reload. Compact last-reload fields ride get_state — no specialty getter.",
+      "domainId": "liquidity",
+      "schema": {
+        "catalogFieldIds": [
+          "market.liquidity.domBookPresent",
+          "market.liquidity.icebergReloadPrice",
+          "market.liquidity.icebergReloadSide"
+        ],
+        "eventTypes": [
+          "iceberg_reload"
+        ],
+        "unit": "enumLabel",
+        "sessionScope": "session",
+        "freshness": "delayedDepthOptional",
+        "costHint": "R1"
+      },
+      "provenance": {
+        "source": "rust_pipeline",
+        "rustModule": "pipelines::dom_cluster",
+        "mathTier": "tier1_reviewed_rust",
+        "behaviorChange": false
+      },
+      "promotionState": "active",
+      "builtin": true
+    },
+    {
       "id": "detector.leg_to_leg",
       "name": "leg_to_leg",
       "kind": "baseDetector",
@@ -2228,6 +2418,33 @@
       "builtin": true
     },
     {
+      "id": "detector.mm_flow",
+      "name": "mm_flow",
+      "kind": "baseDetector",
+      "description": "Base Detector: market-maker flow composite over book velocity, MbP reload, stop-run, and pull-intent (reviewed Rust). Schema, provenance, and promotion are registry-governed. Math lives in pipelines::dom_cluster. Compact mmFlowStatus / mmFlowScore ride get_state. Does not emit a fifth Capsule-mandatory event type. Discovery rides search_catalog — no specialty getter.",
+      "domainId": "liquidity",
+      "schema": {
+        "catalogFieldIds": [
+          "market.liquidity.domBookPresent",
+          "market.liquidity.mmFlowScore",
+          "market.liquidity.mmFlowStatus"
+        ],
+        "eventTypes": [],
+        "unit": "enumLabel",
+        "sessionScope": "session",
+        "freshness": "delayedDepthOptional",
+        "costHint": "R1"
+      },
+      "provenance": {
+        "source": "rust_pipeline",
+        "rustModule": "pipelines::dom_cluster",
+        "mathTier": "tier1_reviewed_rust",
+        "behaviorChange": false
+      },
+      "promotionState": "active",
+      "builtin": true
+    },
+    {
       "id": "detector.pinch",
       "name": "pinch",
       "kind": "baseDetector",
@@ -2248,6 +2465,35 @@
       "provenance": {
         "source": "rust_pipeline",
         "rustModule": "pipelines::pinch",
+        "mathTier": "tier1_reviewed_rust",
+        "behaviorChange": false
+      },
+      "promotionState": "active",
+      "builtin": true
+    },
+    {
+      "id": "detector.pull_intent",
+      "name": "pull_intent",
+      "kind": "baseDetector",
+      "description": "Base Detector: one-sided pull-intent from market-by-price pull vs fill classification (reviewed Rust). Schema, provenance, and promotion are registry-governed. Math lives in pipelines::dom_cluster. Emits Capsule-mandatory pull_intent. Compact side/rate fields ride get_state — no specialty getter.",
+      "domainId": "liquidity",
+      "schema": {
+        "catalogFieldIds": [
+          "market.liquidity.domBookPresent",
+          "market.liquidity.pullIntentRate",
+          "market.liquidity.pullIntentSide"
+        ],
+        "eventTypes": [
+          "pull_intent"
+        ],
+        "unit": "enumLabel",
+        "sessionScope": "session",
+        "freshness": "delayedDepthOptional",
+        "costHint": "R1"
+      },
+      "provenance": {
+        "source": "rust_pipeline",
+        "rustModule": "pipelines::dom_cluster",
         "mathTier": "tier1_reviewed_rust",
         "behaviorChange": false
       },
@@ -2289,6 +2535,35 @@
       "provenance": {
         "source": "rust_pipeline",
         "rustModule": "pipelines::rebid_reoffer",
+        "mathTier": "tier1_reviewed_rust",
+        "behaviorChange": false
+      },
+      "promotionState": "active",
+      "builtin": true
+    },
+    {
+      "id": "detector.stop_run",
+      "name": "stop_run",
+      "kind": "baseDetector",
+      "description": "Base Detector: stop-run detection from one-way tape displacement plus near-touch thinning (reviewed Rust). Schema, provenance, and promotion are registry-governed. Math lives in pipelines::dom_cluster. Emits Capsule-mandatory stop_run. Compact direction and stop-cluster price ride get_state — no specialty getter.",
+      "domainId": "liquidity",
+      "schema": {
+        "catalogFieldIds": [
+          "market.liquidity.domBookPresent",
+          "market.liquidity.stopClusterPrice",
+          "market.liquidity.stopRunDirection"
+        ],
+        "eventTypes": [
+          "stop_run"
+        ],
+        "unit": "enumLabel",
+        "sessionScope": "session",
+        "freshness": "delayedDepthOptional",
+        "costHint": "R1"
+      },
+      "provenance": {
+        "source": "rust_pipeline",
+        "rustModule": "pipelines::dom_cluster",
         "mathTier": "tier1_reviewed_rust",
         "behaviorChange": false
       },

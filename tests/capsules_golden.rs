@@ -1,9 +1,9 @@
-//! Golden/fixture: Capsules around an injected DOM-family Event.
+//! Golden/fixture: Capsules around DOM-family Events.
 //!
-//! Detectors do not emit `stop_run` yet (SIL-M5e). This fixture injects a
-//! synthetic `stop_run` MarketEvent so Capsule policy can be asserted on the
-//! MarketRouter clock: ~30 s before → ~60 s after, joinable to the event and
-//! 1 Hz Journal Frames. No 250 ms forever-store.
+//! The injected `stop_run` row keeps the original window invariant (30s before /
+//! 60s after, one Capsule per `open`). A second fixture drives a real
+//! `DomClusterPipeline` stop-run so Capsules also open on detector-emitted
+//! types, not only injected rows. No 250 ms forever-store.
 
 use the_desk_backend::db::{journal_frame_second_from_ts, Database};
 use the_desk_backend::engine::{
@@ -127,5 +127,213 @@ fn golden_stop_run_capsule_window_on_market_clock() {
     assert!(
         total_frames < ticks,
         "must not persist the 250 ms ring: frames={total_frames} ticks={ticks}"
+    );
+}
+
+fn book_snapshot(
+    ts: f64,
+    bid_qty: u32,
+    ask_qty: u32,
+    bid: f64,
+    ask: f64,
+) -> the_desk_backend::depth::DomSnapshot {
+    use the_desk_backend::depth::{DepthBook, DepthCommand, DepthRecord, DepthSide};
+    let mut book = DepthBook::default();
+    book.apply(&DepthRecord {
+        timestamp_ms: ts,
+        command: DepthCommand::AddBidLevel,
+        side: Some(DepthSide::Bid),
+        end_of_batch: true,
+        num_orders: 1,
+        price: bid,
+        quantity: bid_qty,
+    });
+    book.apply(&DepthRecord {
+        timestamp_ms: ts,
+        command: DepthCommand::AddAskLevel,
+        side: Some(DepthSide::Ask),
+        end_of_batch: true,
+        num_orders: 1,
+        price: ask,
+        quantity: ask_qty,
+    });
+    book.snapshot("golden.depth", ts, 10)
+}
+
+#[test]
+fn golden_detector_driven_stop_run_opens_capsule() {
+    use the_desk_backend::depth::PullStackActivitySummary;
+
+    let db = Database::open(":memory:").expect("db");
+    let router = MarketRouter::new(
+        RouterRoot::Nq,
+        SourceProviderKind::File,
+        "golden-detector-capsule",
+    );
+    let start = RTH_TS;
+    let lookback_n = (CAPSULE_LOOKBACK_MS / CAPSULE_RING_STEP_MS) as i32;
+    for i in 0..=lookback_n {
+        router.apply_tick(
+            RouterRoot::Nq,
+            &tick(start + i as f64 * CAPSULE_RING_STEP_MS, 20_000.0),
+        );
+        router.apply_tick(
+            RouterRoot::Es,
+            &tick(start + i as f64 * CAPSULE_RING_STEP_MS + 10.0, 5_000.0),
+        );
+    }
+
+    let seed_ts = start + CAPSULE_LOOKBACK_MS;
+    let activity = PullStackActivitySummary::default();
+    router
+        .apply_dom_update(
+            RouterRoot::Nq,
+            &book_snapshot(seed_ts, 80, 80, 20_000.0, 20_000.25),
+            &activity,
+            seed_ts,
+        )
+        .expect("seed book");
+
+    let mut last_ts = seed_ts;
+    for i in 1..=10 {
+        last_ts = seed_ts + i as f64 * 80.0;
+        let price = 20_000.0 + i as f64 * 0.25;
+        router.apply_tick(RouterRoot::Nq, &tick(last_ts, price));
+        let ask_qty = if i >= 6 { 20 } else { 80 };
+        router
+            .apply_dom_update(
+                RouterRoot::Nq,
+                &book_snapshot(last_ts, 80, ask_qty, price - 0.25, price),
+                &activity,
+                last_ts,
+            )
+            .expect("thin book");
+    }
+
+    let after_n = (CAPSULE_AFTER_MS / CAPSULE_RING_STEP_MS) as i32;
+    for i in 1..=after_n {
+        router.apply_tick(
+            RouterRoot::Nq,
+            &tick(last_ts + i as f64 * CAPSULE_RING_STEP_MS, 20_002.5),
+        );
+    }
+    router.persist_journal(&db).expect("persist");
+
+    let events = db
+        .list_recent_market_events(20, None, Some("stop_run"))
+        .expect("events");
+    assert!(
+        !events.is_empty(),
+        "detector-driven stop_run must persist (not only injected rows)"
+    );
+    let capsules = db.list_capsules().expect("capsules");
+    assert!(
+        capsules.iter().any(|c| c.event_type == "stop_run"),
+        "every detector-driven stop_run must open a Capsule; capsules={capsules:?}"
+    );
+    let cap = capsules
+        .iter()
+        .find(|c| c.event_type == "stop_run")
+        .expect("stop_run capsule");
+    assert!((cap.window_end_ms - cap.window_start_ms - 90_000.0).abs() < 1.0);
+    assert_eq!(
+        cap.trigger_identity_id,
+        events[0]["identityId"].as_str().unwrap()
+    );
+    let total_frames = db.count_journal_frames().expect("frame count");
+    assert!(
+        total_frames < (lookback_n + after_n + 20) as i64,
+        "must not persist the 250 ms ring"
+    );
+}
+
+fn pull_heavy_bid() -> the_desk_backend::depth::PullStackActivitySummary {
+    use the_desk_backend::depth::{PullStackActivitySummary, SideActivitySummary};
+    PullStackActivitySummary {
+        source_file: "golden.depth".into(),
+        bid: SideActivitySummary {
+            add_events: 0,
+            modify_up_events: 0,
+            modify_down_events: 4,
+            delete_events: 4,
+            stacked_quantity: 0.0,
+            removed_quantity: 80.0,
+            estimated_filled_quantity: 10.0,
+            estimated_pulled_quantity: 70.0,
+        },
+        ask: SideActivitySummary {
+            add_events: 2,
+            modify_up_events: 2,
+            modify_down_events: 0,
+            delete_events: 0,
+            stacked_quantity: 40.0,
+            removed_quantity: 5.0,
+            estimated_filled_quantity: 5.0,
+            estimated_pulled_quantity: 0.0,
+        },
+        ..Default::default()
+    }
+}
+
+#[test]
+fn golden_detector_driven_pull_intent_opens_capsule() {
+    let db = Database::open(":memory:").expect("db");
+    let router = MarketRouter::new(
+        RouterRoot::Nq,
+        SourceProviderKind::File,
+        "golden-detector-pull",
+    );
+    let start = RTH_TS;
+    let lookback_n = (CAPSULE_LOOKBACK_MS / CAPSULE_RING_STEP_MS) as i32;
+    for i in 0..=lookback_n {
+        router.apply_tick(
+            RouterRoot::Nq,
+            &tick(start + i as f64 * CAPSULE_RING_STEP_MS, 20_000.0),
+        );
+        router.apply_tick(
+            RouterRoot::Es,
+            &tick(start + i as f64 * CAPSULE_RING_STEP_MS + 10.0, 5_000.0),
+        );
+    }
+
+    let event_ts = start + CAPSULE_LOOKBACK_MS;
+    router
+        .apply_dom_update(
+            RouterRoot::Nq,
+            &book_snapshot(event_ts, 10, 40, 20_000.0, 20_000.25),
+            &pull_heavy_bid(),
+            event_ts,
+        )
+        .expect("pull-intent book");
+
+    let after_n = (CAPSULE_AFTER_MS / CAPSULE_RING_STEP_MS) as i32;
+    for i in 1..=after_n {
+        router.apply_tick(
+            RouterRoot::Nq,
+            &tick(event_ts + i as f64 * CAPSULE_RING_STEP_MS, 20_000.0),
+        );
+    }
+    router.persist_journal(&db).expect("persist");
+
+    let events = db
+        .list_recent_market_events(20, None, Some("pull_intent"))
+        .expect("events");
+    assert!(
+        !events.is_empty(),
+        "detector-driven pull_intent must persist (not only injected rows)"
+    );
+    let capsules = db.list_capsules().expect("capsules");
+    assert!(
+        capsules.iter().any(|c| c.event_type == "pull_intent"),
+        "every detector-driven pull_intent must open a Capsule; capsules={capsules:?}"
+    );
+    let cap = capsules
+        .iter()
+        .find(|c| c.event_type == "pull_intent")
+        .expect("pull_intent capsule");
+    assert!((cap.window_end_ms - cap.window_start_ms - 90_000.0).abs() < 1.0);
+    assert_eq!(
+        cap.trigger_identity_id,
+        events[0]["identityId"].as_str().unwrap()
     );
 }

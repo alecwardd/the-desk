@@ -68,6 +68,10 @@ pub(crate) const RESEARCH_EVENT_TYPES: &[&str] = &[
     "large_trade_cluster",
     "leg_started",
     "leg_completed",
+    "book_velocity_regime_shift",
+    "iceberg_reload",
+    "pull_intent",
+    "stop_run",
 ];
 pub(crate) const RESEARCH_LEVEL_TEST_NAMES: &[&str] = &[
     "prior_day_high",

@@ -4026,10 +4026,13 @@ fn apply_depth_persist_work_does_not_insert_depth_events() {
     apply_depth_persist_work(
         &server.db,
         &server.pipelines,
+        &server.flow_emitter,
         &server.last_bid,
         &server.last_ask,
         work,
         server.feed_runtime.as_ref(),
+        Some(server.market_router.as_ref()),
+        the_desk_backend::engine::RouterRoot::Nq,
     );
 
     let db = server.db.lock().expect("db lock");

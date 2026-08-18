@@ -31,7 +31,7 @@ flowchart TB
         WARM["Startup warm replay (~2 Globex opens)"]
         TAIL["Live .scid tail loop"]
         DLOOP["Live .depth poll loop"]
-        PIPE["15 pipelines + rules engine"]
+        PIPE["16 pipelines + rules engine"]
         DB[("SQLite data.db (derived cache)")]
         BK["Startup VACUUM INTO backup"]
         TOOLS["123 MCP tools (stdio)"]

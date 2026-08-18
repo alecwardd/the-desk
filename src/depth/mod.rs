@@ -138,7 +138,7 @@ pub struct PriceActivitySummary {
     pub estimated_pulled_quantity: f64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct PullStackActivitySummary {
     pub source_file: String,

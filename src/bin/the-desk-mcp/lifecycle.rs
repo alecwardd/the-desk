@@ -23,7 +23,7 @@ use the_desk_backend::depth::{
     DepthReader, DomFeatureSnapshot, DomSummary, PullStackActivitySummary,
     ScanControl as DepthScanControl, DOM_NARRATIVE_HORIZON_MS,
 };
-use the_desk_backend::engine::MarketRouter;
+use the_desk_backend::engine::{MarketRouter, RouterRoot};
 use the_desk_backend::feed::monotonic::{MonotonicTickGuard, MonotonicTimestampDecision};
 use the_desk_backend::feed::scid_reader::{
     scid_tail_offset_after_shrink, ScidReader, ScidTick, SCID_RECORD_SIZE,
@@ -1334,10 +1334,13 @@ pub(crate) fn compute_depth_poll_step(
 pub(crate) fn apply_depth_persist_work(
     db: &Arc<Mutex<Database>>,
     pipelines: &Arc<Mutex<PipelineEngine>>,
+    flow_emitter: &Arc<Mutex<FlowEventEmitter>>,
     last_bid: &Arc<Mutex<f64>>,
     last_ask: &Arc<Mutex<f64>>,
     mut work: DepthPersistWork,
     feed_rt: &McpFeedRuntimeState,
+    market_router: Option<&MarketRouter>,
+    coaching_root: RouterRoot,
 ) -> i64 {
     // SIL-M3f: `work.records` is the former bulk-insert payload. Count it so
     // the field stays live, then persist only compact snapshots below.
@@ -1386,8 +1389,50 @@ pub(crate) fn apply_depth_persist_work(
         );
     }
 
+    // Live `.depth` uses the same EngineHost seam as Capsule goldens
+    // (`MarketRouter::apply_dom_update` → `on_dom_feature` + `detect_dom_into`).
+    // Do not hold `pipelines` across that call (it locks the same mutex).
+    let mut dom_events = Vec::new();
+    if let Some(router) = market_router {
+        if let Some(out) = router.apply_dom_update(
+            coaching_root,
+            &work.snapshot,
+            &work.feature.activity,
+            work.feature.timestamp_ms,
+        ) {
+            dom_events = out.new_events;
+        }
+    } else {
+        if let Ok(mut pl) = pipelines.lock() {
+            pl.on_dom_feature(
+                &work.snapshot,
+                &work.feature.activity,
+                work.feature.timestamp_ms,
+            );
+        }
+        if let (Ok(pl), Ok(mut fe)) = (pipelines.lock(), flow_emitter.lock()) {
+            let session_date = session_date_from_timestamp_ms(work.feature.timestamp_ms);
+            fe.detect_dom_into(
+                &pl,
+                work.feature.timestamp_ms,
+                &session_date,
+                &mut dom_events,
+            );
+        }
+    }
+    // Overlay the enriched narrative summary after the detector update.
     if let Ok(mut pl) = pipelines.lock() {
         pl.set_dom_summary(Some(work.feature.dom_summary.clone()));
+    }
+    if !dom_events.is_empty() {
+        if let Ok(d) = db.lock() {
+            let _ = d.insert_market_events_batch_scoped(Some(coaching_root.as_str()), &dom_events);
+            if let Some(router) = market_router {
+                if let Err(err) = router.persist_journal(&d) {
+                    tracing::warn!(error = %err, "depth.journal_persist");
+                }
+            }
+        }
     }
 
     persist_feature_state_after_dom_summary(

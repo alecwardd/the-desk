@@ -474,6 +474,9 @@ impl DomClusterPipeline {
         last_trade_price: f64,
         last_trade_is_buy: Option<bool>,
     ) {
+        let bid_fill =
+            self.trade_at_level(timestamp_ms, last_trade_price, last_trade_is_buy, false);
+        let ask_fill = self.trade_at_level(timestamp_ms, last_trade_price, last_trade_is_buy, true);
         update_side_watches(
             self,
             timestamp_ms,
@@ -482,8 +485,7 @@ impl DomClusterPipeline {
                 (
                     l.price,
                     l.quantity as f64,
-                    self.trade_at_level(timestamp_ms, last_trade_price, last_trade_is_buy, false)
-                        && prices_equal(l.price, last_trade_price),
+                    bid_fill && prices_equal(l.price, last_trade_price),
                 )
             }),
         );
@@ -495,8 +497,7 @@ impl DomClusterPipeline {
                 (
                     l.price,
                     l.quantity as f64,
-                    self.trade_at_level(timestamp_ms, last_trade_price, last_trade_is_buy, true)
-                        && prices_equal(l.price, last_trade_price),
+                    ask_fill && prices_equal(l.price, last_trade_price),
                 )
             }),
         );

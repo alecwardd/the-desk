@@ -219,3 +219,20 @@ the-desk/
 - **Data integrity:** Cross-pipeline invariant checks (POC in VA, VA = 70% of TPOs, delta sum, DNVA within range).
 
 Run `cargo test` before every commit.
+
+---
+
+## Agent skills
+
+### Issue tracker
+
+Issues live in GitHub Issues for `alecwardd/the-desk` (via `gh`). See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Canonical five-role labels, 1:1 with tracker strings. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context layout. See `docs/agents/domain.md`.
+

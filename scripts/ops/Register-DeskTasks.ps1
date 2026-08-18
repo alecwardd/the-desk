@@ -45,9 +45,16 @@ function Quote-Path {
 function New-PowerShellAction {
     param(
         [Parameter(Mandatory)][string]$ScriptPath,
-        [string]$Arguments = ""
+        [string]$Arguments = "",
+        # Interactive Sierra keep-alive tasks only: hide the powershell.exe host so the
+        # 4-minute watchdog does not flash a Terminal/console window. Does not hide Sierra.
+        [switch]$HiddenWindow
     )
-    $arg = "-NoProfile -ExecutionPolicy Bypass -File $(Quote-Path $ScriptPath)"
+    $arg = if ($HiddenWindow) {
+        "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File $(Quote-Path $ScriptPath)"
+    } else {
+        "-NoProfile -ExecutionPolicy Bypass -File $(Quote-Path $ScriptPath)"
+    }
     if ($Arguments) {
         $arg = "$arg $Arguments"
     }
@@ -101,14 +108,16 @@ function Get-ExpectedTaskSpecs {
             Name = "Sierra Watchdog"
             ScriptPath = $sierraScript
             Arguments = "-Action Watchdog"
+            HiddenWindow = $true
             PrincipalKind = "Interactive"
             ExpectEnabled = $true
-            Description = "Interactive-session watchdog: launches Sierra during Sun 18:00 ET through Fri 17:00 ET if it is not running. Triggers are local wall-clock."
+            Description = "Interactive-session watchdog: launches Sierra during Sun 18:00 ET through Fri 17:00 ET if it is not running. Idle during daily 17:00-18:00 ET (16:00-17:00 CT) halt. Triggers are local wall-clock."
         },
         [pscustomobject]@{
             Name = "Sierra Weekend Close"
             ScriptPath = $sierraScript
             Arguments = "-Action Close"
+            HiddenWindow = $true
             PrincipalKind = "Interactive"
             ExpectEnabled = $true
             Description = "Friday 16:10 local (Central on this box) / 17:10 ET graceful Sierra close."
@@ -117,6 +126,7 @@ function Get-ExpectedTaskSpecs {
             Name = "Sierra Sunday Open"
             ScriptPath = $sierraScript
             Arguments = "-Action Open"
+            HiddenWindow = $true
             PrincipalKind = "Interactive"
             ExpectEnabled = $true
             Description = "Sunday 16:50 local (Central) / 17:50 ET Sierra pre-open launch."
@@ -125,6 +135,7 @@ function Get-ExpectedTaskSpecs {
             Name = "Friday Data Readiness"
             ScriptPath = $fridayScript
             Arguments = $fridayArgs
+            HiddenWindow = $false
             PrincipalKind = "System"
             ExpectEnabled = $true
             Description = "Friday 16:20 local (Central) / 17:20 ET - post-Sierra-close readiness check + weekend-readiness manifest. Non-destructive; catch-up is operator-gated."
@@ -133,6 +144,7 @@ function Get-ExpectedTaskSpecs {
             Name = "Weekly Storage Archive"
             ScriptPath = $weeklyScript
             Arguments = $weeklyArgs
+            HiddenWindow = $false
             PrincipalKind = "System"
             ExpectEnabled = $true
             Description = "Saturday storage maintenance (task name retained). Saturdays from 09:00 local Central (10:00 ET), retrying hourly for 10h: archive old raw_ticks + depth prune. Exit 2 if MCP writer is up (deferred, not silent success)."
@@ -141,6 +153,7 @@ function Get-ExpectedTaskSpecs {
             Name = "Sunday Pre-Open Readiness"
             ScriptPath = $healthScript
             Arguments = $healthSundayArgs
+            HiddenWindow = $false
             PrincipalKind = "System"
             ExpectEnabled = $true
             Description = "Sunday 16:40 local (Central) / 17:40 ET - health check Mode=SundayPreOpen before Globex. Fails if weekend maintenance marker is missing/stale."
@@ -149,6 +162,7 @@ function Get-ExpectedTaskSpecs {
             Name = "Storage Health Check"
             ScriptPath = $healthScript
             Arguments = $healthDailyArgs
+            HiddenWindow = $false
             PrincipalKind = "System"
             ExpectEnabled = $true
             Description = "Every 6 hours (SYSTEM): Invoke-DeskHealthCheck -Mode Daily. Local wall-clock cadence."
@@ -157,6 +171,7 @@ function Get-ExpectedTaskSpecs {
             Name = "T Drive Low Disk Alarm"
             ScriptPath = $diskScript
             Arguments = $diskArgs
+            HiddenWindow = $false
             PrincipalKind = "System"
             ExpectEnabled = $true
             Description = "Every 30 minutes: alert if T: below 40 GB or X: below 50 GB free."
@@ -165,6 +180,7 @@ function Get-ExpectedTaskSpecs {
             Name = "Monthly Storage Compaction"
             ScriptPath = $reclaimScript
             Arguments = $monthlyArgs
+            HiddenWindow = $false
             PrincipalKind = "System"
             ExpectEnabled = [bool]$EnableMonthlyCompaction
             Description = "Optional disabled-by-default monthly VACUUM INTO + swap when freelist exceeds 50 GB. Saturday 11:00 local Central / 12:00 ET."
@@ -198,7 +214,11 @@ function Invoke-VerifyMode {
                 if ($action.Execute -ne $powershell) {
                     $issues.Add("Execute mismatch: $($action.Execute)")
                 }
-                $expectedArg = "-NoProfile -ExecutionPolicy Bypass -File $(Quote-Path $spec.ScriptPath)"
+                $expectedArg = if ($spec.HiddenWindow) {
+                    "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File $(Quote-Path $spec.ScriptPath)"
+                } else {
+                    "-NoProfile -ExecutionPolicy Bypass -File $(Quote-Path $spec.ScriptPath)"
+                }
                 if ($spec.Arguments) { $expectedArg = "$expectedArg $($spec.Arguments)" }
                 if ($action.Arguments -ne $expectedArg) {
                     $issues.Add("Arguments mismatch.`n    expected: $expectedArg`n    actual:   $($action.Arguments)")
@@ -315,15 +335,15 @@ $diskArgs = "-DriveLetter T -ThresholdGb 40 -AlsoCheckX -XThresholdGb 50"
 
 Register-DeskTask `
     -Name "Sierra Watchdog" `
-    -Action (New-PowerShellAction -ScriptPath $sierraScript -Arguments "-Action Watchdog") `
+    -Action (New-PowerShellAction -ScriptPath $sierraScript -Arguments "-Action Watchdog" -HiddenWindow) `
     -Triggers @($watchdogLogon, $watchdogRepeat) `
     -Principal $sierraPrincipal `
     -Settings $sierraSettings `
-    -Description "Interactive-session watchdog: launches Sierra during Sun 18:00 ET through Fri 17:00 ET if it is not running. Triggers are local wall-clock (Central on this box)."
+    -Description "Interactive-session watchdog: launches Sierra during Sun 18:00 ET through Fri 17:00 ET if it is not running. Idle during daily 17:00-18:00 ET (16:00-17:00 CT) halt. Triggers are local wall-clock (Central on this box)."
 
 Register-DeskTask `
     -Name "Sierra Weekend Close" `
-    -Action (New-PowerShellAction -ScriptPath $sierraScript -Arguments "-Action Close") `
+    -Action (New-PowerShellAction -ScriptPath $sierraScript -Arguments "-Action Close" -HiddenWindow) `
     -Triggers $fridayClose `
     -Principal $sierraPrincipal `
     -Settings $sierraSettings `
@@ -331,7 +351,7 @@ Register-DeskTask `
 
 Register-DeskTask `
     -Name "Sierra Sunday Open" `
-    -Action (New-PowerShellAction -ScriptPath $sierraScript -Arguments "-Action Open") `
+    -Action (New-PowerShellAction -ScriptPath $sierraScript -Arguments "-Action Open" -HiddenWindow) `
     -Triggers $sundayOpen `
     -Principal $sierraPrincipal `
     -Settings $sierraSettings `

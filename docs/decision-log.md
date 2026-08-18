@@ -873,6 +873,27 @@ This note does not implement registry codegen / five emitters (#20), the leg eng
 
 ---
 
+### Decision note: SIL-M5c Feature Registry codegen (one descriptor → five emitters)
+
+**Date:** 2026-08-18
+**Status:** Decided (implements [alecwardd/the-desk#20](https://github.com/alecwardd/the-desk/issues/20); Part of #2)
+
+**Context:** SIL-M5a is the registry waist. SIL-M5b added Feature-IR and five funded Operator Families, with evaluation declaration-and-test-only. Spec (#2) user stories require **one accepted descriptor → five write sites** so Derived Features do not amplify by hand across runtime, storage, query, rules, and agent schema. Journal Frames (`journal_frames.payload`, 1 Hz, NQ+ES) are already the storage target. DuckDB / Parquet are not a dependency.
+
+**Decision:**
+
+1. **Five named emitters** live in `src/catalog/codegen.rs`: `emit_runtime_field` (`get_state`), `emit_storage_column` (named key on existing `journal_frames.payload` / `derivedFeatures.<id>` — not a DuckDB table), `emit_query_dimension` (`query_series` / `query_episodes`), `emit_rule_binding` (generic `ConditionField::CatalogField`, not a specialty variant), `emit_agent_schema` (`search_catalog` / `describe_domain`). `emit_all` is the waist; handwritten `feature.*` catalog fields are a drift failure.
+2. **Accepted means human-gated `active`.** `feature_registry` still registers at `candidate` and promotes `candidate → shadow → active` with `traderConfirmation`. Candidate / shadow stay in `featureHits` only. `apply_codegen_fields` merges generated fields into the catalog overlay only for accepted Derived Features that carry a Feature-IR program.
+3. **Reads stay on the existing kernel.** Promoting a trivial Derived Feature (session-distribution percentiles of `market.location_structure.lastPrice`, id `feature.session_last_price_percentile`, costHint R1) requires **no new specialty MCP tool**. Surface stays **123 tools**. `describe_environment` `featureRegistry.codegen` is `true`.
+4. **One evaluator, two path labels, explicit window bound.** `evaluate_live_shadow` and `evaluate_historical` still call the same `evaluate` (`clock_ms <= asOf`; path is a label). The live pending Journal Frame buffer is capped at `PENDING_JOURNAL_MAX_FRAMES` = 8192. Historical Feature-IR loads use `Database::list_journal_frames_for_feature_ir` (newest-first `LIMIT cap+1` sentinel). `Database::list_journal_frames()` remains an unbounded full-table test/rebuild helper and is not used on the runtime eval path. Session-percentile `n` and dwell fail closed when the as-of session sits on the truncated edge of that window. Historical baselines fail closed when the window is truncated. The two paths must not pretend an unbounded historical scan equals the live cap.
+5. **M5b fail-closed behavior is unchanged.** Unknown Feature-IR program keys are rejected; unused `percentile` without `output=value` / `aggregator=percentile` is rejected; `timeSince` never-true is `unavailable()` (not an epoch); `search_catalog` kind literals stay gated on `FeatureKind`. Base Detector math stays reviewed Rust. No sixth Operator Family.
+
+This note does not implement the leg engine (#21), DOM cluster Base Detectors (#22), ACSIL (#23), Vs3dProvider (#16), DuckDB, Parquet conversion, `get_capsule`, a 250 ms forever-store, a tenth kernel operator / `run_job` poll tool, new specialty market tools, or raising the Trust Ceiling.
+
+**Consequences:** One accepted descriptor is the only way to grow a Derived Feature across runtime, storage, query, rules, and agent schema. A write site added by hand without a descriptor fails the drift test. DuckDB remains deferred.
+
+---
+
 ### Decision note: SIL-P-VS-a Levels-Only Record path
 
 **Date:** 2026-08-13

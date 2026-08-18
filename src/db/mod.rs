@@ -7367,6 +7367,10 @@ impl Database {
     }
 
     /// All Journal Frames ordered by clock (tests / rebuild comparison).
+    ///
+    /// Unbounded full-table read. Feature-IR live/historical evaluation must
+    /// use [`Self::list_journal_frames_for_feature_ir`] instead so session
+    /// windows cannot silently disagree with the live pending cap.
     pub fn list_journal_frames(&self) -> Result<Vec<JournalFrameRecord>, DbError> {
         let mut stmt = self.conn.prepare(
             "SELECT clock_ms, frame_second, root_symbol, session_type, session_segment, trading_day, payload
@@ -7375,6 +7379,37 @@ impl Database {
         )?;
         let rows = stmt.query_map([], map_journal_frame_row)?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Newest-first bounded Journal Frame load for Feature-IR evaluation.
+    ///
+    /// Loads at most `max_frames + 1` rows with `clock_ms <= as_of_ms` so the
+    /// caller can detect truncation versus the live pending buffer
+    /// ([`crate::catalog::FEATURE_IR_EVAL_MAX_FRAMES`]). Never a full-table scan.
+    /// Results are chronological (oldest first) after the sentinel is dropped.
+    pub fn list_journal_frames_for_feature_ir(
+        &self,
+        as_of_ms: f64,
+        max_frames: usize,
+    ) -> Result<(Vec<JournalFrameRecord>, bool), DbError> {
+        let cap = max_frames.max(1);
+        let limit = (cap + 1) as i64;
+        let mut stmt = self.conn.prepare(
+            "SELECT clock_ms, frame_second, root_symbol, session_type, session_segment, trading_day, payload
+             FROM journal_frames
+             WHERE clock_ms <= ?1 AND clock_ms > 0
+             ORDER BY clock_ms DESC, root_symbol DESC
+             LIMIT ?2",
+        )?;
+        let mut rows = stmt
+            .query_map(params![as_of_ms, limit], map_journal_frame_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        let truncated = rows.len() > cap;
+        if truncated {
+            rows.truncate(cap);
+        }
+        rows.reverse();
+        Ok((rows, truncated))
     }
 
     /// Journal Frames at exact `frame_second` values for one root.

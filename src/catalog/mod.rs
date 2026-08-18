@@ -9,6 +9,7 @@
 //! provenance-carrying envelopes at Trust Level L0. See ADR-022 (Trust
 //! Ceiling L3), SIL-M1a (#4), and SIL-M1b (#5).
 
+mod codegen;
 mod config;
 mod envelope;
 mod event_lifecycle;
@@ -23,6 +24,16 @@ mod search;
 mod trust;
 mod types;
 
+pub use codegen::{
+    apply_codegen_fields, emit_agent_schema, emit_all, emit_query_dimension, emit_rule_binding,
+    emit_runtime_field, emit_storage_column, evaluate_accepted_feature, is_accepted_derived,
+    is_codegen_field, read_storage_value, stamp_derived_feature_payload, AgentSchemaArtifact,
+    CodegenArtifacts, CodegenError, QueryDimensionArtifact, RuleBindingArtifact,
+    RuntimeFieldArtifact, StorageColumnArtifact, CATALOG_FIELD_CONDITION,
+    DERIVED_FEATURE_PAYLOAD_OBJECT, EMIT_AGENT_SCHEMA, EMIT_QUERY_DIMENSION, EMIT_RULE_BINDING,
+    EMIT_RUNTIME_FIELD, EMIT_STORAGE_COLUMN, FEATURE_REGISTRY_CODEGEN,
+    JOURNAL_FRAME_STORAGE_TARGET, QUERY_DIMENSION_OPERATORS,
+};
 pub use config::{load_sil_config, EngineMode, SilConfig};
 pub use envelope::{
     apply_token_budget, build_state_envelope, merge_symbol_envelopes, state_envelope_json,
@@ -48,8 +59,9 @@ pub use feature_ir::{
     declare_program, evaluate, evaluate_historical, evaluate_live_shadow, BaselineAggregator,
     DwellMode, EventSelector, FeatureIrError, FeatureIrEvalPath, FeatureIrEvent, FeatureIrFrame,
     FeatureIrProgram, FeatureIrStore, FeatureIrValue, FieldPredicate, OperatorFamily,
-    PercentileOutput, PredicateOp, DERIVED_FEATURE_MATH_TIER, FEATURE_IR_MODULE, FEATURE_IR_SOURCE,
-    FUNDED_OPERATOR_FAMILY_GLOSSARY, FUNDED_OPERATOR_FAMILY_LABELS, NEW_OPERATOR_FAMILY_GATE,
+    PercentileOutput, PredicateOp, DERIVED_FEATURE_MATH_TIER, FEATURE_IR_EVAL_MAX_FRAMES,
+    FEATURE_IR_MODULE, FEATURE_IR_SOURCE, FUNDED_OPERATOR_FAMILY_GLOSSARY,
+    FUNDED_OPERATOR_FAMILY_LABELS, NEW_OPERATOR_FAMILY_GATE,
 };
 pub use feature_registry::{
     apply_promotion, builtin_base_detectors, concept_has_catalog_or_registry_entry,
@@ -137,6 +149,7 @@ pub fn build_catalog_with_overlay(overlay: Vec<FeatureDescriptor>) -> DeskCatalo
     let registry = FeatureRegistry::with_overlay(overlay);
     catalog.base_detectors = registry.base_detectors();
     catalog.derived_features = registry.derived_features();
+    apply_codegen_fields(&mut catalog);
     catalog
 }
 
@@ -622,7 +635,7 @@ mod tests {
         assert_eq!(env["featureRegistry"]["writeVerb"], "feature_registry");
         assert_eq!(env["featureRegistry"]["discoveryEnabled"], true);
         assert_eq!(env["featureRegistry"]["featureIr"], true);
-        assert_eq!(env["featureRegistry"]["codegen"], false);
+        assert_eq!(env["featureRegistry"]["codegen"], true);
         assert_eq!(
             env["featureRegistry"]["newOperatorFamilyGate"],
             "registry_change_proposal"

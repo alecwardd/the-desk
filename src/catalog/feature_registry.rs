@@ -9,18 +9,21 @@
 //! Existing shipped detectors (absorption, pinch, and other already-emitting
 //! detectors) are registered as `active` with `behaviorChange=false`. Discovery
 //! rides the Desk Catalog (`search_catalog` / catalog descriptors). The typed
-//! write verb is `feature_registry`; there is no specialty getter. Codegen
-//! emitters are out of scope (SIL-M5c).
+//! write verb is `feature_registry`; there is no specialty getter. SIL-M5c
+//! codegen emitters (`emit_runtime_field`, `emit_storage_column`,
+//! `emit_query_dimension`, `emit_rule_binding`, `emit_agent_schema`) turn one
+//! accepted Derived Feature into the five kernel write sites.
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use super::codegen::FEATURE_REGISTRY_CODEGEN;
 use super::feature_ir::{
-    FeatureIrError, FeatureIrProgram, DERIVED_FEATURE_MATH_TIER, FEATURE_IR_MODULE,
-    FEATURE_IR_SOURCE, FUNDED_OPERATOR_FAMILY_GLOSSARY, FUNDED_OPERATOR_FAMILY_LABELS,
-    NEW_OPERATOR_FAMILY_GATE,
+    FeatureIrError, FeatureIrProgram, DERIVED_FEATURE_MATH_TIER, FEATURE_IR_EVAL_MAX_FRAMES,
+    FEATURE_IR_MODULE, FEATURE_IR_SOURCE, FUNDED_OPERATOR_FAMILY_GLOSSARY,
+    FUNDED_OPERATOR_FAMILY_LABELS, NEW_OPERATOR_FAMILY_GATE,
 };
 use super::types::{CostHint, DeskCatalog, FreshnessSemantics, SessionScope, Unit};
 
@@ -835,8 +838,10 @@ pub fn feature_registry_environment(catalog: &DeskCatalog) -> serde_json::Value 
         "baseDetectorCount": catalog.base_detectors.len(),
         "derivedFeatureCount": catalog.derived_features.len(),
         "kinds": ["baseDetector", "derivedFeature"],
-        "codegen": false,
+        "codegen": FEATURE_REGISTRY_CODEGEN,
         "featureIr": true,
+        "evalMaxFrames": FEATURE_IR_EVAL_MAX_FRAMES,
+        "evalWindowNote": "Live pending Journal Frames cap at PENDING_JOURNAL_MAX_FRAMES (8192). Historical Feature-IR loads use a newest-first LIMIT cap+1 sentinel — never Database::list_journal_frames(). Session-percentile n and dwell fail closed when the as-of session is truncated by that bound.",
         "operatorFamilies": FUNDED_OPERATOR_FAMILY_LABELS,
         "operatorFamilyGlossary": FUNDED_OPERATOR_FAMILY_GLOSSARY,
         "newOperatorFamilyGate": NEW_OPERATOR_FAMILY_GATE,
@@ -1294,24 +1299,43 @@ mod tests {
     }
 
     #[test]
-    fn sil_m5b_does_not_ship_codegen_emitter_modules() {
+    fn sil_m5c_codegen_emitters_are_present_and_drift_closed() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        for rel in [
-            "src/catalog/codegen.rs",
-            "src/catalog/emitters.rs",
-            "src/catalog/feature_ir_codegen.rs",
-            "src/catalog/five_emitters.rs",
+        assert!(
+            root.join("src/catalog/codegen.rs").exists(),
+            "src/catalog/codegen.rs is the SIL-M5c five-emitter waist"
+        );
+        let codegen = include_str!("codegen.rs");
+        for sym in [
+            "emit_runtime_field",
+            "emit_storage_column",
+            "emit_query_dimension",
+            "emit_rule_binding",
+            "emit_agent_schema",
         ] {
             assert!(
-                !root.join(rel).exists(),
-                "{rel} is SIL-M5c codegen and must not ship in M5b"
+                codegen.contains(&format!("pub fn {sym}")),
+                "{sym} must exist as a public emitter"
             );
         }
         let ir = include_str!("feature_ir.rs");
-        assert!(!ir.contains("emit_runtime_field"));
-        assert!(!ir.contains("emit_storage_column"));
-        assert!(!ir.contains("emit_query_dimension"));
-        assert!(!ir.contains("emit_rule_binding"));
-        assert!(!ir.contains("emit_agent_schema"));
+        assert!(
+            !ir.contains("pub fn emit_runtime_field"),
+            "emitters live in codegen.rs, not Feature-IR"
+        );
+        for reserved in ["emitters.rs", "feature_ir_codegen.rs", "five_emitters.rs"] {
+            assert!(
+                !root.join("src/catalog").join(reserved).exists(),
+                "{reserved} was a reserved M5b absence path; emitters live only in codegen.rs"
+            );
+        }
+        let static_catalog = crate::catalog::build_catalog();
+        assert!(
+            static_catalog
+                .fields
+                .iter()
+                .all(|f| !f.id.starts_with("feature.")),
+            "a handwritten feature.* field in build_catalog() is a write site that skipped the descriptor"
+        );
     }
 }

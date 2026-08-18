@@ -93,11 +93,16 @@ pub fn render_catalog_markdown(catalog: &DeskCatalog) -> String {
          Families (Cross-symbol references, Session-distribution percentiles, Dwell / \
          time-since-predicate, Event sequences, Historical baselines). Unfunded families \
          (including surface lookup / interpolation) are rejected at declaration time. A new \
-         Operator Family requires a registry change proposal. Feature-IR evaluation is \
-         declaration-and-test-only in M5b. Discovery rides `search_catalog` / catalog \
-         descriptors — no specialty getter. The write verb is `feature_registry`. Tier 1 Base \
-         Detector math stays reviewed Rust; this catalog does not implement codegen emitters \
-         (SIL-M5c).\n\n",
+         Operator Family requires a registry change proposal. An accepted (active) Derived \
+         Feature is codegen'd onto the existing kernel (`get_state`, `journal_frames.payload`, \
+         `query_series` / `query_episodes`, catalog-field rules binding, `search_catalog` / \
+         `describe_domain`) — no specialty getter. Candidate and shadow stay in `featureHits` \
+         only. Live-shadow and historical evaluation share one evaluator (`clock_ms <= asOf`) \
+         capped at 8192 frames (equal to the live pending Journal Frame buffer). Session-percentile \
+         n and dwell fail closed when that bound would drop in-session frames. Historical loads \
+         use a newest-first LIMIT cap+1 sentinel — never `Database::list_journal_frames()`. \
+         Discovery rides `search_catalog` / catalog descriptors. The write verb is \
+         `feature_registry`. Tier 1 Base Detector math stays reviewed Rust.\n\n",
     );
     out.push_str("| Id | Domain | Promotion | Builtin | Event types |\n|---|---|---|---|---|\n");
     for detector in &catalog.base_detectors {

@@ -13,7 +13,7 @@ use std::collections::HashMap;
 /// semantics change in a way that invalidates cached backtest statistics.
 /// Examples: adding/removing condition variants, changing comparison semantics
 /// in `evaluate_typed_condition`, or changing `resolve_price_expression` modes.
-pub const RULES_ENGINE_SCHEMA_VERSION: u32 = 5;
+pub const RULES_ENGINE_SCHEMA_VERSION: u32 = 6;
 
 // ---------------------------------------------------------------------------
 // Setup state machine
@@ -168,6 +168,10 @@ pub enum ConditionField {
     /// "up" or "down". Note the trade is typically *opposite* this — a failed
     /// down-defense resolves into an upside vacuum.
     AbsorptionInvalidationDirection,
+
+    /// Desk Catalog field id (Feature Registry codegen). Not a specialty detector
+    /// variant — bind `catalogFieldId` to an accepted `feature.<snake_id>`.
+    CatalogField,
 }
 
 /// Comparison operator for a condition.
@@ -207,6 +211,9 @@ pub struct SetupCondition {
     pub value: ConditionValue,
     #[serde(default)]
     pub label: Option<String>,
+    /// Catalog field id when [`ConditionField::CatalogField`] (codegen binding).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_field_id: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -936,6 +943,9 @@ fn evaluate_typed_condition(
             }
             return false;
         }
+        ConditionField::CatalogField => {
+            return false;
+        }
     };
 
     match &cond.operator {
@@ -1015,6 +1025,55 @@ impl Default for SetupRuntime {
             last_alert_emitted_at_ms: None,
             setup_name: None,
         }
+    }
+}
+
+/// Evaluate a catalog-field condition against a generated / catalog scalar.
+///
+/// Used by Feature Registry codegen (`catalog_field` bindings). Missing values
+/// fail closed (`false`) — they are never invented.
+pub fn evaluate_catalog_field_condition(
+    cond: &SetupCondition,
+    catalog_values: &HashMap<String, f64>,
+) -> bool {
+    if cond.field != ConditionField::CatalogField {
+        return false;
+    }
+    let Some(id) = cond
+        .catalog_field_id
+        .as_deref()
+        .or(cond.label.as_deref())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return false;
+    };
+    let Some(left) = catalog_values.get(id).copied() else {
+        return false;
+    };
+    if !left.is_finite() {
+        return false;
+    }
+    match &cond.operator {
+        ConditionOperator::Above | ConditionOperator::GreaterThan => {
+            matches!(&cond.value, ConditionValue::Number(rhs) if left > *rhs)
+        }
+        ConditionOperator::Below | ConditionOperator::LessThan => {
+            matches!(&cond.value, ConditionValue::Number(rhs) if left < *rhs)
+        }
+        ConditionOperator::Equals => match &cond.value {
+            ConditionValue::Number(rhs) => (left - *rhs).abs() < 0.01,
+            _ => false,
+        },
+        ConditionOperator::Within => match &cond.value {
+            ConditionValue::Number(threshold) => (left).abs() <= *threshold,
+            _ => false,
+        },
+        ConditionOperator::Outside => match &cond.value {
+            ConditionValue::Number(threshold) => left.abs() > *threshold,
+            _ => false,
+        },
+        ConditionOperator::CrossesAbove | ConditionOperator::CrossesBelow => false,
     }
 }
 
@@ -1850,6 +1909,7 @@ mod tests {
             operator: ConditionOperator::Above,
             value: ConditionValue::None,
             label: None,
+            catalog_field_id: None,
         };
         let market = MarketState {
             last_price: 21010.0,
@@ -2035,6 +2095,7 @@ mod tests {
             operator: ConditionOperator::CrossesAbove,
             value: ConditionValue::None,
             label: None,
+            catalog_field_id: None,
         };
         let prev = MarketState {
             last_price: 20990.0,
@@ -2111,6 +2172,7 @@ mod tests {
             operator: ConditionOperator::GreaterThan,
             value: ConditionValue::Number(1.1),
             label: None,
+            catalog_field_id: None,
         };
         let market = MarketState {
             dom_summary: Some(crate::depth::DomSummary {
@@ -2130,6 +2192,7 @@ mod tests {
             operator: ConditionOperator::Above,
             value: ConditionValue::Number(5.0),
             label: None,
+            catalog_field_id: None,
         };
         let market = MarketState {
             dom_summary: Some(crate::depth::DomSummary {
@@ -2139,5 +2202,27 @@ mod tests {
             ..Default::default()
         };
         assert!(evaluate_typed_condition(&tc, &market, None));
+    }
+
+    #[test]
+    fn catalog_field_condition_binds_generated_feature_id() {
+        let cond = SetupCondition {
+            id: "codegen".into(),
+            field: ConditionField::CatalogField,
+            operator: ConditionOperator::GreaterThan,
+            value: ConditionValue::Number(50.0),
+            label: None,
+            catalog_field_id: Some("feature.example_derived".into()),
+        };
+        let mut values = HashMap::new();
+        values.insert("feature.example_derived".into(), 90.0);
+        assert!(evaluate_catalog_field_condition(&cond, &values));
+        values.insert("feature.example_derived".into(), 10.0);
+        assert!(!evaluate_catalog_field_condition(&cond, &values));
+        assert!(!evaluate_typed_condition(
+            &cond,
+            &MarketState::default(),
+            None
+        ));
     }
 }

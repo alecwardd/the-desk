@@ -17,6 +17,10 @@ use std::collections::BTreeMap;
 
 use serde_json::Value;
 
+use crate::catalog::{
+    build_catalog_with_overlay, is_accepted_derived, stamp_derived_feature_payload,
+    FeatureIrEvalPath, FeatureIrFrame, FeatureIrStore, FEATURE_IR_EVAL_MAX_FRAMES,
+};
 use crate::db::{
     journal_frame_second_from_ts, Database, DbError, JournalAsOfSnapshot, JournalFrameRecord,
 };
@@ -73,8 +77,9 @@ pub fn persist_journal_observation(
 ) -> Result<JournalPersistStats, DbError> {
     let mut stats = JournalPersistStats::default();
     if !frames.is_empty() {
-        stats.frames_written = db.insert_journal_frames(frames)?;
-        stats.frame_second = frames.last().map(|f| f.frame_second);
+        let stamped = stamp_frames_with_derived_features(db, frames)?;
+        stats.frames_written = db.insert_journal_frames(&stamped)?;
+        stats.frame_second = stamped.last().map(|f| f.frame_second);
     }
     stats.events_written = insert_transition_events(db, events)?;
     Ok(stats)
@@ -86,6 +91,46 @@ pub fn journal_frames_as_of(
     as_of_ms: f64,
 ) -> Result<Option<JournalAsOfSnapshot>, DbError> {
     db.get_journal_frames_as_of(as_of_ms)
+}
+
+fn stamp_frames_with_derived_features(
+    db: &Database,
+    frames: &[JournalFrameRecord],
+) -> Result<Vec<JournalFrameRecord>, DbError> {
+    let overlay = db.list_feature_registry()?;
+    if !overlay.iter().any(is_accepted_derived) {
+        return Ok(frames.to_vec());
+    }
+    let catalog = build_catalog_with_overlay(overlay);
+    let as_of = frames
+        .iter()
+        .map(|frame| frame.clock_ms)
+        .fold(0.0_f64, f64::max);
+    let (prior, truncated) =
+        db.list_journal_frames_for_feature_ir(as_of, FEATURE_IR_EVAL_MAX_FRAMES)?;
+    let mut history: Vec<FeatureIrFrame> = prior.iter().map(Into::into).collect();
+    for frame in frames {
+        history.push(FeatureIrFrame::from(frame));
+    }
+    let mut out = frames.to_vec();
+    for frame in &mut out {
+        let eval_root = frame.root_symbol.clone();
+        let clock_ms = frame.clock_ms;
+        let store = FeatureIrStore {
+            catalog: &catalog,
+            frames: &history,
+            events: &[],
+            eval_root: &eval_root,
+            window_truncated: truncated,
+        };
+        stamp_derived_feature_payload(
+            &mut frame.payload,
+            store,
+            clock_ms,
+            FeatureIrEvalPath::LiveShadow,
+        );
+    }
+    Ok(out)
 }
 
 fn insert_transition_events(

@@ -847,12 +847,14 @@ fn derived_feature_live_shadow_matches_historical_over_journal_frames() {
         frames: &live_ir_frames,
         events: &events,
         eval_root: "NQ",
+        window_truncated: false,
     };
     let hist_store = FeatureIrStore {
         catalog: &catalog,
         frames: &historical_frames,
         events: &events,
         eval_root: "NQ",
+        window_truncated: false,
     };
 
     let mut points = Vec::new();
@@ -885,4 +887,152 @@ fn derived_feature_live_shadow_matches_historical_over_journal_frames() {
         "points": points,
     });
     compare_or_bless(&fixture_dir().join("expected_feature_ir.json"), &actual);
+}
+
+#[test]
+fn derived_feature_codegen_carries_value_through_query_series() {
+    use the_desk_backend::catalog::{
+        build_catalog, build_catalog_with_overlay, emit_all, is_accepted_derived,
+        read_storage_value, stamp_derived_feature_payload, CostHint, DerivedFeatureRegistration,
+        DetectorSchema, FeatureIrEvalPath, FeatureIrFrame, FeatureIrProgram, FeatureIrStore,
+        FeatureRegistry, FreshnessSemantics, HumanGate, PromotionState, SessionScope, Unit,
+        FEATURE_IR_EVAL_MAX_FRAMES,
+    };
+    use the_desk_backend::engine::JournalFrameRead;
+    use the_desk_backend::research::query_kernel::{
+        query_series_with, QuerySeriesRequest, QueryWindow,
+    };
+
+    let catalog = build_catalog();
+    let program = FeatureIrProgram::parse_value(&json!({
+        "family": "sessionDistributionPercentiles",
+        "field": "market.location_structure.lastPrice"
+    }))
+    .expect("program");
+    let mut registry = FeatureRegistry::builtins();
+    let registered = registry
+        .register_derived(
+            DerivedFeatureRegistration {
+                id: "feature.session_last_price_percentile".into(),
+                name: "session_last_price_percentile".into(),
+                description: "Session-distribution percentiles of lastPrice (Feature-IR).".into(),
+                domain_id: "location_structure".into(),
+                schema: DetectorSchema {
+                    catalog_field_ids: vec!["market.location_structure.lastPrice".into()],
+                    event_types: vec![],
+                    unit: Unit::Percent,
+                    session_scope: SessionScope::Session,
+                    freshness: FreshnessSemantics::LiveTickAnchored,
+                    cost_hint: CostHint::R1,
+                },
+                program,
+            },
+            &catalog,
+        )
+        .expect("register");
+    assert_eq!(registered.promotion_state, PromotionState::Candidate);
+    registry
+        .promote(
+            "feature.session_last_price_percentile",
+            PromotionState::Shadow,
+            HumanGate {
+                trader_confirmation: "Your rules say this derived feature may run in shadow.",
+            },
+        )
+        .expect("shadow");
+    let active = registry
+        .promote(
+            "feature.session_last_price_percentile",
+            PromotionState::Active,
+            HumanGate {
+                trader_confirmation: "Your playbook indicates this descriptor may be active.",
+            },
+        )
+        .expect("active");
+    assert!(is_accepted_derived(&active));
+    let artifacts = emit_all(&active).expect("five emitters");
+    assert_eq!(artifacts.runtime_field.served_by, "get_state");
+    assert_eq!(artifacts.storage_column.table, "journal_frames.payload");
+    assert_eq!(
+        artifacts.query_dimension.operators,
+        vec!["query_series".to_string(), "query_episodes".to_string()]
+    );
+    assert_eq!(artifacts.rule_binding.condition_field, "catalog_field");
+    assert!(artifacts.agent_schema.search_catalog);
+
+    let overlaid = build_catalog_with_overlay(vec![active.clone()]);
+    assert!(overlaid
+        .fields
+        .iter()
+        .any(|f| f.id == "feature.session_last_price_percentile"));
+
+    let t0 = 1_704_207_600_000.0;
+    let frames: Vec<JournalFrameRecord> = (0..5)
+        .map(|i| {
+            feature_ir_journal_frame(
+                t0 + i as f64 * 1000.0,
+                "NQ",
+                "2023-12-31",
+                21_000.0 + i as f64,
+            )
+        })
+        .collect();
+    let db = Database::open(":memory:").expect("db");
+    db.upsert_feature_registry(&active, t0).expect("upsert");
+    db.insert_journal_frames(&frames).expect("insert");
+
+    let (bounded, truncated) = db
+        .list_journal_frames_for_feature_ir(t0 + 4000.0, FEATURE_IR_EVAL_MAX_FRAMES)
+        .expect("bounded historical load");
+    assert!(!truncated, "five frames must sit inside the 8192 cap");
+    assert_eq!(bounded.len(), frames.len());
+    let unbounded = db.list_journal_frames().expect("unbounded test helper");
+    assert_eq!(
+        unbounded.len(),
+        bounded.len(),
+        "small corpora match; runtime still must not call list_journal_frames()"
+    );
+
+    let series = query_series_with(
+        JournalFrameRead::Hot(&db),
+        &QuerySeriesRequest {
+            window: QueryWindow {
+                start_ms: Some(t0),
+                end_ms: Some(t0 + 4000.0),
+                session_type: Some("RTH".into()),
+                symbols: Some(vec!["NQ".into()]),
+            },
+            fields: vec!["feature.session_last_price_percentile".into()],
+        },
+    )
+    .expect("query_series addresses generated dimension");
+    assert_eq!(series.points.len(), 5);
+    let last = series
+        .points
+        .last()
+        .and_then(|p| p.values.get("feature.session_last_price_percentile"))
+        .and_then(|v| v.as_f64())
+        .expect("series value");
+    assert!((last - 90.0).abs() < 1e-9);
+
+    let ir_frames: Vec<FeatureIrFrame> = frames.iter().map(Into::into).collect();
+    let mut payload = frames[4].payload.clone();
+    stamp_derived_feature_payload(
+        &mut payload,
+        FeatureIrStore {
+            catalog: &overlaid,
+            frames: &ir_frames,
+            events: &[],
+            eval_root: "NQ",
+            window_truncated: false,
+        },
+        t0 + 4000.0,
+        FeatureIrEvalPath::LiveShadow,
+    );
+    let stamped = read_storage_value(&payload, "feature.session_last_price_percentile")
+        .expect("storage column");
+    assert!(
+        (stamped - last).abs() < 1e-9,
+        "live-shadow stamp must match historical query_series"
+    );
 }

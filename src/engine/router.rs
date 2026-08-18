@@ -783,6 +783,17 @@ impl MarketRouter {
             .unwrap_or(0)
     }
 
+    /// Snapshot of the pending Journal Frame buffer (live Feature-IR evaluation).
+    ///
+    /// Already capped at [`PENDING_JOURNAL_MAX_FRAMES`]. When `len == cap` the
+    /// caller must treat the window as truncated.
+    pub fn snapshot_pending_journal_frames(&self) -> Vec<JournalFrameRecord> {
+        self.pending_journal_frames
+            .lock()
+            .map(|g| g.values().cloned().collect())
+            .unwrap_or_default()
+    }
+
     fn advance_clock(&self, timestamp_ms: f64) {
         if !timestamp_ms.is_finite() || timestamp_ms <= 0.0 {
             return;
@@ -1196,6 +1207,14 @@ mod tests {
         let stats = router.persist_journal(&db).expect("persist");
         assert!(stats.frames_written >= 2);
         assert!(db.count_journal_frames().expect("count") >= 2);
+    }
+
+    #[test]
+    fn feature_ir_eval_cap_equals_pending_journal_max_frames() {
+        assert_eq!(
+            crate::catalog::FEATURE_IR_EVAL_MAX_FRAMES,
+            PENDING_JOURNAL_MAX_FRAMES
+        );
     }
 
     #[test]

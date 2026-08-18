@@ -7,14 +7,15 @@
 //!
 //! The language is not Turing-complete: no unbounded recursion or user-declared
 //! loops as control flow. A new Operator Family requires a registry change
-//! proposal ([`NEW_OPERATOR_FAMILY_GATE`]). Codegen emitters are out of scope
-//! (SIL-M5c / #20).
+//! proposal ([`NEW_OPERATOR_FAMILY_GATE`]). SIL-M5c codegen emitters (`emit_*`)
+//! live in [`super::codegen`].
 //!
 //! Live-shadow and historical evaluation share **one** evaluator over Journal
 //! Frames (`clock_ms <= asOf`). The path label does not change semantics.
-//! In M5b the evaluator is **declaration-and-test-only**: callers supply the
-//! frame slice (golden replay / unit tests). There is no runtime hook from the
-//! MCP router or the MarketRouter pending-frame buffer.
+//! Both paths cap the visible slice at [`FEATURE_IR_EVAL_MAX_FRAMES`] (equal to
+//! the live pending-journal buffer). Session-distribution `n` and dwell windows
+//! fail closed when that bound would silently drop in-session frames — they
+//! must not pretend an unbounded `list_journal_frames` scan equals the live cap.
 
 use std::collections::BTreeSet;
 
@@ -42,6 +43,15 @@ pub const MAX_BASELINE_LOOKBACK_DAYS: u32 = 60;
 
 /// Maximum event-sequence window (24 hours).
 pub const MAX_SEQUENCE_WINDOW_MS: f64 = 86_400_000.0;
+
+/// Shared live/historical Feature-IR frame cap.
+///
+/// Must stay equal to [`crate::engine::PENDING_JOURNAL_MAX_FRAMES`]. Live
+/// pending Journal Frames drop the oldest past this bound; historical loads
+/// use a newest-first `LIMIT cap+1` sentinel instead of
+/// [`crate::db::Database::list_journal_frames`]. Session-percentile `n` and
+/// dwell fail closed when the as-of session is truncated by this cap.
+pub const FEATURE_IR_EVAL_MAX_FRAMES: usize = 8_192;
 
 /// Wire labels for the five funded families (camelCase IPC).
 pub const FUNDED_OPERATOR_FAMILY_LABELS: &[&str] = &[
@@ -481,6 +491,9 @@ pub struct FeatureIrStore<'a> {
     pub frames: &'a [FeatureIrFrame],
     pub events: &'a [FeatureIrEvent],
     pub eval_root: &'a str,
+    /// True when the caller already dropped frames older than
+    /// [`FEATURE_IR_EVAL_MAX_FRAMES`] (live pending cap or historical sentinel).
+    pub window_truncated: bool,
 }
 
 /// Scalar result of one Feature-IR evaluation at `asOf`.
@@ -549,6 +562,14 @@ pub fn evaluate(
     path: FeatureIrEvalPath,
 ) -> Result<FeatureIrValue, FeatureIrError> {
     program.validate(store.catalog)?;
+    let (bounded, truncated) = bound_eval_frames(store.frames, as_of_ms, store.window_truncated);
+    let store = FeatureIrStore {
+        catalog: store.catalog,
+        frames: &bounded,
+        events: store.events,
+        eval_root: store.eval_root,
+        window_truncated: truncated,
+    };
     let value = match program {
         FeatureIrProgram::CrossSymbolReferences { symbol, field } => {
             eval_cross_symbol(store, as_of_ms, symbol, field)?
@@ -581,16 +602,24 @@ pub fn evaluate(
             same_time_of_day,
             aggregator,
             percentile,
-        } => eval_historical_baseline(
-            store,
-            as_of_ms,
-            field,
-            symbol.as_deref(),
-            *lookback_days,
-            *same_time_of_day,
-            *aggregator,
-            *percentile,
-        )?,
+        } => {
+            if truncated {
+                // Lookback-N-days cannot fit in the live pending cap; fail closed
+                // rather than silently using a truncated day set.
+                unavailable()
+            } else {
+                eval_historical_baseline(
+                    store,
+                    as_of_ms,
+                    field,
+                    symbol.as_deref(),
+                    *lookback_days,
+                    *same_time_of_day,
+                    *aggregator,
+                    *percentile,
+                )?
+            }
+        }
     };
     Ok(FeatureIrValue {
         path,
@@ -604,7 +633,8 @@ pub fn evaluate(
 
 /// Live-shadow evaluation (same evaluator as historical).
 ///
-/// Path is a label only. M5b has no runtime caller; tests supply the frame slice.
+/// Path is a label only. Callers supply the pending-buffer slice (capped at
+/// [`FEATURE_IR_EVAL_MAX_FRAMES`]) or an equivalent bounded historical load.
 pub fn evaluate_live_shadow(
     program: &FeatureIrProgram,
     store: FeatureIrStore<'_>,
@@ -615,8 +645,9 @@ pub fn evaluate_live_shadow(
 
 /// Historical evaluation over a caller-supplied Journal Frame slice (same evaluator as live-shadow).
 ///
-/// Path is a label only. M5b has no runtime SQLite/MCP caller; golden replay
-/// constructs the slice from `list_journal_frames` in tests.
+/// Path is a label only. Runtime historical loads must be bounded (newest
+/// [`FEATURE_IR_EVAL_MAX_FRAMES`] `+ 1` sentinel) — not an unbounded
+/// `list_journal_frames` full-table read.
 pub fn evaluate_historical(
     program: &FeatureIrProgram,
     store: FeatureIrStore<'_>,
@@ -668,6 +699,9 @@ fn eval_session_percentile(
     let Some(as_of_frame) = latest_frame(store.frames, root, as_of_ms) else {
         return Ok(unavailable());
     };
+    if session_window_exceeds_eval_bound(store, root, as_of_frame) {
+        return Ok(unavailable());
+    }
     let mut sample = Vec::new();
     for frame in visible_frames(store.frames, as_of_ms) {
         if frame.root_symbol != root {
@@ -713,6 +747,9 @@ fn eval_dwell(
     let Some(as_of_frame) = latest_frame(store.frames, root, as_of_ms) else {
         return Ok(unavailable());
     };
+    if session_window_exceeds_eval_bound(store, root, as_of_frame) {
+        return Ok(unavailable());
+    }
     let mut session_frames: Vec<&FeatureIrFrame> = visible_frames(store.frames, as_of_ms)
         .filter(|f| f.root_symbol == root && same_session(f, as_of_frame))
         .collect();
@@ -933,6 +970,49 @@ fn unavailable() -> ScalarN {
     }
 }
 
+fn bound_eval_frames(
+    frames: &[FeatureIrFrame],
+    as_of_ms: f64,
+    caller_truncated: bool,
+) -> (Vec<FeatureIrFrame>, bool) {
+    let mut visible: Vec<&FeatureIrFrame> = visible_frames(frames, as_of_ms).collect();
+    visible.sort_by(|a, b| {
+        a.clock_ms
+            .partial_cmp(&b.clock_ms)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.root_symbol.cmp(&b.root_symbol))
+    });
+    let truncated = caller_truncated || visible.len() > FEATURE_IR_EVAL_MAX_FRAMES;
+    if visible.len() > FEATURE_IR_EVAL_MAX_FRAMES {
+        let start = visible.len() - FEATURE_IR_EVAL_MAX_FRAMES;
+        visible = visible[start..].to_vec();
+    }
+    (visible.into_iter().cloned().collect(), truncated)
+}
+
+/// Session-percentile / dwell fail closed when the as-of session is cut by the cap.
+fn session_window_exceeds_eval_bound(
+    store: FeatureIrStore<'_>,
+    root: &str,
+    as_of_frame: &FeatureIrFrame,
+) -> bool {
+    if !store.window_truncated || store.frames.is_empty() {
+        return false;
+    }
+    let Some(oldest) = store.frames.iter().min_by(|a, b| {
+        a.clock_ms
+            .partial_cmp(&b.clock_ms)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    }) else {
+        return false;
+    };
+    store.frames.iter().any(|frame| {
+        frame.root_symbol == root
+            && same_session(frame, as_of_frame)
+            && (frame.clock_ms - oldest.clock_ms).abs() <= f64::EPSILON
+    })
+}
+
 fn visible_frames(
     frames: &[FeatureIrFrame],
     as_of_ms: f64,
@@ -1097,6 +1177,7 @@ mod tests {
             frames,
             events,
             eval_root: "NQ",
+            window_truncated: false,
         }
     }
 
@@ -1503,5 +1584,39 @@ mod tests {
             evaluate_historical(&program, store(&cat, &frames, &events), t0 + 3000.0).unwrap();
         assert!(out.available);
         assert!((out.value - 2000.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn session_percentile_fails_closed_when_session_exceeds_eval_cap() {
+        let cat = catalog();
+        let t0 = 1_700_000_000_000.0;
+        let n = FEATURE_IR_EVAL_MAX_FRAMES + 1;
+        let frames: Vec<_> = (0..n)
+            .map(|i| {
+                frame(
+                    t0 + i as f64 * 1000.0,
+                    "NQ",
+                    "2026-03-03",
+                    "RTH",
+                    21_000.0 + (i % 10) as f64,
+                )
+            })
+            .collect();
+        let program = declare_program(
+            &json!({"family":"sessionDistributionPercentiles","field":LAST_PRICE}),
+            &cat,
+        )
+        .unwrap();
+        let events: Vec<FeatureIrEvent> = Vec::new();
+        let as_of = t0 + (n as f64 - 1.0) * 1000.0;
+        let live = evaluate_live_shadow(&program, store(&cat, &frames, &events), as_of).unwrap();
+        let hist = evaluate_historical(&program, store(&cat, &frames, &events), as_of).unwrap();
+        assert_eq!(live.available, hist.available);
+        assert_eq!(live.n, hist.n);
+        assert!(
+            !live.available,
+            "session percentile must not silently use a truncated live-sized window"
+        );
+        assert_eq!(live.n, 0);
     }
 }

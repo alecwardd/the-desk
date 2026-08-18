@@ -299,8 +299,11 @@ outputs for core session/events, rules-enabled signals/outcomes, and non-monoton
 timestamp handling against `tests/fixtures/session_replay/v1/*.json`. The same harness
 blesses Feature-IR live-shadow ≡ historical parity over Journal Frames
 (`expected_feature_ir.json`): both path labels share one evaluator over supplied
-frame slices (in-memory vs SQLite round-trip). M5b evaluation is
-declaration-and-test-only — there is no runtime MCP/router caller.
+frame slices (in-memory vs SQLite round-trip). SIL-M5c codegen wires an accepted
+Derived Feature onto the existing kernel (`get_state`, `journal_frames.payload`,
+`query_series` / `query_episodes`, catalog-field rules binding, `search_catalog`).
+Live pending frames cap at 8192 (`PENDING_JOURNAL_MAX_FRAMES`); historical Feature-IR
+loads use a bounded `LIMIT cap+1` sentinel — never `Database::list_journal_frames()`.
 
 Use the ignored private regression test for real Sierra files that must not be committed:
 

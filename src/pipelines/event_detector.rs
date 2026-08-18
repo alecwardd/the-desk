@@ -1215,6 +1215,7 @@ mod tests {
             carry_forward_levels_valid: true,
             prior_day_contract_symbol: Some("NQH26.CME".to_string()),
             dom_summary: None,
+            ..Default::default()
         }
     }
 

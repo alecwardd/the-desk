@@ -29,7 +29,7 @@ AI agents in Cursor
 
 1. **Sierra Chart** writes tick data to `.scid` files as part of normal operation
 2. **The Desk** tail-reads those files, parsing 40-byte binary records (price, bid, ask, volume, aggressor side)
-3. **14 pipeline modules** compute market structure incrementally on every tick
+3. **15 pipeline modules** compute market structure incrementally on every tick
 4. **EventDetector** logs ~30 structured market events (level tests, IB extensions, day type changes, etc.)
 5. **Rules engine** evaluates typed playbook conditions and risk gates before any agent synthesis
 6. **SQLite** stores raw ticks, computed state, session summaries, market events, signal outcomes, and playbook signals
@@ -128,7 +128,7 @@ the-desk/
 │   ├── engine/                 # Engine host, SourceProvider, published-state socket
 │   ├── backfill.rs             # Historical .scid backfill engine
 │   ├── research/mod.rs         # Query engine (frequency, conditional, distribution)
-│   ├── pipelines/              # 14 pipeline modules + event detector
+│   ├── pipelines/              # 15 pipeline modules + event detector
 │   │   ├── mod.rs              # PipelineEngine, MarketState
 │   │   ├── event_detector.rs   # Structured event detection (~30 event types)
 │   │   ├── vwap.rs             # VWAP + std dev bands
@@ -144,6 +144,7 @@ the-desk/
 │   │   ├── day_type.rs         # Profile shape / day type
 │   │   ├── rebid_reoffer.rs    # Acceleration zones
 │   │   ├── pinch.rs            # Delta momentum reversals
+│   │   ├── leg_profile.rs      # Swing-anchored leg-to-leg profiles
 │   │   └── session_inventory.rs   # Cross-session positioning
 │   ├── rules/
 │   │   ├── mod.rs              # Rules engine + condition evaluator
@@ -272,7 +273,7 @@ reviewed. Private real-data regressions can be run with `THE_DESK_GOLDEN_SCID_DI
 ```
 Sierra Chart flush:     ~1000ms  (Intraday File Flush Time in SC settings)
 Rust poll + parse:      ~500ms
-Pipeline compute:       ~5ms     (14 pipelines, incremental)
+Pipeline compute:       ~5ms     (15 pipelines, incremental)
 MCP tool response:      ~50ms
 Agent reasoning:        ~3-8s    (model-dependent)
 ────────────────────────────────────────────────────

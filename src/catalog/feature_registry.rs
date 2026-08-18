@@ -739,6 +739,43 @@ pub fn builtin_base_detectors() -> Vec<FeatureDescriptor> {
             ),
         ),
         shipped_detector(
+            "detector.leg_to_leg",
+            "leg_to_leg",
+            "flow",
+            "Base Detector: swing-anchored leg-to-leg volume/delta profile (reviewed Rust). Schema, provenance, and promotion are registry-governed. Math lives in pipelines::leg_profile. Compact current-leg fields ride get_state; optional leg_started / leg_completed events are not Capsule-mandatory. Discovery rides search_catalog — no specialty getter.",
+            "pipelines::leg_profile",
+            shipped_schema(
+                &[
+                    "market.flow.lastLegDirection",
+                    "market.flow.lastLegNetDelta",
+                    "market.flow.lastLegPoc",
+                    "market.flow.lastLegVolume",
+                    "market.flow.legAgeMs",
+                    "market.flow.legAnchorPrice",
+                    "market.flow.legAnchorTimeMs",
+                    "market.flow.legDeltaPoc",
+                    "market.flow.legDirection",
+                    "market.flow.legHvn",
+                    "market.flow.legLvn",
+                    "market.flow.legNetDelta",
+                    "market.flow.legPoc",
+                    "market.flow.legPocAtSessionPoc",
+                    "market.flow.legPocInSessionDnva",
+                    "market.flow.legPocInSessionVa",
+                    "market.flow.legStatus",
+                    "market.flow.legVaHigh",
+                    "market.flow.legVaLow",
+                    "market.flow.legVaOverlapsSessionVa",
+                    "market.flow.legVolume",
+                ],
+                &["leg_completed", "leg_started"],
+                Unit::Count,
+                SessionScope::Session,
+                FreshnessSemantics::LiveTickAnchored,
+                CostHint::R1,
+            ),
+        ),
+        shipped_detector(
             "detector.pinch",
             "pinch",
             "flow",
@@ -885,7 +922,11 @@ mod tests {
     #[test]
     fn builtins_include_absorption_and_pinch_as_active_without_behavior_change() {
         let registry = FeatureRegistry::builtins();
-        for id in ["detector.absorption", "detector.pinch"] {
+        for id in [
+            "detector.absorption",
+            "detector.pinch",
+            "detector.leg_to_leg",
+        ] {
             let d = registry.get(id).unwrap_or_else(|| panic!("{id}"));
             assert_eq!(d.kind, FeatureKind::BaseDetector);
             assert_eq!(d.promotion_state, PromotionState::Active);
@@ -895,6 +936,7 @@ mod tests {
             assert_eq!(d.provenance.math_tier, TIER1_REVIEWED_RUST);
             assert!(!d.schema.event_types.is_empty());
             assert!(!d.schema.catalog_field_ids.is_empty());
+            assert!(d.program.is_none());
         }
         assert!(registry.get("detector.rebid_reoffer").is_some());
         assert!(registry.get("detector.trade_size").is_some());
@@ -963,6 +1005,54 @@ mod tests {
         }
         assert!(!listed.contains("ib_ext_0.5x_high_hit"));
         assert!(listed.contains("ib_extension_hit"));
+    }
+
+    #[test]
+    fn detector_leg_to_leg_is_builtin_active_non_dom() {
+        let catalog = build_catalog();
+        let detector = catalog
+            .base_detectors
+            .iter()
+            .find(|d| d.id == "detector.leg_to_leg")
+            .expect("detector.leg_to_leg");
+        assert_eq!(detector.kind, FeatureKind::BaseDetector);
+        assert_eq!(detector.promotion_state, PromotionState::Active);
+        assert!(detector.builtin);
+        assert!(!detector.provenance.behavior_change);
+        assert!(detector.program.is_none());
+        assert_eq!(detector.schema.session_scope, SessionScope::Session);
+        assert_eq!(detector.schema.cost_hint, CostHint::R1);
+        assert_eq!(
+            detector.schema.freshness,
+            FreshnessSemantics::LiveTickAnchored
+        );
+        let listed: BTreeSet<_> = detector
+            .schema
+            .event_types
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        assert!(listed.contains("leg_started"));
+        assert!(listed.contains("leg_completed"));
+        for event in ["leg_started", "leg_completed"] {
+            assert!(
+                !DOM_FAMILY_EVENT_TYPES.contains(&event),
+                "{event} must not be a DOM-family / Capsule-mandatory type"
+            );
+            assert!(!crate::catalog::is_dom_family_event_type(event));
+            assert!(!crate::catalog::requires_capsule(event));
+            assert_eq!(
+                crate::catalog::classify_event_family(event),
+                crate::catalog::EventFamily::Flow
+            );
+        }
+        assert!(crate::catalog::search_features(&catalog, "leg_to_leg")
+            .iter()
+            .any(|h| h.id == "detector.leg_to_leg"));
+        assert!(crate::catalog::concept_has_catalog_or_registry_entry(
+            &catalog,
+            "detector.leg_to_leg"
+        ));
     }
 
     #[test]
@@ -1292,6 +1382,7 @@ mod tests {
             "kind-literal `detector` must not return Derived Features"
         );
         assert!(detector_hits.iter().any(|h| h.id == "detector.pinch"));
+        assert!(detector_hits.iter().any(|h| h.id == "detector.leg_to_leg"));
         let hits = search_features(&full, "sessionDistributionPercentiles");
         assert!(hits
             .iter()

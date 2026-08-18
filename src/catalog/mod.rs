@@ -315,7 +315,7 @@ fn base_domain_shells() -> Vec<DomainDescriptor> {
         DomainDescriptor {
             id: "flow".into(),
             name: "Flow".into(),
-            summary: "Participation and aggression: delta, tape pace, absorption, pinch, trade size.".into(),
+            summary: "Participation and aggression: delta, tape pace, absorption, pinch, trade size, leg-to-leg profiles.".into(),
             field_ids: vec![],
             record_kinds: vec![],
         },
@@ -653,6 +653,7 @@ mod tests {
         let detectors = flow["baseDetectors"].as_array().expect("baseDetectors");
         assert!(detectors.iter().any(|d| d["id"] == "detector.absorption"));
         assert!(detectors.iter().any(|d| d["id"] == "detector.pinch"));
+        assert!(detectors.iter().any(|d| d["id"] == "detector.leg_to_leg"));
     }
 
     #[test]

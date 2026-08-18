@@ -69,7 +69,7 @@ The actual storage automation is handled by Windows Task Scheduler through `scri
 ```
 Sierra Chart flush:     ~600-1000ms (Intraday File Flush Time)
 The Desk poll:          ~1000ms  (flush_poll_ms in config.toml)
-Pipeline compute:       ~5ms     (14 pipelines, incremental)
+Pipeline compute:       ~5ms     (15 pipelines, incremental)
 ────────────────────────────────────────────────────────
 Data available via MCP: ~1.6s behind reality (worst case)
                         ~0.8s average

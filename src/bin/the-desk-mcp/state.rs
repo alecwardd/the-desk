@@ -66,6 +66,8 @@ pub(crate) const RESEARCH_EVENT_TYPES: &[&str] = &[
     "acceleration_zone_created",
     "acceleration_zone_held",
     "large_trade_cluster",
+    "leg_started",
+    "leg_completed",
 ];
 pub(crate) const RESEARCH_LEVEL_TEST_NAMES: &[&str] = &[
     "prior_day_high",

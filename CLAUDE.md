@@ -26,8 +26,9 @@ The system has three layers. All code must respect this separation:
 ```
 LAYER 1: Deterministic Pipelines (Rust)
   - Reads .scid tick data and computes structured market intelligence
-  - 14 pipeline modules: VWAP, TPO, Delta, Levels, Tape Pace, Footprint,
-    Absorption, Trade Size, OR5, RVOL, Day Type, Rebid/Reoffer, Pinch, Session Inventory
+  - 15 pipeline modules: VWAP, TPO, Delta, Levels, Tape Pace, Footprint,
+    Absorption, Trade Size, OR5, RVOL, Day Type, Rebid/Reoffer, Pinch, Session Inventory,
+    Leg Profile
   - Pure math. No LLM calls. No network requests. Sub-millisecond.
 
 LAYER 2: Rules Engine (Rust)
@@ -62,7 +63,7 @@ LAYER 3: MCP Server + LLM Orchestration
 
 | Component | Technology | Notes |
 |-----------|-----------|-------|
-| Pipeline engine | Rust | 14 incremental pipeline modules, sub-ms per tick |
+| Pipeline engine | Rust | 15 incremental pipeline modules, sub-ms per tick |
 | Rules engine | Rust | Typed conditions, setup state machine |
 | MCP server | `rmcp` crate | 123 MCP tools via stdio transport |
 | Data source | Sierra Chart `.scid` | Binary tick data, 40-byte records |
@@ -161,7 +162,7 @@ the-desk/
 │   │                                 #   playbook, risk, journal, memory, research, admin)
 │   ├── backfill.rs                   # Historical .scid backfill engine
 │   ├── research/mod.rs               # Query engine (frequency, conditional, distribution)
-│   ├── pipelines/                    # 14 pipeline modules + event detector
+│   ├── pipelines/                    # 15 pipeline modules + event detector
 │   │   ├── mod.rs                    # PipelineEngine, MarketState
 │   │   ├── event_detector.rs         # Structured event detection layer
 │   │   ├── vwap.rs                   # VWAP + std dev bands
@@ -177,6 +178,7 @@ the-desk/
 │   │   ├── day_type.rs              # Day type classifier
 │   │   ├── rebid_reoffer.rs         # Acceleration zones
 │   │   ├── pinch.rs                 # Delta momentum reversals
+│   │   ├── leg_profile.rs           # Swing-anchored leg-to-leg profiles
 │   │   └── session_inventory.rs     # Cross-session positioning
 │   ├── rules/                        # Playbook rules engine
 │   │   ├── mod.rs                    # Condition evaluator (40+ fields)

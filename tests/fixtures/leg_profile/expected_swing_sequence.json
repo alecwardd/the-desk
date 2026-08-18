@@ -1,0 +1,17 @@
+{
+  "fixtureVersion": 1,
+  "sequence": "up-swing then 8-point reversal",
+  "afterReversal": {
+    "status": "insufficient",
+    "direction": "down",
+    "anchorPrice": 21016.0,
+    "volume": 8.0,
+    "netDelta": -8.0,
+    "poc": 0.0,
+    "lastDirection": "up",
+    "lastVolume": 70.0,
+    "lastNetDelta": 70.0,
+    "lastPoc": 21008.0
+  },
+  "eventTypes": ["leg_started", "leg_completed", "leg_started"]
+}

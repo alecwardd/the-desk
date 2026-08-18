@@ -1176,6 +1176,19 @@ async fn discovery_tools_return_metadata_only() {
     assert!(feature_hits
         .iter()
         .any(|h| h["id"] == "detector.pinch" && h["promotionState"] == "active"));
+
+    let legs = parse_text_tool_result(
+        server
+            .search_catalog(Parameters(SearchCatalogParams {
+                query: Some("leg_to_leg".into()),
+            }))
+            .await
+            .expect("search_catalog leg_to_leg"),
+    );
+    let leg_hits = legs["featureHits"].as_array().expect("featureHits");
+    assert!(leg_hits.iter().any(|h| h["id"] == "detector.leg_to_leg"
+        && h["promotionState"] == "active"
+        && h["builtin"] == true));
     assert_eq!(env["featureRegistry"]["humanGated"], true);
     assert_eq!(env["featureRegistry"]["writeVerb"], "feature_registry");
     assert_eq!(env["featureRegistry"]["discoveryEnabled"], true);

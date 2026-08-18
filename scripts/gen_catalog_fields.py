@@ -74,6 +74,29 @@ def classify(name: str) -> tuple[str, str, str, str, str]:
             unit = "Milliseconds"
         return "flow", unit, "Session", "LiveTickAnchored", "R1"
 
+    if name.startswith("leg_") or name.startswith("last_leg_"):
+        unit = "Contracts"
+        if name in ("leg_status",) or "direction" in name:
+            unit = "EnumLabel"
+        elif name.endswith("_ms") or "age" in name:
+            unit = "Milliseconds"
+        elif name.startswith("leg_poc_at") or name.startswith("leg_poc_in") or "overlaps" in name:
+            unit = "Bool"
+        elif (
+            "price" in name
+            or name.endswith("_poc")
+            or name.endswith("_hvn")
+            or name.endswith("_lvn")
+            or name.endswith("_va_high")
+            or name.endswith("_va_low")
+        ):
+            unit = "PricePoints"
+        elif "volume" in name:
+            unit = "Contracts"
+        elif "delta" in name:
+            unit = "Contracts"
+        return "flow", unit, "Session", "LiveTickAnchored", "R1"
+
     if name.startswith("rvol_"):
         unit = "Ratio"
         if name in ("rvol_classification", "rvol_baseline_status"):

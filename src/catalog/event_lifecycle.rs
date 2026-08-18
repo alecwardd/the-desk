@@ -326,7 +326,9 @@ pub fn classify_event_family(event_type: &str) -> EventFamily {
         | "acceleration_zone"
         | "large_trade_cluster"
         | "exhaustion"
-        | "delta_divergence" => EventFamily::Flow,
+        | "delta_divergence"
+        | "leg_started"
+        | "leg_completed" => EventFamily::Flow,
         "ib_extension"
         | "ib_formed"
         | "or_formed"

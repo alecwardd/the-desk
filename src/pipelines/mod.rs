@@ -4,6 +4,7 @@ mod delta;
 pub mod event_detector;
 pub mod flow_event_emitter;
 mod footprint;
+mod leg_profile;
 mod levels;
 mod opening_range_5min;
 mod pinch;
@@ -28,6 +29,11 @@ pub use event_detector::{
 };
 pub use flow_event_emitter::FlowEventEmitter;
 pub use footprint::{FootprintLevel, FootprintPipeline, StackedZone};
+pub use leg_profile::{
+    LegDirection, LegProfileEvent, LegProfilePipeline, LegProfileSnapshot, EVENT_LEG_COMPLETED,
+    EVENT_LEG_STARTED, MIN_ELAPSED_MS, MIN_REVERSAL_POINTS, MIN_REVERSAL_TICKS, MIN_VOLUME,
+    NQ_TICK as LEG_NQ_TICK, STATUS_ACTIVE, STATUS_INSUFFICIENT, STATUS_NONE,
+};
 pub use levels::{KeyLevel, KeyLevelType, LevelsPipeline, ProximityLevel};
 pub use opening_range_5min::{OpeningRange5MinPipeline, Or5BreakDirection};
 pub use pinch::{PinchEvent, PinchPipeline};
@@ -95,6 +101,62 @@ mod tests {
         let json = serde_json::to_value(&state).expect("serialize");
         assert_eq!(json["domSummary"]["liquidityBias"], "bid_support");
         assert_eq!(json["domSummary"]["nearTouchBidDepth"], 30.0);
+    }
+
+    #[test]
+    fn leg_profile_resets_on_asia_and_rth_not_london() {
+        let mut engine = PipelineEngine::new();
+        engine.leg_profile.on_trade(0.0, 21_000.0, 10.0, true, true);
+        engine
+            .leg_profile
+            .on_trade(5_000.0, 21_008.0, 50.0, true, true);
+        engine
+            .leg_profile
+            .on_trade(16_000.0, 21_016.0, 10.0, true, true);
+        assert_eq!(
+            engine
+                .leg_profile
+                .snapshot(16_000.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+                .status,
+            crate::pipelines::STATUS_ACTIVE
+        );
+
+        engine.reset_segment(DeltaSegment::London);
+        assert_eq!(
+            engine
+                .leg_profile
+                .snapshot(16_000.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+                .status,
+            crate::pipelines::STATUS_ACTIVE,
+            "London is delta-only; a live Globex rotation must survive 02:00 ET"
+        );
+
+        engine.reset_segment(DeltaSegment::Rth);
+        assert_eq!(
+            engine
+                .leg_profile
+                .snapshot(16_000.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+                .status,
+            crate::pipelines::STATUS_NONE
+        );
+
+        engine
+            .leg_profile
+            .on_trade(0.0, 21_000.0, 10.0, true, false);
+        engine
+            .leg_profile
+            .on_trade(5_000.0, 21_008.0, 50.0, true, false);
+        engine
+            .leg_profile
+            .on_trade(16_000.0, 21_016.0, 10.0, true, false);
+        engine.reset_segment(DeltaSegment::Asia);
+        assert_eq!(
+            engine
+                .leg_profile
+                .snapshot(16_000.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+                .status,
+            crate::pipelines::STATUS_NONE
+        );
     }
 }
 
@@ -380,6 +442,53 @@ pub struct MarketState {
     /// Excess at bottom of profile.
     pub excess_low: bool,
 
+    // --- Leg-to-leg profile (SIL-M5d Base Detector `detector.leg_to_leg`) ---
+    /// Active rotation status: `none` (no trades), `insufficient` (too new/unstable), or `active` (mature).
+    pub leg_status: String,
+    /// Confirmed swing direction of the active rotation (`up` / `down`) when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub leg_direction: Option<String>,
+    /// Timestamp (ms) of the active-leg anchor (last confirmed swing).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub leg_anchor_time_ms: Option<f64>,
+    /// Price of the active-leg anchor (last confirmed swing). Zero when `none`.
+    pub leg_anchor_price: f64,
+    /// Age of the active rotation in milliseconds.
+    pub leg_age_ms: f64,
+    /// Traded volume accumulated in the active rotation.
+    pub leg_volume: f64,
+    /// Net delta (ask buys minus bid sells) accumulated in the active rotation.
+    pub leg_net_delta: f64,
+    /// Volume point of control of the active leg. Zero when the rotation is `insufficient` or `none`.
+    pub leg_poc: f64,
+    /// Highest-volume node of the active leg (compact snapshot: same as `leg_poc`; no clustering).
+    pub leg_hvn: f64,
+    /// Lowest-volume node of the active-leg map (excludes POC when more than one price traded).
+    pub leg_lvn: f64,
+    /// Active-leg value area high (70% of leg volume, expand from volume POC like TPO VA).
+    pub leg_va_high: f64,
+    /// Active-leg value area low (70% of leg volume, expand from volume POC like TPO VA).
+    pub leg_va_low: f64,
+    /// Price with the largest absolute delta in the active-leg delta profile (delta-profile control).
+    pub leg_delta_poc: f64,
+    /// True when mature leg POC is within two ticks of the same-session TPO POC.
+    pub leg_poc_at_session_poc: bool,
+    /// True when mature leg POC sits inside the same-session TPO value area (two-tick band).
+    pub leg_poc_in_session_va: bool,
+    /// True when the mature leg VA overlaps the same-session TPO value area.
+    pub leg_va_overlaps_session_va: bool,
+    /// True when mature leg POC sits inside the current delta-segment DNVA (two-tick band).
+    pub leg_poc_in_session_dnva: bool,
+    /// Direction of the last completed rotation (`up` / `down`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_leg_direction: Option<String>,
+    /// Traded volume of the last completed rotation.
+    pub last_leg_volume: f64,
+    /// Net delta of the last completed rotation.
+    pub last_leg_net_delta: f64,
+    /// Volume POC of the last completed rotation.
+    pub last_leg_poc: f64,
+
     /// Current session type from last tick / snapshot time: "RTH", "Globex", or "Unknown".
     /// During Globex, use overnightHigh/overnightLow as session range; sessionHigh/sessionLow and IB/OR/OR5 are RTH-only.
     pub session_type: String,
@@ -425,6 +534,7 @@ pub struct PipelineEngine {
     pub rebid_reoffer: RebidReofferPipeline,
     pub pinch: PinchPipeline,
     pub session_inventory: SessionInventoryPipeline,
+    pub leg_profile: LegProfilePipeline,
     last_trade_price: Option<f64>,
     cumulative_delta: f64,
     /// Combined Globex delta (Asia + London) from 6 PM ET. Only accumulates during Globex; resets at 6 PM and 9:30 AM.
@@ -457,6 +567,7 @@ impl PipelineEngine {
             rebid_reoffer: RebidReofferPipeline::new(),
             pinch: PinchPipeline::new(),
             session_inventory: SessionInventoryPipeline::new(),
+            leg_profile: LegProfilePipeline::new(0.25),
             last_trade_price: None,
             cumulative_delta: 0.0,
             globex_delta: 0.0,
@@ -519,6 +630,7 @@ impl PipelineEngine {
                 self.rebid_reoffer.reset();
                 self.pinch.reset();
                 self.session_inventory.reset();
+                self.leg_profile.reset();
                 self.last_trade_price = None;
                 self.dom_summary = None;
             }
@@ -656,6 +768,8 @@ impl PipelineEngine {
             },
         );
         self.pinch.on_trade(timestamp_ms, price, volume, is_buy);
+        self.leg_profile
+            .on_trade(timestamp_ms, price, volume, is_buy, is_overnight);
         self.session_inventory
             .update(self.delta.session_delta(), self.delta.dnp());
 
@@ -796,6 +910,14 @@ impl PipelineEngine {
         } else {
             RecentSignalSnapshot::default()
         };
+        let leg = self.leg_profile.snapshot(
+            timestamp_ms,
+            self.tpo.poc(),
+            self.tpo.va_high(),
+            self.tpo.va_low(),
+            self.delta.dnva_high(),
+            self.delta.dnva_low(),
+        );
         let ib_extension_state = ib_extension_state_from_range(
             self.tpo.ib_high(),
             self.tpo.ib_low(),
@@ -974,6 +1096,27 @@ impl PipelineEngine {
                 let (_, bottom) = self.tpo.excess();
                 bottom
             },
+            leg_status: leg.status,
+            leg_direction: leg.direction,
+            leg_anchor_time_ms: leg.anchor_time_ms,
+            leg_anchor_price: leg.anchor_price,
+            leg_age_ms: leg.age_ms,
+            leg_volume: leg.volume,
+            leg_net_delta: leg.net_delta,
+            leg_poc: leg.poc,
+            leg_hvn: leg.hvn,
+            leg_lvn: leg.lvn,
+            leg_va_high: leg.va_high,
+            leg_va_low: leg.va_low,
+            leg_delta_poc: leg.delta_poc,
+            leg_poc_at_session_poc: leg.poc_at_session_poc,
+            leg_poc_in_session_va: leg.poc_in_session_va,
+            leg_va_overlaps_session_va: leg.va_overlaps_session_va,
+            leg_poc_in_session_dnva: leg.poc_in_session_dnva,
+            last_leg_direction: leg.last_direction,
+            last_leg_volume: leg.last_volume,
+            last_leg_net_delta: leg.last_net_delta,
+            last_leg_poc: leg.last_poc,
             session_type,
             session_segment,
             trading_day,

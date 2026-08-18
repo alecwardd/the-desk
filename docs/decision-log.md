@@ -894,6 +894,26 @@ This note does not implement the leg engine (#21), DOM cluster Base Detectors (#
 
 ---
 
+### Decision note: SIL-M5d Tier-1 Base Detector — leg-to-leg profile engine
+
+**Date:** 2026-08-18
+**Status:** Decided (implements [alecwardd/the-desk#21](https://github.com/alecwardd/the-desk/issues/21); Part of #2)
+
+**Context:** SIL-M5c landed Feature Registry codegen. Spec (#2) and IDEA-029 Track C still needed a deterministic swing/rotation boundary so volume-at-price and delta-at-price can be accumulated per rotational **leg**. Four later Derived Feature / setup rows (per-leg auction efficiency, strong-form VWAP pullback, leg-to-leg delta rotation, L2L pullback-join) depend on this engine and are **not** implemented here.
+
+**Decision:**
+
+1. **`LegProfilePipeline`** (`src/pipelines/leg_profile.rs`) is a reviewed-Rust Base Detector. A leg is a Track C rotation anchored to a confirmed swing high/low, not an MFE/MAE outcome leg and not `research::ib_campaign` confluence. Boundary constants are frozen in-module (no `config.toml` knobs): NQ tick = 0.25; minimum reversal = 32 ticks (8.0 points); minimum elapsed time = 15 s; minimum volume = 40 contracts. Chop below the reversal threshold does not form extra legs. A new or unstable rotation is labeled `insufficient` and profile geometry (POC / HVN / LVN / VA / delta POC) fails closed.
+2. **Incremental, session-scoped.** Volume-at-price and delta-at-price maps update on each trade. Full reset on Asia and RTH (same as footprint/pinch/absorption). London does **not** wipe a live Globex rotation. RTH and Globex never mix. Value area is 70% of **leg volume**, expanded from the volume POC the same way TPO VA expands — not the middle 70% of range. HVN in the compact snapshot is the single highest-volume node (no clustering). Delta POC is the price with largest absolute delta (delta-profile control).
+3. **Registry-governed, no specialty tool.** `detector.leg_to_leg` ships `active` / `builtin=true` / `behaviorChange=false` / `program=None` (human-gated M5a path for reviewed Rust). Compact current-leg and last-completed-leg fields ride `get_state` / catalog. Optional `leg_started` / `leg_completed` events go through `FlowEventEmitter` as Flow-family types; they are **not** in `DOM_FAMILY_EVENT_TYPES` and do not require Capsules. `DETECTOR_SPECIALTY_TOOLS` stays the existing four. Surface stays **123 tools**. IDEA-029's future `get_leg_profile` tool is explicitly not built.
+4. **Confluence** flags compare mature leg POC/VA against same-session TPO POC/VA and the current delta-segment DNVA (two-tick band). DNVA follows the delta pipeline's London reset; a Globex-spanning leg may confluence against London-only DNVA after 02:00 ET. That is documented, not a RTH/Globex mix.
+
+This note does not implement the four dependent Derived Feature / setup rows, Feature-IR / a sixth Operator Family / a sixth codegen emitter, DOM cluster Base Detectors (#22), ACSIL (#23), Vs3dProvider (#16), DuckDB, Parquet conversion, `get_capsule`, a 250 ms forever-store, a tenth kernel operator / `run_job` poll tool, `get_leg_profile` or any new specialty MCP tool, or raising the Trust Ceiling.
+
+**Consequences:** Agents can discover `detector.leg_to_leg` via `search_catalog` and read compact leg fields on `get_state`. Later Derived Features can bind those catalog fields without growing the MCP surface.
+
+---
+
 ### Decision note: SIL-P-VS-a Levels-Only Record path
 
 **Date:** 2026-08-13

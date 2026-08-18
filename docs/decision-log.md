@@ -130,7 +130,7 @@ Each decision follows this structure:
 ### ADR-007: Coaching-only, never trade execution
 
 **Date:** 2026-02-20
-**Status:** Decided
+**Status:** Superseded by ADR-022 (2026-08-11)
 **Source:** CLAUDE.md, the-desk-vision.md, epic-brief.md
 
 **Decision:** The Desk never places, modifies, or cancels orders. It never connects to a trading API for execution purposes. It is a coaching and discipline tool.
@@ -472,6 +472,85 @@ New `FeedConfig` fields (all serde-default): `max_ticks_per_poll` (5000), `analy
 - Carry only running high/low for outcome resolution instead of a pending set — rejected because it cannot reproduce the exact first-crossing target/stop semantics the DB tracker guarantees.
 
 **Consequences:** Rule and setup *firing* is now sampled (≤250 ms / 500 ticks) rather than evaluated on every tick — an accepted 100–250 ms alert-coalescing tradeoff for discretionary coaching. Outcome excursion accuracy stays per-tick exact. Parity tests assert capped == uncapped final pipeline state and coalesced == per-tick outcome extremes. `process_tick` is retained for tests and replay utilities but is no longer on the live path.
+
+---
+
+### ADR-022: Trust ladder with an L3 ceiling replaces the permanent execution prohibition
+
+**Date:** 2026-08-11
+**Status:** Decided
+**Supersedes:** ADR-007
+**Source:** Sierra Intelligence Layer grilling session (docs/research/sierra-intelligence-layer-architecture-synthesis-v1.md §7 Q10)
+
+**Context:** ADR-007 prohibited trade execution permanently ("never places, modifies, or cancels orders"). The owner decided the permanence is wrong: agent-assisted execution with per-order human confirmation is acceptable in principle someday, though a long way off. Deleting the prohibition outright would leave no stated ceiling during that gap — permission implied, safety rails absent.
+
+**Decision:** Define the automation trust ladder as project vocabulary and set the current ceiling:
+
+- **L0** read-only market/state queries · **L1** chart annotations and drawings · **L2** alerts and attention signals tied to playbook rules · **L3** drafted trade proposals (entry/stop/target traceable to a playbook rule; human executes manually) · **L4** execution bridge (The Desk transmits an order after explicit per-order human confirmation).
+- **Current ceiling: L3.** The Desk does not place, modify, or cancel orders at this trust level.
+- **L4 is permitted in principle but prohibited until a future ADR** explicitly raises the ceiling and names its preconditions (e.g., risk-engine gating, kill switch, paper burn-in). One front door; no side doors (no ACSIL write path, browser automation, or DTC wiring may reach execution without that ADR).
+- **Invariants that survive any future ceiling change:** execution can never be a side effect of a read/query path — if L4 ever activates, it enters as a distinct capability-gated act verb; every proposal and alert still traces to the trader's own playbook rules; "test an idea for me" means the deterministic research/backtest lifecycle (hypothesis → backtest → outcome tracking), never live orders.
+
+**Consequences:** CLAUDE.md, .cursorrules, and README drop "never executes" in favor of "not at the current trust level (L3 ceiling — ADR-022)". The no-proprietary-signals and no-financial-advice rules are unchanged. Compliance framing shifts from "execution is impossible by charter" to "execution is above the current trust ceiling"; any future L4 ADR must re-examine the coaching-vs-advisory positioning before implementation.
+
+---
+
+### ADR-023: Feature-IR scope — two-tier frame with five funded operator families
+
+**Date:** 2026-08-11
+**Status:** Decided
+**Source:** Grilling session Q2; full classified backlog in docs/research/feature-ir-backlog-triage.md
+
+**Context:** M5 of the Sierra Intelligence Layer plan needed a go/no-go on building a typed expression IR + registry codegen versus shrinking to a schema-only registry (Kimi's <60%-expressible kill-line). A raw triage of the owner's 27-row backlog scored ~50% expressible — but that miscounts base detectors (the absorption/pinch species), which were always going to be reviewed Rust regardless of any IR.
+
+**Decision:**
+- **Two-tier frame.** Tier 1: Base Detectors in reviewed Rust, registry-governed (schema, provenance, promotion gates) but never expressed in the IR. Tier 2: Derived Features declared in the typed Feature-IR over catalog fields, evaluated live in shadow and historically over journal frames.
+- **Fund exactly five operator families:** cross-symbol references, session-distribution percentiles, dwell/time-since-predicate, event sequences ("A then B within T"), historical baselines. Surface lookups deliberately unfunded — the VS3D provider precomputes flip/level fields at ingest.
+- **New families require a registry change proposal** with its own review gate; no ad-hoc extension. The IR stays non-Turing-complete.
+- **IR + codegen goes ahead as M5 scope.** The percentage bar is retired in favor of the funded-families frame.
+
+**Consequences:** With the five families, every Tier 2 backlog row is expressible; eight rows are Tier 1 Rust. Recorded reversal condition: if order-level iceberg detection becomes committed, the parked Databento decision unparks for MBO data (`.depth` is market-by-price and cannot support it). The leg engine (IDEA-035) is the highest-leverage Tier 1 build (four rows depend on it).
+
+---
+
+### ADR-024: Journal cadence — compute at 250 ms, persist 1 Hz frames, capsules mandatory for DOM-family events
+
+**Date:** 2026-08-11
+**Status:** Decided
+**Source:** Owner cadence review (synthesis v1.1 §7 Q3) + grilling session Q3
+
+**Context:** The Market State Journal (SIL M3) needed a persistence cadence, and the owner's sub-second-native DOM backlog (book velocity, thinning/thickening, pull-intent — feature-ir-backlog-triage rows 21/24/25) raised whether episode predicates ever need constant sub-second co-occurrence matching across the whole journal.
+
+**Decision:**
+- Compute/live-publish at ~250 ms (matches `analysis_min_interval_ms`). Persist 1 Hz feature frames plus event rows at transitions. Never persist 250 ms frames permanently (~4× disk/write cost for questions rehydratable from `.scid`/`.depth`).
+- Sub-second DOM behavior enters episode queries through **event forms**: Tier 1 Base Detectors emit journaled events (`stop_run_detected`, `iceberg_reload`, `pull_intent_flagged`, book-velocity regime shifts).
+- **Capsules are mandatory for DOM-family event types**: the rolling 250 ms ring dumps ~30 s before → ~60 s after each salient event, persisted alongside the event row.
+- MFE/MAE stays tick-driven via `outcome_tracker::on_tick`; journal cadence never touches excursion accuracy.
+- 1 Hz frames carry the smoothed indicator values (velocity percentile, thinning slope), so coarse conjunctions remain answerable journal-wide.
+
+**Reversal condition:** if a real episode query fails because a needed conjunction fell *between* events (not near any detection), revisit capsule triggers first; frame cadence changes only after capsule triggers are exhausted.
+
+---
+
+### ADR-025: VS3D gradient capture unit — slices and levels-only records, never surface archives
+
+**Date:** 2026-08-11
+**Status:** Decided
+**Source:** Grilling session Q4; extends docs/research/vs3d-snapshot-schema.md (v1: positions) toward schema v2 (gradient panels)
+
+**Context:** Schema v2 must cover gradient panels (gamma/charm/vanna; delta + delta-change when present). The capture unit determines the core record type. Options: (a) full-surface re-capture per interval, (b) current-time slice capture, (c) derived-levels-only.
+
+**Decision:**
+- Scrape writes **`completeness: slice`**: price-indexed greek values at capture time, the panel tooltip fields (exposure, dollar-per-percent, dollar-value-of-trade, hedge-product-to-trade), and **Desk-derived levels computed at ingest** (zero-gamma/flip cross, max-|gradient| walls, BALANCE / UPSIDE TEST / DOWNSIDE TEST per the ODTE MM level-map methodology).
+- Manual entry writes **`completeness: levels_only`** — a first-class record, not a degraded mode. Both land in the `positioning` domain in one schema (two adapters at one seam, same as positions).
+- **(a) is rejected**: it re-stores yesterday's history every interval, blends observed history with vendor forward projection in one blob (the exact provenance/freshness trap the fail-closed rules exist to prevent), is harder to query ("what was flip at 10:42?"), and puts nothing on Sierra anyway.
+- **Vendor forward projection is excluded from the durable store** — usable as live/ephemeral "as-of-now" context only. The durable store is slices + derived levels + annotations.
+- "Full-surface feel" during RTH = raise slice cadence (~every 5–10 min), never switch the record type.
+- **Sierra pin:** Sierra Chart never stores surfaces. Only Desk-computed levels from slice/levels_only records are drawn — via the annotation path when ACSIL allows it, hand-drawn from the same levels until then.
+
+**Feasibility gate (ToS-gated POC):** grid and by-strike extraction via React props is proven; gradient-slice extraction is not. If the POC cannot prove it, gradient panels run levels_only/manual permanently while grid + by-strike capture proceeds.
+
+**Interpretation layer (decided same session):** three artifacts teach agents to read and mid-day-adjust positioning data — (1) the ODTE MM level-map methodology doc extended from positions to gradient Slices (flip/wall migration, charm drift into expiration, BALANCE→TEST transitions); (2) a seed corpus of ~10 co-annotated sessions (owner has spot-up/vol-up examples, trend days, etc.; historical days enter as levels_only manual records, so the corpus does not wait on the scraper); (3) methodology lives in docs/research, exemplars live in the memory system (`save_agent_insight`/journal) so `recall_agent_insights`/`get_memory_brief` surface them live. Ongoing habit: any live session with a real mid-day re-read gets one exemplar annotation captured same-day.
 
 ---
 

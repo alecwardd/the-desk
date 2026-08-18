@@ -13,7 +13,7 @@ These rules apply to ALL LLM coding agents working in this repository. Read full
 
 The Desk is a backend intelligence platform for discretionary NQ futures traders. It reads Sierra Chart's `.scid` tick data files, computes market structure and microstructure analytics in Rust, stores everything in SQLite, and exposes the intelligence layer via MCP (Model Context Protocol) — making any Cursor agent a trading partner.
 
-**It does NOT place or execute trades.** It is a trading partner — grounded in the trader's playbook and live market structure data. It can share opinions, flag concerns, and offer its read on the market, but the trader always makes the final call.
+**It does not place or execute trades at the current trust level (L3 ceiling — ADR-022: proposals drafted, human executes; raising the ceiling requires a new ADR).** It is a trading partner — grounded in the trader's playbook and live market structure data. It can share opinions, flag concerns, and offer its read on the market, but the trader always makes the final call.
 
 **Primary interface:** AI agents in Cursor (and Claude Code, Codex). This repository is backend-only: Rust, SQLite, and MCP.
 
@@ -118,7 +118,7 @@ These terms have precise meanings. Using them incorrectly will produce a broken 
 ## Never Do List
 
 1. **The Desk includes a deterministic market structure research module.** It logs structured events during pipeline processing, tracks signal outcomes, and answers historical queries (frequencies, conditional probabilities, distributions). It does NOT simulate order fills with slippage models -- it reports what actually happened in the market relative to computed levels.
-2. **Never place or manage trades.** The Desk is coaching only.
+2. **No trade execution at the current trust level.** The Desk drafts proposals; the human executes (L3 ceiling — ADR-022). Raising the ceiling requires a new ADR, and execution must never be reachable from read/query paths.
 3. **Never generate proprietary trading signals.** Every alert traces to the trader's own playbook rules.
 4. **Ground opinions in data and playbook rules.** Sharing a market read or saying "I like this" / "I'd be cautious here" is encouraged — but always tie it back to what the structure and the trader's rules show. The trader makes the final call.
 5. **Never send raw market data to the Claude API.** Send structured summaries only.

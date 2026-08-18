@@ -52,7 +52,7 @@ MCP tools return computed snapshots, profiles, events, outcomes, and diagnostics
 The core system reads local Sierra Chart files and persists to local SQLite. Pipelines, rules, backfill, and research queries work without network connectivity, which keeps the trading-data path reliable and under local control.
 
 ### No Autonomous Execution
-The Desk informs, coaches, logs, and researches. It never places orders, manages positions through a broker, or takes actions on the trader's behalf.
+The Desk informs, coaches, logs, and researches. It does not place orders, manage positions through a broker, or take actions on the trader's behalf at the current trust level (L3 ceiling — see ADR-022 in `docs/decision-log.md`).
 
 ## Ingestion Modes
 

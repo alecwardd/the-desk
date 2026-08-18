@@ -1042,6 +1042,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let runtime_events_analysis = Arc::clone(&runtime_events_bg);
                         let pending_analysis = Arc::clone(&pending_outcomes);
                         let feed_rt_analysis = Arc::clone(&feed_rt_bg);
+                        let router_analysis = Arc::clone(&market_router_bg);
                         let analysis_timestamp_ms = tick.timestamp_ms;
                         feed_rt_bg
                             .scid_worker_phase
@@ -1057,6 +1058,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 &events,
                                 analysis_timestamp_ms,
                                 AttentionPulseKind::EventDriven,
+                                Some(router_analysis.as_ref()),
                             );
                             feed_rt_analysis.last_analysis_pass_wall_ms.store(
                                 chrono::Utc::now().timestamp_millis().max(0) as u64,
@@ -1168,6 +1170,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let runtime_events_analysis = Arc::clone(&runtime_events_bg);
                         let pending_analysis = Arc::clone(&pending_outcomes);
                         let feed_rt_analysis = Arc::clone(&feed_rt_bg);
+                        let router_analysis = Arc::clone(&market_router_bg);
                         let analysis_timestamp_ms = last_market_tick_ts;
                         feed_rt_bg
                             .scid_worker_phase
@@ -1183,6 +1186,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 &events,
                                 analysis_timestamp_ms,
                                 AttentionPulseKind::EventDriven,
+                                Some(router_analysis.as_ref()),
                             );
                             feed_rt_analysis.last_analysis_pass_wall_ms.store(
                                 chrono::Utc::now().timestamp_millis().max(0) as u64,

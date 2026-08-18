@@ -13,7 +13,7 @@ use std::collections::HashMap;
 /// semantics change in a way that invalidates cached backtest statistics.
 /// Examples: adding/removing condition variants, changing comparison semantics
 /// in `evaluate_typed_condition`, or changing `resolve_price_expression` modes.
-pub const RULES_ENGINE_SCHEMA_VERSION: u32 = 5;
+pub const RULES_ENGINE_SCHEMA_VERSION: u32 = 7;
 
 // ---------------------------------------------------------------------------
 // Setup state machine
@@ -168,6 +168,10 @@ pub enum ConditionField {
     /// "up" or "down". Note the trade is typically *opposite* this — a failed
     /// down-defense resolves into an upside vacuum.
     AbsorptionInvalidationDirection,
+
+    /// Desk Catalog field id (Feature Registry codegen). Not a specialty detector
+    /// variant — bind `catalogFieldId` to an accepted `feature.<snake_id>`.
+    CatalogField,
 }
 
 /// Comparison operator for a condition.
@@ -207,6 +211,9 @@ pub struct SetupCondition {
     pub value: ConditionValue,
     #[serde(default)]
     pub label: Option<String>,
+    /// Catalog field id when [`ConditionField::CatalogField`] (codegen binding).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_field_id: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -539,6 +546,7 @@ fn evaluate_typed_condition(
     cond: &SetupCondition,
     market: &MarketState,
     prev: Option<&MarketState>,
+    catalog_values: &HashMap<String, f64>,
 ) -> bool {
     let price = market.last_price;
 
@@ -936,6 +944,9 @@ fn evaluate_typed_condition(
             }
             return false;
         }
+        ConditionField::CatalogField => {
+            return evaluate_catalog_field_condition(cond, catalog_values);
+        }
     };
 
     match &cond.operator {
@@ -1018,6 +1029,55 @@ impl Default for SetupRuntime {
     }
 }
 
+/// Evaluate a catalog-field condition against a generated / catalog scalar.
+///
+/// Used by Feature Registry codegen (`catalog_field` bindings). Missing values
+/// fail closed (`false`) — they are never invented.
+pub fn evaluate_catalog_field_condition(
+    cond: &SetupCondition,
+    catalog_values: &HashMap<String, f64>,
+) -> bool {
+    if cond.field != ConditionField::CatalogField {
+        return false;
+    }
+    let Some(id) = cond
+        .catalog_field_id
+        .as_deref()
+        .or(cond.label.as_deref())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return false;
+    };
+    let Some(left) = catalog_values.get(id).copied() else {
+        return false;
+    };
+    if !left.is_finite() {
+        return false;
+    }
+    match &cond.operator {
+        ConditionOperator::Above | ConditionOperator::GreaterThan => {
+            matches!(&cond.value, ConditionValue::Number(rhs) if left > *rhs)
+        }
+        ConditionOperator::Below | ConditionOperator::LessThan => {
+            matches!(&cond.value, ConditionValue::Number(rhs) if left < *rhs)
+        }
+        ConditionOperator::Equals => match &cond.value {
+            ConditionValue::Number(rhs) => (left - *rhs).abs() < 0.01,
+            _ => false,
+        },
+        ConditionOperator::Within => match &cond.value {
+            ConditionValue::Number(threshold) => (left).abs() <= *threshold,
+            _ => false,
+        },
+        ConditionOperator::Outside => match &cond.value {
+            ConditionValue::Number(threshold) => left.abs() > *threshold,
+            _ => false,
+        },
+        ConditionOperator::CrossesAbove | ConditionOperator::CrossesBelow => false,
+    }
+}
+
 fn condition_label(raw: &str) -> String {
     serde_json::from_str::<SetupCondition>(raw)
         .ok()
@@ -1061,6 +1121,7 @@ fn transition_reason(
 pub struct RulesEngine {
     runtimes: HashMap<String, SetupRuntime>,
     prev_market: Option<MarketState>,
+    catalog_field_values: HashMap<String, f64>,
 }
 
 impl RulesEngine {
@@ -1068,6 +1129,15 @@ impl RulesEngine {
     pub fn reset(&mut self) {
         self.runtimes.clear();
         self.prev_market = None;
+        self.catalog_field_values.clear();
+    }
+
+    /// Bind codegen'd catalog-field scalars for [`ConditionField::CatalogField`].
+    ///
+    /// Missing ids fail closed. Callers stamp MarketState JSON over the same
+    /// Feature-IR eval window as live `get_state` before evaluating.
+    pub fn set_catalog_field_values(&mut self, values: HashMap<String, f64>) {
+        self.catalog_field_values = values;
     }
 
     /// Store previous market state for crosses-above/below detection.
@@ -1194,7 +1264,12 @@ impl RulesEngine {
         for raw in &setup.conditions {
             let label = condition_label(raw);
             let passed = if let Ok(tc) = serde_json::from_str::<SetupCondition>(raw) {
-                evaluate_typed_condition(&tc, market, self.prev_market.as_ref())
+                evaluate_typed_condition(
+                    &tc,
+                    market,
+                    self.prev_market.as_ref(),
+                    &self.catalog_field_values,
+                )
             } else {
                 evaluate_string_condition(raw, market)
             };
@@ -1483,6 +1558,10 @@ impl RulesEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn typed(cond: &SetupCondition, market: &MarketState, prev: Option<&MarketState>) -> bool {
+        evaluate_typed_condition(cond, market, prev, &HashMap::new())
+    }
 
     fn make_setup(conditions: Vec<&str>, min_delta: f64) -> SetupDefinition {
         SetupDefinition {
@@ -1850,13 +1929,14 @@ mod tests {
             operator: ConditionOperator::Above,
             value: ConditionValue::None,
             label: None,
+            catalog_field_id: None,
         };
         let market = MarketState {
             last_price: 21010.0,
             vwap: 21000.0,
             ..Default::default()
         };
-        assert!(evaluate_typed_condition(&tc, &market, None));
+        assert!(typed(&tc, &market, None));
     }
 
     #[test]
@@ -1869,12 +1949,12 @@ mod tests {
             r#"{"id":"c1","field":"regime","operator":"equals","value":"OneSidedAcceptance"}"#,
         )
         .unwrap();
-        assert!(evaluate_typed_condition(&hit, &market, None));
+        assert!(typed(&hit, &market, None));
         let miss: SetupCondition = serde_json::from_str(
             r#"{"id":"c1","field":"regime","operator":"equals","value":"Migration"}"#,
         )
         .unwrap();
-        assert!(!evaluate_typed_condition(&miss, &market, None));
+        assert!(!typed(&miss, &market, None));
     }
 
     #[test]
@@ -1887,12 +1967,12 @@ mod tests {
             r#"{"id":"c1","field":"ib_extension_state","operator":"equals","value":"UpOnly"}"#,
         )
         .unwrap();
-        assert!(evaluate_typed_condition(&hit, &market, None));
+        assert!(typed(&hit, &market, None));
         let miss: SetupCondition = serde_json::from_str(
             r#"{"id":"c1","field":"ib_extension_state","operator":"equals","value":"BothSides"}"#,
         )
         .unwrap();
-        assert!(!evaluate_typed_condition(&miss, &market, None));
+        assert!(!typed(&miss, &market, None));
     }
 
     #[test]
@@ -1905,9 +1985,9 @@ mod tests {
             has_recent_invalidated_absorption: true,
             ..Default::default()
         };
-        assert!(evaluate_typed_condition(&cond, &failed, None));
+        assert!(typed(&cond, &failed, None));
         let calm = MarketState::default();
-        assert!(!evaluate_typed_condition(&cond, &calm, None));
+        assert!(!typed(&cond, &calm, None));
     }
 
     #[test]
@@ -1921,12 +2001,12 @@ mod tests {
             r#"{"id":"c1","field":"absorption_invalidation_direction","operator":"equals","value":"down"}"#,
         )
         .unwrap();
-        assert!(evaluate_typed_condition(&hit, &market, None));
+        assert!(typed(&hit, &market, None));
         let miss: SetupCondition = serde_json::from_str(
             r#"{"id":"c1","field":"absorption_invalidation_direction","operator":"equals","value":"up"}"#,
         )
         .unwrap();
-        assert!(!evaluate_typed_condition(&miss, &market, None));
+        assert!(!typed(&miss, &market, None));
     }
 
     #[test]
@@ -1945,8 +2025,8 @@ mod tests {
             vwap: 21000.0,
             ..Default::default()
         };
-        assert!(evaluate_typed_condition(&above, &pulled_back, None));
-        assert!(evaluate_typed_condition(&within, &pulled_back, None));
+        assert!(typed(&above, &pulled_back, None));
+        assert!(typed(&within, &pulled_back, None));
 
         // Extended 15 pts above VWAP: still above, but the pullback gate rejects it.
         let extended = MarketState {
@@ -1954,8 +2034,8 @@ mod tests {
             vwap: 21000.0,
             ..Default::default()
         };
-        assert!(evaluate_typed_condition(&above, &extended, None));
-        assert!(!evaluate_typed_condition(&within, &extended, None));
+        assert!(typed(&above, &extended, None));
+        assert!(!typed(&within, &extended, None));
     }
 
     #[test]
@@ -1978,9 +2058,9 @@ mod tests {
             r#"{"id":"c1","field":"rebid_zone_retested","operator":"equals","value":true}"#,
         )
         .unwrap();
-        assert!(evaluate_typed_condition(&rebid_near, &market, None));
-        assert!(!evaluate_typed_condition(&reoffer_near, &market, None));
-        assert!(evaluate_typed_condition(&rebid_retested, &market, None));
+        assert!(typed(&rebid_near, &market, None));
+        assert!(!typed(&reoffer_near, &market, None));
+        assert!(typed(&rebid_retested, &market, None));
 
         // rebid_zone_held is now live (was always-false).
         let held_market = MarketState {
@@ -1991,12 +2071,8 @@ mod tests {
             r#"{"id":"c1","field":"rebid_zone_held","operator":"equals","value":true}"#,
         )
         .unwrap();
-        assert!(evaluate_typed_condition(&rebid_held, &held_market, None));
-        assert!(!evaluate_typed_condition(
-            &rebid_held,
-            &MarketState::default(),
-            None
-        ));
+        assert!(typed(&rebid_held, &held_market, None));
+        assert!(!typed(&rebid_held, &MarketState::default(), None));
     }
 
     #[test]
@@ -2035,6 +2111,7 @@ mod tests {
             operator: ConditionOperator::CrossesAbove,
             value: ConditionValue::None,
             label: None,
+            catalog_field_id: None,
         };
         let prev = MarketState {
             last_price: 20990.0,
@@ -2046,8 +2123,8 @@ mod tests {
             vwap: 21000.0,
             ..Default::default()
         };
-        assert!(evaluate_typed_condition(&tc, &curr, Some(&prev)));
-        assert!(!evaluate_typed_condition(&tc, &prev, Some(&prev)));
+        assert!(typed(&tc, &curr, Some(&prev)));
+        assert!(!typed(&tc, &prev, Some(&prev)));
     }
 
     #[test]
@@ -2111,6 +2188,7 @@ mod tests {
             operator: ConditionOperator::GreaterThan,
             value: ConditionValue::Number(1.1),
             label: None,
+            catalog_field_id: None,
         };
         let market = MarketState {
             dom_summary: Some(crate::depth::DomSummary {
@@ -2119,7 +2197,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(evaluate_typed_condition(&tc, &market, None));
+        assert!(typed(&tc, &market, None));
     }
 
     #[test]
@@ -2130,6 +2208,7 @@ mod tests {
             operator: ConditionOperator::Above,
             value: ConditionValue::Number(5.0),
             label: None,
+            catalog_field_id: None,
         };
         let market = MarketState {
             dom_summary: Some(crate::depth::DomSummary {
@@ -2138,6 +2217,43 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(evaluate_typed_condition(&tc, &market, None));
+        assert!(typed(&tc, &market, None));
+    }
+
+    #[test]
+    fn catalog_field_condition_binds_generated_feature_id() {
+        let cond = SetupCondition {
+            id: "codegen".into(),
+            field: ConditionField::CatalogField,
+            operator: ConditionOperator::GreaterThan,
+            value: ConditionValue::Number(50.0),
+            label: None,
+            catalog_field_id: Some("feature.example_derived".into()),
+        };
+        let mut values = HashMap::new();
+        values.insert("feature.example_derived".into(), 90.0);
+        assert!(evaluate_catalog_field_condition(&cond, &values));
+        assert!(evaluate_typed_condition(
+            &cond,
+            &MarketState::default(),
+            None,
+            &values
+        ));
+        values.insert("feature.example_derived".into(), 10.0);
+        assert!(!evaluate_catalog_field_condition(&cond, &values));
+        assert!(!typed(&cond, &MarketState::default(), None));
+
+        let setup = SetupDefinition {
+            conditions: vec![serde_json::to_string(&cond).expect("cond json")],
+            min_delta: 0.0,
+            ..make_setup(vec![], 0.0)
+        };
+        let mut engine = RulesEngine::default();
+        engine.set_catalog_field_values(HashMap::from([("feature.example_derived".into(), 90.0)]));
+        let outcome = engine.evaluate_detailed(&setup, &MarketState::default(), false);
+        assert!(outcome.evaluation.deterministic_all_met);
+        engine.set_catalog_field_values(HashMap::new());
+        let outcome = engine.evaluate_detailed(&setup, &MarketState::default(), false);
+        assert!(!outcome.evaluation.deterministic_all_met);
     }
 }

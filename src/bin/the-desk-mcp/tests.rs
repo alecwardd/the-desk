@@ -1181,7 +1181,7 @@ async fn discovery_tools_return_metadata_only() {
     assert_eq!(env["featureRegistry"]["discoveryEnabled"], true);
     assert_eq!(env["featureRegistry"]["readRequiresCatalogDiscovery"], true);
     assert_eq!(env["featureRegistry"]["featureIr"], true);
-    assert_eq!(env["featureRegistry"]["codegen"], false);
+    assert_eq!(env["featureRegistry"]["codegen"], true);
     assert_eq!(
         env["featureRegistry"]["newOperatorFamilyGate"],
         "registry_change_proposal"
@@ -1427,8 +1427,8 @@ async fn feature_registry_register_derived_feature_and_rejects_unfunded_family()
     assert!(
         registered["note"]
             .as_str()
-            .is_some_and(|n| n.contains("declaration-and-test-only")),
-        "agents must not present an active Derived Feature as producing values"
+            .is_some_and(|n| n.contains("five kernel artifacts")),
+        "agents must know an active Derived Feature is codegen'd onto the existing kernel"
     );
 
     let skip = server
@@ -1507,6 +1507,279 @@ async fn feature_registry_register_derived_feature_and_rejects_unfunded_family()
         ))
         .await;
     assert!(missing_program.is_err(), "derivedFeature requires program");
+}
+
+#[tokio::test]
+async fn sil_m5c_accepted_derived_feature_codegen_end_to_end_on_existing_kernel() {
+    use the_desk_backend::db::JournalFrameRecord;
+
+    let server = test_server_with_sil();
+    let feature_id = "feature.session_last_price_percentile";
+    let registered = parse_text_tool_result(
+        server
+            .feature_registry(Parameters(
+                the_desk_backend::mcp::feature_registry::FeatureRegistryParams {
+                    action: Some("register".into()),
+                    feature_id: Some(feature_id.into()),
+                    name: Some("session_last_price_percentile".into()),
+                    description: Some(
+                        "Session-distribution percentiles of lastPrice (Feature-IR).".into(),
+                    ),
+                    domain_id: Some("location_structure".into()),
+                    kind: Some("derivedFeature".into()),
+                    unit: Some("percent".into()),
+                    cost_hint: Some("R1".into()),
+                    program: Some(serde_json::json!({
+                        "family": "sessionDistributionPercentiles",
+                        "field": "market.location_structure.lastPrice"
+                    })),
+                    ..Default::default()
+                },
+            ))
+            .await
+            .expect("register derived"),
+    );
+    assert_eq!(registered["feature"]["promotionState"], "candidate");
+
+    let shadow = parse_text_tool_result(
+        server
+            .feature_registry(Parameters(
+                the_desk_backend::mcp::feature_registry::FeatureRegistryParams {
+                    action: Some("promote".into()),
+                    feature_id: Some(feature_id.into()),
+                    target_state: Some("shadow".into()),
+                    trader_confirmation: Some(
+                        "Your rules say this derived feature may run in shadow.".into(),
+                    ),
+                    ..Default::default()
+                },
+            ))
+            .await
+            .expect("shadow"),
+    );
+    assert_eq!(shadow["feature"]["promotionState"], "shadow");
+
+    let active = parse_text_tool_result(
+        server
+            .feature_registry(Parameters(
+                the_desk_backend::mcp::feature_registry::FeatureRegistryParams {
+                    action: Some("promote".into()),
+                    feature_id: Some(feature_id.into()),
+                    target_state: Some("active".into()),
+                    trader_confirmation: Some(
+                        "Your playbook indicates this descriptor may be active.".into(),
+                    ),
+                    ..Default::default()
+                },
+            ))
+            .await
+            .expect("active"),
+    );
+    assert_eq!(active["feature"]["promotionState"], "active");
+
+    let t0 = 1_704_207_600_000.0;
+    let live_clock = t0 + 5000.0;
+    server.market_router.apply_tick(
+        the_desk_backend::engine::RouterRoot::Nq,
+        &the_desk_backend::engine::SourceTick {
+            timestamp_ms: live_clock,
+            price: 21_005.0,
+            volume: 1.0,
+            bid: 21_004.75,
+            ask: 21_005.25,
+            side: TradeSide::Buy,
+            root_symbol: Some("NQ".into()),
+        },
+    );
+    server.market_router.queue_journal_frames();
+    let pending = server.market_router.snapshot_pending_journal_frames();
+    assert_eq!(
+        pending.len(),
+        1,
+        "sixth frame must sit in the pending drain, not SQLite, before persist"
+    );
+    let session_type = pending[0].session_type.clone();
+    let trading_day = pending[0].trading_day.clone();
+    {
+        let db = server.db.lock().expect("db");
+        let frames: Vec<JournalFrameRecord> = (0..5)
+            .map(|i| {
+                let clock = t0 + i as f64 * 1000.0;
+                JournalFrameRecord {
+                    clock_ms: clock,
+                    frame_second: the_desk_backend::db::journal_frame_second_from_ts(clock)
+                        .expect("frame second"),
+                    root_symbol: "NQ".into(),
+                    session_type: session_type.clone(),
+                    session_segment: "None".into(),
+                    trading_day: trading_day.clone(),
+                    payload: serde_json::json!({
+                        "lastPrice": 21_000.0 + i as f64,
+                        "rootSymbol": "NQ",
+                        "sessionType": session_type,
+                        "tradingDay": trading_day
+                    }),
+                }
+            })
+            .collect();
+        db.insert_journal_frames(&frames).expect("insert frames");
+    }
+
+    let env = parse_text_tool_result(
+        server
+            .describe_environment()
+            .await
+            .expect("describe_environment"),
+    );
+    assert_eq!(env["featureRegistry"]["codegen"], true);
+    assert_eq!(TheDeskMcp::tool_router().list_all().len(), 123);
+
+    let search = parse_text_tool_result(
+        server
+            .search_catalog(Parameters(SearchCatalogParams {
+                query: Some("session_last_price_percentile".into()),
+            }))
+            .await
+            .expect("search_catalog"),
+    );
+    let hits = search["hits"].as_array().expect("hits");
+    assert!(
+        hits.iter()
+            .any(|h| h["id"] == feature_id && h["rustField"] == "feature_ir"),
+        "accepted descriptor must emit an agent-schema / runtime field"
+    );
+    let feature_hits = search["featureHits"].as_array().expect("featureHits");
+    assert!(feature_hits
+        .iter()
+        .any(|h| h["id"] == feature_id && h["promotionState"] == "active"));
+
+    let domain = parse_text_tool_result(
+        server
+            .describe_domain(Parameters(DescribeDomainParams {
+                domain: Some("location_structure".into()),
+            }))
+            .await
+            .expect("describe_domain"),
+    );
+    let fields = domain["fields"].as_array().expect("fields");
+    assert!(fields.iter().any(|f| f["id"] == feature_id));
+
+    let as_of = t0 + 4000.0;
+    let state = parse_text_tool_result(
+        server
+            .get_state(Parameters(GetStateParams {
+                symbols: Some(vec!["NQ".into()]),
+                domains: Some(vec!["location_structure".into()]),
+                fields: Some(vec![feature_id.into()]),
+                resolution: Some("R1".into()),
+                as_of: Some(as_of),
+                budget_tokens: None,
+            }))
+            .await
+            .expect("get_state as_of"),
+    );
+    assert_eq!(state["trustLevel"], "L0");
+    let values = state["values"].as_object().expect("values");
+    let served = values
+        .get(feature_id)
+        .and_then(|v| v.as_f64())
+        .expect("get_state must serve the generated runtime field");
+    assert!(
+        (served - 90.0).abs() < 1e-9,
+        "session percentile rank of the last of five prices must be 90, got {served}"
+    );
+
+    let series = parse_text_tool_result(
+        server
+            .query_series(Parameters(QuerySeriesParams {
+                start_ms: Some(t0),
+                end_ms: Some(as_of),
+                session_type: Some(session_type.clone()),
+                symbols: Some(vec!["NQ".into()]),
+                fields: Some(vec![feature_id.into()]),
+                store: None,
+            }))
+            .await
+            .expect("query_series"),
+    );
+    assert_eq!(series["trustLevel"], "L0");
+    let points = series["points"].as_array().expect("points");
+    assert_eq!(points.len(), 5);
+    let last = points
+        .last()
+        .and_then(|p| p["values"][feature_id].as_f64())
+        .expect("query_series must address the generated dimension");
+    assert!((last - 90.0).abs() < 1e-9);
+
+    let live = parse_text_tool_result(
+        server
+            .get_state(Parameters(GetStateParams {
+                symbols: Some(vec!["NQ".into()]),
+                domains: Some(vec!["location_structure".into()]),
+                fields: Some(vec![feature_id.into()]),
+                resolution: Some("R1".into()),
+                as_of: None,
+                budget_tokens: None,
+            }))
+            .await
+            .expect("get_state live"),
+    );
+    let live_served = live["values"][feature_id]
+        .as_f64()
+        .expect("live get_state must serve the generated runtime field");
+    let six_frame_rank = 100.0 * 5.5 / 6.0;
+    assert!(
+        (live_served - 50.0).abs() > 1.0,
+        "live get_state must not evaluate the pending frame alone (n=1 rank=50), got {live_served}"
+    );
+    assert!(
+        (live_served - six_frame_rank).abs() < 1e-6,
+        "live get_state must merge SQLite+pending (n=6 rank={six_frame_rank}), got {live_served}"
+    );
+
+    {
+        let db = server.db.lock().expect("db");
+        server
+            .market_router
+            .persist_journal(&db)
+            .expect("persist pending");
+    }
+    let live_after = parse_text_tool_result(
+        server
+            .get_state(Parameters(GetStateParams {
+                symbols: Some(vec!["NQ".into()]),
+                domains: Some(vec!["location_structure".into()]),
+                fields: Some(vec![feature_id.into()]),
+                resolution: Some("R1".into()),
+                as_of: None,
+                budget_tokens: None,
+            }))
+            .await
+            .expect("get_state live after persist"),
+    );
+    let as_of_after = parse_text_tool_result(
+        server
+            .get_state(Parameters(GetStateParams {
+                symbols: Some(vec!["NQ".into()]),
+                domains: Some(vec!["location_structure".into()]),
+                fields: Some(vec![feature_id.into()]),
+                resolution: Some("R1".into()),
+                as_of: Some(live_clock),
+                budget_tokens: None,
+            }))
+            .await
+            .expect("get_state as_of after persist"),
+    );
+    let live_after_v = live_after["values"][feature_id]
+        .as_f64()
+        .expect("live after persist");
+    let as_of_after_v = as_of_after["values"][feature_id]
+        .as_f64()
+        .expect("as_of after persist");
+    assert!(
+        (live_after_v - as_of_after_v).abs() < 1e-9,
+        "after persist, live and as_of at the same clock must agree ({live_after_v} vs {as_of_after_v})"
+    );
 }
 
 #[tokio::test]

@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
+use super::codegen::read_storage_value;
 use super::types::{CostHint, DeskCatalog, FieldDescriptor, TrustCeiling, CATALOG_VERSION};
 
 /// Pull-band resolution accepted by `get_state` (R0 orientation / R1 state).
@@ -311,14 +312,18 @@ fn domain_provenance(
 fn extract_field_value(snapshot: Option<&Value>, field: &FieldDescriptor) -> Option<Value> {
     let snap = snapshot?;
     // MarketState serializes camelCase via `name` (catalog field name).
-    snap.get(&field.name).cloned().or_else(|| {
-        // Also accept catalog id tail after last '.' for resilient callers.
-        field
-            .id
-            .rsplit('.')
-            .next()
-            .and_then(|tail| snap.get(tail).cloned())
-    })
+    snap.get(&field.name)
+        .cloned()
+        .or_else(|| {
+            // Also accept catalog id tail after last '.' for resilient callers.
+            field
+                .id
+                .rsplit('.')
+                .next()
+                .and_then(|tail| snap.get(tail).cloned())
+        })
+        .or_else(|| snap.get(&field.id).cloned())
+        .or_else(|| read_storage_value(snap, &field.id).map(Value::from))
 }
 
 /// Re-apply a token budget after late overlays (e.g. Positioning) so

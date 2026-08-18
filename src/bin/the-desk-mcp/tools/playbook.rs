@@ -3,6 +3,7 @@
 use rmcp::{
     handler::server::wrapper::Parameters, model::*, tool, tool_router, ErrorData as McpError,
 };
+use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use the_desk_backend::attention::{
     apply_inbox_cursor, persist_event_stream_attention, rank_attention_inbox,
@@ -69,8 +70,28 @@ impl TheDeskMcp {
             None
         };
 
+        let catalog_values = if let Some(ref market) = market {
+            let as_of_ms = self
+                .market_router
+                .clock_ms()
+                .or(market.tape_last_trade_timestamp_ms)
+                .unwrap_or(0.0);
+            match self.db.lock() {
+                Ok(db) => catalog_field_values_for_snapshot(
+                    &db,
+                    Some(&self.market_router),
+                    market,
+                    as_of_ms,
+                ),
+                Err(_) => HashMap::new(),
+            }
+        } else {
+            HashMap::new()
+        };
+
         if let (Some(market), Ok(rules)) = (market, self.rules.lock()) {
             let mut preview_rules = rules.clone();
+            preview_rules.set_catalog_field_values(catalog_values);
             for setup in setups.iter() {
                 let outcome = preview_rules.evaluate_detailed(setup, &market, risk_at_limit);
                 let runtime = preview_rules.runtime_snapshot(&setup.id);

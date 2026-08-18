@@ -202,6 +202,13 @@ fn typed_conditions(setup: &SetupDefinition) -> Result<Vec<SetupCondition>, Stri
                     cond.field
                 ));
             }
+            ConditionField::CatalogField => {
+                return Err(
+                    "condition field CatalogField is not supported for hypothesis backtests \
+                     (catalog-field bindings are not evaluated on the backfill path)"
+                        .into(),
+                );
+            }
             _ => {}
         }
         out.push(cond);
@@ -1432,6 +1439,30 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("not supported"));
+    }
+
+    #[test]
+    fn catalog_field_condition_rejected_for_hypothesis() {
+        let db = test_db();
+        let mut setup = hypothesis_setup();
+        setup.conditions = vec![serde_json::json!({
+            "id": "c1",
+            "field": "catalog_field",
+            "catalogFieldId": "feature.session_last_price_percentile",
+            "operator": "greater_than",
+            "value": 80.0
+        })
+        .to_string()];
+        let err = register_hypothesis(
+            &db,
+            RegisterHypothesisRequest {
+                metadata: metadata(1),
+                setup_definition: setup,
+                dry_run: true,
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("catalog-field bindings are not evaluated on the backfill path"));
     }
 
     #[test]

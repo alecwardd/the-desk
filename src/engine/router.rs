@@ -14,7 +14,8 @@ use std::sync::{Arc, Mutex};
 
 use crate::attention::persist_event_stream_attention;
 use crate::catalog::{
-    collapse_events_latest_per_dedup, kernel_event_from_db_row, EVENT_LIFECYCLE_TTL_MS,
+    collapse_events_latest_per_dedup, kernel_event_from_db_row, FeatureIrEvalCache,
+    EVENT_LIFECYCLE_TTL_MS, FEATURE_IR_EVAL_MAX_FRAMES,
 };
 use crate::db::{market_event_dedup_id, market_event_id, Database, DbError, JournalFrameRecord};
 use crate::feed::ContractMetadata;
@@ -30,7 +31,7 @@ use super::cold_frames::ColdFrameStore;
 use super::health::{EngineHealth, FeedStallState};
 use super::host::{EngineHost, IngestOutcome};
 use super::journal::{
-    journal_frame_from_snapshot, journal_frame_second, persist_journal_observation,
+    journal_frame_from_snapshot, journal_frame_second, persist_journal_observation_with_cache,
     JournalPersistStats,
 };
 use super::published::{PublishedEngineState, PublishedStateStore};
@@ -62,6 +63,9 @@ pub struct MarketRouter {
     /// Optional SIL-M3d cold dump target. `None` in unit tests that only
     /// exercise the SQLite hot window.
     cold_frames: Mutex<Option<ColdFrameStore>>,
+    /// Rolling Feature-IR eval window (persisted frames). Hydrate once, append
+    /// on persist — live readers must not re-parse SQLite on every call.
+    feature_ir_eval_cache: Mutex<FeatureIrEvalCache>,
 }
 
 impl MarketRouter {
@@ -88,6 +92,7 @@ impl MarketRouter {
             capsule_rings: Mutex::new(BTreeMap::new()),
             pending_capsules: Mutex::new(Vec::new()),
             cold_frames: Mutex::new(None),
+            feature_ir_eval_cache: Mutex::new(FeatureIrEvalCache::new()),
         }
     }
 
@@ -131,6 +136,7 @@ impl MarketRouter {
             capsule_rings: Mutex::new(BTreeMap::new()),
             pending_capsules: Mutex::new(Vec::new()),
             cold_frames: Mutex::new(None),
+            feature_ir_eval_cache: Mutex::new(FeatureIrEvalCache::new()),
         }
     }
 
@@ -525,7 +531,13 @@ impl MarketRouter {
             .lock()
             .map(|mut g| std::mem::take(&mut *g))
             .unwrap_or_default();
-        match persist_journal_observation(db, &frames, &events) {
+        let mut cache_guard = self.feature_ir_eval_cache.lock().ok();
+        match persist_journal_observation_with_cache(
+            db,
+            &frames,
+            &events,
+            cache_guard.as_deref_mut(),
+        ) {
             Ok(mut stats) => {
                 let cold_store = self.cold_frames.lock().ok().and_then(|slot| slot.clone());
                 if let Some(store) = cold_store {
@@ -781,6 +793,59 @@ impl MarketRouter {
             .lock()
             .map(|g| g.len())
             .unwrap_or(0)
+    }
+
+    /// Snapshot of the pending Journal Frame buffer (live Feature-IR evaluation).
+    ///
+    /// Already capped at [`PENDING_JOURNAL_MAX_FRAMES`]. When `len == cap` the
+    /// caller must treat the window as truncated.
+    pub fn snapshot_pending_journal_frames(&self) -> Vec<JournalFrameRecord> {
+        self.pending_journal_frames
+            .lock()
+            .map(|g| g.values().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Hydrate the rolling Feature-IR eval window once from SQLite.
+    ///
+    /// Subsequent live reads merge this cache with pending frames. Safe to call
+    /// while the caller already holds the `Database` mutex.
+    pub fn hydrate_feature_ir_eval_cache(
+        &self,
+        db: &Database,
+        as_of_ms: f64,
+    ) -> Result<(), DbError> {
+        let already = self
+            .feature_ir_eval_cache
+            .lock()
+            .map(|c| c.is_hydrated())
+            .unwrap_or(true);
+        if already {
+            return Ok(());
+        }
+        let (rows, truncated) =
+            db.list_journal_frames_for_feature_ir(as_of_ms, FEATURE_IR_EVAL_MAX_FRAMES)?;
+        if let Ok(mut cache) = self.feature_ir_eval_cache.lock() {
+            cache.hydrate_from_frames(rows.iter().map(Into::into).collect(), truncated);
+        }
+        Ok(())
+    }
+
+    /// Persisted Feature-IR window concatenated with pending (pending wins).
+    pub fn live_feature_ir_eval_window(
+        &self,
+        pending: &[JournalFrameRecord],
+    ) -> crate::catalog::MergedEvalWindow {
+        let pending_ir = pending.iter().map(Into::into).collect();
+        match self.feature_ir_eval_cache.lock() {
+            Ok(cache) => cache.merged_with_pending(pending_ir),
+            Err(_) => crate::catalog::merge_eval_frames(
+                Vec::new(),
+                false,
+                pending.iter().map(Into::into).collect(),
+                FEATURE_IR_EVAL_MAX_FRAMES,
+            ),
+        }
     }
 
     fn advance_clock(&self, timestamp_ms: f64) {
@@ -1196,6 +1261,16 @@ mod tests {
         let stats = router.persist_journal(&db).expect("persist");
         assert!(stats.frames_written >= 2);
         assert!(db.count_journal_frames().expect("count") >= 2);
+    }
+
+    #[test]
+    fn feature_ir_eval_cap_is_independent_of_pending_journal_max_frames() {
+        assert_ne!(
+            crate::catalog::FEATURE_IR_EVAL_MAX_FRAMES,
+            PENDING_JOURNAL_MAX_FRAMES
+        );
+        assert_eq!(crate::catalog::FEATURE_IR_EVAL_MAX_FRAMES, 57_600);
+        assert_eq!(PENDING_JOURNAL_MAX_FRAMES, 8_192);
     }
 
     #[test]

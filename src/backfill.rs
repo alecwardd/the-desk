@@ -12,7 +12,9 @@ use crate::pipelines::{EventDetector, FlowEventEmitter, MarketState, PipelineEng
 use crate::research::context_frame::snapshot_context_buckets;
 use crate::research::hypothesis::current_engine_version;
 use crate::rollover::{build_contract_rollover_status, PriorReferenceTrust};
-use crate::rules::{RulesEngine, SetupDefinition, SetupRuntimeSnapshot};
+use crate::rules::{
+    ConditionField, RulesEngine, SetupCondition, SetupDefinition, SetupRuntimeSnapshot,
+};
 use crate::{
     classify_delta_segment, session_date_from_timestamp_ms, tick_time_context_from_timestamp_ms,
     DeltaSegment, SessionType,
@@ -544,7 +546,10 @@ where
             cfg.analysis_max_ticks.max(1),
         )
     };
-    let setups = prepare_backfill_setups(db, params)?;
+    let mut setups = prepare_backfill_setups(db, params)?;
+    let skipped_catalog_field = setups.len();
+    setups.retain(|setup| !setup_has_catalog_field_condition(setup));
+    let skipped_catalog_field = skipped_catalog_field - setups.len();
     let r_value_points = db
         .load_risk_config()
         .ok()
@@ -643,6 +648,12 @@ where
         None
     };
 
+    if skipped_catalog_field > 0 {
+        state.warnings.push(format!(
+            "skipped {skipped_catalog_field} setup(s) with catalog-field bindings; \
+             catalog-field conditions are not evaluated on the backfill path"
+        ));
+    }
     if params.run_rules && setups.is_empty() {
         state
             .warnings
@@ -1188,6 +1199,14 @@ where
     state.progress.sessions_completed = state.sessions_processed;
     state.session_dates.push(session_date.to_string());
     Ok(())
+}
+
+fn setup_has_catalog_field_condition(setup: &SetupDefinition) -> bool {
+    setup.conditions.iter().any(|raw| {
+        serde_json::from_str::<SetupCondition>(raw)
+            .ok()
+            .is_some_and(|cond| matches!(cond.field, ConditionField::CatalogField))
+    })
 }
 
 fn prepare_backfill_setups(

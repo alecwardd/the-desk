@@ -7,16 +7,24 @@
 //!
 //! The language is not Turing-complete: no unbounded recursion or user-declared
 //! loops as control flow. A new Operator Family requires a registry change
-//! proposal ([`NEW_OPERATOR_FAMILY_GATE`]). Codegen emitters are out of scope
-//! (SIL-M5c / #20).
+//! proposal ([`NEW_OPERATOR_FAMILY_GATE`]). SIL-M5c codegen emitters (`emit_*`)
+//! live in [`super::codegen`].
 //!
 //! Live-shadow and historical evaluation share **one** evaluator over Journal
 //! Frames (`clock_ms <= asOf`). The path label does not change semantics.
-//! In M5b the evaluator is **declaration-and-test-only**: callers supply the
-//! frame slice (golden replay / unit tests). There is no runtime hook from the
-//! MCP router or the MarketRouter pending-frame buffer.
+//! Both paths cap the visible slice at [`FEATURE_IR_EVAL_MAX_FRAMES`] (~8 hours
+//! of 1 Hz NQ+ES). That bound is **not** the live pending-journal drain
+//! ([`crate::engine::PENDING_JOURNAL_MAX_FRAMES`]). Live persist / `get_state` /
+//! playbook evaluation keep a rolling [`FeatureIrEvalCache`] (hydrate once from
+//! SQLite, append on persist) and concatenate pending frames (pending wins on
+//! identity). Session-distribution `n` and dwell windows fail closed when that
+//! bound would silently drop in-session frames — they must not pretend an
+//! unbounded `list_journal_frames` scan equals the eval cap. Globex (~17h) and
+//! historical-baseline lookbacks longer than the cap fail closed rather than
+//! returning a truncated number.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -42,6 +50,23 @@ pub const MAX_BASELINE_LOOKBACK_DAYS: u32 = 60;
 
 /// Maximum event-sequence window (24 hours).
 pub const MAX_SEQUENCE_WINDOW_MS: f64 = 86_400_000.0;
+
+/// Shared live/historical Feature-IR evaluation cap (~8 hours of 1 Hz NQ+ES).
+///
+/// Intentionally **not** equal to [`crate::engine::PENDING_JOURNAL_MAX_FRAMES`].
+/// The pending buffer is an in-memory drain (8192). Live evaluation hydrates a
+/// rolling [`FeatureIrEvalCache`] of this size once from SQLite and concatenates
+/// pending frames ([`merge_eval_frames`]; pending wins on
+/// `(frame_second, root_symbol)`). Historical / research loads use a
+/// newest-first `LIMIT cap+1` sentinel instead of
+/// [`crate::db::Database::list_journal_frames`]. Session-percentile `n` and
+/// dwell fail closed when the as-of session is truncated by this cap. Globex
+/// (~17 hours) does not fit; historical baselines fail closed whenever the
+/// load is truncated (60-day lookback cannot fit in 8 hours).
+pub const FEATURE_IR_EVAL_MAX_FRAMES: usize = 57_600;
+
+/// Wire note for `describe_environment` / catalog docs (keep in one place).
+pub const FEATURE_IR_EVAL_WINDOW_NOTE: &str = "Live Feature-IR evaluation hydrates a rolling in-memory window once (FEATURE_IR_EVAL_MAX_FRAMES = 57600, ~8 hours of 1 Hz NQ+ES) and appends on persist; it concatenates the pending drain (PENDING_JOURNAL_MAX_FRAMES = 8192; pending wins on frame_second+root) instead of re-parsing SQLite on every persist, analysis pass, get_state, or evaluate_playbook. Historical / research loads use a newest-first LIMIT cap+1 sentinel — never Database::list_journal_frames(). Session-percentile n and dwell fail closed when the as-of session is truncated by that bound, including when the truncation edge is another root. Globex (~17h) exceeds the cap, so those families are unavailable for the rest of an overnight session once the mixed NQ+ES journal is longer than ~8 hours and the left edge still sits in that Globex session. Historical baselines fail closed whenever the window is truncated, so they do not return a runtime value on a journal that exceeds the cap.";
 
 /// Wire labels for the five funded families (camelCase IPC).
 pub const FUNDED_OPERATOR_FAMILY_LABELS: &[&str] = &[
@@ -463,7 +488,8 @@ pub struct FeatureIrFrame {
     pub root_symbol: String,
     pub session_type: String,
     pub trading_day: String,
-    pub payload: Value,
+    /// Shared JSON payload so rolling-window clones do not deep-copy MarketState.
+    pub payload: Arc<Value>,
 }
 
 /// Evaluation path label. Live-shadow and historical share one evaluator.
@@ -481,6 +507,9 @@ pub struct FeatureIrStore<'a> {
     pub frames: &'a [FeatureIrFrame],
     pub events: &'a [FeatureIrEvent],
     pub eval_root: &'a str,
+    /// True when the caller already dropped frames older than
+    /// [`FEATURE_IR_EVAL_MAX_FRAMES`] (bounded SQLite sentinel or merged window).
+    pub window_truncated: bool,
 }
 
 /// Scalar result of one Feature-IR evaluation at `asOf`.
@@ -549,6 +578,112 @@ pub fn evaluate(
     path: FeatureIrEvalPath,
 ) -> Result<FeatureIrValue, FeatureIrError> {
     program.validate(store.catalog)?;
+    if frames_are_chronological(store.frames) {
+        return evaluate_prepared_validated(program, store, as_of_ms, path);
+    }
+    let (owned, truncated) = bound_eval_owned(store.frames, as_of_ms, store.window_truncated);
+    evaluate_on_window(
+        program,
+        FeatureIrStore {
+            catalog: store.catalog,
+            frames: &owned,
+            events: store.events,
+            eval_root: store.eval_root,
+            window_truncated: truncated,
+        },
+        as_of_ms,
+        path,
+    )
+}
+
+/// Evaluate over an already-chronological window (no `frames_are_chronological` scan).
+///
+/// Query / series callers pay the chronology check once, then use this per as-of
+/// (or [`evaluate_series`] for a single pass). Frames must be sorted by
+/// `(clock_ms, root_symbol)`.
+pub fn evaluate_prepared(
+    program: &FeatureIrProgram,
+    store: FeatureIrStore<'_>,
+    as_of_ms: f64,
+    path: FeatureIrEvalPath,
+) -> Result<FeatureIrValue, FeatureIrError> {
+    program.validate(store.catalog)?;
+    evaluate_prepared_validated(program, store, as_of_ms, path)
+}
+
+fn evaluate_prepared_validated(
+    program: &FeatureIrProgram,
+    store: FeatureIrStore<'_>,
+    as_of_ms: f64,
+    path: FeatureIrEvalPath,
+) -> Result<FeatureIrValue, FeatureIrError> {
+    let (slice, truncated) = bound_eval_slice(store.frames, as_of_ms, store.window_truncated);
+    evaluate_on_window(
+        program,
+        FeatureIrStore {
+            catalog: store.catalog,
+            frames: slice,
+            events: store.events,
+            eval_root: store.eval_root,
+            window_truncated: truncated,
+        },
+        as_of_ms,
+        path,
+    )
+}
+
+/// One value per input frame (`as_of` = that frame's clock, `eval_root` = its root).
+///
+/// Assumes `store.frames` is chronological. Session-percentile and dwell walk
+/// the window once so `query_series` / `query_episodes` do not re-scan the cap
+/// at every point.
+pub fn evaluate_series(
+    program: &FeatureIrProgram,
+    store: FeatureIrStore<'_>,
+    path: FeatureIrEvalPath,
+) -> Result<Vec<(i64, String, FeatureIrValue)>, FeatureIrError> {
+    program.validate(store.catalog)?;
+    if store.frames.is_empty() {
+        return Ok(Vec::new());
+    }
+    match program {
+        FeatureIrProgram::SessionDistributionPercentiles {
+            field,
+            symbol,
+            percentile,
+            output,
+        } => eval_session_percentile_series(
+            store,
+            path,
+            field,
+            symbol.as_deref(),
+            *percentile,
+            *output,
+        ),
+        FeatureIrProgram::DwellTimeSincePredicate { predicate, mode } => {
+            eval_dwell_series(store, path, predicate, *mode)
+        }
+        FeatureIrProgram::CrossSymbolReferences { symbol, field } => {
+            eval_cross_symbol_series(store, path, symbol, field)
+        }
+        FeatureIrProgram::EventSequences {
+            first,
+            then,
+            within_ms,
+        } => eval_event_sequence_series(store, path, first, then, *within_ms),
+        FeatureIrProgram::HistoricalBaselines { .. } => {
+            eval_historical_baseline_series(program, store, path)
+        }
+    }
+}
+
+fn evaluate_on_window(
+    program: &FeatureIrProgram,
+    store: FeatureIrStore<'_>,
+    as_of_ms: f64,
+    path: FeatureIrEvalPath,
+) -> Result<FeatureIrValue, FeatureIrError> {
+    let truncated = store.window_truncated;
     let value = match program {
         FeatureIrProgram::CrossSymbolReferences { symbol, field } => {
             eval_cross_symbol(store, as_of_ms, symbol, field)?
@@ -581,16 +716,24 @@ pub fn evaluate(
             same_time_of_day,
             aggregator,
             percentile,
-        } => eval_historical_baseline(
-            store,
-            as_of_ms,
-            field,
-            symbol.as_deref(),
-            *lookback_days,
-            *same_time_of_day,
-            *aggregator,
-            *percentile,
-        )?,
+        } => {
+            if truncated {
+                // Lookback-N-days cannot fit in the bounded eval window; fail
+                // closed rather than silently using a truncated day set.
+                unavailable()
+            } else {
+                eval_historical_baseline(
+                    store,
+                    as_of_ms,
+                    field,
+                    symbol.as_deref(),
+                    *lookback_days,
+                    *same_time_of_day,
+                    *aggregator,
+                    *percentile,
+                )?
+            }
+        }
     };
     Ok(FeatureIrValue {
         path,
@@ -604,7 +747,9 @@ pub fn evaluate(
 
 /// Live-shadow evaluation (same evaluator as historical).
 ///
-/// Path is a label only. M5b has no runtime caller; tests supply the frame slice.
+/// Path is a label only. Callers supply the merged live window (bounded SQLite
+/// load + pending drain, capped at [`FEATURE_IR_EVAL_MAX_FRAMES`]) or an
+/// equivalent bounded historical load.
 pub fn evaluate_live_shadow(
     program: &FeatureIrProgram,
     store: FeatureIrStore<'_>,
@@ -615,8 +760,9 @@ pub fn evaluate_live_shadow(
 
 /// Historical evaluation over a caller-supplied Journal Frame slice (same evaluator as live-shadow).
 ///
-/// Path is a label only. M5b has no runtime SQLite/MCP caller; golden replay
-/// constructs the slice from `list_journal_frames` in tests.
+/// Path is a label only. Runtime historical loads must be bounded (newest
+/// [`FEATURE_IR_EVAL_MAX_FRAMES`] `+ 1` sentinel) — not an unbounded
+/// `list_journal_frames` full-table read. Live pending drain size is independent.
 pub fn evaluate_historical(
     program: &FeatureIrProgram,
     store: FeatureIrStore<'_>,
@@ -668,6 +814,9 @@ fn eval_session_percentile(
     let Some(as_of_frame) = latest_frame(store.frames, root, as_of_ms) else {
         return Ok(unavailable());
     };
+    if session_window_exceeds_eval_bound(store, root, as_of_frame) {
+        return Ok(unavailable());
+    }
     let mut sample = Vec::new();
     for frame in visible_frames(store.frames, as_of_ms) {
         if frame.root_symbol != root {
@@ -713,6 +862,9 @@ fn eval_dwell(
     let Some(as_of_frame) = latest_frame(store.frames, root, as_of_ms) else {
         return Ok(unavailable());
     };
+    if session_window_exceeds_eval_bound(store, root, as_of_frame) {
+        return Ok(unavailable());
+    }
     let mut session_frames: Vec<&FeatureIrFrame> = visible_frames(store.frames, as_of_ms)
         .filter(|f| f.root_symbol == root && same_session(f, as_of_frame))
         .collect();
@@ -903,6 +1055,312 @@ fn time_since_true_ms(truths: &[(f64, bool)], as_of_ms: f64) -> Option<f64> {
         .map(|(clock, _)| (as_of_ms - clock).max(0.0))
 }
 
+fn ir_value(
+    path: FeatureIrEvalPath,
+    family: OperatorFamily,
+    as_of_ms: f64,
+    value: ScalarN,
+) -> FeatureIrValue {
+    FeatureIrValue {
+        path,
+        family,
+        as_of_ms,
+        value: value.scalar,
+        available: value.available,
+        n: value.n,
+    }
+}
+
+fn eval_session_percentile_series(
+    store: FeatureIrStore<'_>,
+    path: FeatureIrEvalPath,
+    field_id: &str,
+    symbol: Option<&str>,
+    percentile: Option<f64>,
+    output: PercentileOutput,
+) -> Result<Vec<(i64, String, FeatureIrValue)>, FeatureIrError> {
+    let field = resolve_catalog_field(store.catalog, field_id)?;
+    let family = OperatorFamily::SessionDistributionPercentiles;
+    let mut samples: HashMap<(String, String, String), Vec<f64>> = HashMap::new();
+    let mut out = Vec::with_capacity(store.frames.len());
+    let mut i = 0usize;
+    while i < store.frames.len() {
+        let clock = store.frames[i].clock_ms;
+        let mut j = i + 1;
+        while j < store.frames.len() && store.frames[j].clock_ms == clock {
+            j += 1;
+        }
+        for frame in &store.frames[i..j] {
+            let sample_root = symbol.unwrap_or(frame.root_symbol.as_str());
+            if frame.root_symbol != sample_root {
+                continue;
+            }
+            if let Some(v) = numeric_field(&frame.payload, field) {
+                samples
+                    .entry((
+                        frame.root_symbol.clone(),
+                        frame.trading_day.clone(),
+                        frame.session_type.clone(),
+                    ))
+                    .or_default()
+                    .push(v);
+            }
+        }
+        for frame in &store.frames[i..j] {
+            let sample_root = symbol.unwrap_or(frame.root_symbol.as_str());
+            let as_of_frame = store.frames[..j]
+                .iter()
+                .rev()
+                .find(|f| f.root_symbol == sample_root);
+            let Some(as_of_frame) = as_of_frame else {
+                out.push((
+                    frame.frame_second,
+                    frame.root_symbol.clone(),
+                    ir_value(path, family, clock, unavailable()),
+                ));
+                continue;
+            };
+            if session_window_exceeds_eval_bound(store, sample_root, as_of_frame) {
+                out.push((
+                    frame.frame_second,
+                    frame.root_symbol.clone(),
+                    ir_value(path, family, clock, unavailable()),
+                ));
+                continue;
+            }
+            let sample = samples
+                .get(&(
+                    sample_root.to_string(),
+                    as_of_frame.trading_day.clone(),
+                    as_of_frame.session_type.clone(),
+                ))
+                .cloned()
+                .unwrap_or_default();
+            let value = if sample.is_empty() {
+                unavailable()
+            } else {
+                let n = sample.len();
+                let scalar = match output {
+                    PercentileOutput::Value => {
+                        let mut sorted = sample.clone();
+                        sorted
+                            .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                        percentile_type7(&sorted, percentile.unwrap_or(50.0))
+                    }
+                    PercentileOutput::Rank => {
+                        let current =
+                            numeric_field(&as_of_frame.payload, field).unwrap_or(sample[n - 1]);
+                        percentile_rank(&sample, current)
+                    }
+                };
+                ScalarN {
+                    scalar,
+                    available: true,
+                    n,
+                }
+            };
+            out.push((
+                frame.frame_second,
+                frame.root_symbol.clone(),
+                ir_value(path, family, clock, value),
+            ));
+        }
+        i = j;
+    }
+    Ok(out)
+}
+
+fn eval_dwell_series(
+    store: FeatureIrStore<'_>,
+    path: FeatureIrEvalPath,
+    predicate: &FieldPredicate,
+    mode: DwellMode,
+) -> Result<Vec<(i64, String, FeatureIrValue)>, FeatureIrError> {
+    let field = resolve_catalog_field(store.catalog, &predicate.field)?;
+    let family = OperatorFamily::DwellTimeSincePredicate;
+    let mut truths: HashMap<(String, String, String), Vec<(f64, bool)>> = HashMap::new();
+    let mut out = Vec::with_capacity(store.frames.len());
+    let mut i = 0usize;
+    while i < store.frames.len() {
+        let clock = store.frames[i].clock_ms;
+        let mut j = i + 1;
+        while j < store.frames.len() && store.frames[j].clock_ms == clock {
+            j += 1;
+        }
+        for frame in &store.frames[i..j] {
+            let sample_root = predicate
+                .symbol
+                .as_deref()
+                .unwrap_or(frame.root_symbol.as_str());
+            if frame.root_symbol != sample_root {
+                continue;
+            }
+            let ok = numeric_field(&frame.payload, field)
+                .map(|v| predicate_holds(predicate.op, v, predicate.value))
+                .unwrap_or(false);
+            truths
+                .entry((
+                    frame.root_symbol.clone(),
+                    frame.trading_day.clone(),
+                    frame.session_type.clone(),
+                ))
+                .or_default()
+                .push((frame.clock_ms, ok));
+        }
+        for frame in &store.frames[i..j] {
+            let sample_root = predicate
+                .symbol
+                .as_deref()
+                .unwrap_or(frame.root_symbol.as_str());
+            let as_of_frame = store.frames[..j]
+                .iter()
+                .rev()
+                .find(|f| f.root_symbol == sample_root);
+            let Some(as_of_frame) = as_of_frame else {
+                out.push((
+                    frame.frame_second,
+                    frame.root_symbol.clone(),
+                    ir_value(path, family, clock, unavailable()),
+                ));
+                continue;
+            };
+            if session_window_exceeds_eval_bound(store, sample_root, as_of_frame) {
+                out.push((
+                    frame.frame_second,
+                    frame.root_symbol.clone(),
+                    ir_value(path, family, clock, unavailable()),
+                ));
+                continue;
+            }
+            let series = truths
+                .get(&(
+                    sample_root.to_string(),
+                    as_of_frame.trading_day.clone(),
+                    as_of_frame.session_type.clone(),
+                ))
+                .cloned()
+                .unwrap_or_default();
+            let value = if series.is_empty() {
+                unavailable()
+            } else {
+                let n = series.len();
+                let last_clock = as_of_frame.clock_ms.min(clock);
+                match mode {
+                    DwellMode::Dwell => ScalarN {
+                        scalar: dwell_ms(&series, last_clock),
+                        available: true,
+                        n,
+                    },
+                    DwellMode::TimeSince => match time_since_true_ms(&series, last_clock) {
+                        Some(ms) => ScalarN {
+                            scalar: ms,
+                            available: true,
+                            n,
+                        },
+                        None => unavailable(),
+                    },
+                }
+            };
+            out.push((
+                frame.frame_second,
+                frame.root_symbol.clone(),
+                ir_value(path, family, clock, value),
+            ));
+        }
+        i = j;
+    }
+    Ok(out)
+}
+
+fn eval_cross_symbol_series(
+    store: FeatureIrStore<'_>,
+    path: FeatureIrEvalPath,
+    symbol: &str,
+    field_id: &str,
+) -> Result<Vec<(i64, String, FeatureIrValue)>, FeatureIrError> {
+    let field = resolve_catalog_field(store.catalog, field_id)?;
+    let family = OperatorFamily::CrossSymbolReferences;
+    let mut by_id: HashMap<(i64, String), &FeatureIrFrame> =
+        HashMap::with_capacity(store.frames.len());
+    for frame in store.frames {
+        by_id.insert((frame.frame_second, frame.root_symbol.clone()), frame);
+    }
+    let mut out = Vec::with_capacity(store.frames.len());
+    for frame in store.frames {
+        let other = by_id.get(&(frame.frame_second, symbol.to_string()));
+        let value = match other.and_then(|other| numeric_field(&other.payload, field)) {
+            Some(v) => ScalarN {
+                scalar: v,
+                available: true,
+                n: 1,
+            },
+            None => unavailable(),
+        };
+        out.push((
+            frame.frame_second,
+            frame.root_symbol.clone(),
+            ir_value(path, family, frame.clock_ms, value),
+        ));
+    }
+    Ok(out)
+}
+
+fn eval_event_sequence_series(
+    store: FeatureIrStore<'_>,
+    path: FeatureIrEvalPath,
+    first: &EventSelector,
+    then: &EventSelector,
+    within_ms: f64,
+) -> Result<Vec<(i64, String, FeatureIrValue)>, FeatureIrError> {
+    let family = OperatorFamily::EventSequences;
+    let mut out = Vec::with_capacity(store.frames.len());
+    for frame in store.frames {
+        let nested = FeatureIrStore {
+            catalog: store.catalog,
+            frames: store.frames,
+            events: store.events,
+            eval_root: frame.root_symbol.as_str(),
+            window_truncated: store.window_truncated,
+        };
+        let value = eval_event_sequence(nested, frame.clock_ms, first, then, within_ms);
+        out.push((
+            frame.frame_second,
+            frame.root_symbol.clone(),
+            ir_value(path, family, frame.clock_ms, value),
+        ));
+    }
+    Ok(out)
+}
+
+fn eval_historical_baseline_series(
+    program: &FeatureIrProgram,
+    store: FeatureIrStore<'_>,
+    path: FeatureIrEvalPath,
+) -> Result<Vec<(i64, String, FeatureIrValue)>, FeatureIrError> {
+    let family = OperatorFamily::HistoricalBaselines;
+    let mut out = Vec::with_capacity(store.frames.len());
+    for frame in store.frames {
+        if store.window_truncated {
+            out.push((
+                frame.frame_second,
+                frame.root_symbol.clone(),
+                ir_value(path, family, frame.clock_ms, unavailable()),
+            ));
+            continue;
+        }
+        let nested = FeatureIrStore {
+            catalog: store.catalog,
+            frames: store.frames,
+            events: store.events,
+            eval_root: frame.root_symbol.as_str(),
+            window_truncated: store.window_truncated,
+        };
+        let value = evaluate_prepared_validated(program, nested, frame.clock_ms, path)?;
+        out.push((frame.frame_second, frame.root_symbol.clone(), value));
+    }
+    Ok(out)
+}
+
 fn predicate_holds(op: PredicateOp, left: f64, right: Option<f64>) -> bool {
     let rhs = right.unwrap_or(0.0);
     match op {
@@ -931,6 +1389,220 @@ fn unavailable() -> ScalarN {
         available: false,
         n: 0,
     }
+}
+
+/// Merged Feature-IR eval window (SQLite history + in-memory pending).
+#[derive(Debug, Clone, PartialEq)]
+pub struct MergedEvalWindow {
+    pub frames: Vec<FeatureIrFrame>,
+    pub truncated: bool,
+}
+
+/// Concatenate history and pending; pending wins on `(frame_second, root_symbol)`.
+///
+/// Callers that previously chose pending *or* SQLite must use this instead.
+/// Results are chronological. When `history_truncated` is set or the merge
+/// exceeds `cap`, `truncated` is true and only the newest `cap` frames remain.
+pub fn merge_eval_frames(
+    history: Vec<FeatureIrFrame>,
+    history_truncated: bool,
+    pending: Vec<FeatureIrFrame>,
+    cap: usize,
+) -> MergedEvalWindow {
+    let cap = cap.max(1);
+    if pending.is_empty() {
+        let truncated = history_truncated || history.len() > cap;
+        let frames = if history.len() > cap {
+            history[history.len() - cap..].to_vec()
+        } else {
+            history
+        };
+        return MergedEvalWindow { frames, truncated };
+    }
+    let mut by_identity: HashMap<(i64, String), FeatureIrFrame> =
+        HashMap::with_capacity(history.len() + pending.len());
+    for frame in history {
+        by_identity.insert((frame.frame_second, frame.root_symbol.clone()), frame);
+    }
+    for frame in pending {
+        by_identity.insert((frame.frame_second, frame.root_symbol.clone()), frame);
+    }
+    let mut frames: Vec<FeatureIrFrame> = by_identity.into_values().collect();
+    frames.sort_by(|a, b| {
+        a.clock_ms
+            .partial_cmp(&b.clock_ms)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.root_symbol.cmp(&b.root_symbol))
+    });
+    let truncated = history_truncated || frames.len() > cap;
+    if frames.len() > cap {
+        frames = frames[frames.len() - cap..].to_vec();
+    }
+    MergedEvalWindow { frames, truncated }
+}
+
+/// Rolling persisted Feature-IR eval window for the live persist / coaching path.
+///
+/// Hydrate once from a bounded SQLite load, then append newly persisted frames.
+/// Live readers merge this with the pending drain instead of re-querying SQLite
+/// on every persist, analysis pass, `get_state`, or `evaluate_playbook`.
+#[derive(Debug, Clone, Default)]
+pub struct FeatureIrEvalCache {
+    frames: Vec<FeatureIrFrame>,
+    truncated: bool,
+    hydrated: bool,
+}
+
+impl FeatureIrEvalCache {
+    /// Empty unhydrated cache.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// True after the first SQLite hydrate (including an empty journal).
+    pub fn is_hydrated(&self) -> bool {
+        self.hydrated
+    }
+
+    /// Replace the window with a bounded SQLite load. Idempotent if already hydrated.
+    pub fn hydrate_from_frames(&mut self, frames: Vec<FeatureIrFrame>, truncated: bool) {
+        if self.hydrated {
+            return;
+        }
+        self.frames = frames;
+        self.truncated = truncated;
+        self.hydrated = true;
+        self.sort_and_cap();
+    }
+
+    /// Insert newly persisted frames; drop the oldest past the eval cap.
+    pub fn append_persisted(&mut self, frames: impl IntoIterator<Item = FeatureIrFrame>) {
+        if !self.hydrated {
+            return;
+        }
+        for frame in frames {
+            if let Some(pos) = self.frames.iter().rposition(|existing| {
+                existing.frame_second == frame.frame_second
+                    && existing.root_symbol == frame.root_symbol
+            }) {
+                self.frames[pos] = frame;
+            } else {
+                self.frames.push(frame);
+            }
+        }
+        self.sort_and_cap();
+    }
+
+    /// Borrow persisted frames (no pending overlay).
+    pub fn frames(&self) -> &[FeatureIrFrame] {
+        &self.frames
+    }
+
+    /// True when the left edge was dropped by the cap (or the hydrate sentinel).
+    pub fn truncated(&self) -> bool {
+        self.truncated
+    }
+
+    /// History plus pending (pending wins on identity). Clones `Arc` payloads.
+    pub fn merged_with_pending(&self, pending: Vec<FeatureIrFrame>) -> MergedEvalWindow {
+        if !self.hydrated {
+            return merge_eval_frames(Vec::new(), false, pending, FEATURE_IR_EVAL_MAX_FRAMES);
+        }
+        merge_eval_frames(
+            self.frames.clone(),
+            self.truncated,
+            pending,
+            FEATURE_IR_EVAL_MAX_FRAMES,
+        )
+    }
+
+    fn sort_and_cap(&mut self) {
+        self.frames.sort_by(|a, b| {
+            a.clock_ms
+                .partial_cmp(&b.clock_ms)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.root_symbol.cmp(&b.root_symbol))
+        });
+        if self.frames.len() > FEATURE_IR_EVAL_MAX_FRAMES {
+            let drop = self.frames.len() - FEATURE_IR_EVAL_MAX_FRAMES;
+            self.frames.drain(..drop);
+            self.truncated = true;
+        }
+    }
+}
+
+fn frames_are_chronological(frames: &[FeatureIrFrame]) -> bool {
+    frames
+        .windows(2)
+        .all(|w| match w[0].clock_ms.partial_cmp(&w[1].clock_ms) {
+            Some(std::cmp::Ordering::Less) => true,
+            Some(std::cmp::Ordering::Equal) => w[0].root_symbol <= w[1].root_symbol,
+            _ => false,
+        })
+}
+
+/// Prefix `clock_ms <= as_of` then keep the newest `FEATURE_IR_EVAL_MAX_FRAMES`.
+///
+/// Callers must pass chronological frames. No payload clone.
+fn bound_eval_slice(
+    frames: &[FeatureIrFrame],
+    as_of_ms: f64,
+    caller_truncated: bool,
+) -> (&[FeatureIrFrame], bool) {
+    let end =
+        frames.partition_point(|frame| frame.clock_ms.is_finite() && frame.clock_ms <= as_of_ms);
+    let visible = &frames[..end];
+    let truncated = caller_truncated || visible.len() > FEATURE_IR_EVAL_MAX_FRAMES;
+    if visible.len() > FEATURE_IR_EVAL_MAX_FRAMES {
+        let start = visible.len() - FEATURE_IR_EVAL_MAX_FRAMES;
+        (&visible[start..], truncated)
+    } else {
+        (visible, truncated)
+    }
+}
+
+/// Unsorted fallback: clone + sort, then apply the same cap. Avoid this path
+/// on the query/runtime hot path (loaders already emit chronological frames).
+fn bound_eval_owned(
+    frames: &[FeatureIrFrame],
+    as_of_ms: f64,
+    caller_truncated: bool,
+) -> (Vec<FeatureIrFrame>, bool) {
+    let mut visible: Vec<&FeatureIrFrame> = visible_frames(frames, as_of_ms).collect();
+    visible.sort_by(|a, b| {
+        a.clock_ms
+            .partial_cmp(&b.clock_ms)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.root_symbol.cmp(&b.root_symbol))
+    });
+    let truncated = caller_truncated || visible.len() > FEATURE_IR_EVAL_MAX_FRAMES;
+    if visible.len() > FEATURE_IR_EVAL_MAX_FRAMES {
+        let start = visible.len() - FEATURE_IR_EVAL_MAX_FRAMES;
+        visible = visible[start..].to_vec();
+    }
+    (visible.into_iter().cloned().collect(), truncated)
+}
+
+/// Session-percentile / dwell fail closed when the as-of session is cut by the cap.
+///
+/// Truncation is a mixed NQ+ES timeline. An ES-only second at the left edge
+/// must still fail closed for an NQ as-of in the same session.
+fn session_window_exceeds_eval_bound(
+    store: FeatureIrStore<'_>,
+    _root: &str,
+    as_of_frame: &FeatureIrFrame,
+) -> bool {
+    if !store.window_truncated || store.frames.is_empty() {
+        return false;
+    }
+    let Some(oldest) = store.frames.iter().min_by(|a, b| {
+        a.clock_ms
+            .partial_cmp(&b.clock_ms)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    }) else {
+        return false;
+    };
+    oldest.trading_day == as_of_frame.trading_day && oldest.session_type == as_of_frame.session_type
 }
 
 fn visible_frames(
@@ -1079,7 +1751,7 @@ mod tests {
             root_symbol: root.into(),
             session_type: session_type.into(),
             trading_day: trading_day.into(),
-            payload: json!({ "lastPrice": last_price, "sessionType": session_type }),
+            payload: Arc::new(json!({ "lastPrice": last_price, "sessionType": session_type })),
         }
     }
 
@@ -1097,6 +1769,7 @@ mod tests {
             frames,
             events,
             eval_root: "NQ",
+            window_truncated: false,
         }
     }
 
@@ -1503,5 +2176,208 @@ mod tests {
             evaluate_historical(&program, store(&cat, &frames, &events), t0 + 3000.0).unwrap();
         assert!(out.available);
         assert!((out.value - 2000.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn session_percentile_fails_closed_when_session_exceeds_eval_cap() {
+        let cat = catalog();
+        let t0 = 1_700_000_000_000.0;
+        let frames = vec![
+            frame(t0, "NQ", "2026-03-03", "RTH", 21_000.0),
+            frame(t0 + 1000.0, "NQ", "2026-03-03", "RTH", 21_001.0),
+            frame(t0 + 2000.0, "NQ", "2026-03-03", "RTH", 21_002.0),
+        ];
+        let program = declare_program(
+            &json!({"family":"sessionDistributionPercentiles","field":LAST_PRICE}),
+            &cat,
+        )
+        .unwrap();
+        let events: Vec<FeatureIrEvent> = Vec::new();
+        let mut live_store = store(&cat, &frames, &events);
+        live_store.window_truncated = true;
+        let mut hist_store = store(&cat, &frames, &events);
+        hist_store.window_truncated = true;
+        let as_of = t0 + 2000.0;
+        let live = evaluate_live_shadow(&program, live_store, as_of).unwrap();
+        let hist = evaluate_historical(&program, hist_store, as_of).unwrap();
+        assert_eq!(live.available, hist.available);
+        assert_eq!(live.n, hist.n);
+        assert!(
+            !live.available,
+            "session percentile must not silently use a truncated eval window"
+        );
+        assert_eq!(live.n, 0);
+    }
+
+    #[test]
+    fn session_percentile_fails_closed_when_oldest_truncated_frame_is_other_root() {
+        let cat = catalog();
+        let t0 = 1_700_000_000_000.0;
+        let frames = vec![
+            frame(t0, "ES", "2026-03-03", "RTH", 5_000.0),
+            frame(t0 + 1000.0, "NQ", "2026-03-03", "RTH", 21_000.0),
+            frame(t0 + 2000.0, "NQ", "2026-03-03", "RTH", 21_001.0),
+        ];
+        let program = declare_program(
+            &json!({"family":"sessionDistributionPercentiles","field":LAST_PRICE}),
+            &cat,
+        )
+        .unwrap();
+        let events: Vec<FeatureIrEvent> = Vec::new();
+        let mut ir_store = store(&cat, &frames, &events);
+        ir_store.window_truncated = true;
+        let out = evaluate_historical(&program, ir_store, t0 + 2000.0).unwrap();
+        assert!(
+            !out.available,
+            "an ES-only truncation edge must fail closed for NQ in the same session"
+        );
+    }
+
+    #[test]
+    fn session_percentile_available_when_truncated_edge_is_prior_session() {
+        let cat = catalog();
+        let t0 = 1_700_000_000_000.0;
+        let frames = vec![
+            frame(t0, "NQ", "2026-03-02", "RTH", 21_000.0),
+            frame(t0 + 1000.0, "NQ", "2026-03-03", "RTH", 21_001.0),
+            frame(t0 + 2000.0, "NQ", "2026-03-03", "RTH", 21_002.0),
+        ];
+        let program = declare_program(
+            &json!({"family":"sessionDistributionPercentiles","field":LAST_PRICE}),
+            &cat,
+        )
+        .unwrap();
+        let events: Vec<FeatureIrEvent> = Vec::new();
+        let mut ir_store = store(&cat, &frames, &events);
+        ir_store.window_truncated = true;
+        let out = evaluate_historical(&program, ir_store, t0 + 2000.0).unwrap();
+        assert!(
+            out.available,
+            "current session fully inside the window must still evaluate"
+        );
+        assert_eq!(out.n, 2);
+    }
+
+    #[test]
+    fn merge_eval_frames_pending_wins_on_identity_and_concatenates() {
+        let t0 = 1_700_000_000_000.0;
+        let history = vec![
+            frame(t0, "NQ", "2026-03-03", "RTH", 21_000.0),
+            frame(t0 + 1000.0, "NQ", "2026-03-03", "RTH", 21_001.0),
+        ];
+        let mut pending_dup = frame(t0 + 1000.0, "NQ", "2026-03-03", "RTH", 21_099.0);
+        pending_dup.payload = Arc::new(json!({ "lastPrice": 21_099.0, "sessionType": "RTH" }));
+        let pending = vec![
+            pending_dup,
+            frame(t0 + 2000.0, "NQ", "2026-03-03", "RTH", 21_002.0),
+        ];
+        let merged = merge_eval_frames(history, false, pending, FEATURE_IR_EVAL_MAX_FRAMES);
+        assert!(!merged.truncated);
+        assert_eq!(merged.frames.len(), 3);
+        assert_eq!(
+            merged.frames[1].payload["lastPrice"].as_f64(),
+            Some(21_099.0),
+            "pending must replace the same (frame_second, root) history row"
+        );
+        assert_eq!(
+            merged.frames[2].payload["lastPrice"].as_f64(),
+            Some(21_002.0)
+        );
+    }
+
+    #[test]
+    fn reverse_order_frames_still_evaluate_via_owned_bound() {
+        let cat = catalog();
+        let t0 = 1_700_000_000_000.0;
+        let frames = vec![
+            frame(t0 + 2000.0, "NQ", "2026-03-03", "RTH", 21_002.0),
+            frame(t0 + 1000.0, "NQ", "2026-03-03", "RTH", 21_001.0),
+            frame(t0, "NQ", "2026-03-03", "RTH", 21_000.0),
+        ];
+        assert!(!frames_are_chronological(&frames));
+        let program = declare_program(
+            &json!({"family":"sessionDistributionPercentiles","field":LAST_PRICE,"output":"rank"}),
+            &cat,
+        )
+        .unwrap();
+        let events: Vec<FeatureIrEvent> = Vec::new();
+        let out =
+            evaluate_historical(&program, store(&cat, &frames, &events), t0 + 2000.0).unwrap();
+        assert!(out.available);
+        assert_eq!(out.n, 3);
+        assert!((out.value - 5.0 / 6.0 * 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn evaluate_series_matches_per_frame_session_percentile_rank() {
+        let cat = catalog();
+        let t0 = 1_700_000_000_000.0;
+        let frames: Vec<FeatureIrFrame> = (0..5)
+            .map(|i| {
+                frame(
+                    t0 + i as f64 * 1000.0,
+                    "NQ",
+                    "2026-03-03",
+                    "RTH",
+                    21_000.0 + i as f64,
+                )
+            })
+            .collect();
+        let program = declare_program(
+            &json!({"family":"sessionDistributionPercentiles","field":LAST_PRICE,"output":"rank"}),
+            &cat,
+        )
+        .unwrap();
+        let events: Vec<FeatureIrEvent> = Vec::new();
+        let ir_store = store(&cat, &frames, &events);
+        let series = evaluate_series(&program, ir_store, FeatureIrEvalPath::Historical).unwrap();
+        assert_eq!(series.len(), 5);
+        for (i, frame) in frames.iter().enumerate() {
+            let point = evaluate(
+                &program,
+                store(&cat, &frames, &events),
+                frame.clock_ms,
+                FeatureIrEvalPath::Historical,
+            )
+            .unwrap();
+            assert_eq!(series[i].0, frame.frame_second);
+            assert_eq!(series[i].1, "NQ");
+            assert_eq!(series[i].2.available, point.available);
+            assert_eq!(series[i].2.n, point.n);
+            assert!((series[i].2.value - point.value).abs() < 1e-9);
+        }
+        assert!((series[4].2.value - 90.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn eval_cache_hydrates_once_and_appends_pending_wins() {
+        let t0 = 1_700_000_000_000.0;
+        let mut cache = FeatureIrEvalCache::new();
+        assert!(!cache.is_hydrated());
+        cache.hydrate_from_frames(
+            vec![
+                frame(t0, "NQ", "2026-03-03", "RTH", 21_000.0),
+                frame(t0 + 1000.0, "NQ", "2026-03-03", "RTH", 21_001.0),
+            ],
+            false,
+        );
+        cache.hydrate_from_frames(vec![frame(t0, "ES", "2026-03-03", "RTH", 1.0)], true);
+        assert_eq!(cache.frames().len(), 2);
+        assert!(!cache.truncated());
+        cache.append_persisted(vec![frame(
+            t0 + 2000.0,
+            "NQ",
+            "2026-03-03",
+            "RTH",
+            21_002.0,
+        )]);
+        assert_eq!(cache.frames().len(), 3);
+        let pending = vec![frame(t0 + 2000.0, "NQ", "2026-03-03", "RTH", 21_099.0)];
+        let merged = cache.merged_with_pending(pending);
+        assert_eq!(merged.frames.len(), 3);
+        assert_eq!(
+            merged.frames[2].payload["lastPrice"].as_f64(),
+            Some(21_099.0)
+        );
     }
 }

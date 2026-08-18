@@ -12,7 +12,7 @@
 //! or DuckDB. Default `store=hot` is the SQLite window. Events / ticks stay
 //! on SQLite even when frames are read from cold.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -22,8 +22,10 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::catalog::{
-    build_catalog, DeskCatalog, FieldDescriptor, FrameRef, PositioningRecord, TrustCeiling,
-    TrustLevel, CATALOG_VERSION,
+    build_catalog, build_catalog_with_overlay, evaluate_series, is_accepted_derived,
+    is_codegen_field, read_storage_value, DeskCatalog, FeatureIrEvalPath, FeatureIrFrame,
+    FeatureIrStore, FieldDescriptor, FrameRef, PositioningRecord, TrustCeiling, TrustLevel,
+    CATALOG_VERSION, FEATURE_IR_EVAL_MAX_FRAMES,
 };
 use crate::db::{
     journal_frame_second_from_ts, Database, DbError, HypothesisSignalOutcomeRow,
@@ -718,19 +720,117 @@ fn extract_field_value(
     field: &FieldDescriptor,
     path: Option<&str>,
 ) -> Option<Value> {
-    let mut val = payload.get(&field.name).cloned().or_else(|| {
-        field
-            .id
-            .rsplit('.')
-            .next()
-            .and_then(|tail| payload.get(tail).cloned())
-    })?;
+    let mut val = payload
+        .get(&field.name)
+        .cloned()
+        .or_else(|| {
+            field
+                .id
+                .rsplit('.')
+                .next()
+                .and_then(|tail| payload.get(tail).cloned())
+        })
+        .or_else(|| payload.get(&field.id).cloned())
+        .or_else(|| read_storage_value(payload, &field.id).map(Value::from))?;
     if let Some(path) = path.filter(|p| !p.is_empty()) {
         for part in path.split('.') {
             val = val.get(part)?.clone();
         }
     }
     Some(val)
+}
+
+fn extract_or_derive_field(
+    payload: &Value,
+    field: &FieldDescriptor,
+    path: Option<&str>,
+    _catalog: &DeskCatalog,
+    frame: &JournalFrameRecord,
+    history: Option<&FeatureIrQueryHistory>,
+) -> Option<Value> {
+    if let Some(val) = extract_field_value(payload, field, path) {
+        return Some(val);
+    }
+    if !is_codegen_field(field) {
+        return None;
+    }
+    history?
+        .series
+        .get(&(frame.frame_second, frame.root_symbol.clone()))
+        .and_then(|m| m.get(&field.id).copied())
+        .map(Value::from)
+}
+
+fn catalog_for_frame_read(frames: JournalFrameRead<'_>) -> Result<DeskCatalog, QueryKernelError> {
+    match frames {
+        JournalFrameRead::Hot(db) => Ok(build_catalog_with_overlay(db.list_feature_registry()?)),
+        JournalFrameRead::Cold(_) => Ok(build_catalog()),
+    }
+}
+
+struct FeatureIrQueryHistory {
+    series: HashMap<(i64, String), HashMap<String, f64>>,
+}
+
+fn derived_history(
+    frames: JournalFrameRead<'_>,
+    as_of_ms: f64,
+    catalog: &DeskCatalog,
+) -> Option<FeatureIrQueryHistory> {
+    if !catalog.fields.iter().any(is_codegen_field) {
+        return None;
+    }
+    let (ir_frames, truncated) = match frames {
+        JournalFrameRead::Hot(db) => db
+            .list_journal_frames_for_feature_ir(as_of_ms, FEATURE_IR_EVAL_MAX_FRAMES)
+            .ok()
+            .map(|(rows, truncated)| {
+                let ir_frames: Vec<FeatureIrFrame> = rows.iter().map(Into::into).collect();
+                (ir_frames, truncated)
+            })?,
+        JournalFrameRead::Cold(_) => return None,
+    };
+    Some(FeatureIrQueryHistory {
+        series: derived_series_lookup(catalog, &ir_frames, truncated),
+    })
+}
+
+fn derived_series_lookup(
+    catalog: &DeskCatalog,
+    frames: &[FeatureIrFrame],
+    truncated: bool,
+) -> HashMap<(i64, String), HashMap<String, f64>> {
+    let mut out: HashMap<(i64, String), HashMap<String, f64>> = HashMap::new();
+    if frames.is_empty() {
+        return out;
+    }
+    let store = FeatureIrStore {
+        catalog,
+        frames,
+        events: &[],
+        eval_root: "NQ",
+        window_truncated: truncated,
+    };
+    for desc in catalog
+        .derived_features
+        .iter()
+        .filter(|d| is_accepted_derived(d))
+    {
+        let Some(program) = desc.program.as_ref() else {
+            continue;
+        };
+        let Ok(series) = evaluate_series(program, store, FeatureIrEvalPath::Historical) else {
+            continue;
+        };
+        for (second, root, value) in series {
+            if value.available && value.value.is_finite() {
+                out.entry((second, root))
+                    .or_default()
+                    .insert(desc.id.clone(), value.value);
+            }
+        }
+    }
+    out
 }
 
 fn as_f64(value: &Value) -> Option<f64> {
@@ -779,6 +879,8 @@ fn eval_predicate(
     by_root: &BTreeMap<String, &JournalFrameRecord>,
     events: &[Value],
     positioning_levels: Option<&[f64]>,
+    catalog: &DeskCatalog,
+    history: Option<&FeatureIrQueryHistory>,
 ) -> PredicateEval {
     if let Some(event_type) = pred
         .event_type
@@ -848,11 +950,11 @@ fn eval_predicate(
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
-    let payload = match root {
-        Some(sym) => by_root.get(sym).map(|f| &f.payload),
-        None => by_root.values().next().map(|f| &f.payload),
+    let frame = match root {
+        Some(sym) => by_root.get(sym).copied(),
+        None => by_root.values().next().copied(),
     };
-    let Some(payload) = payload else {
+    let Some(frame) = frame else {
         return PredicateEval {
             matched: false,
             available: false,
@@ -862,9 +964,18 @@ fn eval_predicate(
             )),
         };
     };
+    let payload = &frame.payload;
 
     if pred.op == PredicateOp::Exists {
-        let present = extract_field_value(payload, field, pred.path.as_deref()).is_some();
+        let present = extract_or_derive_field(
+            payload,
+            field,
+            pred.path.as_deref(),
+            catalog,
+            frame,
+            history,
+        )
+        .is_some();
         return PredicateEval {
             matched: present,
             available: true,
@@ -872,7 +983,14 @@ fn eval_predicate(
         };
     }
 
-    let extracted = extract_field_value(payload, field, pred.path.as_deref());
+    let extracted = extract_or_derive_field(
+        payload,
+        field,
+        pred.path.as_deref(),
+        catalog,
+        frame,
+        history,
+    );
     let Some(left) = extracted else {
         return PredicateEval {
             matched: false,
@@ -1065,7 +1183,7 @@ pub fn query_series_with(
 ) -> Result<QuerySeriesResult, QueryKernelError> {
     let (start, end) = validate_window(QueryKind::Series, req.window.start_ms, req.window.end_ms)?;
     let session = resolve_session_type(&frames, start, end, req.window.session_type.as_deref())?;
-    let catalog = build_catalog();
+    let catalog = catalog_for_frame_read(frames)?;
     let mut fields = Vec::new();
     for id in &req.fields {
         fields.push(resolve_catalog_field(&catalog, id)?);
@@ -1075,6 +1193,7 @@ pub fn query_series_with(
             "query_series requires at least one catalog field".into(),
         ));
     }
+    let history = derived_history(frames, end, &catalog);
 
     let roots = req
         .window
@@ -1105,7 +1224,14 @@ pub fn query_series_with(
             for frame in rows {
                 let mut values = BTreeMap::new();
                 for field in &fields {
-                    match extract_field_value(&frame.payload, field, None) {
+                    match extract_or_derive_field(
+                        &frame.payload,
+                        field,
+                        None,
+                        &catalog,
+                        &frame,
+                        history.as_ref(),
+                    ) {
                         Some(v) => {
                             values.insert(field.id.clone(), v);
                         }
@@ -1222,7 +1348,10 @@ pub fn query_episodes_with_opts(
         }
     }
     let session = resolve_session_type(&frame_src, start, end, req.window.session_type.as_deref())?;
-    let catalog = build_catalog();
+    let catalog = match frame_src {
+        JournalFrameRead::Hot(_) => build_catalog_with_overlay(db.list_feature_registry()?),
+        JournalFrameRead::Cold(_) => build_catalog(),
+    };
     let mut resolved_fields: Vec<Option<&FieldDescriptor>> = Vec::new();
     for pred in &req.predicates {
         if pred
@@ -1235,6 +1364,7 @@ pub fn query_episodes_with_opts(
         }
         resolved_fields.push(Some(resolve_catalog_field(&catalog, &pred.field)?));
     }
+    let history = derived_history(frame_src, end, &catalog);
 
     let root_filters: Vec<Option<String>> = match &req.window.symbols {
         Some(syms) if !syms.is_empty() => syms.iter().cloned().map(Some).collect(),
@@ -1371,7 +1501,15 @@ pub fn query_episodes_with_opts(
 
             let mut all_match = true;
             for (i, pred) in req.predicates.iter().enumerate() {
-                let eval = eval_predicate(pred, resolved_fields[i], &refs, &second_events, levels);
+                let eval = eval_predicate(
+                    pred,
+                    resolved_fields[i],
+                    &refs,
+                    &second_events,
+                    levels,
+                    &catalog,
+                    history.as_ref(),
+                );
                 if eval.available {
                     coverage[i].available_seconds += 1;
                 } else {

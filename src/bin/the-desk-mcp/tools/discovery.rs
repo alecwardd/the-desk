@@ -10,14 +10,16 @@ use rmcp::{
     handler::server::wrapper::Parameters, model::*, tool, tool_router, ErrorData as McpError,
 };
 use the_desk_backend::catalog::{
-    apply_positioning_slice, apply_token_budget, attach_capsule_refs, build_catalog,
-    build_catalog_with_overlay, build_state_envelope, collapse_events_latest_per_dedup,
-    describe_domain, describe_environment, kernel_event_from_db_row,
-    kernel_event_from_market_event_scoped, merge_symbol_envelopes, positioning_state_slice,
-    search_catalog, search_features, state_envelope_json, EventsEnvelope, KernelEvent,
-    PositioningStateSlice, ProvenanceSource, StateEnvelope, StateReadRequest, StateResolution,
-    TrustLevel, KERNEL_READ_QUERY_TOOLS,
+    apply_positioning_slice, apply_token_budget, attach_capsule_refs, build_catalog_with_overlay,
+    build_state_envelope, collapse_events_latest_per_dedup, describe_domain, describe_environment,
+    kernel_event_from_db_row, kernel_event_from_market_event_scoped, merge_eval_frames,
+    merge_symbol_envelopes, positioning_state_slice, request_needs_derived_stamp, search_catalog,
+    search_features, stamp_derived_feature_payload, state_envelope_json, EventsEnvelope,
+    FeatureIrEvalPath, FeatureIrFrame, FeatureIrStore, KernelEvent, PositioningStateSlice,
+    ProvenanceSource, StateEnvelope, StateReadRequest, StateResolution, TrustLevel,
+    FEATURE_IR_EVAL_MAX_FRAMES, KERNEL_READ_QUERY_TOOLS,
 };
+use the_desk_backend::db::{Database, JournalFrameRecord};
 use the_desk_backend::engine::{parse_requested_roots, RouterRoot, RouterRootError};
 use the_desk_backend::trading_day_from_timestamp_ms;
 
@@ -123,7 +125,7 @@ impl TheDeskMcp {
         let resolution = StateResolution::parse(resolution_raw)
             .map_err(|e| invalid_params_error(e.to_string()))?;
 
-        let catalog = build_catalog();
+        let catalog = catalog_with_registry_overlay(self)?;
         let requested_roots = parse_requested_roots(params.symbols.as_deref()).map_err(|e| {
             invalid_params_error(match e {
                 RouterRootError::MicroNotInScope(s) => format!(
@@ -167,18 +169,31 @@ impl TheDeskMcp {
             as_of.is_none() && requested_roots.len() > 1 && (caller_listed_both || both_live);
 
         if include_multi {
+            let as_of_ms = self.market_router.clock_ms().or(data_time).unwrap_or(0.0);
+            let (ir_frames, truncated) = load_live_feature_ir_frames(
+                self,
+                &catalog,
+                as_of_ms,
+                params.fields.as_deref(),
+                params.domains.as_deref(),
+            )?;
             let mut by_root = std::collections::BTreeMap::new();
             for root in &requested_roots {
                 let snap = live_by_symbol.get(root);
-                let (snapshot, data_time, degraded, note) = match snap {
-                    Some(piece) => (
-                        Some(&piece.snapshot),
-                        piece.data_time,
-                        piece.degraded,
-                        piece.note.clone(),
-                    ),
+                let stamped = snap.map(|piece| {
+                    stamp_get_state_snapshot(
+                        &piece.snapshot,
+                        &catalog,
+                        &ir_frames,
+                        root.as_str(),
+                        piece.data_time.unwrap_or(as_of_ms),
+                        FeatureIrEvalPath::LiveShadow,
+                        truncated,
+                    )
+                });
+                let (data_time, degraded, note) = match snap {
+                    Some(piece) => (piece.data_time, piece.degraded, piece.note.clone()),
                     None => (
-                        None,
                         data_time,
                         true,
                         Some(format!(
@@ -194,7 +209,7 @@ impl TheDeskMcp {
                     resolution,
                     as_of,
                     budget_tokens: None,
-                    snapshot,
+                    snapshot: stamped.as_ref(),
                     snapshot_source,
                     data_time,
                     source_degraded: degraded,
@@ -230,14 +245,27 @@ impl TheDeskMcp {
         // Single-symbol (M1b shape): requested root must match the snapshot when known.
         if requested_roots.len() == 1 {
             let want = requested_roots[0];
-            if let Some(root) = snapshot_owned
-                .as_ref()
-                .and_then(|s| s.get("rootSymbol"))
-                .and_then(|v| v.as_str())
-            {
+            if let Some(root) = snapshot_root_symbol(snapshot_owned.as_ref()) {
                 if let Ok(have) = RouterRoot::parse(root) {
                     if have != want {
                         if let Some(piece) = live_by_symbol.get(&want) {
+                            let as_of_ms = piece.data_time.or(data_time).unwrap_or(0.0);
+                            let (ir_frames, truncated) = load_live_feature_ir_frames(
+                                self,
+                                &catalog,
+                                as_of_ms,
+                                params.fields.as_deref(),
+                                params.domains.as_deref(),
+                            )?;
+                            let stamped = stamp_get_state_snapshot(
+                                &piece.snapshot,
+                                &catalog,
+                                &ir_frames,
+                                want.as_str(),
+                                as_of_ms,
+                                FeatureIrEvalPath::LiveShadow,
+                                truncated,
+                            );
                             let req = StateReadRequest {
                                 symbols: Some(vec![want.as_str().to_string()]),
                                 domains: params.domains.clone(),
@@ -245,7 +273,7 @@ impl TheDeskMcp {
                                 resolution,
                                 as_of,
                                 budget_tokens: params.budget_tokens,
-                                snapshot: Some(&piece.snapshot),
+                                snapshot: Some(&stamped),
                                 snapshot_source,
                                 data_time: piece.data_time,
                                 source_degraded: piece.degraded,
@@ -280,6 +308,29 @@ impl TheDeskMcp {
         }
 
         let fields = params.fields.clone();
+        let eval_root = snapshot_root_symbol(snapshot_owned.as_ref())
+            .map(|s| s.to_string())
+            .or_else(|| requested_roots.first().map(|r| r.as_str().to_string()))
+            .unwrap_or_else(|| "NQ".into());
+        let as_of_ms = data_time.unwrap_or(0.0);
+        let (ir_frames, truncated) = load_live_feature_ir_frames(
+            self,
+            &catalog,
+            as_of_ms,
+            params.fields.as_deref(),
+            params.domains.as_deref(),
+        )?;
+        let stamped = snapshot_owned.as_ref().map(|s| {
+            stamp_get_state_snapshot(
+                s,
+                &catalog,
+                &ir_frames,
+                &eval_root,
+                as_of_ms,
+                FeatureIrEvalPath::LiveShadow,
+                truncated,
+            )
+        });
         let req = StateReadRequest {
             symbols: params.symbols,
             domains: params.domains,
@@ -287,7 +338,7 @@ impl TheDeskMcp {
             resolution,
             as_of,
             budget_tokens: params.budget_tokens,
-            snapshot: snapshot_owned.as_ref(),
+            snapshot: stamped.as_ref(),
             snapshot_source,
             data_time,
             source_degraded,
@@ -668,6 +719,17 @@ impl TheDeskMcp {
             let db = self.db.lock().map_err(|_| lock_error())?;
             db.get_journal_frames_as_of(ts).map_err(db_error)?
         };
+        let (ir_frames, truncated) = {
+            let db = self.db.lock().map_err(|_| lock_error())?;
+            load_feature_ir_eval_frames(
+                &db,
+                &[],
+                catalog,
+                ts,
+                params.fields.as_deref(),
+                params.domains.as_deref(),
+            )
+        };
 
         let note_missing = "as_of Journal Frame unavailable; domains degraded — Your playbook indicates historical structure is incomplete";
         let mut by_root = std::collections::BTreeMap::new();
@@ -675,7 +737,15 @@ impl TheDeskMcp {
             let (snapshot, data_time, degraded, note) = match journal.as_ref() {
                 Some(snap) => match snap.by_root.get(root.as_str()) {
                     Some(payload) if !payload.is_null() => (
-                        Some(payload.clone()),
+                        Some(stamp_get_state_snapshot(
+                            payload,
+                            catalog,
+                            &ir_frames,
+                            root.as_str(),
+                            snap.clock_ms,
+                            FeatureIrEvalPath::Historical,
+                            truncated,
+                        )),
                         Some(snap.clock_ms),
                         false,
                         Some("as_of served from Journal Frames".into()),
@@ -1085,4 +1155,84 @@ fn catalog_with_registry_overlay(
     let db = server.db.lock().map_err(|_| lock_error())?;
     let overlay = db.list_feature_registry().map_err(db_error)?;
     Ok(build_catalog_with_overlay(overlay))
+}
+
+/// Non-empty `rootSymbol` on a live snapshot (empty string is treated as unknown).
+fn snapshot_root_symbol(snapshot: Option<&serde_json::Value>) -> Option<&str> {
+    snapshot
+        .and_then(|s| s.get("rootSymbol"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+/// Loads a Feature-IR eval window from SQLite (historical `as_of` path).
+///
+/// Never `list_journal_frames()`. Skips the journal read when the request
+/// cannot resolve a codegen field.
+fn load_feature_ir_eval_frames(
+    db: &Database,
+    pending: &[JournalFrameRecord],
+    catalog: &the_desk_backend::catalog::DeskCatalog,
+    as_of_ms: f64,
+    fields: Option<&[String]>,
+    domains: Option<&[String]>,
+) -> (Vec<FeatureIrFrame>, bool) {
+    if !request_needs_derived_stamp(catalog, fields, domains) {
+        return (Vec::new(), false);
+    }
+    let (history, truncated) = db
+        .list_journal_frames_for_feature_ir(as_of_ms, FEATURE_IR_EVAL_MAX_FRAMES)
+        .map(|(rows, truncated)| (rows.iter().map(Into::into).collect(), truncated))
+        .unwrap_or_else(|_| (Vec::new(), false));
+    let pending_ir = pending.iter().map(Into::into).collect();
+    let merged = merge_eval_frames(history, truncated, pending_ir, FEATURE_IR_EVAL_MAX_FRAMES);
+    (merged.frames, merged.truncated)
+}
+
+fn load_live_feature_ir_frames(
+    server: &TheDeskMcp,
+    catalog: &the_desk_backend::catalog::DeskCatalog,
+    as_of_ms: f64,
+    fields: Option<&[String]>,
+    domains: Option<&[String]>,
+) -> Result<(Vec<FeatureIrFrame>, bool), McpError> {
+    if !request_needs_derived_stamp(catalog, fields, domains) {
+        return Ok((Vec::new(), false));
+    }
+    let pending = server.market_router.snapshot_pending_journal_frames();
+    {
+        let db = server.db.lock().map_err(|_| lock_error())?;
+        server
+            .market_router
+            .hydrate_feature_ir_eval_cache(&db, as_of_ms)
+            .map_err(db_error)?;
+    }
+    let merged = server.market_router.live_feature_ir_eval_window(&pending);
+    Ok((merged.frames, merged.truncated))
+}
+
+fn stamp_get_state_snapshot(
+    snapshot: &serde_json::Value,
+    catalog: &the_desk_backend::catalog::DeskCatalog,
+    frames: &[FeatureIrFrame],
+    eval_root: &str,
+    as_of_ms: f64,
+    path: FeatureIrEvalPath,
+    truncated: bool,
+) -> serde_json::Value {
+    let mut payload = snapshot.clone();
+    stamp_derived_feature_payload(
+        &mut payload,
+        FeatureIrStore {
+            catalog,
+            frames,
+            events: &[],
+            eval_root,
+            window_truncated: truncated,
+        },
+        as_of_ms,
+        path,
+    );
+    payload
 }

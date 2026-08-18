@@ -79,7 +79,7 @@ pub(crate) fn tool_domains() -> Vec<ToolDomain> {
         ToolDomain {
             name: "Research",
             module: "research",
-            summary: "Historical research: hypotheses, backtests, Feature Registry lifecycle (`feature_registry`), and frequency/conditional/distribution queries over recorded sessions.",
+            summary: "Historical research: hypotheses, backtests, Feature Registry lifecycle (`feature_registry` for Base Detectors and Derived Features), and frequency/conditional/distribution queries over recorded sessions.",
             reach_for_when: "answering \"how often\" / \"what happens after\" questions or running and comparing backtests",
             router: TheDeskMcp::research_router,
         },

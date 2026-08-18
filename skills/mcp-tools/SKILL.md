@@ -134,7 +134,7 @@ This is the canonical "potential trade" flow — keep state in the system, not i
 2. `run_backtest` → poll `get_backfill_status` → `summarize_hypothesis_run`.
 3. `get_backtest_results`, `compare_backtests` for stored runs.
 4. Promotion gate: `propose_draft_setup` → human confirmation → `activate_draft_setup`.
-5. Feature Registry (Base Detectors): lifecycle writes use `feature_registry` (`register` at candidate, `promote` candidate→shadow→active with `traderConfirmation`; optional `unit` / `sessionScope` / `freshness` / `costHint` on register). Discovery via `search_catalog` (`featureHits`) requires `[sil].catalog_discovery = true`. The write verb stays on the default surface and reports `discoveryEnabled`. Do not add a specialty getter.
+5. Feature Registry: lifecycle writes use `feature_registry` (`register` at candidate for `kind=baseDetector` or `kind=derivedFeature` with a Feature-IR `program`, `promote` candidate→shadow→active with `traderConfirmation`; optional `unit` / `sessionScope` / `freshness` / `costHint` on register). Discovery via `search_catalog` (`featureHits`) requires `[sil].catalog_discovery = true`. The write verb stays on the default surface and reports `discoveryEnabled`. Do not add a specialty getter. Derived Features use only the five funded Operator Families; unfunded families (including surface lookup) are rejected at declaration time. Feature-IR evaluation is declaration-and-test-only in M5b — do not present an `active` Derived Feature as producing live or historical values.
 6. `list_hypotheses` first so you never re-test a rejected idea; `set_hypothesis_lifecycle` to retire/reject.
 7. `cancel_backfill` for runaway jobs.
 
@@ -176,7 +176,8 @@ This is the canonical "potential trade" flow — keep state in the system, not i
 > detector tool**. Kernel operators (`describe_*`, `search_catalog`, `get_state`,
 > `get_events`, `query_series`, `query_episodes`, `query_raw`, `run_job`)
 > are behind `[sil].catalog_discovery`, not specialty market tools.
-> The Feature Registry write verb is `feature_registry` (research domain); discovery
+> The Feature Registry write verb is `feature_registry` (research domain; Base Detectors
+> and Derived Features / Feature-IR); discovery
 > rides `search_catalog` when `[sil].catalog_discovery = true`. Do not delete existing tools under this policy. Do not re-bless
 > `docs/mcp/sil-m0-tool-telemetry-baseline.json` unless the orientation-chain
 > contract itself changes.

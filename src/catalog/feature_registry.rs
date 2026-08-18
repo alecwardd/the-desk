@@ -1,20 +1,27 @@
-//! Feature Registry — governance waist for Base Detectors (SIL-M5a).
+//! Feature Registry — governance waist for Base Detectors and Derived Features.
 //!
 //! Registers schema, provenance, and promotion state (`candidate` → `shadow`
-//! → `active`). Promotion is **human-gated**. Tier 1 math stays reviewed Rust
-//! in the existing pipeline modules — this ticket does not implement Feature-IR,
-//! codegen, the leg engine, or DOM cluster detectors.
+//! → `active`). Promotion is **human-gated**. Tier 1 Base Detector math stays
+//! reviewed Rust in the existing pipeline modules and is never re-expressed in
+//! Feature-IR. Derived Features declare as Feature-IR over catalog fields using
+//! the five funded Operator Families (SIL-M5b).
 //!
 //! Existing shipped detectors (absorption, pinch, and other already-emitting
 //! detectors) are registered as `active` with `behaviorChange=false`. Discovery
 //! rides the Desk Catalog (`search_catalog` / catalog descriptors). The typed
-//! write verb is `feature_registry`; there is no specialty getter.
+//! write verb is `feature_registry`; there is no specialty getter. Codegen
+//! emitters are out of scope (SIL-M5c).
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use super::feature_ir::{
+    FeatureIrError, FeatureIrProgram, DERIVED_FEATURE_MATH_TIER, FEATURE_IR_MODULE,
+    FEATURE_IR_SOURCE, FUNDED_OPERATOR_FAMILY_GLOSSARY, FUNDED_OPERATOR_FAMILY_LABELS,
+    NEW_OPERATOR_FAMILY_GATE,
+};
 use super::types::{CostHint, DeskCatalog, FreshnessSemantics, SessionScope, Unit};
 
 /// MCP / catalog write-verb name for Feature Registry lifecycle.
@@ -41,7 +48,7 @@ pub const DETECTOR_SPECIALTY_TOOLS: &[(&str, &str)] = &[
     ("get_trade_size_profile", "detector.trade_size"),
 ];
 
-/// Feature kind. M5a accepts Base Detectors only; Derived Features are later.
+/// Feature kind. Base Detectors stay reviewed Rust; Derived Features carry Feature-IR.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum FeatureKind {
@@ -118,7 +125,7 @@ pub struct FeatureProvenance {
     pub source: String,
     /// Rust module path (e.g. `pipelines::absorption`).
     pub rust_module: String,
-    /// Always [`TIER1_REVIEWED_RUST`] for Base Detectors in M5a.
+    /// [`TIER1_REVIEWED_RUST`] for Base Detectors; [`DERIVED_FEATURE_MATH_TIER`] for Derived Features.
     pub math_tier: String,
     /// Must stay false for shipped registrations — this ticket does not change math.
     pub behavior_change: bool,
@@ -151,6 +158,9 @@ pub struct FeatureDescriptor {
     pub builtin: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_gate_note: Option<String>,
+    /// Feature-IR program. Required for Derived Features; absent on Base Detectors.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program: Option<FeatureIrProgram>,
 }
 
 /// Input accepted when registering a new Base Detector (always starts `candidate`).
@@ -162,6 +172,17 @@ pub struct BaseDetectorRegistration {
     pub domain_id: String,
     pub schema: DetectorSchema,
     pub provenance: FeatureProvenance,
+}
+
+/// Input accepted when registering a Derived Feature (Feature-IR; always `candidate`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DerivedFeatureRegistration {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub domain_id: String,
+    pub schema: DetectorSchema,
+    pub program: FeatureIrProgram,
 }
 
 /// Human confirmation required to move candidate → shadow → active.
@@ -185,10 +206,14 @@ impl<'a> HumanGate<'a> {
 /// Feature Registry errors (typed until the MCP / CLI boundary).
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum FeatureRegistryError {
-    #[error("feature registry requires a Base Detector descriptor (kind=baseDetector); Derived Features are later (SIL-M5b)")]
-    DerivedFeatureNotAccepted,
+    #[error("kind=derivedFeature requires a Feature-IR `program` over funded Operator Families")]
+    DerivedFeatureProgramRequired,
+    #[error("kind=baseDetector cannot carry a Feature-IR program (Base Detector math stays reviewed Rust)")]
+    BaseDetectorCannotCarryProgram,
     #[error("feature id `{0}` is invalid (expected detector.<snake_id>)")]
     InvalidId(String),
+    #[error("feature id `{0}` is invalid (expected feature.<snake_id> for Derived Features)")]
+    InvalidDerivedId(String),
     #[error("feature `{0}` is already registered")]
     DuplicateId(String),
     #[error("feature `{0}` is a shipped builtin and cannot be overwritten or re-promoted")]
@@ -210,6 +235,8 @@ pub enum FeatureRegistryError {
     AlreadyInState(PromotionState),
     #[error("name, description, and domainId are required")]
     MissingIdentity,
+    #[error("{0}")]
+    FeatureIr(#[from] FeatureIrError),
 }
 
 /// In-memory Feature Registry (builtins + optional SQLite overlay).
@@ -263,12 +290,53 @@ impl FeatureRegistry {
         self.descriptors.into_values().collect()
     }
 
+    /// Base Detector descriptors (builtins + overlay), sorted by id.
+    pub fn base_detectors(&self) -> Vec<FeatureDescriptor> {
+        let mut rows: Vec<_> = self
+            .descriptors
+            .values()
+            .filter(|d| d.kind == FeatureKind::BaseDetector)
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| a.id.cmp(&b.id));
+        rows
+    }
+
+    /// Derived Feature descriptors (overlay only; none are shipped builtins), sorted by id.
+    pub fn derived_features(&self) -> Vec<FeatureDescriptor> {
+        let mut rows: Vec<_> = self
+            .descriptors
+            .values()
+            .filter(|d| d.kind == FeatureKind::DerivedFeature)
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| a.id.cmp(&b.id));
+        rows
+    }
+
     /// Register a Base Detector at `candidate`. Does not change pipeline math.
     pub fn register(
         &mut self,
         input: BaseDetectorRegistration,
     ) -> Result<FeatureDescriptor, FeatureRegistryError> {
         let desc = validate_registration(input)?;
+        self.insert_new(desc)
+    }
+
+    /// Register a Derived Feature at `candidate` after Feature-IR declaration checks.
+    pub fn register_derived(
+        &mut self,
+        input: DerivedFeatureRegistration,
+        catalog: &DeskCatalog,
+    ) -> Result<FeatureDescriptor, FeatureRegistryError> {
+        let desc = validate_derived_feature(input, catalog)?;
+        self.insert_new(desc)
+    }
+
+    fn insert_new(
+        &mut self,
+        desc: FeatureDescriptor,
+    ) -> Result<FeatureDescriptor, FeatureRegistryError> {
         if let Some(existing) = self.descriptors.get(&desc.id) {
             if existing.builtin {
                 return Err(FeatureRegistryError::BuiltinImmutable(desc.id));
@@ -370,6 +438,63 @@ pub fn validate_registration(
         promotion_state: PromotionState::Candidate,
         builtin: false,
         last_gate_note: None,
+        program: None,
+    })
+}
+
+/// Validate a Derived Feature declaration (Feature-IR; always `candidate`).
+pub fn validate_derived_feature(
+    input: DerivedFeatureRegistration,
+    catalog: &DeskCatalog,
+) -> Result<FeatureDescriptor, FeatureRegistryError> {
+    let id = input.id.trim().to_string();
+    if !valid_derived_id(&id) {
+        return Err(FeatureRegistryError::InvalidDerivedId(id));
+    }
+    if input.name.trim().is_empty()
+        || input.description.trim().is_empty()
+        || input.domain_id.trim().is_empty()
+    {
+        return Err(FeatureRegistryError::MissingIdentity);
+    }
+    input.program.validate(catalog)?;
+    let mut catalog_field_ids = unique_sorted(input.schema.catalog_field_ids);
+    if catalog_field_ids.is_empty() {
+        catalog_field_ids = unique_sorted(input.program.catalog_field_ids());
+    }
+    let mut event_types = unique_sorted(input.schema.event_types);
+    if event_types.is_empty() {
+        if let FeatureIrProgram::EventSequences { first, then, .. } = &input.program {
+            event_types = unique_sorted(vec![first.event_type.clone(), then.event_type.clone()]);
+        }
+    }
+    if catalog_field_ids.is_empty() && event_types.is_empty() {
+        return Err(FeatureRegistryError::MissingSchema);
+    }
+    Ok(FeatureDescriptor {
+        id,
+        name: input.name.trim().to_string(),
+        kind: FeatureKind::DerivedFeature,
+        description: input.description.trim().to_string(),
+        domain_id: input.domain_id.trim().to_string(),
+        schema: DetectorSchema {
+            catalog_field_ids,
+            event_types,
+            unit: input.schema.unit,
+            session_scope: input.schema.session_scope,
+            freshness: input.schema.freshness,
+            cost_hint: input.schema.cost_hint,
+        },
+        provenance: FeatureProvenance {
+            source: FEATURE_IR_SOURCE.into(),
+            rust_module: FEATURE_IR_MODULE.into(),
+            math_tier: DERIVED_FEATURE_MATH_TIER.into(),
+            behavior_change: false,
+        },
+        promotion_state: PromotionState::Candidate,
+        builtin: false,
+        last_gate_note: None,
+        program: Some(input.program),
     })
 }
 
@@ -382,7 +507,9 @@ pub fn concept_has_catalog_or_registry_entry(catalog: &DeskCatalog, concept_id: 
     if id.is_empty() {
         return false;
     }
-    catalog.fields.iter().any(|f| f.id == id) || catalog.base_detectors.iter().any(|d| d.id == id)
+    catalog.fields.iter().any(|f| f.id == id)
+        || catalog.base_detectors.iter().any(|d| d.id == id)
+        || catalog.derived_features.iter().any(|d| d.id == id)
 }
 
 /// Registry id a detector specialty tool must cite, if any.
@@ -393,7 +520,7 @@ pub fn specialty_tool_registry_id(tool_name: &str) -> Option<&'static str> {
         .map(|(_, id)| *id)
 }
 
-/// Case-insensitive search over Base Detector descriptors.
+/// Case-insensitive search over Base Detector and Derived Feature descriptors.
 pub fn search_features(catalog: &DeskCatalog, query: &str) -> Vec<FeatureDescriptor> {
     let q = query.trim().to_ascii_lowercase();
     if q.is_empty() {
@@ -402,6 +529,7 @@ pub fn search_features(catalog: &DeskCatalog, query: &str) -> Vec<FeatureDescrip
     catalog
         .base_detectors
         .iter()
+        .chain(catalog.derived_features.iter())
         .filter(|d| feature_matches(d, &q))
         .cloned()
         .collect()
@@ -424,19 +552,40 @@ fn feature_matches(d: &FeatureDescriptor, q: &str) -> bool {
             .catalog_field_ids
             .iter()
             .any(|e| e.to_ascii_lowercase().contains(q))
-        || (q == "base detector" || q == "basedetector" || q == "detector")
+        || (d.kind == FeatureKind::BaseDetector
+            && (q == "base detector" || q == "basedetector" || q == "detector"))
+        || (d.kind == FeatureKind::DerivedFeature
+            && (q == "derived feature"
+                || q == "derivedfeature"
+                || q == "feature-ir"
+                || q == "featureir"))
+        || d.program.as_ref().is_some_and(|p| {
+            p.family().as_str().to_ascii_lowercase().contains(q)
+                || p.family().glossary_name().to_ascii_lowercase().contains(q)
+        })
 }
 
-fn valid_detector_id(id: &str) -> bool {
-    let Some(rest) = id.strip_prefix("detector.") else {
+fn valid_derived_id(id: &str) -> bool {
+    let Some(rest) = id.strip_prefix("feature.") else {
         return false;
     };
+    valid_snake_suffix(rest)
+}
+
+fn valid_snake_suffix(rest: &str) -> bool {
     let mut chars = rest.chars();
     let Some(first) = chars.next() else {
         return false;
     };
     first.is_ascii_lowercase()
         && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+}
+
+fn valid_detector_id(id: &str) -> bool {
+    let Some(rest) = id.strip_prefix("detector.") else {
+        return false;
+    };
+    valid_snake_suffix(rest)
 }
 
 fn unique_sorted(mut items: Vec<String>) -> Vec<String> {
@@ -495,6 +644,7 @@ fn shipped_detector(
         promotion_state: PromotionState::Active,
         builtin: true,
         last_gate_note: None,
+        program: None,
     }
 }
 
@@ -683,9 +833,13 @@ pub fn feature_registry_environment(catalog: &DeskCatalog) -> serde_json::Value 
         "promotion": PROMOTION_STATES,
         "humanGated": true,
         "baseDetectorCount": catalog.base_detectors.len(),
-        "kinds": ["baseDetector"],
+        "derivedFeatureCount": catalog.derived_features.len(),
+        "kinds": ["baseDetector", "derivedFeature"],
         "codegen": false,
-        "featureIr": false,
+        "featureIr": true,
+        "operatorFamilies": FUNDED_OPERATOR_FAMILY_LABELS,
+        "operatorFamilyGlossary": FUNDED_OPERATOR_FAMILY_GLOSSARY,
+        "newOperatorFamilyGate": NEW_OPERATOR_FAMILY_GATE,
         "newSpecialtyToolPolicy": "no_catalog_or_registry_entry_no_new_market_tool",
         "readOperator": "search_catalog",
         "readRequiresCatalogDiscovery": true,
@@ -697,6 +851,7 @@ mod tests {
     use super::*;
     use crate::catalog::build_catalog;
     use crate::catalog::event_lifecycle::DOM_FAMILY_EVENT_TYPES;
+    use crate::catalog::feature_ir::{FeatureIrError, FeatureIrProgram};
     use std::collections::BTreeSet;
 
     fn example_registration() -> BaseDetectorRegistration {
@@ -992,5 +1147,171 @@ mod tests {
                 .promotion_state,
             PromotionState::Candidate
         );
+    }
+
+    fn derived_example(catalog: &DeskCatalog) -> DerivedFeatureRegistration {
+        let program = FeatureIrProgram::parse_value(&serde_json::json!({
+            "family": "sessionDistributionPercentiles",
+            "field": "market.location_structure.lastPrice"
+        }))
+        .expect("program");
+        program.validate(catalog).expect("validate");
+        DerivedFeatureRegistration {
+            id: "feature.session_last_price_percentile".into(),
+            name: "session_last_price_percentile".into(),
+            description: "Session-distribution percentiles of lastPrice.".into(),
+            domain_id: "location_structure".into(),
+            schema: DetectorSchema {
+                catalog_field_ids: vec![],
+                event_types: vec![],
+                unit: Unit::Percent,
+                session_scope: SessionScope::Session,
+                freshness: FreshnessSemantics::LiveTickAnchored,
+                cost_hint: CostHint::R2,
+            },
+            program,
+        }
+    }
+
+    #[test]
+    fn register_derived_feature_at_candidate_and_human_gate_still_applies() {
+        let catalog = build_catalog();
+        let mut registry = FeatureRegistry::builtins();
+        let desc = registry
+            .register_derived(derived_example(&catalog), &catalog)
+            .expect("register derived");
+        assert_eq!(desc.kind, FeatureKind::DerivedFeature);
+        assert_eq!(desc.promotion_state, PromotionState::Candidate);
+        assert!(!desc.builtin);
+        assert_eq!(desc.provenance.source, crate::catalog::FEATURE_IR_SOURCE);
+        assert_eq!(
+            desc.provenance.math_tier,
+            crate::catalog::DERIVED_FEATURE_MATH_TIER
+        );
+        assert!(!desc.provenance.behavior_change);
+        assert!(desc.program.is_some());
+        assert!(desc
+            .schema
+            .catalog_field_ids
+            .iter()
+            .any(|id| id == "market.location_structure.lastPrice"));
+
+        let gate = HumanGate::parse("Your rules say this derived feature may run in shadow.")
+            .expect("gate");
+        assert!(matches!(
+            registry.promote(
+                "feature.session_last_price_percentile",
+                PromotionState::Active,
+                gate
+            ),
+            Err(FeatureRegistryError::IllegalPromotion { .. })
+        ));
+        let shadow = registry
+            .promote(
+                "feature.session_last_price_percentile",
+                PromotionState::Shadow,
+                gate,
+            )
+            .expect("shadow");
+        assert_eq!(shadow.promotion_state, PromotionState::Shadow);
+        let active = registry
+            .promote(
+                "feature.session_last_price_percentile",
+                PromotionState::Active,
+                gate,
+            )
+            .expect("active");
+        assert_eq!(active.promotion_state, PromotionState::Active);
+    }
+
+    #[test]
+    fn register_derived_rejects_unfunded_surface_lookup() {
+        let catalog = build_catalog();
+        let err = FeatureIrProgram::parse_value(&serde_json::json!({
+            "family": "surfaceLookup",
+            "field": "market.location_structure.lastPrice"
+        }))
+        .unwrap_err();
+        assert!(matches!(err, FeatureIrError::UnfundedOperatorFamily(_)));
+        let mut bad = derived_example(&catalog);
+        bad.id = "detector.not_derived".into();
+        let mut registry = FeatureRegistry::builtins();
+        assert!(matches!(
+            registry.register_derived(bad, &catalog),
+            Err(FeatureRegistryError::InvalidDerivedId(_))
+        ));
+    }
+
+    #[test]
+    fn derived_overlay_round_trips_and_search_finds_feature_ir() {
+        let catalog = build_catalog();
+        let db = crate::db::Database::open(":memory:").expect("db");
+        let mut registry = FeatureRegistry::builtins();
+        let registered = registry
+            .register_derived(derived_example(&catalog), &catalog)
+            .expect("register");
+        db.upsert_feature_registry(&registered, 1_700_000_000_000.0)
+            .expect("upsert");
+        let overlay = db.list_feature_registry().expect("list");
+        let merged = FeatureRegistry::with_overlay(overlay);
+        let derived = merged
+            .get("feature.session_last_price_percentile")
+            .expect("derived");
+        assert_eq!(derived.kind, FeatureKind::DerivedFeature);
+        assert!(derived.program.is_some());
+        let full = crate::catalog::build_catalog_with_overlay(
+            db.list_feature_registry().expect("overlay"),
+        );
+        assert!(full.base_detectors.iter().any(|d| d.id == "detector.pinch"));
+        assert!(full
+            .derived_features
+            .iter()
+            .any(|d| d.id == "feature.session_last_price_percentile"));
+        let hits = search_features(&full, "derived feature");
+        assert!(
+            hits.iter().all(|h| h.kind == FeatureKind::DerivedFeature),
+            "kind-literal `derived feature` must not return Base Detectors"
+        );
+        assert!(hits
+            .iter()
+            .any(|h| h.id == "feature.session_last_price_percentile"));
+        let ir_hits = search_features(&full, "feature-ir");
+        assert!(ir_hits
+            .iter()
+            .all(|h| h.kind == FeatureKind::DerivedFeature));
+        let detector_hits = search_features(&full, "detector");
+        assert!(
+            detector_hits
+                .iter()
+                .all(|h| h.kind == FeatureKind::BaseDetector),
+            "kind-literal `detector` must not return Derived Features"
+        );
+        assert!(detector_hits.iter().any(|h| h.id == "detector.pinch"));
+        let hits = search_features(&full, "sessionDistributionPercentiles");
+        assert!(hits
+            .iter()
+            .any(|h| h.id == "feature.session_last_price_percentile"));
+    }
+
+    #[test]
+    fn sil_m5b_does_not_ship_codegen_emitter_modules() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        for rel in [
+            "src/catalog/codegen.rs",
+            "src/catalog/emitters.rs",
+            "src/catalog/feature_ir_codegen.rs",
+            "src/catalog/five_emitters.rs",
+        ] {
+            assert!(
+                !root.join(rel).exists(),
+                "{rel} is SIL-M5c codegen and must not ship in M5b"
+            );
+        }
+        let ir = include_str!("feature_ir.rs");
+        assert!(!ir.contains("emit_runtime_field"));
+        assert!(!ir.contains("emit_storage_column"));
+        assert!(!ir.contains("emit_query_dimension"));
+        assert!(!ir.contains("emit_rule_binding"));
+        assert!(!ir.contains("emit_agent_schema"));
     }
 }

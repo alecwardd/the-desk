@@ -6,9 +6,10 @@ use rmcp::{
 use std::sync::atomic::Ordering;
 use the_desk_backend::backfill;
 use the_desk_backend::catalog::{
-    BaseDetectorRegistration, CostHint, DetectorSchema, FeatureKind, FeatureProvenance,
-    FeatureRegistry, FeatureRegistryError, FreshnessSemantics, HumanGate, PromotionState,
-    SessionScope, Unit, RUST_PIPELINE_SOURCE, TIER1_REVIEWED_RUST,
+    declare_program, BaseDetectorRegistration, CostHint, DerivedFeatureRegistration,
+    DetectorSchema, FeatureKind, FeatureProvenance, FeatureRegistry, FeatureRegistryError,
+    FreshnessSemantics, HumanGate, PromotionState, SessionScope, Unit, RUST_PIPELINE_SOURCE,
+    TIER1_REVIEWED_RUST,
 };
 use the_desk_backend::feed::load_feed_config;
 use the_desk_backend::feed::scid_reader::ScidReader;
@@ -935,7 +936,7 @@ impl TheDeskMcp {
     }
 
     #[tool(
-        description = "Typed workflow verb for the Feature Registry lifecycle. action=register accepts a Base Detector descriptor (schema + provenance) at promotion=candidate. Schema fields catalogFieldIds, eventTypes, unit, sessionScope, freshness, and costHint are accepted on register (unknown labels rejected; omitted unit/scope/freshness/cost default to count/session/liveTickAnchored/R1). action=promote moves candidate → shadow or shadow → active and requires traderConfirmation (human gate). Shipped detectors (absorption, pinch, …) are already active and cannot be overwritten. Reading descriptors back requires [sil].catalog_discovery = true so search_catalog / describe_environment / describe_domain are on the router — this is not a specialty getter and does not implement detector math. Trust Ceiling stays L3; no order authority. Your playbook / your rules say how to use a registered descriptor."
+        description = "Typed workflow verb for the Feature Registry lifecycle. action=register accepts a Base Detector (kind=baseDetector, default) or a Derived Feature (kind=derivedFeature) at promotion=candidate. Derived Features require a Feature-IR `program` using only the five funded Operator Families (cross-symbol references, session-distribution percentiles, dwell/time-since-predicate, event sequences, historical baselines); unfunded families including surface lookup/interpolation are rejected at declaration time. Unknown program keys are rejected. Base Detector math stays reviewed Rust and is not re-expressed in Feature-IR. Schema fields catalogFieldIds, eventTypes, unit, sessionScope, freshness, and costHint are accepted on register (unknown labels rejected; omitted unit/scope/freshness/cost default to count/session/liveTickAnchored/R1). action=promote moves candidate → shadow or shadow → active and requires traderConfirmation (human gate). Shipped detectors (absorption, pinch, …) are already active and cannot be overwritten. Reading descriptors back requires [sil].catalog_discovery = true so search_catalog / describe_environment / describe_domain are on the router — this is not a specialty getter and does not implement detector math or codegen emitters. Derived Feature evaluation is declaration-and-test-only in M5b: an active descriptor is not computed live or historically by this verb or by search_catalog. Trust Ceiling stays L3; no order authority. Your playbook / your rules say how to use a registered descriptor."
     )]
     pub(crate) async fn feature_registry(
         &self,
@@ -960,52 +961,85 @@ impl TheDeskMcp {
             let mut registry = FeatureRegistry::with_overlay(overlay);
             let descriptor = match action {
                 "register" => {
-                    if let Some(kind_raw) = params
+                    let kind = match params
                         .kind
                         .as_deref()
                         .map(str::trim)
                         .filter(|s| !s.is_empty())
                     {
-                        match FeatureKind::parse(kind_raw) {
-                            Some(FeatureKind::BaseDetector) => {}
-                            Some(FeatureKind::DerivedFeature) => {
+                        None => FeatureKind::BaseDetector,
+                        Some(kind_raw) => FeatureKind::parse(kind_raw).ok_or_else(|| {
+                            invalid_params_error(format!(
+                                "unknown feature kind `{kind_raw}` (expected baseDetector or derivedFeature)"
+                            ))
+                        })?,
+                    };
+                    match kind {
+                        FeatureKind::DerivedFeature => {
+                            let program_raw =
+                                params.program.filter(|v| !v.is_null()).ok_or_else(|| {
+                                    invalid_params_error(
+                                        FeatureRegistryError::DerivedFeatureProgramRequired
+                                            .to_string(),
+                                    )
+                                })?;
+                            let catalog = the_desk_backend::catalog::build_catalog();
+                            let program = declare_program(&program_raw, &catalog)
+                                .map_err(|e| invalid_params_error(e.to_string()))?;
+                            let input = DerivedFeatureRegistration {
+                                id: params.feature_id.unwrap_or_default(),
+                                name: params.name.unwrap_or_default(),
+                                description: params.description.unwrap_or_default(),
+                                domain_id: params.domain_id.unwrap_or_default(),
+                                schema: DetectorSchema {
+                                    catalog_field_ids: params.catalog_field_ids.unwrap_or_default(),
+                                    event_types: params.event_types.unwrap_or_default(),
+                                    unit: schema_unit,
+                                    session_scope: schema_session_scope,
+                                    freshness: schema_freshness,
+                                    cost_hint: schema_cost_hint,
+                                },
+                                program,
+                            };
+                            registry
+                                .register_derived(input, &catalog)
+                                .map_err(|e| invalid_params_error(e.to_string()))?
+                        }
+                        FeatureKind::BaseDetector => {
+                            if params.program.as_ref().is_some_and(|v| !v.is_null()) {
                                 return Err(invalid_params_error(
-                                    FeatureRegistryError::DerivedFeatureNotAccepted.to_string(),
+                                    FeatureRegistryError::BaseDetectorCannotCarryProgram
+                                        .to_string(),
                                 ));
                             }
-                            None => {
-                                return Err(invalid_params_error(format!(
-                                    "unknown feature kind `{kind_raw}` (expected baseDetector)"
-                                )));
-                            }
+                            let input = BaseDetectorRegistration {
+                                id: params.feature_id.unwrap_or_default(),
+                                name: params.name.unwrap_or_default(),
+                                description: params.description.unwrap_or_default(),
+                                domain_id: params.domain_id.unwrap_or_default(),
+                                schema: DetectorSchema {
+                                    catalog_field_ids: params.catalog_field_ids.unwrap_or_default(),
+                                    event_types: params.event_types.unwrap_or_default(),
+                                    unit: schema_unit,
+                                    session_scope: schema_session_scope,
+                                    freshness: schema_freshness,
+                                    cost_hint: schema_cost_hint,
+                                },
+                                provenance: FeatureProvenance {
+                                    source: params
+                                        .source
+                                        .filter(|s| !s.trim().is_empty())
+                                        .unwrap_or_else(|| RUST_PIPELINE_SOURCE.to_string()),
+                                    rust_module: params.rust_module.unwrap_or_default(),
+                                    math_tier: TIER1_REVIEWED_RUST.to_string(),
+                                    behavior_change: false,
+                                },
+                            };
+                            registry
+                                .register(input)
+                                .map_err(|e| invalid_params_error(e.to_string()))?
                         }
                     }
-                    let input = BaseDetectorRegistration {
-                        id: params.feature_id.unwrap_or_default(),
-                        name: params.name.unwrap_or_default(),
-                        description: params.description.unwrap_or_default(),
-                        domain_id: params.domain_id.unwrap_or_default(),
-                        schema: DetectorSchema {
-                            catalog_field_ids: params.catalog_field_ids.unwrap_or_default(),
-                            event_types: params.event_types.unwrap_or_default(),
-                            unit: schema_unit,
-                            session_scope: schema_session_scope,
-                            freshness: schema_freshness,
-                            cost_hint: schema_cost_hint,
-                        },
-                        provenance: FeatureProvenance {
-                            source: params
-                                .source
-                                .filter(|s| !s.trim().is_empty())
-                                .unwrap_or_else(|| RUST_PIPELINE_SOURCE.to_string()),
-                            rust_module: params.rust_module.unwrap_or_default(),
-                            math_tier: TIER1_REVIEWED_RUST.to_string(),
-                            behavior_change: false,
-                        },
-                    };
-                    registry
-                        .register(input)
-                        .map_err(|e| invalid_params_error(e.to_string()))?
                 }
                 "promote" => {
                     let id = params
@@ -1053,7 +1087,7 @@ impl TheDeskMcp {
             "readOperator": "search_catalog",
             "discoveryEnabled": self.sil_config.catalog_discovery,
             "readRequiresCatalogDiscovery": true,
-            "note": "Your playbook / your rules say how to use a registered Base Detector. Discovery rides search_catalog when [sil].catalog_discovery is true; this verb does not change detector math and does not place orders."
+            "note": "Your playbook / your rules say how to use a registered descriptor. Discovery rides search_catalog when [sil].catalog_discovery is true; this verb does not change Base Detector math, does not run codegen emitters, and does not place orders. Derived Feature evaluation is declaration-and-test-only in M5b: an active descriptor is not computed live or historically by this verb or by search_catalog."
         })))
     }
 }

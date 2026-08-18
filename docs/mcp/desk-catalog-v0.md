@@ -266,9 +266,9 @@ Catalog v0 enforces **no catalog entry → no new market tool**. The allowlist b
 - `get_tpo_profile`
 - `get_trade_size_profile`
 
-## Feature Registry (Base Detectors)
+## Feature Registry (shipped Base Detectors)
 
-Governance waist for **Base Detectors**: schema, provenance, and promotion (`candidate` → `shadow` → `active`, human-gated). Discovery rides `search_catalog` / catalog descriptors — no specialty getter. The write verb is `feature_registry`. Tier 1 math stays reviewed Rust; this catalog does not implement Feature-IR, codegen, or new detector math.
+Governance waist for **Base Detectors** and **Derived Features**: schema, provenance, and promotion (`candidate` → `shadow` → `active`, human-gated). This generated snapshot lists shipped Base Detectors only. Overlay Derived Features live in SQLite and are discovered via `search_catalog` when `[sil].catalog_discovery` is on. Derived Features declare a Feature-IR program over catalog fields using exactly five funded Operator Families (Cross-symbol references, Session-distribution percentiles, Dwell / time-since-predicate, Event sequences, Historical baselines). Unfunded families (including surface lookup / interpolation) are rejected at declaration time. A new Operator Family requires a registry change proposal. Feature-IR evaluation is declaration-and-test-only in M5b. Discovery rides `search_catalog` / catalog descriptors — no specialty getter. The write verb is `feature_registry`. Tier 1 Base Detector math stays reviewed Rust; this catalog does not implement codegen emitters (SIL-M5c).
 
 | Id | Domain | Promotion | Builtin | Event types |
 |---|---|---|---|---|

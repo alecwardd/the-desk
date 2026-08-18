@@ -852,6 +852,27 @@ This note does not implement Feature-IR / Operator Families (#19), registry code
 
 ---
 
+### Decision note: SIL-M5b Feature-IR + five Operator Families + shadow≡historical parity
+
+**Date:** 2026-08-16
+**Status:** Decided (implements [alecwardd/the-desk#19](https://github.com/alecwardd/the-desk/issues/19); Part of #2)
+
+**Context:** SIL-M5a registered shipped Base Detectors and the human-gated Feature Registry waist. Spec (#2) user stories 44–46 and 52 require Derived Features to be declared as data in a typed **Feature-IR** over catalog fields, using exactly five funded **Operator Families**, with live-shadow and historical evaluation sharing one descriptor so the two cannot diverge. Surface interpolation stays unfunded. Codegen emitters are a later ticket (#20).
+
+**Decision:**
+
+1. **Feature-IR** is a typed, non-Turing-complete program over Desk Catalog fields. It is for **Derived Features only**. Absorption, pinch, rebid/reoffer, trade-size, and structure math stay reviewed Rust Base Detectors and are not re-expressed in IR.
+2. **Exactly five funded Operator Families** (glossary names): Cross-symbol references; Session-distribution percentiles; Dwell / time-since-predicate; Event sequences (“A then B within T”); Historical baselines (including cross-session “versus the same time of day over N days”). Unfunded families — including surface lookup / interpolation — are rejected at declaration time with a typed error. Composition is a single funded family per program; predicates may name NQ/ES catalog fields. No unbounded recursion or user-declared loops.
+3. **New family = registry change proposal.** Adding a sixth family is a documented gate (`newOperatorFamilyGate=registry_change_proposal`), not an in-band extension. Positioning continues to precompute level fields at ingest; this ticket does not add a surface-lookup family.
+4. **One evaluator, two path labels (declaration-and-test-only in M5b).** `evaluate_live_shadow` and `evaluate_historical` call the same `evaluate` over caller-supplied Journal Frame slices with `clock_ms <= asOf`. The path is a label only; it does not change semantics. There is no runtime caller from the MCP router, the MarketRouter pending-frame buffer, or a specialty getter — registering and promoting a Derived Feature does not compute values. Golden replay (`tests/session_replay_golden.rs`) blesses per-descriptor parity by evaluating the same programs over in-memory frames versus frames round-tripped through SQLite (`insert_journal_frames` → `list_journal_frames` → `FeatureIrFrame`). Wiring evaluation onto the live pending-frame buffer (and matching its bound against historical loads) is later work.
+5. **Registry waist unchanged in shape.** `feature_registry` accepts `kind=derivedFeature` with a `program` (ids `feature.<snake_id>`). Promotion remains human-gated `candidate` → `shadow` → `active`. Discovery still rides `search_catalog` when `[sil].catalog_discovery = true`. No specialty getter, no tenth kernel operator, no new market tools. Trust Ceiling stays **L3**.
+
+This note does not implement registry codegen / five emitters (#20), the leg engine (#21), DOM cluster Base Detectors (#22), ACSIL (#23), Vs3dProvider (#16), DuckDB, Parquet conversion, `get_capsule`, a 250 ms forever-store, a tenth kernel operator / `run_job` poll tool, new specialty market tools, or raising the Trust Ceiling.
+
+**Consequences:** A Derived Feature is declared once; live-shadow and historical path labels share one evaluator over supplied Journal Frame slices (golden-tested). Runtime evaluation is not wired in M5b — an `active` descriptor is not producing values yet. IR expressive power cannot creep toward Turing-completeness without an explicit family-gate review.
+
+---
+
 ### Decision note: SIL-P-VS-a Levels-Only Record path
 
 **Date:** 2026-08-13

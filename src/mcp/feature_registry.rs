@@ -21,7 +21,7 @@ pub struct FeatureRegistryParams {
     pub description: Option<String>,
     #[serde(alias = "domain_id")]
     pub domain_id: Option<String>,
-    /// Must be `baseDetector` when set. Derived Features are rejected (SIL-M5b).
+    /// `baseDetector` (default) or `derivedFeature` (requires `program`).
     pub kind: Option<String>,
     #[serde(alias = "catalog_field_ids")]
     pub catalog_field_ids: Option<Vec<String>>,
@@ -38,4 +38,7 @@ pub struct FeatureRegistryParams {
     #[serde(alias = "rust_module")]
     pub rust_module: Option<String>,
     pub source: Option<String>,
+    /// Feature-IR program (required when kind=derivedFeature). Unfunded families are rejected.
+    #[serde(default)]
+    pub program: Option<serde_json::Value>,
 }

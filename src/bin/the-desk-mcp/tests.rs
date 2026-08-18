@@ -1180,6 +1180,12 @@ async fn discovery_tools_return_metadata_only() {
     assert_eq!(env["featureRegistry"]["writeVerb"], "feature_registry");
     assert_eq!(env["featureRegistry"]["discoveryEnabled"], true);
     assert_eq!(env["featureRegistry"]["readRequiresCatalogDiscovery"], true);
+    assert_eq!(env["featureRegistry"]["featureIr"], true);
+    assert_eq!(env["featureRegistry"]["codegen"], false);
+    assert_eq!(
+        env["featureRegistry"]["newOperatorFamilyGate"],
+        "registry_change_proposal"
+    );
 }
 
 #[tokio::test]
@@ -1381,6 +1387,126 @@ async fn feature_registry_reports_discovery_disabled_when_sil_off() {
     assert_eq!(registered["discoveryEnabled"], false);
     assert_eq!(registered["readRequiresCatalogDiscovery"], true);
     assert_eq!(registered["readOperator"], "search_catalog");
+}
+
+#[tokio::test]
+async fn feature_registry_register_derived_feature_and_rejects_unfunded_family() {
+    let server = test_server_with_sil();
+    let registered = parse_text_tool_result(
+        server
+            .feature_registry(Parameters(
+                the_desk_backend::mcp::feature_registry::FeatureRegistryParams {
+                    action: Some("register".into()),
+                    feature_id: Some("feature.session_last_price_percentile".into()),
+                    name: Some("session_last_price_percentile".into()),
+                    description: Some(
+                        "Session-distribution percentiles of lastPrice (Feature-IR).".into(),
+                    ),
+                    domain_id: Some("location_structure".into()),
+                    kind: Some("derivedFeature".into()),
+                    unit: Some("percent".into()),
+                    cost_hint: Some("R2".into()),
+                    program: Some(serde_json::json!({
+                        "family": "sessionDistributionPercentiles",
+                        "field": "market.location_structure.lastPrice"
+                    })),
+                    ..Default::default()
+                },
+            ))
+            .await
+            .expect("register derived"),
+    );
+    assert_eq!(registered["feature"]["kind"], "derivedFeature");
+    assert_eq!(registered["feature"]["promotionState"], "candidate");
+    assert_eq!(registered["feature"]["provenance"]["source"], "feature_ir");
+    assert_eq!(
+        registered["feature"]["program"]["family"],
+        "sessionDistributionPercentiles"
+    );
+    assert_eq!(registered["orderAuthority"], false);
+    assert!(
+        registered["note"]
+            .as_str()
+            .is_some_and(|n| n.contains("declaration-and-test-only")),
+        "agents must not present an active Derived Feature as producing values"
+    );
+
+    let skip = server
+        .feature_registry(Parameters(
+            the_desk_backend::mcp::feature_registry::FeatureRegistryParams {
+                action: Some("promote".into()),
+                feature_id: Some("feature.session_last_price_percentile".into()),
+                target_state: Some("active".into()),
+                trader_confirmation: Some("Your rules say skip is not allowed.".into()),
+                ..Default::default()
+            },
+        ))
+        .await;
+    assert!(
+        skip.is_err(),
+        "candidate → active must fail for derived too"
+    );
+
+    let surface = server
+        .feature_registry(Parameters(
+            the_desk_backend::mcp::feature_registry::FeatureRegistryParams {
+                action: Some("register".into()),
+                feature_id: Some("feature.surface_lookup".into()),
+                name: Some("surface_lookup".into()),
+                description: Some("Unfunded surface interpolation must fail.".into()),
+                domain_id: Some("positioning".into()),
+                kind: Some("derivedFeature".into()),
+                program: Some(serde_json::json!({
+                    "family": "surfaceLookup",
+                    "field": "positioning.derivedLevels"
+                })),
+                ..Default::default()
+            },
+        ))
+        .await;
+    assert!(
+        surface.is_err(),
+        "surface lookup must be rejected at declaration"
+    );
+
+    let unknown_key = server
+        .feature_registry(Parameters(
+            the_desk_backend::mcp::feature_registry::FeatureRegistryParams {
+                action: Some("register".into()),
+                feature_id: Some("feature.typo_baseline".into()),
+                name: Some("typo_baseline".into()),
+                description: Some("Wrong-case sameTimeOfDay must fail closed.".into()),
+                domain_id: Some("location_structure".into()),
+                kind: Some("derivedFeature".into()),
+                program: Some(serde_json::json!({
+                    "family": "historicalBaselines",
+                    "field": "market.location_structure.lastPrice",
+                    "lookbackDays": 5,
+                    "sametimeofday": false
+                })),
+                ..Default::default()
+            },
+        ))
+        .await;
+    assert!(
+        unknown_key.is_err(),
+        "unknown program keys must be rejected at declaration"
+    );
+
+    let missing_program = server
+        .feature_registry(Parameters(
+            the_desk_backend::mcp::feature_registry::FeatureRegistryParams {
+                action: Some("register".into()),
+                feature_id: Some("feature.no_program".into()),
+                name: Some("no_program".into()),
+                description: Some("Derived Feature without a program.".into()),
+                domain_id: Some("flow".into()),
+                kind: Some("derivedFeature".into()),
+                ..Default::default()
+            },
+        ))
+        .await;
+    assert!(missing_program.is_err(), "derivedFeature requires program");
 }
 
 #[tokio::test]

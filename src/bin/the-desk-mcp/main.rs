@@ -1341,6 +1341,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let last_ask_depth = Arc::clone(&server.last_ask);
         let feed_depth_rt = Arc::clone(&server.feed_runtime);
         let runtime_events_depth = Arc::clone(&server.runtime_events);
+        let flow_emitter_depth = Arc::clone(&server.flow_emitter);
+        let market_router_depth = Arc::clone(&server.market_router);
 
         tokio::spawn(async move {
             let poll = Duration::from_millis(1_000);
@@ -1379,10 +1381,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         state.batch_id = apply_depth_persist_work(
                             &db_depth,
                             &pipelines_depth,
+                            &flow_emitter_depth,
                             &last_bid_depth,
                             &last_ask_depth,
                             work,
                             feed_depth_rt.as_ref(),
+                            Some(market_router_depth.as_ref()),
+                            RouterRoot::Nq,
                         );
                     }
                     Ok(None) => {}

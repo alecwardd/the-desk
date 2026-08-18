@@ -7,7 +7,7 @@
 - **catalogVersion:** `0.1.0`
 - **Trust Ceiling:** L3 (ADR-022)
 - **domains:** 10
-- **fields:** 167
+- **fields:** 178
 - **Positioning provider:** none (no Vs3dProvider). Levels-Only Records are first-class via `positioning_entry` (manual/as-of).
 
 ## Domains
@@ -123,11 +123,22 @@ Instrument identity, session labels, and contract resolution metadata.
 
 ### `liquidity` — Liquidity
 
-Order-book / DOM liquidity summaries when depth context is available.
+Order-book / DOM liquidity: compact book-velocity, MbP reload, stop-run, pull-intent, and MM-flow fields when depth context is available.
 
 | Field id | Unit | Session scope | Freshness | Cost |
 |---|---|---|---|---|
+| `market.liquidity.bookVelocityPerSec` | Ratio | Session | DelayedDepthOptional | R1 |
+| `market.liquidity.bookVelocityRegime` | EnumLabel | Session | DelayedDepthOptional | R1 |
+| `market.liquidity.domBookPresent` | Bool | Session | DelayedDepthOptional | R1 |
 | `market.liquidity.domSummary` | StructuredBlob | Session | DelayedDepthOptional | R1 |
+| `market.liquidity.icebergReloadPrice` | PricePoints | Session | DelayedDepthOptional | R1 |
+| `market.liquidity.icebergReloadSide` | EnumLabel | Session | DelayedDepthOptional | R1 |
+| `market.liquidity.mmFlowScore` | Ratio | Session | DelayedDepthOptional | R1 |
+| `market.liquidity.mmFlowStatus` | EnumLabel | Session | DelayedDepthOptional | R1 |
+| `market.liquidity.pullIntentRate` | Ratio | Session | DelayedDepthOptional | R1 |
+| `market.liquidity.pullIntentSide` | EnumLabel | Session | DelayedDepthOptional | R1 |
+| `market.liquidity.stopClusterPrice` | PricePoints | Session | DelayedDepthOptional | R1 |
+| `market.liquidity.stopRunDirection` | EnumLabel | Session | DelayedDepthOptional | R1 |
 
 ### `location_structure` — Location / structure
 
@@ -294,9 +305,14 @@ Governance waist for **Base Detectors** and **Derived Features**: schema, proven
 | Id | Domain | Promotion | Builtin | Event types |
 |---|---|---|---|---|
 | `detector.absorption` | `flow` | active | true | absorption_detected, absorption_confirmed, absorption_invalidated |
+| `detector.book_velocity_regime_shift` | `liquidity` | active | true | book_velocity_regime_shift |
+| `detector.iceberg_reload` | `liquidity` | active | true | iceberg_reload |
 | `detector.leg_to_leg` | `flow` | active | true | leg_completed, leg_started |
+| `detector.mm_flow` | `liquidity` | active | true |  |
 | `detector.pinch` | `flow` | active | true | pinch_detected |
+| `detector.pull_intent` | `liquidity` | active | true | pull_intent |
 | `detector.rebid_reoffer` | `response` | active | true | acceleration_zone_created, acceleration_zone_held |
+| `detector.stop_run` | `liquidity` | active | true | stop_run |
 | `detector.structure` | `location_structure` | active | true | day_type_change, dnp_cross, dnp_test, dnva_high_test, dnva_low_test, excess_high_detected, excess_low_detected, ib_extension_hit, ib_formed, ib_high_test, ib_low_test, ib_mid_test, ib_reentry, ib_reentry_full_traverse, ib_reentry_hit_mid, new_session_high, new_session_low, or5_mid_retest, or_formed, overnight_high_test, overnight_low_test, poc_test, poor_high_detected, poor_low_detected, prior_close_test, prior_day_high_test, prior_day_low_test, prior_poc_test, prior_vah_test, prior_val_test, rvol_at_ib_close, rvol_spike, vah_test, val_test, vwap_1sd_lower_test, vwap_1sd_upper_test, vwap_2sd_lower_test, vwap_2sd_upper_test, vwap_test |
 | `detector.trade_size` | `flow` | active | true | large_trade_cluster |
 

@@ -420,7 +420,7 @@ impl TheDeskMcp {
     }
 
     #[tool(
-        description = "Queue a historical backfill job and return a job id. Processes past sessions through all 15 pipelines, detects market events, and persists session summaries without blocking the MCP server."
+        description = "Queue a historical backfill job and return a job id. Processes past sessions through all 16 pipelines, detects market events, and persists session summaries without blocking the MCP server."
     )]
     pub(crate) async fn backfill_history(
         &self,

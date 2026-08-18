@@ -23,7 +23,7 @@ use the_desk_backend::depth::{
     DepthReader, DomFeatureSnapshot, DomSummary, PullStackActivitySummary,
     ScanControl as DepthScanControl, DOM_NARRATIVE_HORIZON_MS,
 };
-use the_desk_backend::engine::MarketRouter;
+use the_desk_backend::engine::{MarketRouter, RouterRoot};
 use the_desk_backend::feed::monotonic::{MonotonicTickGuard, MonotonicTimestampDecision};
 use the_desk_backend::feed::scid_reader::{
     scid_tail_offset_after_shrink, ScidReader, ScidTick, SCID_RECORD_SIZE,
@@ -1334,10 +1334,13 @@ pub(crate) fn compute_depth_poll_step(
 pub(crate) fn apply_depth_persist_work(
     db: &Arc<Mutex<Database>>,
     pipelines: &Arc<Mutex<PipelineEngine>>,
+    flow_emitter: &Arc<Mutex<FlowEventEmitter>>,
     last_bid: &Arc<Mutex<f64>>,
     last_ask: &Arc<Mutex<f64>>,
     mut work: DepthPersistWork,
     feed_rt: &McpFeedRuntimeState,
+    market_router: Option<&MarketRouter>,
+    coaching_root: RouterRoot,
 ) -> i64 {
     // SIL-M3f: `work.records` is the former bulk-insert payload. Count it so
     // the field stays live, then persist only compact snapshots below.
@@ -1387,7 +1390,45 @@ pub(crate) fn apply_depth_persist_work(
     }
 
     if let Ok(mut pl) = pipelines.lock() {
+        pl.on_dom_feature(
+            &work.snapshot,
+            &work.feature.activity,
+            work.feature.timestamp_ms,
+        );
         pl.set_dom_summary(Some(work.feature.dom_summary.clone()));
+    }
+
+    let mut dom_events = Vec::new();
+    if let (Ok(pl), Ok(mut fe)) = (pipelines.lock(), flow_emitter.lock()) {
+        let session_date = session_date_from_timestamp_ms(work.feature.timestamp_ms);
+        let price = pl
+            .snapshot_for_detection(
+                work.snapshot.best_bid.unwrap_or(0.0),
+                work.snapshot.best_ask.unwrap_or(0.0),
+                work.feature.timestamp_ms,
+            )
+            .last_price;
+        fe.detect_into(
+            &pl,
+            work.feature.timestamp_ms,
+            &session_date,
+            price,
+            &mut dom_events,
+        );
+    }
+    if !dom_events.is_empty() {
+        if let Some(router) = market_router {
+            router.note_transition_events(coaching_root, &dom_events);
+            router.queue_journal_frames();
+        }
+        if let Ok(d) = db.lock() {
+            let _ = d.insert_market_events_batch_scoped(Some(coaching_root.as_str()), &dom_events);
+            if let Some(router) = market_router {
+                if let Err(err) = router.persist_journal(&d) {
+                    tracing::warn!(error = %err, "depth.journal_persist");
+                }
+            }
+        }
     }
 
     persist_feature_state_after_dom_summary(

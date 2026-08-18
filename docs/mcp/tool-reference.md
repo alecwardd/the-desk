@@ -476,7 +476,7 @@ Distribution of a numeric metric from session summaries. Returns mean, median, p
 
 ### `query_event_frequency`
 
-Query how often a market event occurs. Returns total occurrences, sessions with event, per-session average, percentage of sessions, and research metadata. Session counts use resolved trading-day/session context under the requested scope; exact duplicate market-event rows are ignored by DB identity constraints, but distinct occurrences of the same phenomenon still count separately. Structural event types: *_test (level tests), ib_extension_hit, ib_formed, or_formed, new_session_high/low, day_type_change, poor_high/low_detected, excess_high/low_detected, or5_mid_retest, dnp_cross, rvol_spike. Flow event types: absorption_detected/absorption_confirmed/absorption_invalidated (metadata.eventSubtype: absorption/exhaustion/delta_divergence), pinch_detected (metadata.timeframe: 1m/5m/15m/30m), acceleration_zone_created, acceleration_zone_held, large_trade_cluster, leg_started, leg_completed.
+Query how often a market event occurs. Returns total occurrences, sessions with event, per-session average, percentage of sessions, and research metadata. Session counts use resolved trading-day/session context under the requested scope; exact duplicate market-event rows are ignored by DB identity constraints, but distinct occurrences of the same phenomenon still count separately. Structural event types: *_test (level tests), ib_extension_hit, ib_formed, or_formed, new_session_high/low, day_type_change, poor_high/low_detected, excess_high/low_detected, or5_mid_retest, dnp_cross, rvol_spike. Flow event types: absorption_detected/absorption_confirmed/absorption_invalidated (metadata.eventSubtype: absorption/exhaustion/delta_divergence), pinch_detected (metadata.timeframe: 1m/5m/15m/30m), acceleration_zone_created, acceleration_zone_held, large_trade_cluster, leg_started, leg_completed. DOM-family event types (Capsule-mandatory): stop_run, iceberg_reload, pull_intent, book_velocity_regime_shift.
 
 ### `query_signal_outcome_conditional`
 
@@ -522,7 +522,7 @@ Storage tier status: shows hot (current session), warm (SQLite ticks), and cold 
 
 ### `backfill_history`
 
-Queue a historical backfill job and return a job id. Processes past sessions through all 15 pipelines, detects market events, and persists session summaries without blocking the MCP server.
+Queue a historical backfill job and return a job id. Processes past sessions through all 16 pipelines, detects market events, and persists session summaries without blocking the MCP server.
 
 ### `create_database_backup`
 

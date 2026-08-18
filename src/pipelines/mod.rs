@@ -1,6 +1,7 @@
 mod absorption;
 mod day_type;
 mod delta;
+mod dom_cluster;
 pub mod event_detector;
 pub mod flow_event_emitter;
 mod footprint;
@@ -23,6 +24,10 @@ pub use day_type::{
     DayType, DayTypeClassifier, ProfileShape, SinglePrintsDirection,
 };
 pub use delta::DeltaPipeline;
+pub use dom_cluster::{
+    DomClusterEvent, DomClusterPipeline, DomClusterSnapshot, EVENT_BOOK_VELOCITY_REGIME_SHIFT,
+    EVENT_ICEBERG_RELOAD, EVENT_PULL_INTENT, EVENT_STOP_RUN, NQ_TICK as DOM_NQ_TICK,
+};
 pub use event_detector::{
     crossed_level, EventDetector, MarketEvent, IB_EXTENSION_DIRECTION_DOWN,
     IB_EXTENSION_DIRECTION_UP, IB_EXTENSION_RATIO,
@@ -52,7 +57,7 @@ pub use vwap::VwapPipeline;
 
 use serde::{Deserialize, Serialize};
 
-use crate::depth::DomSummary;
+use crate::depth::{DomSnapshot, DomSummary, PullStackActivitySummary};
 use crate::feed::ContractMetadata;
 use crate::{
     classify_session, et_minutes_from_timestamp, tick_time_context_from_timestamp_ms, DeltaSegment,
@@ -101,6 +106,55 @@ mod tests {
         let json = serde_json::to_value(&state).expect("serialize");
         assert_eq!(json["domSummary"]["liquidityBias"], "bid_support");
         assert_eq!(json["domSummary"]["nearTouchBidDepth"], 30.0);
+        let empty = MarketState::default();
+        let empty_json = serde_json::to_value(&empty).expect("serialize empty");
+        assert!(empty_json.get("domBookPresent").is_none());
+        assert!(empty_json.get("bookVelocityRegime").is_none());
+        assert!(empty_json.get("mmFlowStatus").is_none());
+    }
+
+    #[test]
+    fn dom_cluster_resets_on_asia_and_rth_not_london() {
+        let mut engine = PipelineEngine::new();
+        engine.dom_cluster.event_seq();
+        // Seed seq by a book update through the public API.
+        // London must keep state; RTH/Asia wipe it.
+        let snap = crate::depth::DomSnapshot {
+            source_file: "t".into(),
+            snapshot_timestamp_ms: 1.0,
+            session_date: "2024-01-02".into(),
+            best_bid: Some(21_000.0),
+            best_ask: Some(21_000.25),
+            spread_ticks: Some(1),
+            touch_imbalance_ratio: None,
+            total_bid_levels: 1,
+            total_ask_levels: 1,
+            bids: vec![crate::depth::DomLevel {
+                price: 21_000.0,
+                quantity: 10,
+                num_orders: 1,
+                distance_from_touch_ticks: 0,
+            }],
+            asks: vec![crate::depth::DomLevel {
+                price: 21_000.25,
+                quantity: 10,
+                num_orders: 1,
+                distance_from_touch_ticks: 0,
+            }],
+        };
+        engine.on_dom_feature(
+            &snap,
+            &crate::depth::PullStackActivitySummary::default(),
+            1_704_207_600_000.0,
+        );
+        assert!(engine.dom_cluster.snapshot().book_present);
+        engine.reset_segment(DeltaSegment::London);
+        assert!(
+            engine.dom_cluster.snapshot().book_present,
+            "London is Globex continuation; live book detectors must survive 02:00 ET"
+        );
+        engine.reset_segment(DeltaSegment::Rth);
+        assert!(!engine.dom_cluster.snapshot().book_present);
     }
 
     #[test]
@@ -158,6 +212,11 @@ mod tests {
             crate::pipelines::STATUS_NONE
         );
     }
+}
+
+/// Omit `false` bools so SCID-only snapshots do not grow DOM fail-closed keys.
+fn serde_skip_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Consolidated snapshot of all pipeline outputs for the current session.
@@ -489,6 +548,41 @@ pub struct MarketState {
     /// Volume POC of the last completed rotation.
     pub last_leg_poc: f64,
 
+    // --- DOM cluster (SIL-M5e Base Detectors) ---
+    /// True when a usable bid/ask book has been observed this session. Omitted when the book is missing (fail-closed).
+    #[serde(default, skip_serializing_if = "serde_skip_false")]
+    pub dom_book_present: bool,
+    /// Book-update velocity regime: `quiet` / `normal` / `fast`. Absent when the book is missing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub book_velocity_regime: Option<String>,
+    /// Short-window book update rate (events/sec). Absent when the book is missing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub book_velocity_per_sec: Option<f64>,
+    /// Side of the most recent market-by-price reload inference (`bid` / `ask`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub iceberg_reload_side: Option<String>,
+    /// Price of the most recent market-by-price reload inference.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub iceberg_reload_price: Option<f64>,
+    /// Direction of an open stop-run (`up` / `down`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_run_direction: Option<String>,
+    /// Compact stop-cluster marker: first thinned price of the open (or last) run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_cluster_price: Option<f64>,
+    /// Side showing pull-intent (`bid` / `ask`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pull_intent_side: Option<String>,
+    /// Pull rate on the intent side (0–1).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pull_intent_rate: Option<f64>,
+    /// Market-maker flow composite status: `insufficient` / `none` / `bid_dominant` / `ask_dominant` / `mixed`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mm_flow_status: Option<String>,
+    /// Market-maker flow composite score in `[-1, 1]` (positive = bid-dominant).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mm_flow_score: Option<f64>,
+
     /// Current session type from last tick / snapshot time: "RTH", "Globex", or "Unknown".
     /// During Globex, use overnightHigh/overnightLow as session range; sessionHigh/sessionLow and IB/OR/OR5 are RTH-only.
     pub session_type: String,
@@ -535,7 +629,9 @@ pub struct PipelineEngine {
     pub pinch: PinchPipeline,
     pub session_inventory: SessionInventoryPipeline,
     pub leg_profile: LegProfilePipeline,
+    pub dom_cluster: DomClusterPipeline,
     last_trade_price: Option<f64>,
+    last_trade_is_buy: Option<bool>,
     cumulative_delta: f64,
     /// Combined Globex delta (Asia + London) from 6 PM ET. Only accumulates during Globex; resets at 6 PM and 9:30 AM.
     globex_delta: f64,
@@ -568,7 +664,9 @@ impl PipelineEngine {
             pinch: PinchPipeline::new(),
             session_inventory: SessionInventoryPipeline::new(),
             leg_profile: LegProfilePipeline::new(0.25),
+            dom_cluster: DomClusterPipeline::new(),
             last_trade_price: None,
+            last_trade_is_buy: None,
             cumulative_delta: 0.0,
             globex_delta: 0.0,
             dom_summary: None,
@@ -631,7 +729,9 @@ impl PipelineEngine {
                 self.pinch.reset();
                 self.session_inventory.reset();
                 self.leg_profile.reset();
+                self.dom_cluster.reset();
                 self.last_trade_price = None;
+                self.last_trade_is_buy = None;
                 self.dom_summary = None;
             }
             DeltaSegment::London => {
@@ -643,6 +743,28 @@ impl PipelineEngine {
 
     pub fn set_dom_summary(&mut self, dom_summary: Option<DomSummary>) {
         self.dom_summary = dom_summary;
+    }
+
+    /// Feed a compact book snapshot into the DOM-cluster Base Detectors.
+    ///
+    /// Fail-closed when the snapshot has no bid/ask. RTH and Globex never mix.
+    pub fn on_dom_feature(
+        &mut self,
+        snapshot: &DomSnapshot,
+        activity: &PullStackActivitySummary,
+        timestamp_ms: f64,
+    ) {
+        let is_overnight = tick_time_context_from_timestamp_ms(timestamp_ms)
+            .map(|ctx| ctx.session_type == SessionType::Globex)
+            .unwrap_or(false);
+        self.dom_cluster.on_book_update(
+            timestamp_ms,
+            snapshot,
+            activity,
+            is_overnight,
+            self.last_trade_price.unwrap_or(0.0),
+            self.last_trade_is_buy,
+        );
     }
 
     /// Current session's ending state for archival into prior-day levels.
@@ -770,6 +892,8 @@ impl PipelineEngine {
         self.pinch.on_trade(timestamp_ms, price, volume, is_buy);
         self.leg_profile
             .on_trade(timestamp_ms, price, volume, is_buy, is_overnight);
+        self.dom_cluster
+            .on_trade(timestamp_ms, price, volume, is_buy, is_overnight);
         self.session_inventory
             .update(self.delta.session_delta(), self.delta.dnp());
 
@@ -778,6 +902,7 @@ impl PipelineEngine {
             self.refresh_day_type_classification();
         }
         self.last_trade_price = Some(price);
+        self.last_trade_is_buy = Some(is_buy);
     }
 
     /// Recompute day-type classification from the latest TPO state.
@@ -918,6 +1043,7 @@ impl PipelineEngine {
             self.delta.dnva_high(),
             self.delta.dnva_low(),
         );
+        let dom_cluster = self.dom_cluster.snapshot();
         let ib_extension_state = ib_extension_state_from_range(
             self.tpo.ib_high(),
             self.tpo.ib_low(),
@@ -1117,6 +1243,17 @@ impl PipelineEngine {
             last_leg_volume: leg.last_volume,
             last_leg_net_delta: leg.last_net_delta,
             last_leg_poc: leg.last_poc,
+            dom_book_present: dom_cluster.book_present,
+            book_velocity_regime: dom_cluster.book_velocity_regime,
+            book_velocity_per_sec: dom_cluster.book_velocity_per_sec,
+            iceberg_reload_side: dom_cluster.iceberg_reload_side,
+            iceberg_reload_price: dom_cluster.iceberg_reload_price,
+            stop_run_direction: dom_cluster.stop_run_direction,
+            stop_cluster_price: dom_cluster.stop_cluster_price,
+            pull_intent_side: dom_cluster.pull_intent_side,
+            pull_intent_rate: dom_cluster.pull_intent_rate,
+            mm_flow_status: dom_cluster.mm_flow_status,
+            mm_flow_score: dom_cluster.mm_flow_score,
             session_type,
             session_segment,
             trading_day,

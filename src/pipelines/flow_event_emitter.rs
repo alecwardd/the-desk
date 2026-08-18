@@ -7,7 +7,8 @@ use crate::tick_time_context_from_timestamp_ms;
 /// Emits flow events from pipeline ring buffers into the MarketEvent stream.
 ///
 /// Runs alongside the structural `EventDetector`, reading absorption, pinch,
-/// rebid/reoffer, and trade size pipelines to produce `MarketEvent` objects
+/// rebid/reoffer, trade size, leg-to-leg, and DOM-cluster pipelines to produce
+/// `MarketEvent` objects
 /// that flow into the same `market_events` DB table — making them queryable
 /// via `query_event_frequency` and `query_conditional`.
 #[derive(Debug)]
@@ -17,6 +18,8 @@ pub struct FlowEventEmitter {
     prev_zone_count: usize,
     /// High-watermark of [`LegProfilePipeline::event_seq`], not ring length.
     prev_leg_event_seq: u64,
+    /// High-watermark of [`DomClusterPipeline::event_seq`], not ring length.
+    prev_dom_event_seq: u64,
     /// (high, low) of zones we already emitted a "held" event for.
     prev_held_zones: Vec<(f64, f64)>,
     /// price_key -> last-known 21+ lot count, for large_trade_cluster detection.
@@ -46,6 +49,7 @@ impl FlowEventEmitter {
             prev_pinch_count: 0,
             prev_zone_count: 0,
             prev_leg_event_seq: 0,
+            prev_dom_event_seq: 0,
             prev_held_zones: Vec::new(),
             prev_large_trade_counts: HashMap::new(),
             last_event_ts: HashMap::new(),
@@ -58,6 +62,7 @@ impl FlowEventEmitter {
         self.prev_pinch_count = 0;
         self.prev_zone_count = 0;
         self.prev_leg_event_seq = 0;
+        self.prev_dom_event_seq = 0;
         self.prev_held_zones.clear();
         self.prev_large_trade_counts.clear();
         self.last_event_ts.clear();
@@ -71,6 +76,7 @@ impl FlowEventEmitter {
         self.prev_pinch_count = pipelines.pinch.recent_events().len();
         self.prev_zone_count = pipelines.rebid_reoffer.all_zones().len();
         self.prev_leg_event_seq = pipelines.leg_profile.event_seq();
+        self.prev_dom_event_seq = pipelines.dom_cluster.event_seq();
 
         self.prev_held_zones.clear();
         for zone in pipelines.rebid_reoffer.all_zones() {
@@ -118,6 +124,7 @@ impl FlowEventEmitter {
         self.detect_absorption(events, pipelines, timestamp_ms, session_date);
         self.detect_pinch(events, pipelines, timestamp_ms, session_date);
         self.detect_legs(events, pipelines, timestamp_ms, session_date);
+        self.detect_dom(events, pipelines, timestamp_ms, session_date);
         self.detect_zones(events, pipelines, timestamp_ms, session_date);
         self.detect_large_trade_clusters(
             events,
@@ -297,6 +304,46 @@ impl FlowEventEmitter {
             }
         }
         self.prev_leg_event_seq = seq;
+    }
+
+    /// DOM-cluster events (Capsule-mandatory DOM-family types).
+    fn detect_dom(
+        &mut self,
+        events: &mut Vec<MarketEvent>,
+        pipelines: &PipelineEngine,
+        timestamp_ms: f64,
+        session_date: &str,
+    ) {
+        let (session_type, session_segment, trading_day) =
+            Self::event_context(timestamp_ms, session_date);
+        let current = pipelines.dom_cluster.recent_events();
+        let seq = pipelines.dom_cluster.event_seq();
+        if seq < self.prev_dom_event_seq {
+            // Pipeline reset (Asia/RTH or session-kind flip) while the emitter
+            // still holds a high watermark.
+            self.prev_dom_event_seq = 0;
+        }
+        if seq > self.prev_dom_event_seq {
+            let newly = (seq - self.prev_dom_event_seq) as usize;
+            let emit_n = newly.min(current.len());
+            let skip = current.len().saturating_sub(emit_n);
+            for evt in current.iter().skip(skip) {
+                events.push(MarketEvent {
+                    session_date: session_date.to_string(),
+                    timestamp_ms: evt.timestamp_ms,
+                    event_type: evt.event_type.clone(),
+                    level_name: None,
+                    price: evt.price,
+                    direction: evt.direction.clone(),
+                    sequence_num: evt.sequence_num,
+                    metadata: Some(evt.metadata.clone()),
+                    session_type: session_type.clone(),
+                    session_segment: session_segment.clone(),
+                    trading_day: trading_day.clone(),
+                });
+            }
+        }
+        self.prev_dom_event_seq = seq;
     }
 
     /// Acceleration zone created / held events.
@@ -653,5 +700,98 @@ mod tests {
         let mut emitter = FlowEventEmitter::new();
         let events = emitter.detect(&pipelines, 1000.0, "2026-02-26", 21000.0);
         assert!(events.is_empty());
+    }
+
+    fn pull_heavy_book(
+        ts: f64,
+    ) -> (
+        crate::depth::DomSnapshot,
+        crate::depth::PullStackActivitySummary,
+    ) {
+        use crate::depth::{
+            DepthBook, DepthCommand, DepthRecord, DepthSide, PullStackActivitySummary,
+            SideActivitySummary,
+        };
+        let mut book = DepthBook::default();
+        book.apply(&DepthRecord {
+            timestamp_ms: ts,
+            command: DepthCommand::AddBidLevel,
+            side: Some(DepthSide::Bid),
+            end_of_batch: true,
+            num_orders: 1,
+            price: 21_000.0,
+            quantity: 10,
+        });
+        book.apply(&DepthRecord {
+            timestamp_ms: ts,
+            command: DepthCommand::AddAskLevel,
+            side: Some(DepthSide::Ask),
+            end_of_batch: true,
+            num_orders: 1,
+            price: 21_000.25,
+            quantity: 40,
+        });
+        let activity = PullStackActivitySummary {
+            bid: SideActivitySummary {
+                add_events: 0,
+                modify_up_events: 0,
+                modify_down_events: 4,
+                delete_events: 4,
+                stacked_quantity: 0.0,
+                removed_quantity: 80.0,
+                estimated_filled_quantity: 10.0,
+                estimated_pulled_quantity: 70.0,
+            },
+            ask: SideActivitySummary {
+                add_events: 2,
+                modify_up_events: 2,
+                modify_down_events: 0,
+                delete_events: 0,
+                stacked_quantity: 40.0,
+                removed_quantity: 5.0,
+                estimated_filled_quantity: 5.0,
+                estimated_pulled_quantity: 0.0,
+            },
+            ..Default::default()
+        };
+        (book.snapshot("test.depth", ts, 10), activity)
+    }
+
+    #[test]
+    fn detects_dom_cluster_events_as_capsule_types() {
+        let mut pipelines = PipelineEngine::new();
+        let ts = 1_704_207_600_000.0;
+        let (snap, activity) = pull_heavy_book(ts);
+        pipelines.on_dom_feature(&snap, &activity, ts);
+        assert!(!pipelines.dom_cluster.recent_events().is_empty());
+
+        let mut emitter = FlowEventEmitter::new();
+        let events = emitter.detect(&pipelines, ts, "2024-01-02", 21_000.0);
+        assert!(events.iter().any(|e| e.event_type == "pull_intent"));
+        assert!(events
+            .iter()
+            .all(|e| { e.event_type != "mm_flow" && e.event_type != "mm_flow_shift" }));
+        assert_eq!(
+            emitter.prev_dom_event_seq,
+            pipelines.dom_cluster.event_seq()
+        );
+        let events2 = emitter.detect(&pipelines, ts + 1.0, "2024-01-02", 21_000.0);
+        assert!(events2.iter().all(|e| e.event_type != "pull_intent"));
+    }
+
+    #[test]
+    fn detect_dom_recovers_when_pipeline_resets_without_emitter_reset() {
+        let mut pipelines = PipelineEngine::new();
+        let ts = 1_704_207_600_000.0;
+        let (snap, activity) = pull_heavy_book(ts);
+        pipelines.on_dom_feature(&snap, &activity, ts);
+        let mut emitter = FlowEventEmitter::new();
+        let _ = emitter.detect(&pipelines, ts, "2024-01-02", 21_000.0);
+        assert!(emitter.prev_dom_event_seq > 0);
+
+        pipelines.dom_cluster.reset();
+        pipelines.on_dom_feature(&snap, &activity, ts);
+        let recovered = emitter.detect(&pipelines, ts, "2024-01-02", 21_000.0);
+        assert!(recovered.iter().any(|e| e.event_type == "pull_intent"));
     }
 }

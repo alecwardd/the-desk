@@ -225,6 +225,25 @@ impl MarketRouter {
         Some(out)
     }
 
+    /// Apply a compact book snapshot to one root and note DOM-family events.
+    pub fn apply_dom_update(
+        &self,
+        root: RouterRoot,
+        snapshot: &crate::depth::DomSnapshot,
+        activity: &crate::depth::PullStackActivitySummary,
+        timestamp_ms: f64,
+    ) -> Option<IngestOutcome> {
+        let out = self
+            .lane(root)
+            .apply_dom_update(snapshot, activity, timestamp_ms)?;
+        self.advance_clock(timestamp_ms);
+        if !out.new_events.is_empty() {
+            self.note_transition_events(root, &out.new_events);
+        }
+        self.queue_journal_frames();
+        Some(out)
+    }
+
     /// Deterministic one-clock apply: merge-sort by `(timestamp_ms, root)` then apply.
     pub fn apply_merged(&self, mut ticks: Vec<(RouterRoot, SourceTick)>) -> usize {
         sort_ticks_one_clock(&mut ticks);

@@ -272,6 +272,75 @@ impl EngineHost {
         })
     }
 
+    /// Apply a compact book snapshot to the DOM-cluster detectors and emit events.
+    ///
+    /// Used by the live `.depth` path so Capsule-mandatory types are noted
+    /// without waiting for the next trade. Fail-closed when the book is empty.
+    pub fn apply_dom_update(
+        &self,
+        snapshot: &crate::depth::DomSnapshot,
+        activity: &crate::depth::PullStackActivitySummary,
+        timestamp_ms: f64,
+    ) -> Option<IngestOutcome> {
+        let mut event_buffer = Vec::new();
+        let market_snapshot = {
+            let mut p = self.pipelines.lock().ok()?;
+            p.on_dom_feature(snapshot, activity, timestamp_ms);
+            p.set_dom_summary(Some(crate::depth::build_dom_summary(snapshot, activity)));
+            let bid = snapshot.best_bid.unwrap_or(0.0);
+            let ask = snapshot.best_ask.unwrap_or(0.0);
+            if bid > 0.0 {
+                if let Ok(mut b) = self.last_bid.lock() {
+                    *b = bid;
+                }
+            }
+            if ask > 0.0 {
+                if let Ok(mut a) = self.last_ask.lock() {
+                    *a = ask;
+                }
+            }
+            let market_snapshot = p.snapshot_at(bid, ask, timestamp_ms);
+            let session_date = crate::session_date_from_timestamp_ms(timestamp_ms);
+            if let Ok(mut fe) = self.flow_emitter.lock() {
+                fe.detect_into(
+                    &p,
+                    timestamp_ms,
+                    &session_date,
+                    market_snapshot.last_price,
+                    &mut event_buffer,
+                );
+            }
+            market_snapshot
+        };
+        if timestamp_ms.is_finite() && timestamp_ms > 0.0 {
+            self.last_tick_timestamp_bits
+                .store(timestamp_ms.to_bits(), Ordering::Release);
+        }
+        self.events_detected
+            .fetch_add(event_buffer.len() as u64, Ordering::Release);
+        self.last_ingest_wall_ms.store(
+            chrono::Utc::now().timestamp_millis().max(0) as u64,
+            Ordering::Release,
+        );
+        if !event_buffer.is_empty() {
+            if let Ok(mut recent) = self.recent_events.lock() {
+                for ev in &event_buffer {
+                    if let Ok(v) = serde_json::to_value(ev) {
+                        recent.push(v);
+                    }
+                }
+                let excess = recent.len().saturating_sub(RECENT_EVENTS_CAP);
+                if excess > 0 {
+                    recent.drain(0..excess);
+                }
+            }
+        }
+        Some(IngestOutcome {
+            snapshot: market_snapshot,
+            new_events: event_buffer,
+        })
+    }
+
     /// Poll a [`SourceProvider`], apply ticks, and publish lock-free state.
     pub fn poll_once(
         &self,

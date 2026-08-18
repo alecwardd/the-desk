@@ -322,7 +322,7 @@ fn base_domain_shells() -> Vec<DomainDescriptor> {
         DomainDescriptor {
             id: "liquidity".into(),
             name: "Liquidity".into(),
-            summary: "Order-book / DOM liquidity summaries when depth context is available.".into(),
+            summary: "Order-book / DOM liquidity: compact book-velocity, MbP reload, stop-run, pull-intent, and MM-flow fields when depth context is available.".into(),
             field_ids: vec![],
             record_kinds: vec![],
         },
@@ -654,6 +654,13 @@ mod tests {
         assert!(detectors.iter().any(|d| d["id"] == "detector.absorption"));
         assert!(detectors.iter().any(|d| d["id"] == "detector.pinch"));
         assert!(detectors.iter().any(|d| d["id"] == "detector.leg_to_leg"));
+        let liq = describe_domain(&cat, "liquidity").expect("liquidity");
+        let liq_detectors = liq["baseDetectors"].as_array().expect("baseDetectors");
+        assert!(liq_detectors
+            .iter()
+            .any(|d| d["id"] == "detector.iceberg_reload"));
+        assert!(liq_detectors.iter().any(|d| d["id"] == "detector.stop_run"));
+        assert!(liq_detectors.iter().any(|d| d["id"] == "detector.mm_flow"));
     }
 
     #[test]

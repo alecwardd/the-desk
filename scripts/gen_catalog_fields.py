@@ -62,6 +62,25 @@ def classify(name: str) -> tuple[str, str, str, str, str]:
     if name == "dom_summary":
         return "liquidity", "StructuredBlob", "Session", "DelayedDepthOptional", "R1"
 
+    if name == "dom_book_present" or name.startswith(
+        (
+            "book_velocity_",
+            "iceberg_reload_",
+            "stop_run_",
+            "stop_cluster_",
+            "pull_intent_",
+            "mm_flow_",
+        )
+    ):
+        unit = "EnumLabel"
+        if name == "dom_book_present":
+            unit = "Bool"
+        elif name.endswith("_price"):
+            unit = "PricePoints"
+        elif name.endswith("_per_sec") or name.endswith("_rate") or name.endswith("_score"):
+            unit = "Ratio"
+        return "liquidity", unit, "Session", "DelayedDepthOptional", "R1"
+
     if name.startswith("tape_") or name == "pace_percentile":
         unit = "TicksPerSec"
         if "volume" in name:

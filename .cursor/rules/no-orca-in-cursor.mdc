@@ -1,0 +1,25 @@
+---
+description: Never use Orca skills, CLI, or orchestration prompts in Cursor
+alwaysApply: true
+---
+
+# No Orca in Cursor
+
+Do not use Orca in this Cursor workspace. Global skills may appear in the available-skills list; ignore them here.
+
+## Never engage
+
+- `orca-cli` skill
+- `orchestration` skill (Orca multi-agent coordination)
+- Orca Computer Use flows for Orca-managed worktrees, terminals, handoffs, or the Orca embedded browser
+- Commands via `orca`, `orca-dev`, `orca-ide`, or `$ORCA_CLI_COMMAND`
+- Orca handoffs / handovers / "another worktree" / cardStatus / Orca terminal send-wait
+
+## Use instead
+
+- Cursor Task / subagents, Shell, MCP tools, and normal git/worktree commands
+- The Desk project skills (`trading-domain`, `mcp-tools`, `compliance-research`, etc.)
+
+## Exception
+
+Only use Orca if the user explicitly asks for Orca in this conversation (e.g. "use orca cli", "$orca-cli").

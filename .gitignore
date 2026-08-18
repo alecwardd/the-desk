@@ -4,6 +4,7 @@ target/
 target_alt/
 target_verify/
 target_verify2/
+target_ib_verify/
 
 # Build output
 dist/
@@ -42,6 +43,16 @@ target/
 # Session recordings (large binary files)
 recordings/
 .the-desk/memory/
+
+# Local scratch / research debris (never commit)
+private/
+.scratch/
+.tmp_ocr/
+.tmp_ocr_grids.py
+
+# Local agent-tooling mirrors (machine-local, not repo policy)
+.codex/
+.agents/
 
 # SQLite databases
 *.db

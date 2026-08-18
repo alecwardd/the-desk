@@ -11,11 +11,15 @@
 //!
 //! Base Detector math stays reviewed Rust and is not re-expressed here.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
-use super::feature_ir::{evaluate, FeatureIrError, FeatureIrEvalPath, FeatureIrStore};
+use super::feature_ir::{
+    evaluate, FeatureIrError, FeatureIrEvalPath, FeatureIrFrame, FeatureIrStore,
+};
 use super::feature_registry::{
     FeatureDescriptor, FeatureKind, PromotionState, FEATURE_REGISTRY_WRITE_VERB,
 };
@@ -278,6 +282,46 @@ pub fn read_storage_value(payload: &Value, feature_id: &str) -> Option<f64> {
         .and_then(|obj| obj.get(feature_id))
         .and_then(json_f64)
         .or_else(|| payload.get(feature_id).and_then(json_f64))
+}
+
+/// Stamped scalars for accepted Derived Features (rules-engine catalog binding).
+pub fn read_catalog_field_values(catalog: &DeskCatalog, payload: &Value) -> HashMap<String, f64> {
+    catalog
+        .derived_features
+        .iter()
+        .filter(|desc| is_accepted_derived(desc))
+        .filter_map(|desc| {
+            read_storage_value(payload, &desc.id).map(|value| (desc.id.clone(), value))
+        })
+        .collect()
+}
+
+/// Stamp `payload` then read accepted Derived Feature scalars for the rules engine.
+pub fn catalog_field_values_from_eval(
+    catalog: &DeskCatalog,
+    mut payload: Value,
+    frames: &[FeatureIrFrame],
+    truncated: bool,
+    eval_root: &str,
+    as_of_ms: f64,
+    path: FeatureIrEvalPath,
+) -> HashMap<String, f64> {
+    if !catalog.derived_features.iter().any(is_accepted_derived) {
+        return HashMap::new();
+    }
+    stamp_derived_feature_payload(
+        &mut payload,
+        FeatureIrStore {
+            catalog,
+            frames,
+            events: &[],
+            eval_root,
+            window_truncated: truncated,
+        },
+        as_of_ms,
+        path,
+    );
+    read_catalog_field_values(catalog, &payload)
 }
 
 /// Evaluate one accepted Derived Feature at `as_of` (same evaluator, path is a label).

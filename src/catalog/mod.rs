@@ -25,14 +25,15 @@ mod trust;
 mod types;
 
 pub use codegen::{
-    apply_codegen_fields, emit_agent_schema, emit_all, emit_query_dimension, emit_rule_binding,
-    emit_runtime_field, emit_storage_column, evaluate_accepted_feature, is_accepted_derived,
-    is_codegen_field, read_storage_value, stamp_derived_feature_payload, AgentSchemaArtifact,
-    CodegenArtifacts, CodegenError, QueryDimensionArtifact, RuleBindingArtifact,
-    RuntimeFieldArtifact, StorageColumnArtifact, CATALOG_FIELD_CONDITION,
-    DERIVED_FEATURE_PAYLOAD_OBJECT, EMIT_AGENT_SCHEMA, EMIT_QUERY_DIMENSION, EMIT_RULE_BINDING,
-    EMIT_RUNTIME_FIELD, EMIT_STORAGE_COLUMN, FEATURE_REGISTRY_CODEGEN,
-    JOURNAL_FRAME_STORAGE_TARGET, QUERY_DIMENSION_OPERATORS,
+    apply_codegen_fields, catalog_field_values_from_eval, emit_agent_schema, emit_all,
+    emit_query_dimension, emit_rule_binding, emit_runtime_field, emit_storage_column,
+    evaluate_accepted_feature, is_accepted_derived, is_codegen_field, read_catalog_field_values,
+    read_storage_value, stamp_derived_feature_payload, AgentSchemaArtifact, CodegenArtifacts,
+    CodegenError, QueryDimensionArtifact, RuleBindingArtifact, RuntimeFieldArtifact,
+    StorageColumnArtifact, CATALOG_FIELD_CONDITION, DERIVED_FEATURE_PAYLOAD_OBJECT,
+    EMIT_AGENT_SCHEMA, EMIT_QUERY_DIMENSION, EMIT_RULE_BINDING, EMIT_RUNTIME_FIELD,
+    EMIT_STORAGE_COLUMN, FEATURE_REGISTRY_CODEGEN, JOURNAL_FRAME_STORAGE_TARGET,
+    QUERY_DIMENSION_OPERATORS,
 };
 pub use config::{load_sil_config, EngineMode, SilConfig};
 pub use envelope::{
@@ -56,12 +57,12 @@ pub use events_kernel::{
     KernelEvent, COACHING_EVENT_FETCH_CAP, SEVERITY_PLACEHOLDER,
 };
 pub use feature_ir::{
-    declare_program, evaluate, evaluate_historical, evaluate_live_shadow, BaselineAggregator,
-    DwellMode, EventSelector, FeatureIrError, FeatureIrEvalPath, FeatureIrEvent, FeatureIrFrame,
-    FeatureIrProgram, FeatureIrStore, FeatureIrValue, FieldPredicate, OperatorFamily,
-    PercentileOutput, PredicateOp, DERIVED_FEATURE_MATH_TIER, FEATURE_IR_EVAL_MAX_FRAMES,
-    FEATURE_IR_MODULE, FEATURE_IR_SOURCE, FUNDED_OPERATOR_FAMILY_GLOSSARY,
-    FUNDED_OPERATOR_FAMILY_LABELS, NEW_OPERATOR_FAMILY_GATE,
+    declare_program, evaluate, evaluate_historical, evaluate_live_shadow, merge_eval_frames,
+    BaselineAggregator, DwellMode, EventSelector, FeatureIrError, FeatureIrEvalPath,
+    FeatureIrEvent, FeatureIrFrame, FeatureIrProgram, FeatureIrStore, FeatureIrValue,
+    FieldPredicate, MergedEvalWindow, OperatorFamily, PercentileOutput, PredicateOp,
+    DERIVED_FEATURE_MATH_TIER, FEATURE_IR_EVAL_MAX_FRAMES, FEATURE_IR_MODULE, FEATURE_IR_SOURCE,
+    FUNDED_OPERATOR_FAMILY_GLOSSARY, FUNDED_OPERATOR_FAMILY_LABELS, NEW_OPERATOR_FAMILY_GATE,
 };
 pub use feature_registry::{
     apply_promotion, builtin_base_detectors, concept_has_catalog_or_registry_entry,

@@ -302,8 +302,11 @@ blesses Feature-IR live-shadow ≡ historical parity over Journal Frames
 frame slices (in-memory vs SQLite round-trip). SIL-M5c codegen wires an accepted
 Derived Feature onto the existing kernel (`get_state`, `journal_frames.payload`,
 `query_series` / `query_episodes`, catalog-field rules binding, `search_catalog`).
-Live pending frames cap at 8192 (`PENDING_JOURNAL_MAX_FRAMES`); historical Feature-IR
-loads use a bounded `LIMIT cap+1` sentinel — never `Database::list_journal_frames()`.
+Live pending frames drain at 8192 (`PENDING_JOURNAL_MAX_FRAMES`). Feature-IR
+evaluation is capped at 57600 frames (`FEATURE_IR_EVAL_MAX_FRAMES`, ~8 hours of
+1 Hz NQ+ES) and concatenates a bounded SQLite load with pending (pending wins).
+Historical Feature-IR loads use a bounded `LIMIT cap+1` sentinel — never
+`Database::list_journal_frames()`.
 
 Use the ignored private regression test for real Sierra files that must not be committed:
 

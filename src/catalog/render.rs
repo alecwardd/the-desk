@@ -98,8 +98,11 @@ pub fn render_catalog_markdown(catalog: &DeskCatalog) -> String {
          `query_series` / `query_episodes`, catalog-field rules binding, `search_catalog` / \
          `describe_domain`) — no specialty getter. Candidate and shadow stay in `featureHits` \
          only. Live-shadow and historical evaluation share one evaluator (`clock_ms <= asOf`) \
-         capped at 8192 frames (equal to the live pending Journal Frame buffer). Session-percentile \
-         n and dwell fail closed when that bound would drop in-session frames. Historical loads \
+         capped at 57600 frames (~8 hours of 1 Hz NQ+ES). That eval cap is independent of the \
+         8192 live pending-journal drain. Live evaluation concatenates a bounded SQLite load \
+         with pending frames (pending wins on identity). Session-percentile \
+         n and dwell fail closed when that bound would drop in-session frames, including when \
+         the truncation edge is another root. Historical loads \
          use a newest-first LIMIT cap+1 sentinel — never `Database::list_journal_frames()`. \
          Discovery rides `search_catalog` / catalog descriptors. The write verb is \
          `feature_registry`. Tier 1 Base Detector math stays reviewed Rust.\n\n",

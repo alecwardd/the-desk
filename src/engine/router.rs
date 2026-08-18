@@ -1210,11 +1210,13 @@ mod tests {
     }
 
     #[test]
-    fn feature_ir_eval_cap_equals_pending_journal_max_frames() {
-        assert_eq!(
+    fn feature_ir_eval_cap_is_independent_of_pending_journal_max_frames() {
+        assert_ne!(
             crate::catalog::FEATURE_IR_EVAL_MAX_FRAMES,
             PENDING_JOURNAL_MAX_FRAMES
         );
+        assert_eq!(crate::catalog::FEATURE_IR_EVAL_MAX_FRAMES, 57_600);
+        assert_eq!(PENDING_JOURNAL_MAX_FRAMES, 8_192);
     }
 
     #[test]

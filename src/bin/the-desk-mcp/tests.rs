@@ -1578,6 +1578,28 @@ async fn sil_m5c_accepted_derived_feature_codegen_end_to_end_on_existing_kernel(
     assert_eq!(active["feature"]["promotionState"], "active");
 
     let t0 = 1_704_207_600_000.0;
+    let live_clock = t0 + 5000.0;
+    server.market_router.apply_tick(
+        the_desk_backend::engine::RouterRoot::Nq,
+        &the_desk_backend::engine::SourceTick {
+            timestamp_ms: live_clock,
+            price: 21_005.0,
+            volume: 1.0,
+            bid: 21_004.75,
+            ask: 21_005.25,
+            side: TradeSide::Buy,
+            root_symbol: Some("NQ".into()),
+        },
+    );
+    server.market_router.queue_journal_frames();
+    let pending = server.market_router.snapshot_pending_journal_frames();
+    assert_eq!(
+        pending.len(),
+        1,
+        "sixth frame must sit in the pending drain, not SQLite, before persist"
+    );
+    let session_type = pending[0].session_type.clone();
+    let trading_day = pending[0].trading_day.clone();
     {
         let db = server.db.lock().expect("db");
         let frames: Vec<JournalFrameRecord> = (0..5)
@@ -1588,14 +1610,14 @@ async fn sil_m5c_accepted_derived_feature_codegen_end_to_end_on_existing_kernel(
                     frame_second: the_desk_backend::db::journal_frame_second_from_ts(clock)
                         .expect("frame second"),
                     root_symbol: "NQ".into(),
-                    session_type: "RTH".into(),
+                    session_type: session_type.clone(),
                     session_segment: "None".into(),
-                    trading_day: "2023-12-31".into(),
+                    trading_day: trading_day.clone(),
                     payload: serde_json::json!({
                         "lastPrice": 21_000.0 + i as f64,
                         "rootSymbol": "NQ",
-                        "sessionType": "RTH",
-                        "tradingDay": "2023-12-31"
+                        "sessionType": session_type,
+                        "tradingDay": trading_day
                     }),
                 }
             })
@@ -1672,7 +1694,7 @@ async fn sil_m5c_accepted_derived_feature_codegen_end_to_end_on_existing_kernel(
             .query_series(Parameters(QuerySeriesParams {
                 start_ms: Some(t0),
                 end_ms: Some(as_of),
-                session_type: Some("RTH".into()),
+                session_type: Some(session_type.clone()),
                 symbols: Some(vec!["NQ".into()]),
                 fields: Some(vec![feature_id.into()]),
                 store: None,
@@ -1688,6 +1710,76 @@ async fn sil_m5c_accepted_derived_feature_codegen_end_to_end_on_existing_kernel(
         .and_then(|p| p["values"][feature_id].as_f64())
         .expect("query_series must address the generated dimension");
     assert!((last - 90.0).abs() < 1e-9);
+
+    let live = parse_text_tool_result(
+        server
+            .get_state(Parameters(GetStateParams {
+                symbols: Some(vec!["NQ".into()]),
+                domains: Some(vec!["location_structure".into()]),
+                fields: Some(vec![feature_id.into()]),
+                resolution: Some("R1".into()),
+                as_of: None,
+                budget_tokens: None,
+            }))
+            .await
+            .expect("get_state live"),
+    );
+    let live_served = live["values"][feature_id]
+        .as_f64()
+        .expect("live get_state must serve the generated runtime field");
+    let six_frame_rank = 100.0 * 5.5 / 6.0;
+    assert!(
+        (live_served - 50.0).abs() > 1.0,
+        "live get_state must not evaluate the pending frame alone (n=1 rank=50), got {live_served}"
+    );
+    assert!(
+        (live_served - six_frame_rank).abs() < 1e-6,
+        "live get_state must merge SQLite+pending (n=6 rank={six_frame_rank}), got {live_served}"
+    );
+
+    {
+        let db = server.db.lock().expect("db");
+        server
+            .market_router
+            .persist_journal(&db)
+            .expect("persist pending");
+    }
+    let live_after = parse_text_tool_result(
+        server
+            .get_state(Parameters(GetStateParams {
+                symbols: Some(vec!["NQ".into()]),
+                domains: Some(vec!["location_structure".into()]),
+                fields: Some(vec![feature_id.into()]),
+                resolution: Some("R1".into()),
+                as_of: None,
+                budget_tokens: None,
+            }))
+            .await
+            .expect("get_state live after persist"),
+    );
+    let as_of_after = parse_text_tool_result(
+        server
+            .get_state(Parameters(GetStateParams {
+                symbols: Some(vec!["NQ".into()]),
+                domains: Some(vec!["location_structure".into()]),
+                fields: Some(vec![feature_id.into()]),
+                resolution: Some("R1".into()),
+                as_of: Some(live_clock),
+                budget_tokens: None,
+            }))
+            .await
+            .expect("get_state as_of after persist"),
+    );
+    let live_after_v = live_after["values"][feature_id]
+        .as_f64()
+        .expect("live after persist");
+    let as_of_after_v = as_of_after["values"][feature_id]
+        .as_f64()
+        .expect("as_of after persist");
+    assert!(
+        (live_after_v - as_of_after_v).abs() < 1e-9,
+        "after persist, live and as_of at the same clock must agree ({live_after_v} vs {as_of_after_v})"
+    );
 }
 
 #[tokio::test]

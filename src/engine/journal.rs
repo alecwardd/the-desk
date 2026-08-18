@@ -18,8 +18,8 @@ use std::collections::BTreeMap;
 use serde_json::Value;
 
 use crate::catalog::{
-    build_catalog_with_overlay, is_accepted_derived, stamp_derived_feature_payload,
-    FeatureIrEvalPath, FeatureIrFrame, FeatureIrStore, FEATURE_IR_EVAL_MAX_FRAMES,
+    build_catalog_with_overlay, is_accepted_derived, merge_eval_frames,
+    stamp_derived_feature_payload, FeatureIrEvalPath, FeatureIrStore, FEATURE_IR_EVAL_MAX_FRAMES,
 };
 use crate::db::{
     journal_frame_second_from_ts, Database, DbError, JournalAsOfSnapshot, JournalFrameRecord,
@@ -108,20 +108,22 @@ fn stamp_frames_with_derived_features(
         .fold(0.0_f64, f64::max);
     let (prior, truncated) =
         db.list_journal_frames_for_feature_ir(as_of, FEATURE_IR_EVAL_MAX_FRAMES)?;
-    let mut history: Vec<FeatureIrFrame> = prior.iter().map(Into::into).collect();
-    for frame in frames {
-        history.push(FeatureIrFrame::from(frame));
-    }
+    let merged = merge_eval_frames(
+        prior.iter().map(Into::into).collect(),
+        truncated,
+        frames.iter().map(Into::into).collect(),
+        FEATURE_IR_EVAL_MAX_FRAMES,
+    );
     let mut out = frames.to_vec();
     for frame in &mut out {
         let eval_root = frame.root_symbol.clone();
         let clock_ms = frame.clock_ms;
         let store = FeatureIrStore {
             catalog: &catalog,
-            frames: &history,
+            frames: &merged.frames,
             events: &[],
             eval_root: &eval_root,
-            window_truncated: truncated,
+            window_truncated: merged.truncated,
         };
         stamp_derived_feature_payload(
             &mut frame.payload,

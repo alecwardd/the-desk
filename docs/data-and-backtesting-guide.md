@@ -97,7 +97,7 @@ record `signal_outcomes` you query for stats. Run from any MCP client (a Cursor 
 [setup-ideas-and-backtesting.md](setup-ideas-and-backtesting.md) before registering anything new.
 
 ### 4.0 Before you start — three freshness/safety gates
-1. **Rules-engine version:** `RULES_ENGINE_SCHEMA_VERSION` is currently **5**. If you changed any
+1. **Rules-engine version:** `RULES_ENGINE_SCHEMA_VERSION` is currently **7**. If you changed any
    `ConditionField`/operator/evaluate semantics, bump it and **rebuild + restart the MCP** —
    otherwise a stale binary rejects new fields and cached backtest stats are invalid. (Cursor runs
    `target_alt\release\the-desk-mcp.exe`; build there.)

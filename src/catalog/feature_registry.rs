@@ -841,7 +841,7 @@ pub fn feature_registry_environment(catalog: &DeskCatalog) -> serde_json::Value 
         "codegen": FEATURE_REGISTRY_CODEGEN,
         "featureIr": true,
         "evalMaxFrames": FEATURE_IR_EVAL_MAX_FRAMES,
-        "evalWindowNote": "Live pending Journal Frames cap at PENDING_JOURNAL_MAX_FRAMES (8192). Historical Feature-IR loads use a newest-first LIMIT cap+1 sentinel — never Database::list_journal_frames(). Session-percentile n and dwell fail closed when the as-of session is truncated by that bound.",
+        "evalWindowNote": "Live Feature-IR evaluation concatenates a bounded SQLite load (FEATURE_IR_EVAL_MAX_FRAMES = 57600, ~8 hours of 1 Hz NQ+ES) with the in-memory pending drain (PENDING_JOURNAL_MAX_FRAMES = 8192; pending wins on frame_second+root). Historical loads use a newest-first LIMIT cap+1 sentinel — never Database::list_journal_frames(). Session-percentile n and dwell fail closed when the as-of session is truncated by that bound, including when the truncation edge is another root.",
         "operatorFamilies": FUNDED_OPERATOR_FAMILY_LABELS,
         "operatorFamilyGlossary": FUNDED_OPERATOR_FAMILY_GLOSSARY,
         "newOperatorFamilyGate": NEW_OPERATOR_FAMILY_GATE,

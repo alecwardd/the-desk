@@ -7370,7 +7370,7 @@ impl Database {
     ///
     /// Unbounded full-table read. Feature-IR live/historical evaluation must
     /// use [`Self::list_journal_frames_for_feature_ir`] instead so session
-    /// windows cannot silently disagree with the live pending cap.
+    /// windows cannot silently disagree with [`crate::catalog::FEATURE_IR_EVAL_MAX_FRAMES`].
     pub fn list_journal_frames(&self) -> Result<Vec<JournalFrameRecord>, DbError> {
         let mut stmt = self.conn.prepare(
             "SELECT clock_ms, frame_second, root_symbol, session_type, session_segment, trading_day, payload
@@ -7384,8 +7384,9 @@ impl Database {
     /// Newest-first bounded Journal Frame load for Feature-IR evaluation.
     ///
     /// Loads at most `max_frames + 1` rows with `clock_ms <= as_of_ms` so the
-    /// caller can detect truncation versus the live pending buffer
-    /// ([`crate::catalog::FEATURE_IR_EVAL_MAX_FRAMES`]). Never a full-table scan.
+    /// caller can detect truncation versus [`crate::catalog::FEATURE_IR_EVAL_MAX_FRAMES`].
+    /// Never a full-table scan. This bound is the Feature-IR eval window, not
+    /// the live pending-journal drain.
     /// Results are chronological (oldest first) after the sentinel is dropped.
     pub fn list_journal_frames_for_feature_ir(
         &self,

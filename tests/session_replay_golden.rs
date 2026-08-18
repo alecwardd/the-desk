@@ -984,7 +984,10 @@ fn derived_feature_codegen_carries_value_through_query_series() {
     let (bounded, truncated) = db
         .list_journal_frames_for_feature_ir(t0 + 4000.0, FEATURE_IR_EVAL_MAX_FRAMES)
         .expect("bounded historical load");
-    assert!(!truncated, "five frames must sit inside the 8192 cap");
+    assert!(
+        !truncated,
+        "five frames must sit inside FEATURE_IR_EVAL_MAX_FRAMES"
+    );
     assert_eq!(bounded.len(), frames.len());
     let unbounded = db.list_journal_frames().expect("unbounded test helper");
     assert_eq!(

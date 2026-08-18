@@ -13,7 +13,7 @@ use std::collections::HashMap;
 /// semantics change in a way that invalidates cached backtest statistics.
 /// Examples: adding/removing condition variants, changing comparison semantics
 /// in `evaluate_typed_condition`, or changing `resolve_price_expression` modes.
-pub const RULES_ENGINE_SCHEMA_VERSION: u32 = 6;
+pub const RULES_ENGINE_SCHEMA_VERSION: u32 = 7;
 
 // ---------------------------------------------------------------------------
 // Setup state machine
@@ -546,6 +546,7 @@ fn evaluate_typed_condition(
     cond: &SetupCondition,
     market: &MarketState,
     prev: Option<&MarketState>,
+    catalog_values: &HashMap<String, f64>,
 ) -> bool {
     let price = market.last_price;
 
@@ -944,7 +945,7 @@ fn evaluate_typed_condition(
             return false;
         }
         ConditionField::CatalogField => {
-            return false;
+            return evaluate_catalog_field_condition(cond, catalog_values);
         }
     };
 
@@ -1120,6 +1121,7 @@ fn transition_reason(
 pub struct RulesEngine {
     runtimes: HashMap<String, SetupRuntime>,
     prev_market: Option<MarketState>,
+    catalog_field_values: HashMap<String, f64>,
 }
 
 impl RulesEngine {
@@ -1127,6 +1129,15 @@ impl RulesEngine {
     pub fn reset(&mut self) {
         self.runtimes.clear();
         self.prev_market = None;
+        self.catalog_field_values.clear();
+    }
+
+    /// Bind codegen'd catalog-field scalars for [`ConditionField::CatalogField`].
+    ///
+    /// Missing ids fail closed. Callers stamp MarketState JSON over the same
+    /// Feature-IR eval window as live `get_state` before evaluating.
+    pub fn set_catalog_field_values(&mut self, values: HashMap<String, f64>) {
+        self.catalog_field_values = values;
     }
 
     /// Store previous market state for crosses-above/below detection.
@@ -1253,7 +1264,12 @@ impl RulesEngine {
         for raw in &setup.conditions {
             let label = condition_label(raw);
             let passed = if let Ok(tc) = serde_json::from_str::<SetupCondition>(raw) {
-                evaluate_typed_condition(&tc, market, self.prev_market.as_ref())
+                evaluate_typed_condition(
+                    &tc,
+                    market,
+                    self.prev_market.as_ref(),
+                    &self.catalog_field_values,
+                )
             } else {
                 evaluate_string_condition(raw, market)
             };
@@ -1542,6 +1558,10 @@ impl RulesEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn typed(cond: &SetupCondition, market: &MarketState, prev: Option<&MarketState>) -> bool {
+        evaluate_typed_condition(cond, market, prev, &HashMap::new())
+    }
 
     fn make_setup(conditions: Vec<&str>, min_delta: f64) -> SetupDefinition {
         SetupDefinition {
@@ -1916,7 +1936,7 @@ mod tests {
             vwap: 21000.0,
             ..Default::default()
         };
-        assert!(evaluate_typed_condition(&tc, &market, None));
+        assert!(typed(&tc, &market, None));
     }
 
     #[test]
@@ -1929,12 +1949,12 @@ mod tests {
             r#"{"id":"c1","field":"regime","operator":"equals","value":"OneSidedAcceptance"}"#,
         )
         .unwrap();
-        assert!(evaluate_typed_condition(&hit, &market, None));
+        assert!(typed(&hit, &market, None));
         let miss: SetupCondition = serde_json::from_str(
             r#"{"id":"c1","field":"regime","operator":"equals","value":"Migration"}"#,
         )
         .unwrap();
-        assert!(!evaluate_typed_condition(&miss, &market, None));
+        assert!(!typed(&miss, &market, None));
     }
 
     #[test]
@@ -1947,12 +1967,12 @@ mod tests {
             r#"{"id":"c1","field":"ib_extension_state","operator":"equals","value":"UpOnly"}"#,
         )
         .unwrap();
-        assert!(evaluate_typed_condition(&hit, &market, None));
+        assert!(typed(&hit, &market, None));
         let miss: SetupCondition = serde_json::from_str(
             r#"{"id":"c1","field":"ib_extension_state","operator":"equals","value":"BothSides"}"#,
         )
         .unwrap();
-        assert!(!evaluate_typed_condition(&miss, &market, None));
+        assert!(!typed(&miss, &market, None));
     }
 
     #[test]
@@ -1965,9 +1985,9 @@ mod tests {
             has_recent_invalidated_absorption: true,
             ..Default::default()
         };
-        assert!(evaluate_typed_condition(&cond, &failed, None));
+        assert!(typed(&cond, &failed, None));
         let calm = MarketState::default();
-        assert!(!evaluate_typed_condition(&cond, &calm, None));
+        assert!(!typed(&cond, &calm, None));
     }
 
     #[test]
@@ -1981,12 +2001,12 @@ mod tests {
             r#"{"id":"c1","field":"absorption_invalidation_direction","operator":"equals","value":"down"}"#,
         )
         .unwrap();
-        assert!(evaluate_typed_condition(&hit, &market, None));
+        assert!(typed(&hit, &market, None));
         let miss: SetupCondition = serde_json::from_str(
             r#"{"id":"c1","field":"absorption_invalidation_direction","operator":"equals","value":"up"}"#,
         )
         .unwrap();
-        assert!(!evaluate_typed_condition(&miss, &market, None));
+        assert!(!typed(&miss, &market, None));
     }
 
     #[test]
@@ -2005,8 +2025,8 @@ mod tests {
             vwap: 21000.0,
             ..Default::default()
         };
-        assert!(evaluate_typed_condition(&above, &pulled_back, None));
-        assert!(evaluate_typed_condition(&within, &pulled_back, None));
+        assert!(typed(&above, &pulled_back, None));
+        assert!(typed(&within, &pulled_back, None));
 
         // Extended 15 pts above VWAP: still above, but the pullback gate rejects it.
         let extended = MarketState {
@@ -2014,8 +2034,8 @@ mod tests {
             vwap: 21000.0,
             ..Default::default()
         };
-        assert!(evaluate_typed_condition(&above, &extended, None));
-        assert!(!evaluate_typed_condition(&within, &extended, None));
+        assert!(typed(&above, &extended, None));
+        assert!(!typed(&within, &extended, None));
     }
 
     #[test]
@@ -2038,9 +2058,9 @@ mod tests {
             r#"{"id":"c1","field":"rebid_zone_retested","operator":"equals","value":true}"#,
         )
         .unwrap();
-        assert!(evaluate_typed_condition(&rebid_near, &market, None));
-        assert!(!evaluate_typed_condition(&reoffer_near, &market, None));
-        assert!(evaluate_typed_condition(&rebid_retested, &market, None));
+        assert!(typed(&rebid_near, &market, None));
+        assert!(!typed(&reoffer_near, &market, None));
+        assert!(typed(&rebid_retested, &market, None));
 
         // rebid_zone_held is now live (was always-false).
         let held_market = MarketState {
@@ -2051,12 +2071,8 @@ mod tests {
             r#"{"id":"c1","field":"rebid_zone_held","operator":"equals","value":true}"#,
         )
         .unwrap();
-        assert!(evaluate_typed_condition(&rebid_held, &held_market, None));
-        assert!(!evaluate_typed_condition(
-            &rebid_held,
-            &MarketState::default(),
-            None
-        ));
+        assert!(typed(&rebid_held, &held_market, None));
+        assert!(!typed(&rebid_held, &MarketState::default(), None));
     }
 
     #[test]
@@ -2107,8 +2123,8 @@ mod tests {
             vwap: 21000.0,
             ..Default::default()
         };
-        assert!(evaluate_typed_condition(&tc, &curr, Some(&prev)));
-        assert!(!evaluate_typed_condition(&tc, &prev, Some(&prev)));
+        assert!(typed(&tc, &curr, Some(&prev)));
+        assert!(!typed(&tc, &prev, Some(&prev)));
     }
 
     #[test]
@@ -2181,7 +2197,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(evaluate_typed_condition(&tc, &market, None));
+        assert!(typed(&tc, &market, None));
     }
 
     #[test]
@@ -2201,7 +2217,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(evaluate_typed_condition(&tc, &market, None));
+        assert!(typed(&tc, &market, None));
     }
 
     #[test]
@@ -2217,12 +2233,27 @@ mod tests {
         let mut values = HashMap::new();
         values.insert("feature.example_derived".into(), 90.0);
         assert!(evaluate_catalog_field_condition(&cond, &values));
-        values.insert("feature.example_derived".into(), 10.0);
-        assert!(!evaluate_catalog_field_condition(&cond, &values));
-        assert!(!evaluate_typed_condition(
+        assert!(evaluate_typed_condition(
             &cond,
             &MarketState::default(),
-            None
+            None,
+            &values
         ));
+        values.insert("feature.example_derived".into(), 10.0);
+        assert!(!evaluate_catalog_field_condition(&cond, &values));
+        assert!(!typed(&cond, &MarketState::default(), None));
+
+        let setup = SetupDefinition {
+            conditions: vec![serde_json::to_string(&cond).expect("cond json")],
+            min_delta: 0.0,
+            ..make_setup(vec![], 0.0)
+        };
+        let mut engine = RulesEngine::default();
+        engine.set_catalog_field_values(HashMap::from([("feature.example_derived".into(), 90.0)]));
+        let outcome = engine.evaluate_detailed(&setup, &MarketState::default(), false);
+        assert!(outcome.evaluation.deterministic_all_met);
+        engine.set_catalog_field_values(HashMap::new());
+        let outcome = engine.evaluate_detailed(&setup, &MarketState::default(), false);
+        assert!(!outcome.evaluation.deterministic_all_met);
     }
 }

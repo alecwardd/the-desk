@@ -10,16 +10,21 @@ use the_desk_backend::attention::{
     SignalComposerInput,
 };
 use the_desk_backend::backfill;
-use the_desk_backend::catalog::kernel_event_from_market_event_scoped;
+use the_desk_backend::catalog::{
+    build_catalog_with_overlay, catalog_field_values_from_eval, is_accepted_derived,
+    kernel_event_from_market_event_scoped, merge_eval_frames, FeatureIrEvalPath,
+    FEATURE_IR_EVAL_MAX_FRAMES,
+};
 use the_desk_backend::db::{
-    AttentionSignalQuery, AttentionSignalRecord, Database, ReplaySignalRecord, SessionScopeFilter,
-    SetupRuntimeStateRecord, SignalOutcome,
+    AttentionSignalQuery, AttentionSignalRecord, Database, JournalFrameRecord, ReplaySignalRecord,
+    SessionScopeFilter, SetupRuntimeStateRecord, SignalOutcome,
 };
 use the_desk_backend::depth::{
     build_dom_feature_snapshot, build_dom_summary, enrich_dom_summary, DepthBook, DepthCommand,
     DepthReader, DomFeatureSnapshot, DomSummary, PullStackActivitySummary,
     ScanControl as DepthScanControl, DOM_NARRATIVE_HORIZON_MS,
 };
+use the_desk_backend::engine::MarketRouter;
 use the_desk_backend::feed::monotonic::{MonotonicTickGuard, MonotonicTimestampDecision};
 use the_desk_backend::feed::scid_reader::{
     scid_tail_offset_after_shrink, ScidReader, ScidTick, SCID_RECORD_SIZE,
@@ -331,6 +336,43 @@ pub(crate) fn persist_setup_evaluation(
     }
 }
 
+pub(crate) fn catalog_field_values_for_snapshot(
+    db: &Database,
+    pending: &[JournalFrameRecord],
+    snapshot: &the_desk_backend::pipelines::MarketState,
+    as_of_ms: f64,
+) -> HashMap<String, f64> {
+    let overlay = db.list_feature_registry().unwrap_or_default();
+    if !overlay.iter().any(is_accepted_derived) {
+        return HashMap::new();
+    }
+    let catalog = build_catalog_with_overlay(overlay);
+    let (history, truncated) = db
+        .list_journal_frames_for_feature_ir(as_of_ms, FEATURE_IR_EVAL_MAX_FRAMES)
+        .unwrap_or_else(|_| (Vec::new(), false));
+    let merged = merge_eval_frames(
+        history.iter().map(Into::into).collect(),
+        truncated,
+        pending.iter().map(Into::into).collect(),
+        FEATURE_IR_EVAL_MAX_FRAMES,
+    );
+    let payload = serde_json::to_value(snapshot).unwrap_or_else(|_| serde_json::json!({}));
+    let eval_root = if snapshot.root_symbol.trim().is_empty() {
+        "NQ"
+    } else {
+        snapshot.root_symbol.as_str()
+    };
+    catalog_field_values_from_eval(
+        &catalog,
+        payload,
+        &merged.frames,
+        merged.truncated,
+        eval_root,
+        as_of_ms,
+        FeatureIrEvalPath::LiveShadow,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn evaluate_setups_for_snapshot(
     rules: &Arc<Mutex<RulesEngine>>,
@@ -341,9 +383,18 @@ pub(crate) fn evaluate_setups_for_snapshot(
     session_date: &str,
     evaluation_ts_ms: f64,
     policy: SetupPersistencePolicy,
+    market_router: Option<&MarketRouter>,
 ) {
     let (setups, risk_at_limit) = playbook_cache.snapshot();
+    let pending = market_router
+        .map(|router| router.snapshot_pending_journal_frames())
+        .unwrap_or_default();
+    let catalog_values = match db.lock() {
+        Ok(d) => catalog_field_values_for_snapshot(&d, &pending, snapshot, evaluation_ts_ms),
+        Err(_) => HashMap::new(),
+    };
     let persist_items = if let Ok(mut r) = rules.lock() {
+        r.set_catalog_field_values(catalog_values);
         let mut items = Vec::new();
         for setup in setups.iter() {
             let outcome = r.evaluate_detailed_at(setup, snapshot, risk_at_limit, evaluation_ts_ms);
@@ -814,6 +865,7 @@ pub(crate) fn run_analysis_pass(
     new_attention_events: &[MarketEvent],
     timestamp_ms: f64,
     pulse_kind: AttentionPulseKind,
+    market_router: Option<&MarketRouter>,
 ) {
     let setup_trading_day = trading_day_from_timestamp_ms(timestamp_ms);
     evaluate_setups_for_snapshot(
@@ -825,6 +877,7 @@ pub(crate) fn run_analysis_pass(
         &setup_trading_day,
         timestamp_ms,
         SetupPersistencePolicy::Live,
+        market_router,
     );
 
     if let Ok(d) = db.lock() {
@@ -903,6 +956,7 @@ pub(crate) fn process_tick(
         &outcome.new_events,
         timestamp_ms,
         AttentionPulseKind::EventDriven,
+        None,
     );
 
     // Flush event buffer periodically
@@ -2346,6 +2400,7 @@ pub(crate) fn run_startup_warm_replay(
                 &setup_trading_day,
                 tick.timestamp_ms,
                 SetupPersistencePolicy::StartupReplay,
+                None,
             );
             pipelines_guard = match pipelines.lock() {
                 Ok(p) => p,

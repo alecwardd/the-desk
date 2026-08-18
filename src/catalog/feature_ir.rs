@@ -12,12 +12,15 @@
 //!
 //! Live-shadow and historical evaluation share **one** evaluator over Journal
 //! Frames (`clock_ms <= asOf`). The path label does not change semantics.
-//! Both paths cap the visible slice at [`FEATURE_IR_EVAL_MAX_FRAMES`] (equal to
-//! the live pending-journal buffer). Session-distribution `n` and dwell windows
-//! fail closed when that bound would silently drop in-session frames — they
-//! must not pretend an unbounded `list_journal_frames` scan equals the live cap.
+//! Both paths cap the visible slice at [`FEATURE_IR_EVAL_MAX_FRAMES`] (~8 hours
+//! of 1 Hz NQ+ES). That bound is **not** the live pending-journal drain
+//! ([`crate::engine::PENDING_JOURNAL_MAX_FRAMES`]). Live evaluation concatenates
+//! a bounded SQLite load with pending frames (pending wins on identity).
+//! Session-distribution `n` and dwell windows fail closed when that bound would
+//! silently drop in-session frames — they must not pretend an unbounded
+//! `list_journal_frames` scan equals the eval cap.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -44,14 +47,16 @@ pub const MAX_BASELINE_LOOKBACK_DAYS: u32 = 60;
 /// Maximum event-sequence window (24 hours).
 pub const MAX_SEQUENCE_WINDOW_MS: f64 = 86_400_000.0;
 
-/// Shared live/historical Feature-IR frame cap.
+/// Shared live/historical Feature-IR evaluation cap (~8 hours of 1 Hz NQ+ES).
 ///
-/// Must stay equal to [`crate::engine::PENDING_JOURNAL_MAX_FRAMES`]. Live
-/// pending Journal Frames drop the oldest past this bound; historical loads
-/// use a newest-first `LIMIT cap+1` sentinel instead of
+/// Intentionally **not** equal to [`crate::engine::PENDING_JOURNAL_MAX_FRAMES`].
+/// The pending buffer is an in-memory drain (8192). Live evaluation loads a
+/// bounded SQLite window of this size and concatenates pending frames
+/// ([`merge_eval_frames`]; pending wins on `(frame_second, root_symbol)`).
+/// Historical loads use a newest-first `LIMIT cap+1` sentinel instead of
 /// [`crate::db::Database::list_journal_frames`]. Session-percentile `n` and
 /// dwell fail closed when the as-of session is truncated by this cap.
-pub const FEATURE_IR_EVAL_MAX_FRAMES: usize = 8_192;
+pub const FEATURE_IR_EVAL_MAX_FRAMES: usize = 57_600;
 
 /// Wire labels for the five funded families (camelCase IPC).
 pub const FUNDED_OPERATOR_FAMILY_LABELS: &[&str] = &[
@@ -492,7 +497,7 @@ pub struct FeatureIrStore<'a> {
     pub events: &'a [FeatureIrEvent],
     pub eval_root: &'a str,
     /// True when the caller already dropped frames older than
-    /// [`FEATURE_IR_EVAL_MAX_FRAMES`] (live pending cap or historical sentinel).
+    /// [`FEATURE_IR_EVAL_MAX_FRAMES`] (bounded SQLite sentinel or merged window).
     pub window_truncated: bool,
 }
 
@@ -562,14 +567,43 @@ pub fn evaluate(
     path: FeatureIrEvalPath,
 ) -> Result<FeatureIrValue, FeatureIrError> {
     program.validate(store.catalog)?;
-    let (bounded, truncated) = bound_eval_frames(store.frames, as_of_ms, store.window_truncated);
-    let store = FeatureIrStore {
-        catalog: store.catalog,
-        frames: &bounded,
-        events: store.events,
-        eval_root: store.eval_root,
-        window_truncated: truncated,
-    };
+    if frames_are_chronological(store.frames) {
+        let (slice, truncated) = bound_eval_slice(store.frames, as_of_ms, store.window_truncated);
+        return evaluate_on_window(
+            program,
+            FeatureIrStore {
+                catalog: store.catalog,
+                frames: slice,
+                events: store.events,
+                eval_root: store.eval_root,
+                window_truncated: truncated,
+            },
+            as_of_ms,
+            path,
+        );
+    }
+    let (owned, truncated) = bound_eval_owned(store.frames, as_of_ms, store.window_truncated);
+    evaluate_on_window(
+        program,
+        FeatureIrStore {
+            catalog: store.catalog,
+            frames: &owned,
+            events: store.events,
+            eval_root: store.eval_root,
+            window_truncated: truncated,
+        },
+        as_of_ms,
+        path,
+    )
+}
+
+fn evaluate_on_window(
+    program: &FeatureIrProgram,
+    store: FeatureIrStore<'_>,
+    as_of_ms: f64,
+    path: FeatureIrEvalPath,
+) -> Result<FeatureIrValue, FeatureIrError> {
+    let truncated = store.window_truncated;
     let value = match program {
         FeatureIrProgram::CrossSymbolReferences { symbol, field } => {
             eval_cross_symbol(store, as_of_ms, symbol, field)?
@@ -604,8 +638,8 @@ pub fn evaluate(
             percentile,
         } => {
             if truncated {
-                // Lookback-N-days cannot fit in the live pending cap; fail closed
-                // rather than silently using a truncated day set.
+                // Lookback-N-days cannot fit in the bounded eval window; fail
+                // closed rather than silently using a truncated day set.
                 unavailable()
             } else {
                 eval_historical_baseline(
@@ -633,8 +667,9 @@ pub fn evaluate(
 
 /// Live-shadow evaluation (same evaluator as historical).
 ///
-/// Path is a label only. Callers supply the pending-buffer slice (capped at
-/// [`FEATURE_IR_EVAL_MAX_FRAMES`]) or an equivalent bounded historical load.
+/// Path is a label only. Callers supply the merged live window (bounded SQLite
+/// load + pending drain, capped at [`FEATURE_IR_EVAL_MAX_FRAMES`]) or an
+/// equivalent bounded historical load.
 pub fn evaluate_live_shadow(
     program: &FeatureIrProgram,
     store: FeatureIrStore<'_>,
@@ -647,7 +682,7 @@ pub fn evaluate_live_shadow(
 ///
 /// Path is a label only. Runtime historical loads must be bounded (newest
 /// [`FEATURE_IR_EVAL_MAX_FRAMES`] `+ 1` sentinel) — not an unbounded
-/// `list_journal_frames` full-table read.
+/// `list_journal_frames` full-table read. Live pending drain size is independent.
 pub fn evaluate_historical(
     program: &FeatureIrProgram,
     store: FeatureIrStore<'_>,
@@ -970,7 +1005,80 @@ fn unavailable() -> ScalarN {
     }
 }
 
-fn bound_eval_frames(
+/// Merged Feature-IR eval window (SQLite history + in-memory pending).
+#[derive(Debug, Clone, PartialEq)]
+pub struct MergedEvalWindow {
+    pub frames: Vec<FeatureIrFrame>,
+    pub truncated: bool,
+}
+
+/// Concatenate history and pending; pending wins on `(frame_second, root_symbol)`.
+///
+/// Callers that previously chose pending *or* SQLite must use this instead.
+/// Results are chronological. When `history_truncated` is set or the merge
+/// exceeds `cap`, `truncated` is true and only the newest `cap` frames remain.
+pub fn merge_eval_frames(
+    history: Vec<FeatureIrFrame>,
+    history_truncated: bool,
+    pending: Vec<FeatureIrFrame>,
+    cap: usize,
+) -> MergedEvalWindow {
+    let cap = cap.max(1);
+    let mut by_identity: HashMap<(i64, String), FeatureIrFrame> =
+        HashMap::with_capacity(history.len() + pending.len());
+    for frame in history {
+        by_identity.insert((frame.frame_second, frame.root_symbol.clone()), frame);
+    }
+    for frame in pending {
+        by_identity.insert((frame.frame_second, frame.root_symbol.clone()), frame);
+    }
+    let mut frames: Vec<FeatureIrFrame> = by_identity.into_values().collect();
+    frames.sort_by(|a, b| {
+        a.clock_ms
+            .partial_cmp(&b.clock_ms)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.root_symbol.cmp(&b.root_symbol))
+    });
+    let truncated = history_truncated || frames.len() > cap;
+    if frames.len() > cap {
+        frames = frames[frames.len() - cap..].to_vec();
+    }
+    MergedEvalWindow { frames, truncated }
+}
+
+fn frames_are_chronological(frames: &[FeatureIrFrame]) -> bool {
+    frames
+        .windows(2)
+        .all(|w| match w[0].clock_ms.partial_cmp(&w[1].clock_ms) {
+            Some(std::cmp::Ordering::Less) => true,
+            Some(std::cmp::Ordering::Equal) => w[0].root_symbol <= w[1].root_symbol,
+            _ => false,
+        })
+}
+
+/// Prefix `clock_ms <= as_of` then keep the newest `FEATURE_IR_EVAL_MAX_FRAMES`.
+///
+/// Callers must pass chronological frames. No payload clone.
+fn bound_eval_slice(
+    frames: &[FeatureIrFrame],
+    as_of_ms: f64,
+    caller_truncated: bool,
+) -> (&[FeatureIrFrame], bool) {
+    let end =
+        frames.partition_point(|frame| frame.clock_ms.is_finite() && frame.clock_ms <= as_of_ms);
+    let visible = &frames[..end];
+    let truncated = caller_truncated || visible.len() > FEATURE_IR_EVAL_MAX_FRAMES;
+    if visible.len() > FEATURE_IR_EVAL_MAX_FRAMES {
+        let start = visible.len() - FEATURE_IR_EVAL_MAX_FRAMES;
+        (&visible[start..], truncated)
+    } else {
+        (visible, truncated)
+    }
+}
+
+/// Unsorted fallback: clone + sort, then apply the same cap. Avoid this path
+/// on the query/runtime hot path (loaders already emit chronological frames).
+fn bound_eval_owned(
     frames: &[FeatureIrFrame],
     as_of_ms: f64,
     caller_truncated: bool,
@@ -991,9 +1099,12 @@ fn bound_eval_frames(
 }
 
 /// Session-percentile / dwell fail closed when the as-of session is cut by the cap.
+///
+/// Truncation is a mixed NQ+ES timeline. An ES-only second at the left edge
+/// must still fail closed for an NQ as-of in the same session.
 fn session_window_exceeds_eval_bound(
     store: FeatureIrStore<'_>,
-    root: &str,
+    _root: &str,
     as_of_frame: &FeatureIrFrame,
 ) -> bool {
     if !store.window_truncated || store.frames.is_empty() {
@@ -1006,11 +1117,7 @@ fn session_window_exceeds_eval_bound(
     }) else {
         return false;
     };
-    store.frames.iter().any(|frame| {
-        frame.root_symbol == root
-            && same_session(frame, as_of_frame)
-            && (frame.clock_ms - oldest.clock_ms).abs() <= f64::EPSILON
-    })
+    oldest.trading_day == as_of_frame.trading_day && oldest.session_type == as_of_frame.session_type
 }
 
 fn visible_frames(
@@ -1590,33 +1697,129 @@ mod tests {
     fn session_percentile_fails_closed_when_session_exceeds_eval_cap() {
         let cat = catalog();
         let t0 = 1_700_000_000_000.0;
-        let n = FEATURE_IR_EVAL_MAX_FRAMES + 1;
-        let frames: Vec<_> = (0..n)
-            .map(|i| {
-                frame(
-                    t0 + i as f64 * 1000.0,
-                    "NQ",
-                    "2026-03-03",
-                    "RTH",
-                    21_000.0 + (i % 10) as f64,
-                )
-            })
-            .collect();
+        let frames = vec![
+            frame(t0, "NQ", "2026-03-03", "RTH", 21_000.0),
+            frame(t0 + 1000.0, "NQ", "2026-03-03", "RTH", 21_001.0),
+            frame(t0 + 2000.0, "NQ", "2026-03-03", "RTH", 21_002.0),
+        ];
         let program = declare_program(
             &json!({"family":"sessionDistributionPercentiles","field":LAST_PRICE}),
             &cat,
         )
         .unwrap();
         let events: Vec<FeatureIrEvent> = Vec::new();
-        let as_of = t0 + (n as f64 - 1.0) * 1000.0;
-        let live = evaluate_live_shadow(&program, store(&cat, &frames, &events), as_of).unwrap();
-        let hist = evaluate_historical(&program, store(&cat, &frames, &events), as_of).unwrap();
+        let mut live_store = store(&cat, &frames, &events);
+        live_store.window_truncated = true;
+        let mut hist_store = store(&cat, &frames, &events);
+        hist_store.window_truncated = true;
+        let as_of = t0 + 2000.0;
+        let live = evaluate_live_shadow(&program, live_store, as_of).unwrap();
+        let hist = evaluate_historical(&program, hist_store, as_of).unwrap();
         assert_eq!(live.available, hist.available);
         assert_eq!(live.n, hist.n);
         assert!(
             !live.available,
-            "session percentile must not silently use a truncated live-sized window"
+            "session percentile must not silently use a truncated eval window"
         );
         assert_eq!(live.n, 0);
+    }
+
+    #[test]
+    fn session_percentile_fails_closed_when_oldest_truncated_frame_is_other_root() {
+        let cat = catalog();
+        let t0 = 1_700_000_000_000.0;
+        let frames = vec![
+            frame(t0, "ES", "2026-03-03", "RTH", 5_000.0),
+            frame(t0 + 1000.0, "NQ", "2026-03-03", "RTH", 21_000.0),
+            frame(t0 + 2000.0, "NQ", "2026-03-03", "RTH", 21_001.0),
+        ];
+        let program = declare_program(
+            &json!({"family":"sessionDistributionPercentiles","field":LAST_PRICE}),
+            &cat,
+        )
+        .unwrap();
+        let events: Vec<FeatureIrEvent> = Vec::new();
+        let mut ir_store = store(&cat, &frames, &events);
+        ir_store.window_truncated = true;
+        let out = evaluate_historical(&program, ir_store, t0 + 2000.0).unwrap();
+        assert!(
+            !out.available,
+            "an ES-only truncation edge must fail closed for NQ in the same session"
+        );
+    }
+
+    #[test]
+    fn session_percentile_available_when_truncated_edge_is_prior_session() {
+        let cat = catalog();
+        let t0 = 1_700_000_000_000.0;
+        let frames = vec![
+            frame(t0, "NQ", "2026-03-02", "RTH", 21_000.0),
+            frame(t0 + 1000.0, "NQ", "2026-03-03", "RTH", 21_001.0),
+            frame(t0 + 2000.0, "NQ", "2026-03-03", "RTH", 21_002.0),
+        ];
+        let program = declare_program(
+            &json!({"family":"sessionDistributionPercentiles","field":LAST_PRICE}),
+            &cat,
+        )
+        .unwrap();
+        let events: Vec<FeatureIrEvent> = Vec::new();
+        let mut ir_store = store(&cat, &frames, &events);
+        ir_store.window_truncated = true;
+        let out = evaluate_historical(&program, ir_store, t0 + 2000.0).unwrap();
+        assert!(
+            out.available,
+            "current session fully inside the window must still evaluate"
+        );
+        assert_eq!(out.n, 2);
+    }
+
+    #[test]
+    fn merge_eval_frames_pending_wins_on_identity_and_concatenates() {
+        let t0 = 1_700_000_000_000.0;
+        let history = vec![
+            frame(t0, "NQ", "2026-03-03", "RTH", 21_000.0),
+            frame(t0 + 1000.0, "NQ", "2026-03-03", "RTH", 21_001.0),
+        ];
+        let mut pending_dup = frame(t0 + 1000.0, "NQ", "2026-03-03", "RTH", 21_099.0);
+        pending_dup.payload = json!({ "lastPrice": 21_099.0, "sessionType": "RTH" });
+        let pending = vec![
+            pending_dup,
+            frame(t0 + 2000.0, "NQ", "2026-03-03", "RTH", 21_002.0),
+        ];
+        let merged = merge_eval_frames(history, false, pending, FEATURE_IR_EVAL_MAX_FRAMES);
+        assert!(!merged.truncated);
+        assert_eq!(merged.frames.len(), 3);
+        assert_eq!(
+            merged.frames[1].payload["lastPrice"].as_f64(),
+            Some(21_099.0),
+            "pending must replace the same (frame_second, root) history row"
+        );
+        assert_eq!(
+            merged.frames[2].payload["lastPrice"].as_f64(),
+            Some(21_002.0)
+        );
+    }
+
+    #[test]
+    fn reverse_order_frames_still_evaluate_via_owned_bound() {
+        let cat = catalog();
+        let t0 = 1_700_000_000_000.0;
+        let frames = vec![
+            frame(t0 + 2000.0, "NQ", "2026-03-03", "RTH", 21_002.0),
+            frame(t0 + 1000.0, "NQ", "2026-03-03", "RTH", 21_001.0),
+            frame(t0, "NQ", "2026-03-03", "RTH", 21_000.0),
+        ];
+        assert!(!frames_are_chronological(&frames));
+        let program = declare_program(
+            &json!({"family":"sessionDistributionPercentiles","field":LAST_PRICE,"output":"rank"}),
+            &cat,
+        )
+        .unwrap();
+        let events: Vec<FeatureIrEvent> = Vec::new();
+        let out =
+            evaluate_historical(&program, store(&cat, &frames, &events), t0 + 2000.0).unwrap();
+        assert!(out.available);
+        assert_eq!(out.n, 3);
+        assert!((out.value - 5.0 / 6.0 * 100.0).abs() < 1e-9);
     }
 }

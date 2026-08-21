@@ -22,6 +22,12 @@ Location → trigger → confirmation → invalidation → risk state.
 ## Status / verdicts
 Narrative of where this stands. **No bare win rates.** Any numeric performance claim must carry an `mcpPointers` entry, a `jobId`, or an explicit `<!-- stats: point-in-time -->` marker — pull fresh numbers from MCP/SQLite at query time.
 
+## Unknowns
+What is not yet known, and what would change the design if answered differently.
+
+## Invalidation
+What would kill the idea (structure, sample, or logical inconsistency between gate and entry).
+
 ## See also
 - Hub stub: [setup-ideas-and-backtesting.md#idea-nnn](../setup-ideas-and-backtesting.md#idea-nnn)
 
@@ -49,6 +55,7 @@ mcpPointers:
 
 ### hypothesisAnchor
 Only `IDEA-000` sets `hypothesisAnchor: true`. That file must contain the
-`<!-- hypothesis-anchor: IDEA-000 -->` comment immediately followed by the fenced
-`json` hypothesis example — `src/research/hypothesis.rs` reads it via `include_str!`
-and `cargo test idea_000_doc_anchor` validates it. Do not move or reformat that block casually.
+`<!-- hypothesis-anchor: IDEA-000 -->` comment and the fenced `json` hypothesis
+example — `src/research/hypothesis.rs` reads
+`docs/setup-ideas/IDEA-000-regime-gated-selector.md` via `include_str!` and
+`cargo test idea_000_doc_anchor` validates it. Do not move or reformat that block casually.

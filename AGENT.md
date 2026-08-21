@@ -113,6 +113,7 @@ When you need specialized help, spawn subagents for these tasks.
 
 When implementing a feature:
 
+0. **Run the blindspot pass** (`commands/unknowns-pass.md`) if the change is substantial, crosses a layer, or touches an unfamiliar area
 1. **Read the relevant skill** from `skills/` for domain knowledge
 2. **Write the Rust code** in the appropriate module (`pipelines/`, `rules/`, `feed/`, `db/`)
 3. **Write tests** alongside the code — every pipeline must have unit tests
@@ -120,6 +121,10 @@ When implementing a feature:
 5. **Add `ConditionField` variants** if the rules engine needs to evaluate the new data
 6. **Add MCP tool** in the matching domain module under `src/bin/the-desk-mcp/tools/` if agents need access (checklist: `docs/mcp/README.md`), then regenerate `docs/mcp/tool-reference.md`
 7. **Run `cargo test`** before declaring done
+
+### Map vs territory
+
+The map (docs, prompts, assumptions) is not the territory (code, data, constraints). For substantial work, run `/unknowns-pass` before writing code. Ask the trader one architecture-changing question at a time. Do not re-test a rejected IDEA in its rejected form — see `docs/setup-ideas/index.md`. This is process, not a change to coaching vs advisory phrasing (`CLAUDE.md` Never-Do list still applies).
 
 ---
 

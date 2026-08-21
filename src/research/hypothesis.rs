@@ -1639,7 +1639,7 @@ mod tests {
 
     #[test]
     fn idea_000_doc_anchor_has_typed_hypothesis_example() {
-        let doc = include_str!("../../docs/setup-ideas-and-backtesting.md");
+        let doc = include_str!("../../docs/setup-ideas/IDEA-000-regime-gated-selector.md");
         let after_anchor = doc
             .split("<!-- hypothesis-anchor: IDEA-000 -->")
             .nth(1)

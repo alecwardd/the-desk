@@ -11,7 +11,7 @@
 | [social-confluence-design.md](social-confluence-design.md) | v1 implementation spec (Layer-3 cache + MCP tool) |
 | [decision-log.md](decision-log.md) ADR-020 | Architectural decision (Pending) |
 | [trader-memory/architecture.md](trader-memory/architecture.md) | Where validated learning lives |
-| [setup-ideas-and-backtesting.md](setup-ideas-and-backtesting.md) IDEA-023 | Idea tracker entry |
+| [setup-ideas/IDEA-023-social-intelligence-continual-learning.md](setup-ideas/IDEA-023-social-intelligence-continual-learning.md) | Idea tracker entry |
 | [skills/compliance-research/SKILL.md](../skills/compliance-research/SKILL.md) | Coaching vs advisory boundary |
 | [X MCP docs](https://docs.x.com/tools/mcp) | External API + hosted MCP server |
 

@@ -3,7 +3,7 @@
 //! Derives a coarse, session-level *regime* from already-computed pipeline
 //! outputs. The regime is the top-level selector intended to gate which setup
 //! *families* are eligible to fire (continuation vs. responsive vs. stand
-//! aside). See `docs/setup-ideas-and-backtesting.md` (IDEA-000).
+//! aside). See `docs/setup-ideas/IDEA-000-regime-gated-selector.md`.
 //!
 //! This module is pure math over snapshot inputs — no tick accumulation, no
 //! I/O, no LLM. Thresholds are deliberately conservative and tunable; the

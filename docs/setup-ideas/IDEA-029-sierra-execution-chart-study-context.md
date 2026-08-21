@@ -90,8 +90,9 @@ those notes used here are the copied dispatch summary:
 
 Repo evidence checked:
 
-- `docs/setup-ideas-and-backtesting.md` already has IDEA-019 for adaptive
-  session-pace volume bars and ties it to Sierra ACSIL custom chart bars.
+- `docs/setup-ideas/IDEA-019-adaptive-session-pace-volume-bars.md` already
+  covers adaptive session-pace volume bars and ties them to Sierra ACSIL
+  custom chart bars.
 - `docs/decision-log.md` records prior rejection of Sierra spreadsheet export as
   a primary live feed and ACSIL push plugins as a maintenance-heavy route.
 - `docs/mcp/tool-reference.md` already exposes `get_rvol`, `get_tape_pace`,
@@ -403,5 +404,5 @@ Advisory/offline only:
 ## See Also
 
 - Hub stub: [setup-ideas-and-backtesting.md#idea-029](../setup-ideas-and-backtesting.md#idea-029)
-- Existing adaptive bar body: [setup-ideas-and-backtesting.md#idea-019](../setup-ideas-and-backtesting.md#idea-019)
+- Existing adaptive bar body: [IDEA-019-adaptive-session-pace-volume-bars.md](IDEA-019-adaptive-session-pace-volume-bars.md)
 - Setup index: [index.md](index.md)

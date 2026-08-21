@@ -198,7 +198,7 @@ the-desk/
 ├── skills/                           # Domain knowledge for agents
 │   ├── trading-domain/SKILL.md       # TPO, delta, PTT methodology
 │   └── compliance-research/          # Coaching vs advisory
-├── commands/                         # Cursor slash-commands (/quick-check, /pipeline-test, /coaching-test, …)
+├── commands/                         # Cursor slash-commands (/quick-check, /pipeline-test, /coaching-test, /unknowns-pass, …)
 ├── .cursor/                          # Cursor IDE integration
 │   ├── mcp.example.json              # MCP server config template
 │   ├── agents/ → ../agents/

@@ -210,8 +210,8 @@ microstructure tools.
 
 - Hub stub: [setup-ideas-and-backtesting.md#idea-032](../setup-ideas-and-backtesting.md#idea-032)
 - Setup index: [index.md](index.md)
-- Related: [IDEA-007 hub section](../setup-ideas-and-backtesting.md) (microstructure
-  regime; still hub-resident), [IDEA-000](../setup-ideas-and-backtesting.md),
+- Related: [IDEA-007](IDEA-007-microstructure-regime-detection.md) (microstructure
+  regime), [IDEA-000](IDEA-000-regime-gated-selector.md),
   [IDEA-030](IDEA-030-nq-balance-zone-taxonomy.md),
   [IDEA-031](IDEA-031-session-range-compression-expansion.md)
 - Pipeline: [`src/pipelines/regime.rs`](../../src/pipelines/regime.rs)

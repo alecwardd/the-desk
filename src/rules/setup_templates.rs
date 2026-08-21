@@ -4,7 +4,7 @@ use crate::db::{Database, DbError};
 /// Regime family tag carried in each template's `market_context`.
 ///
 /// These mirror the IDEA-000 regime buckets in
-/// `docs/setup-ideas-and-backtesting.md`:
+/// `docs/setup-ideas/IDEA-000-regime-gated-selector.md`:
 /// - `continuation` — one-sided acceptance / initiative setups
 /// - `responsive` — migration / inventory-clear / mean-reversion setups
 /// - `transition` — context-dependent reversal / liquidity-failure setups

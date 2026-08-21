@@ -11,7 +11,7 @@ hypothesisAnchor: false
 
 # IDEA-020 — Footprint Rebid/Reoffer Zone Lifecycle
 
-> Per-idea detail file. The hub ([setup-ideas-and-backtesting.md](../setup-ideas-and-backtesting.md)) keeps a one-line stub anchor pointing here.
+> Per-idea detail file. The hub ([setup-ideas-and-backtesting.md](../setup-ideas-and-backtesting.md)) keeps a short stub (status, source, framing, detail link) pointing here.
 
 <!-- stats: point-in-time -->
 **Status:** Stage 1 landed (2026-06-23); Stage 2 deferred. **Now the primary track** — the framework

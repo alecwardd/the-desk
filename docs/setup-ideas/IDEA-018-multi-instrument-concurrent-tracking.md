@@ -11,7 +11,7 @@ hypothesisAnchor: false
 
 # IDEA-018 — Multi-Instrument Concurrent Tracking (NQ, MNQ, ES, MES)
 
-> Per-idea detail file. The hub ([setup-ideas-and-backtesting.md](../setup-ideas-and-backtesting.md)) keeps a one-line stub anchor pointing here.
+> Per-idea detail file. The hub ([setup-ideas-and-backtesting.md](../setup-ideas-and-backtesting.md)) keeps a short stub (status, source, framing, detail link) pointing here.
 
 **Status:** Idea
 **Source:** Roadmap — full product vision once the MCP surface and single-symbol path are “done enough”

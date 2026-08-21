@@ -11,7 +11,7 @@ hypothesisAnchor: false
 
 # IDEA-017 — MCP Product Hardening — Playbook & Guidance as First-Class Data
 
-> Per-idea detail file. The hub ([setup-ideas-and-backtesting.md](../setup-ideas-and-backtesting.md)) keeps a one-line stub anchor pointing here.
+> Per-idea detail file. The hub ([setup-ideas-and-backtesting.md](../setup-ideas-and-backtesting.md)) keeps a short stub (status, source, framing, detail link) pointing here.
 
 **Status:** Idea
 **Source:** Product review — MCP exposes market intelligence well; playbook and trading philosophy remain primarily in repository markdown

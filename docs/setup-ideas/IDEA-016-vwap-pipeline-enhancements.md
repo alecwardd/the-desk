@@ -11,7 +11,7 @@ hypothesisAnchor: false
 
 # IDEA-016 — VWAP Pipeline Enhancements (Dual Session + Anchored)
 
-> Per-idea detail file. The hub ([setup-ideas-and-backtesting.md](../setup-ideas-and-backtesting.md)) keeps a one-line stub anchor pointing here.
+> Per-idea detail file. The hub ([setup-ideas-and-backtesting.md](../setup-ideas-and-backtesting.md)) keeps a short stub (status, source, framing, detail link) pointing here.
 
 **Status:** Idea
 **Source:** QA review of `vwap.rs` pipeline, March 2026

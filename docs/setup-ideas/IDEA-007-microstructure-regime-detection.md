@@ -11,8 +11,9 @@ hypothesisAnchor: false
 
 # IDEA-007 — Microstructure Regime Detection
 
-> Per-idea detail file. The hub ([setup-ideas-and-backtesting.md](../setup-ideas-and-backtesting.md)) keeps a one-line stub anchor pointing here.
+> Per-idea detail file. The hub ([setup-ideas-and-backtesting.md](../setup-ideas-and-backtesting.md)) keeps a short stub (status, source, framing, detail link) pointing here.
 
+<!-- stats: point-in-time -->
 **Status:** Researched
 **Source:** HMM literature, Park & Kownatzki 2024, Lopez de Prado 2018
 **Complements:** All setups (meta-filter)
@@ -33,7 +34,7 @@ hypothesisAnchor: false
 
 **Advanced: Hidden Markov Model:**
 - 3-state HMM on returns + volatility at 1-min frequency
-- Academic Sharpe > 2.0 pre-cost on e-mini S&P500
+- Source-reported academic result (HMM literature / Park & Kownatzki 2024): Sharpe > 2.0 **pre-cost on e-mini S&P500**, not a Desk NQ backtest. `N` is not in this file; do not quote as Desk expectancy.
 - Requires: state estimation library in Rust or pre-computed in Python/exported
 
 **Implementation Notes:**

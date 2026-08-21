@@ -12,7 +12,7 @@ hypothesisAnchor: true
 
 # IDEA-000 — Regime-Gated Setup Selector
 
-> Per-idea detail file. The hub ([setup-ideas-and-backtesting.md](../setup-ideas-and-backtesting.md)) keeps a one-line stub anchor pointing here.
+> Per-idea detail file. The hub ([setup-ideas-and-backtesting.md](../setup-ideas-and-backtesting.md)) keeps a short stub (status, source, framing, detail link) pointing here.
 
 <!-- stats: point-in-time -->
 <!-- hypothesis-anchor: IDEA-000 -->

@@ -3,7 +3,7 @@
 Per-entity catalog of setup ideas and cross-cutting research tracks. Each row links to a
 per-IDEA detail file. The hub, [setup-ideas-and-backtesting.md](../setup-ideas-and-backtesting.md),
 keeps cross-cutting material (March 2026 snapshot, backtest results table, roadmap, queue) plus a
-one-line stub anchor per IDEA pointing back here.
+short stub per IDEA (status, source, framing, detail link) pointing back here.
 
 - **Detail lives here**, in `IDEA-NNN-*.md`.
 - **Numbers do not.** Detail files carry `mcpPointers`; pull fresh stats from MCP/SQLite at query time.

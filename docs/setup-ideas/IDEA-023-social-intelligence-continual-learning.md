@@ -13,7 +13,7 @@ hypothesisAnchor: false
 
 # IDEA-023 — Social Intelligence & Continual Learning (X / Trusted Accounts)
 
-> Per-idea detail file. The hub ([setup-ideas-and-backtesting.md](../setup-ideas-and-backtesting.md)) keeps a one-line stub anchor pointing here.
+> Per-idea detail file. The hub ([setup-ideas-and-backtesting.md](../setup-ideas-and-backtesting.md)) keeps a short stub (status, source, framing, detail link) pointing here.
 
 **Status:** Idea (exploration documented; Phase A build blocked on ADR-020 trader decisions)
 **Source:** Trader vision — trusted X accounts for live confluence, backtest hypothesis discovery, and subagent prompts from external edge situations

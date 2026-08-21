@@ -11,7 +11,9 @@ hypothesisAnchor: false # true only for IDEA-000 (carries the hypothesis-anchor 
 
 # IDEA-NNN — {title}
 
-> Per-idea detail file. The hub ([setup-ideas-and-backtesting.md](../setup-ideas-and-backtesting.md)) keeps a one-line stub anchor pointing here.
+> Per-idea detail file. The hub ([setup-ideas-and-backtesting.md](../setup-ideas-and-backtesting.md)) keeps a short stub (status, source, framing, detail link) pointing here.
+
+> **New-idea starter.** `Thesis` / `Mechanics` / `Status / verdicts` are the recommended outline when creating a file from this template. Migrated IDEA-000–023 keep the hub's original `**Concept:**` / `**Setup:**` headings. Do not retrofit those files to this outline.
 
 ## Thesis
 What the setup is and why an edge should exist. Auction / order-flow mechanics.
@@ -20,13 +22,13 @@ What the setup is and why an edge should exist. Auction / order-flow mechanics.
 Location → trigger → confirmation → invalidation → risk state.
 
 ## Status / verdicts
-Narrative of where this stands. **No bare win rates.** Any numeric performance claim must carry an `mcpPointers` entry, a `jobId`, or an explicit `<!-- stats: point-in-time -->` marker — pull fresh numbers from MCP/SQLite at query time.
+Narrative of where this stands. **No bare win rates.** Any numeric performance claim must carry an `mcpPointers` entry, a `jobId`, or an explicit `<!-- stats: point-in-time -->` marker — pull fresh numbers from MCP/SQLite at query time. Literature figures must name the source and must not be quoted as Desk expectancy.
 
-## Unknowns
-What is not yet known, and what would change the design if answered differently.
+## Unknowns (optional, new ideas only)
+What is not yet known, and what would change the design if answered differently. Not a retrofit requirement for IDEA-000–023.
 
-## Invalidation
-What would kill the idea (structure, sample, or logical inconsistency between gate and entry).
+## Invalidation (optional, new ideas only)
+What would kill the idea (structure, sample, or logical inconsistency between gate and entry). Not a retrofit requirement for IDEA-000–023.
 
 ## See also
 - Hub stub: [setup-ideas-and-backtesting.md#idea-nnn](../setup-ideas-and-backtesting.md#idea-nnn)

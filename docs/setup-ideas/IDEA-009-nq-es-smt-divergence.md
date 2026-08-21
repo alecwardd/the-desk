@@ -11,7 +11,7 @@ hypothesisAnchor: false
 
 # IDEA-009 — NQ/ES SMT Divergence
 
-> Per-idea detail file. The hub ([setup-ideas-and-backtesting.md](../setup-ideas-and-backtesting.md)) keeps a one-line stub anchor pointing here.
+> Per-idea detail file. The hub ([setup-ideas-and-backtesting.md](../setup-ideas-and-backtesting.md)) keeps a short stub (status, source, framing, detail link) pointing here.
 
 **Status:** Researched
 **Source:** ICT methodology, cross-asset analysis

@@ -12,7 +12,7 @@ hypothesisAnchor: false
 
 # IDEA-021 — Multi-Instrument Flow Architecture (NQ / MNQ / ES / MES)
 
-> Per-idea detail file. The hub ([setup-ideas-and-backtesting.md](../setup-ideas-and-backtesting.md)) keeps a one-line stub anchor pointing here.
+> Per-idea detail file. The hub ([setup-ideas-and-backtesting.md](../setup-ideas-and-backtesting.md)) keeps a short stub (status, source, framing, detail link) pointing here.
 
 **Status:** Spec drafted (2026-06-23); Stage A buildable
 **Source:** Trader architecture session 2026-06-23 (memory `multi-instrument-flow-architecture`)

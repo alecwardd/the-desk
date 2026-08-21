@@ -11,7 +11,7 @@ hypothesisAnchor: false
 
 # IDEA-019 — Adaptive Session-Pace Volume Bars (Sierra Chart ACSIL)
 
-> Per-idea detail file. The hub ([setup-ideas-and-backtesting.md](../setup-ideas-and-backtesting.md)) keeps a one-line stub anchor pointing here.
+> Per-idea detail file. The hub ([setup-ideas-and-backtesting.md](../setup-ideas-and-backtesting.md)) keeps a short stub (status, source, framing, detail link) pointing here.
 
 **Status:** Idea
 **Source:** Sierra Chart ACSIL custom chart bar docs; Relative Volume / cumulative volume ratio docs; April 2026 research pass

@@ -11,7 +11,7 @@ hypothesisAnchor: false
 
 # IDEA-011 — One-Sided IB Extension Acceptance
 
-> Per-idea detail file. The hub ([setup-ideas-and-backtesting.md](../setup-ideas-and-backtesting.md)) keeps a one-line stub anchor pointing here.
+> Per-idea detail file. The hub ([setup-ideas-and-backtesting.md](../setup-ideas-and-backtesting.md)) keeps a short stub (status, source, framing, detail link) pointing here.
 
 <!-- stats: point-in-time -->
 **Status:** Backtesting-ready
@@ -20,11 +20,11 @@ hypothesisAnchor: false
 
 **Concept:** The useful signal is not "IB extension happened." It is whether extension stayed one-sided or became two-sided. Two-sided extension usually means migration / auction, not trend acceptance.
 
-**Local Statistics:**
-- `up_only`: 12 sessions, 75.0% closed up
-- `down_only`: 8 sessions, 62.5% closed down
-- `both_sides`: 43 sessions, mixed / noisy
-- `none`: 18 sessions
+**Local Statistics** (RTH window 2025-11-28 through 2026-03-06; session-close direction, not a verified setup expectancy):
+- `up_only`: 12 sessions, 75.0% closed up — **Insufficient** (`N=12` < 20). Directional context only; do not treat as a reliable edge.
+- `down_only`: 8 sessions, 62.5% closed down — **Insufficient** (`N=8` < 20). Directional context only.
+- `both_sides`: 43 sessions, mixed / noisy — Reportable sample (`N=43`) for "no clean directional read," not for a continuation edge.
+- `none`: 18 sessions — **Insufficient** (`N=18` < 20).
 
 **Setup — One-Sided Acceptance Continuation:**
 - Context:

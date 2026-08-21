@@ -2,7 +2,7 @@
 
 Living document for trade setup ideas, backtesting hypotheses, research findings, and cross-cutting infrastructure work (pipelines, MCP server surface, multi-instrument support). Each idea is tracked from concept through validation.
 
-> **Per-idea detail:** [`setup-ideas/index.md`](setup-ideas/index.md). This hub keeps cross-cutting material (snapshot, backtest results, roadmap, queue) plus a one-line stub per IDEA. Idea bodies live in `docs/setup-ideas/IDEA-NNN-*.md`.
+> **Per-idea detail:** [`setup-ideas/index.md`](setup-ideas/index.md). This hub keeps cross-cutting material (snapshot, backtest results, roadmap, queue) plus a short stub per IDEA (status, source, framing, detail link). Idea bodies live in `docs/setup-ideas/IDEA-NNN-*.md`.
 
 ### Companion specs
 
@@ -59,9 +59,9 @@ These are the highest-signal observations from the local history sample:
 - **Double Distribution dominates.** 52 of 81 valid RTH sessions were classified `DoubleDistribution`. Only 7 of 81 were `Trend`.
 - **London did not carry cleanly into RTH.** London and RTH closed in the same direction only 41.5% of the time; reversal happened 58.5% of the time.
 - **One-sided IB extension was cleaner than generic IB extension.**
-  - `up_only`: 12 sessions, 75.0% closed up
-  - `down_only`: 8 sessions, 62.5% closed down
-  - `both_sides`: 43 sessions, noisy / mixed
+  - `up_only`: 12 sessions, 75.0% closed up — **Insufficient** (`N=12` < 20); directional context only
+  - `down_only`: 8 sessions, 62.5% closed down — **Insufficient** (`N=8` < 20); directional context only
+  - `both_sides`: 43 sessions, noisy / mixed — Reportable (`N=43`) as mixed, not as a continuation edge
 - **Raw pinch was not compelling as a standalone directional edge.** Higher-severity pinch events did not show strong session-close alignment in the current sample.
 - **Absorption failure looked more actionable than absorption itself.**
   - RTH `absorption_confirmed` with `direction=down` aligned with down closes only 38.9%
@@ -366,7 +366,7 @@ Follow-up hardening added a rules-enabled golden (`expected_rules.json`), a non-
 **Complements:** All existing setups (infrastructure improvement)
 **Detail:** [setup-ideas/IDEA-006-volume-imbalance-bars.md](setup-ideas/IDEA-006-volume-imbalance-bars.md)
 
-**Framing:** Replace or supplement time-based bars with volume/tick/dollar bars that normalize information arrival. Imbalance bars fire at the *moment* information arrives — 3-8 bars earlier than time-bar traders see it.
+**Framing:** Replace or supplement time-based bars with volume/tick/dollar bars that normalize information arrival. The "3–8 bars earlier" figure is Lopez de Prado (2018), not a Desk sample.
 
 <a id="idea-019"></a>
 ### IDEA-019: Adaptive Session-Pace Volume Bars (Sierra Chart ACSIL Study)

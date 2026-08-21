@@ -10,7 +10,7 @@ short stub per IDEA (status, source, framing, detail link) pointing back here.
 - **Template:** [`_template.md`](_template.md). **Lint:** `cargo test docs_lint`.
 - **Pre-change checklist:** [`commands/unknowns-pass.md`](../../commands/unknowns-pass.md) for substantial work.
 
-> Phase 1b is complete. Every IDEA-000–034 row has a detail file. The hub keeps stubs plus cross-cutting material (snapshot, backtest results, queue).
+> Phase 1b is complete. Every IDEA-000–036 row has a detail file. The hub keeps stubs plus cross-cutting material (snapshot, backtest results, queue).
 
 | ID | Title | File |
 |----|-------|------|
@@ -49,3 +49,5 @@ short stub per IDEA (status, source, framing, detail link) pointing back here.
 | IDEA-032 | Hidden Markov Models lecture notes — docs-only repo-fit | [IDEA-032-hmm-lecture-notes-repo-fit.md](IDEA-032-hmm-lecture-notes-repo-fit.md) |
 | IDEA-033 | Expected-range ATR vs RV vs IV (session sizing + runners) | [IDEA-033-expected-range-atr-rv-iv-research-plan.md](IDEA-033-expected-range-atr-rv-iv-research-plan.md) |
 | IDEA-034 | Time-of-day liquidity-event calendar (participation anomalies + continuation/reversal) | [IDEA-034-time-of-day-liquidity-events.md](IDEA-034-time-of-day-liquidity-events.md) |
+| IDEA-035 | Leg-to-Leg Volume/Delta Profile Engine (swing-anchored per-leg profiles) | [IDEA-035-leg-to-leg-profile-engine.md](IDEA-035-leg-to-leg-profile-engine.md) |
+| IDEA-036 | L2L Pullback-Join — stacked leg-to-leg profile pullback entry | [IDEA-036-l2l-pullback-join.md](IDEA-036-l2l-pullback-join.md) |

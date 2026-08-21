@@ -45,6 +45,14 @@ function Test-TradingWeekWindow {
     }
 }
 
+# CME daily halt: 17:00-18:00 ET = 16:00-17:00 Central. Watchdog stays idle so
+# operators can close Sierra / edit the feed without it relaunching every 4 min.
+function Test-DailyMaintenanceHalt {
+    param([Parameter(Mandatory)][datetime]$EasternNow)
+    $time = $EasternNow.TimeOfDay
+    return ($time -ge ([TimeSpan]::FromHours(17))) -and ($time -lt ([TimeSpan]::FromHours(18)))
+}
+
 function Open-Sierra {
     $existing = Get-Process -Name $script:ProcessName -ErrorAction SilentlyContinue
     if ($existing) {
@@ -98,7 +106,9 @@ Write-Log "Action=$Action ET=$($et.ToString('yyyy-MM-dd HH:mm:ss'))"
 
 switch ($Action) {
     "Watchdog" {
-        if (Test-TradingWeekWindow -EasternNow $et) {
+        if (Test-DailyMaintenanceHalt -EasternNow $et) {
+            Write-Log "Inside daily maintenance halt (17:00-18:00 ET / 16:00-17:00 CT); watchdog is intentionally idle."
+        } elseif (Test-TradingWeekWindow -EasternNow $et) {
             Write-Log "Inside trading-week window; ensuring Sierra is running."
             Open-Sierra
         } else {

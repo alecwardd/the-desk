@@ -19,6 +19,8 @@ Standalone deep-dive specs referenced by ideas in this document:
 - **HMM lecture-notes repo-fit (docs-only)** — [`docs/setup-ideas/IDEA-032-hmm-lecture-notes-repo-fit.md`](setup-ideas/IDEA-032-hmm-lecture-notes-repo-fit.md): Miller 2016 HMM notes assessed as **ADAPT** reference for a future offline regime-research design; not a live signal and not an implement-now task.
 - **Expected-range ATR / RV / IV research plan (docs-only)** — [`docs/setup-ideas/IDEA-033-expected-range-atr-rv-iv-research-plan.md`](setup-ideas/IDEA-033-expected-range-atr-rv-iv-research-plan.md): staged offline plan comparing ATR, realized vol, and provenance-gated IV (or labeled proxy) for session sizing vs runner decisions; no backtest executed.
 - **Time-of-day liquidity-event calendar (offline research)** — [`docs/setup-ideas/IDEA-034-time-of-day-liquidity-events.md`](setup-ideas/IDEA-034-time-of-day-liquidity-events.md): bucket-stats evidence accepted after clean-`b63e83a` verification; calendar/event-rate extraction has not run, Stage 1 has not passed, and continuation/reversal remains gated.
+- **Leg-to-leg volume/delta profile engine (docs-only)** — [`docs/setup-ideas/IDEA-035-leg-to-leg-profile-engine.md`](setup-ideas/IDEA-035-leg-to-leg-profile-engine.md): locked quantitative definitions for swing-anchored legs (k×ATR confirmation, delta-percentile provisional trigger), per-leg HVN/LVN/shelf/taper metrics, and a boundary-stability backtest plan plus a Sierra translation path; no backtest executed.
+- **L2L pullback-join setup (docs-only)** — [`docs/setup-ideas/IDEA-036-l2l-pullback-join.md`](setup-ideas/IDEA-036-l2l-pullback-join.md): first tradeable setup on the IDEA-035 engine — second-touch pullback into the prior leg's LVN/shelf zone with taper + delta-realignment confirmation, structural "two LVNs away" invalidation, event-study outcome measurement; gated behind the engine's Stage 1 pass.
 
 ---
 
@@ -582,6 +584,39 @@ Calendar/event-rate extraction remains a separate approval gate. Stage 2
 (gated) tests continuation/reversal after events vs matched same-bucket
 controls. Deliverable is a research calendar + gated verdicts only — no live
 integration. See [the verification record](backtests/2026-08-11-idea-034-bucket-stats-verification.md).
+
+<a id="idea-035"></a>
+### IDEA-035: Leg-to-leg volume/delta profile engine (swing-anchored per-leg profiles)
+
+**Status:** Researched (docs-only spec; pre-backtest Adapt; no code or signal claim)
+**Source:** second-brain inbox "Stacked Leg-To-Leg Volume Profiles" (2026-07-16) + "delta rotation calculator in the-desk" (2026-07-09); interviewed and locked 2026-07-24
+**Complements:** IDEA-029 (Track C), IDEA-020, IDEA-004, IDEA-033
+**Detail:** [setup-ideas/IDEA-035-leg-to-leg-profile-engine.md](setup-ideas/IDEA-035-leg-to-leg-profile-engine.md)
+
+**Framing:** Quantifies the trader's leg-to-leg read into repo-native
+contracts: provisional anchors from 1-min delta-percentile spikes + opposite
+displacement, confirmed anchors on k×ATR retracement, per-leg volume/delta
+profiles (4-tick bins) with local-shape HVN/LVN/shelf definitions and a
+rate+expansion building/tapering metric. Stage 1 is an offline boundary
+stability study over recorded `.scid` (RTH, NQ); a gated Stage 2 prototypes
+`get_leg_profile`. Sierra translation is config-assembly only (same math,
+approximate visuals, no ACSIL).
+
+<a id="idea-036"></a>
+### IDEA-036: L2L pullback-join (stacked leg profiles)
+
+**Status:** Researched (docs-only setup spec; gated behind IDEA-035 Stage 1; no signal claim)
+**Source:** same 2026-07-16 inbox note + 2026-07-24 interview
+**Complements:** IDEA-035 (hard dependency), IDEA-020, IDEA-012
+**Detail:** [setup-ideas/IDEA-036-l2l-pullback-join.md](setup-ideas/IDEA-036-l2l-pullback-join.md)
+
+**Framing:** First tradeable setup on the leg engine: counter-leg B pulls back
+into leg A's LVN/shelf zone, event fires on the **second touch** with B
+tapering + delta realigning to A's direction; invalidation is "two LVNs away"
+(structural R), target is the far side of A's value area. Outcome measurement
+is event-study MFE/MAE in points and R vs matched controls — no fill model.
+Continuation-through and leg-failure variants are future tracks on the same
+engine.
 
 ---
 

@@ -25,13 +25,32 @@ Shared convention (`scripts/ops/Desk-ExitCodes.ps1`):
 
 Weekend maintenance must not look green when it skipped: `Run-Weekly-Archive.ps1` exits **2** when `the-desk-mcp` is running, logs `DEFERRED`, and writes `X:\TheDesk\logs\last-deferred-maintenance.json`. On success it writes `X:\TheDesk\logs\last-successful-maintenance.json`.
 
+## Timezone note
+
+Scheduled task triggers use **machine local wall-clock** time. This trading workstation is expected to be set to **Central Time**. ET equivalents in the table below are CT+1 (standard offset used in descriptions; ignore DST edge cases for ops planning and prefer the local times on the box).
+
+## Exit codes (ops scripts)
+
+Shared convention (`scripts/ops/Desk-ExitCodes.ps1`):
+
+| Code | Meaning |
+| --- | --- |
+| 0 | Success |
+| 2 | Deferred (MCP writer active / maintenance blocked) — **not** silent success |
+| 3 | Config error (including `Register-DeskTasks.ps1 -Verify` mismatches) |
+| 4 | Integrity failure (stale/missing maintenance marker, health criticals) |
+| 5 | Storage failure (X: missing, free space critical, temp unusable) |
+| 1 | General failure |
+
+Weekend maintenance must not look green when it skipped: `Run-Weekly-Archive.ps1` exits **2** when `the-desk-mcp` is running, logs `DEFERRED`, and writes `X:\TheDesk\logs\last-deferred-maintenance.json`. On success it writes `X:\TheDesk\logs\last-successful-maintenance.json`.
+
 ## Scheduled Tasks
 
 All tasks are registered under `\TheDesk\` by `scripts\ops\Register-DeskTasks.ps1`.
 
 | Task | Trigger local (CT) | Trigger ET | Account | Behavior |
 | --- | --- | --- | --- | --- |
-| `Sierra Watchdog` | Logon and every 4 minutes | same | Interactive user | During Sun 18:00 ET through Fri 17:00 ET, starts Sierra if `SierraChart_64` is not running. It does not close Sierra during the daily 17:00-18:00 ET maintenance halt. |
+| `Sierra Watchdog` | Logon and every 4 minutes | same | Interactive user | During Sun 18:00 ET through Fri 17:00 ET, starts Sierra if `SierraChart_64` is not running. Stays idle (does not relaunch) during the daily 17:00-18:00 ET / 16:00-17:00 CT maintenance halt. Does not close Sierra on its own. |
 | `Engine Watchdog` | Logon and every 4 minutes | same | Interactive user | SIL-M2a: starts `the-desk-engine` if down so ingest covers Globex overnight when `[sil].engine_mode=external`. See `docs/ops/engine-lifecycle.md`. |
 | `Sierra Weekend Close` | Friday 16:10 | Friday 17:10 | Interactive user | Calls `CloseMainWindow()`, waits up to 60 seconds, then force-kills Sierra if it has not exited. |
 | `Friday Data Readiness` | Friday 16:20 | Friday 17:20 | `SYSTEM` | Runs `Invoke-FridayDataReadiness.ps1`: Sierra/SCID idle check, `the-desk-storage --status`, prints operator-gated catch-up MCP/CLI commands, writes `weekend-readiness-YYYYMMDD.json`. Does **not** ingest/backfill unless the operator runs those commands. |

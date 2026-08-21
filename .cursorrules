@@ -8,7 +8,7 @@ You are working on The Desk, a backend intelligence platform for discretionary N
 
 **Stack:** Rust backend + SQLite + MCP (`rmcp`). No in-repo frontend.
 
-**Key constraint:** The Desk NEVER places trades, generates signals, or gives financial advice. It reflects the trader's own rules back to them.
+**Key constraint:** The Desk does not place trades at the current trust level (L3 ceiling — ADR-022), never generates proprietary signals, and never gives financial advice. It reflects the trader's own rules back to them.
 
 ## Before Writing Code
 

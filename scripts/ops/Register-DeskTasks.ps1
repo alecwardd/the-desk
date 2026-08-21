@@ -103,7 +103,7 @@ function Get-ExpectedTaskSpecs {
             Arguments = "-Action Watchdog"
             PrincipalKind = "Interactive"
             ExpectEnabled = $true
-            Description = "Interactive-session watchdog: launches Sierra during Sun 18:00 ET through Fri 17:00 ET if it is not running. Triggers are local wall-clock."
+            Description = "Interactive-session watchdog: launches Sierra during Sun 18:00 ET through Fri 17:00 ET if it is not running. Idle during daily 17:00-18:00 ET (16:00-17:00 CT) halt. Triggers are local wall-clock."
         },
         [pscustomobject]@{
             Name = "Engine Watchdog"
@@ -328,7 +328,7 @@ Register-DeskTask `
     -Triggers @($watchdogLogon, $watchdogRepeat) `
     -Principal $sierraPrincipal `
     -Settings $sierraSettings `
-    -Description "Interactive-session watchdog: launches Sierra during Sun 18:00 ET through Fri 17:00 ET if it is not running. Triggers are local wall-clock (Central on this box)."
+    -Description "Interactive-session watchdog: launches Sierra during Sun 18:00 ET through Fri 17:00 ET if it is not running. Idle during daily 17:00-18:00 ET (16:00-17:00 CT) halt. Triggers are local wall-clock (Central on this box)."
 
 Register-DeskTask `
     -Name "Engine Watchdog" `

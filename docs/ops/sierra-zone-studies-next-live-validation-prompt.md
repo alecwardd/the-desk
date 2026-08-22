@@ -25,8 +25,8 @@ Read these current files in order:
 4. `C:\the-desk\docs\agent-interaction-guide.md`
 5. `C:\the-desk\docs\trader-memory\identity.md`
 6. `C:\the-desk\skills\trading-domain\SKILL.md`
-7. `C:\Users\alecw\Claude\Projects\second-brain\raw\transcripts\2026-08-06-sierra-zone-studies.md`
-8. `C:\Users\alecw\Claude\Projects\second-brain\raw\transcripts\2026-08-11-sierra-zone-studies-live-visual-check.md`
+7. Owner-held private provenance, not present in this repository: 2026-08-06 Sierra zone studies session transcript, topic slug `sierra-zone-studies`.
+8. Owner-held private provenance, not present in this repository: 2026-08-11 Sierra zone studies live visual check transcript, topic slug `sierra-zone-studies-live-visual-check`.
 9. Both ACSIL source files and `T:\SierraChart\ACS_Source\BuildInkZoneStudies.bat`
 
 Inspect `git status` in `C:\the-desk` before doing anything. The worktree already contains unrelated user changes; preserve them exactly. Do not stage, commit, push, clean, reset, or rewrite unrelated files.

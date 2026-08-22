@@ -195,7 +195,7 @@ That said, the project is in the zone where the next order of improvement is not
 2. **Incremental math everywhere.** Every pipeline accumulates; nothing recomputes from scratch. This is the right ceiling for sub-ms tick latency and the reason 100-pt volatile opens do not melt the system.
 3. **Terminology precision.** [CLAUDE.md](../CLAUDE.md) enforces it and the code reflects it. That is a moat — most trading tooling (retail and vendor) gets TPO/delta/value-area wrong.
 4. **Research infrastructure exists.** [src/research/mod.rs](../src/research/mod.rs) plus [src/backfill.rs](../src/backfill.rs) plus the event detector means you can actually ask "given X, what is P(Y)?" against real history. Most traders never get there.
-5. **Observability primitives are in place.** `McpFeedRuntimeState` in [src/bin/the-desk-mcp.rs](../src/bin/the-desk-mcp.rs) exposes tick freshness, lock contention, poll latency, SCID offsets, and now non-monotonic SCID counters via tools. Combined with `scan_scid_timestamp_anomalies`, this is a good foundation for feed diagnostics.
+5. **Observability primitives are in place.** `McpFeedRuntimeState` in [src/bin/the-desk-mcp/state.rs](../src/bin/the-desk-mcp/state.rs) exposes tick freshness, lock contention, poll latency, SCID offsets, and now non-monotonic SCID counters via tools. Combined with `scan_scid_timestamp_anomalies`, this is a good foundation for feed diagnostics.
 6. **This document (`setup-ideas-and-backtesting.md`) is gold.** It is the kind of living artifact that makes the rest of the system valuable. Keep investing here.
 
 ### Weakest points that need addressing
@@ -215,7 +215,7 @@ Follow-up hardening added a rules-enabled golden (`expected_rules.json`), a non-
 
 ### MCP server construction — specific read
 
-[src/bin/the-desk-mcp.rs](../src/bin/the-desk-mcp.rs) at ~9K LOC with 50+ tools is approaching the point where **it should be split**. Right now it is a single file handling snapshots, profiles, microstructure, options, research, risk, memory, backfill, and ingest. Recommendations:
+[src/bin/the-desk-mcp/](../src/bin/the-desk-mcp/) at ~9K LOC with 50+ tools is approaching the point where **it should be split**. Right now it is a single file handling snapshots, profiles, microstructure, options, research, risk, memory, backfill, and ingest. Recommendations:
 
 - **Module-split by domain:** `mcp/snapshots.rs`, `mcp/research.rs`, `mcp/risk.rs`, `mcp/memory.rs`, `mcp/backfill.rs`. Keeps each file <1K LOC and makes tool inventory reviewable.
 - **Tool description quality is currently good-to-very-good** but uneven. For an agentic caller, descriptions should be written to answer "when should I call this vs. the adjacent tool?" — lean into disambiguation. E.g., `get_market_snapshot` vs `get_session_context` vs `get_snapshot_at(t)` — a 1-line "call this when…" clause dramatically improves agent tool selection.
@@ -225,6 +225,11 @@ Follow-up hardening added a rules-enabled golden (`expected_rules.json`), a non-
   - `explain_current_setup_state()` — agent-friendly explanation of *why* a setup is at "Approaching" vs "Confirmed", citing which conditions are met/missing. Makes the black box legible.
   - `what_changed_since(t)` — diff of structure (new levels, POC shift, day-type reclassification, VA break). Perfect for coaching "hey, since 10:15 things changed…"
   - `risk_check_before_entry(setup_id, size)` — combines Kelly, current R used, consecutive-loss state, and day-type stats into a single "green/yellow/red" response.
+
+**Implementation note (2026-08-22):** The split has since shipped; the binary is now the directory
+`src/bin/the-desk-mcp/` holding eleven top-level modules plus a `tools/` submodule, whose families are
+`admin.rs`, `discovery.rs`, `dom.rs`, `journal.rs`, `market.rs`, `memory.rs`, `options.rs`, `playbook.rs`,
+`research.rs` and `risk.rs`; and this differs from the `mcp/` prefixed layout recommended above.
 
 ### How to make this a higher-level agentic thinking system
 

@@ -42,16 +42,36 @@ function Quote-Path {
     return '"' + $Path.Replace('"', '\"') + '"'
 }
 
-function New-PowerShellAction {
+function Get-PowerShellActionArgument {
     param(
         [Parameter(Mandatory)][string]$ScriptPath,
-        [string]$Arguments = ""
+        [string]$Arguments = "",
+        [switch]$HiddenWindow
     )
-    $arg = "-NoProfile -ExecutionPolicy Bypass -File $(Quote-Path $ScriptPath)"
+    if ($HiddenWindow) {
+        $arg = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File $(Quote-Path $ScriptPath)"
+    } else {
+        $arg = "-NoProfile -ExecutionPolicy Bypass -File $(Quote-Path $ScriptPath)"
+    }
     if ($Arguments) {
         $arg = "$arg $Arguments"
     }
+    return $arg
+}
+
+function New-PowerShellAction {
+    param(
+        [Parameter(Mandatory)][string]$ScriptPath,
+        [string]$Arguments = "",
+        [switch]$HiddenWindow
+    )
+    $arg = Get-PowerShellActionArgument -ScriptPath $ScriptPath -Arguments $Arguments -HiddenWindow:$HiddenWindow
     return New-ScheduledTaskAction -Execute $powershell -Argument $arg -WorkingDirectory $RepoRoot
+}
+
+function New-PowerShellActionFromSpec {
+    param([Parameter(Mandatory)]$Spec)
+    return New-PowerShellAction -ScriptPath $Spec.ScriptPath -Arguments $Spec.Arguments -HiddenWindow:$Spec.HiddenWindow
 }
 
 function Register-DeskTask {
@@ -83,6 +103,7 @@ function Register-DeskTask {
 
 function Get-ExpectedTaskSpecs {
     $sierraScript = Join-Path $RepoRoot "scripts\ops\Sierra-Lifecycle.ps1"
+    $engineScript = Join-Path $RepoRoot "scripts\ops\Engine-Lifecycle.ps1"
     $weeklyScript = Join-Path $RepoRoot "scripts\ops\Run-Weekly-Archive.ps1"
     $diskScript = Join-Path $RepoRoot "scripts\ops\Check-Disk-Space.ps1"
     $reclaimScript = Join-Path $RepoRoot "scripts\ops\Reclaim-Storage.ps1"
@@ -101,6 +122,7 @@ function Get-ExpectedTaskSpecs {
             Name = "Sierra Watchdog"
             ScriptPath = $sierraScript
             Arguments = "-Action Watchdog"
+            HiddenWindow = $true
             PrincipalKind = "Interactive"
             ExpectEnabled = $true
             Description = "Interactive-session watchdog: launches Sierra during Sun 18:00 ET through Fri 17:00 ET if it is not running. Idle during daily 17:00-18:00 ET (16:00-17:00 CT) halt. Triggers are local wall-clock."
@@ -109,6 +131,7 @@ function Get-ExpectedTaskSpecs {
             Name = "Engine Watchdog"
             ScriptPath = $engineScript
             Arguments = "-Action Watchdog"
+            HiddenWindow = $false
             PrincipalKind = "Interactive"
             ExpectEnabled = $true
             Description = "SIL-M2a: keep the-desk-engine running for Globex overnight coverage when [sil].engine_mode=external. MCP disconnect must not stop ingest."
@@ -117,6 +140,7 @@ function Get-ExpectedTaskSpecs {
             Name = "Sierra Weekend Close"
             ScriptPath = $sierraScript
             Arguments = "-Action Close"
+            HiddenWindow = $true
             PrincipalKind = "Interactive"
             ExpectEnabled = $true
             Description = "Friday 16:10 local (Central on this box) / 17:10 ET graceful Sierra close."
@@ -125,6 +149,7 @@ function Get-ExpectedTaskSpecs {
             Name = "Sierra Sunday Open"
             ScriptPath = $sierraScript
             Arguments = "-Action Open"
+            HiddenWindow = $true
             PrincipalKind = "Interactive"
             ExpectEnabled = $true
             Description = "Sunday 16:50 local (Central) / 17:50 ET Sierra pre-open launch."
@@ -133,6 +158,7 @@ function Get-ExpectedTaskSpecs {
             Name = "Friday Data Readiness"
             ScriptPath = $fridayScript
             Arguments = $fridayArgs
+            HiddenWindow = $false
             PrincipalKind = "System"
             ExpectEnabled = $true
             Description = "Friday 16:20 local (Central) / 17:20 ET - post-Sierra-close readiness check + weekend-readiness manifest. Non-destructive; catch-up is operator-gated."
@@ -141,6 +167,7 @@ function Get-ExpectedTaskSpecs {
             Name = "Weekly Storage Archive"
             ScriptPath = $weeklyScript
             Arguments = $weeklyArgs
+            HiddenWindow = $false
             PrincipalKind = "System"
             ExpectEnabled = $true
             Description = "Saturday storage maintenance (task name retained). Saturdays from 09:00 local Central (10:00 ET), retrying hourly for 10h: archive old raw_ticks + depth prune. Exit 2 if MCP writer is up (deferred, not silent success)."
@@ -149,6 +176,7 @@ function Get-ExpectedTaskSpecs {
             Name = "Sunday Pre-Open Readiness"
             ScriptPath = $healthScript
             Arguments = $healthSundayArgs
+            HiddenWindow = $false
             PrincipalKind = "System"
             ExpectEnabled = $true
             Description = "Sunday 16:40 local (Central) / 17:40 ET - health check Mode=SundayPreOpen before Globex. Fails if weekend maintenance marker is missing/stale."
@@ -157,6 +185,7 @@ function Get-ExpectedTaskSpecs {
             Name = "Storage Health Check"
             ScriptPath = $healthScript
             Arguments = $healthDailyArgs
+            HiddenWindow = $false
             PrincipalKind = "System"
             ExpectEnabled = $true
             Description = "Every 6 hours (SYSTEM): Invoke-DeskHealthCheck -Mode Daily. Local wall-clock cadence."
@@ -165,6 +194,7 @@ function Get-ExpectedTaskSpecs {
             Name = "T Drive Low Disk Alarm"
             ScriptPath = $diskScript
             Arguments = $diskArgs
+            HiddenWindow = $false
             PrincipalKind = "System"
             ExpectEnabled = $true
             Description = "Every 30 minutes: alert if T: below 40 GB or X: below 50 GB free."
@@ -173,6 +203,7 @@ function Get-ExpectedTaskSpecs {
             Name = "Monthly Storage Compaction"
             ScriptPath = $reclaimScript
             Arguments = $monthlyArgs
+            HiddenWindow = $false
             PrincipalKind = "System"
             ExpectEnabled = [bool]$EnableMonthlyCompaction
             Description = "Optional disabled-by-default monthly VACUUM INTO + swap when freelist exceeds 50 GB. Saturday 11:00 local Central / 12:00 ET."
@@ -206,8 +237,7 @@ function Invoke-VerifyMode {
                 if ($action.Execute -ne $powershell) {
                     $issues.Add("Execute mismatch: $($action.Execute)")
                 }
-                $expectedArg = "-NoProfile -ExecutionPolicy Bypass -File $(Quote-Path $spec.ScriptPath)"
-                if ($spec.Arguments) { $expectedArg = "$expectedArg $($spec.Arguments)" }
+                $expectedArg = Get-PowerShellActionArgument -ScriptPath $spec.ScriptPath -Arguments $spec.Arguments -HiddenWindow:$spec.HiddenWindow
                 if ($action.Arguments -ne $expectedArg) {
                     $issues.Add("Arguments mismatch.`n    expected: $expectedArg`n    actual:   $($action.Arguments)")
                 }
@@ -280,13 +310,10 @@ if ([string]::IsNullOrWhiteSpace($UserProfilePath)) {
     exit $script:EXIT_CONFIG
 }
 
-$sierraScript = Join-Path $RepoRoot "scripts\ops\Sierra-Lifecycle.ps1"
-$engineScript = Join-Path $RepoRoot "scripts\ops\Engine-Lifecycle.ps1"
-$weeklyScript = Join-Path $RepoRoot "scripts\ops\Run-Weekly-Archive.ps1"
-$diskScript = Join-Path $RepoRoot "scripts\ops\Check-Disk-Space.ps1"
-$reclaimScript = Join-Path $RepoRoot "scripts\ops\Reclaim-Storage.ps1"
-$fridayScript = Join-Path $RepoRoot "scripts\ops\Invoke-FridayDataReadiness.ps1"
-$healthScript = Join-Path $RepoRoot "scripts\ops\Invoke-DeskHealthCheck.ps1"
+$specByName = @{}
+foreach ($spec in (Get-ExpectedTaskSpecs)) {
+    $specByName[$spec.Name] = $spec
+}
 
 $sierraPrincipal = New-ScheduledTaskPrincipal -UserId $currentUser -LogonType Interactive -RunLevel Limited
 $systemPrincipal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
@@ -316,15 +343,9 @@ $diskAlarm = New-ScheduledTaskTrigger -Once -At ((Get-Date).Date.AddMinutes(2)) 
 $healthDaily = New-ScheduledTaskTrigger -Once -At ((Get-Date).Date.AddMinutes(3)) -RepetitionInterval (New-TimeSpan -Hours 6) -RepetitionDuration (New-TimeSpan -Days 3650)
 $monthlyCompact = New-ScheduledTaskTrigger -Weekly -WeeksInterval 4 -DaysOfWeek Saturday -At "11:00"
 
-$weeklyArgs = "-UserProfilePath $(Quote-Path $UserProfilePath)"
-$fridayArgs = "-UserProfilePath $(Quote-Path $UserProfilePath)"
-$healthDailyArgs = "-Mode Daily -UserProfilePath $(Quote-Path $UserProfilePath)"
-$healthSundayArgs = "-Mode SundayPreOpen -UserProfilePath $(Quote-Path $UserProfilePath)"
-$diskArgs = "-DriveLetter T -ThresholdGb 40 -AlsoCheckX -XThresholdGb 50"
-
 Register-DeskTask `
     -Name "Sierra Watchdog" `
-    -Action (New-PowerShellAction -ScriptPath $sierraScript -Arguments "-Action Watchdog") `
+    -Action (New-PowerShellActionFromSpec $specByName["Sierra Watchdog"]) `
     -Triggers @($watchdogLogon, $watchdogRepeat) `
     -Principal $sierraPrincipal `
     -Settings $sierraSettings `
@@ -332,7 +353,7 @@ Register-DeskTask `
 
 Register-DeskTask `
     -Name "Engine Watchdog" `
-    -Action (New-PowerShellAction -ScriptPath $engineScript -Arguments "-Action Watchdog") `
+    -Action (New-PowerShellActionFromSpec $specByName["Engine Watchdog"]) `
     -Triggers @($watchdogLogon, $watchdogRepeat) `
     -Principal $sierraPrincipal `
     -Settings $sierraSettings `
@@ -340,7 +361,7 @@ Register-DeskTask `
 
 Register-DeskTask `
     -Name "Sierra Weekend Close" `
-    -Action (New-PowerShellAction -ScriptPath $sierraScript -Arguments "-Action Close") `
+    -Action (New-PowerShellActionFromSpec $specByName["Sierra Weekend Close"]) `
     -Triggers $fridayClose `
     -Principal $sierraPrincipal `
     -Settings $sierraSettings `
@@ -348,7 +369,7 @@ Register-DeskTask `
 
 Register-DeskTask `
     -Name "Sierra Sunday Open" `
-    -Action (New-PowerShellAction -ScriptPath $sierraScript -Arguments "-Action Open") `
+    -Action (New-PowerShellActionFromSpec $specByName["Sierra Sunday Open"]) `
     -Triggers $sundayOpen `
     -Principal $sierraPrincipal `
     -Settings $sierraSettings `
@@ -356,7 +377,7 @@ Register-DeskTask `
 
 Register-DeskTask `
     -Name "Friday Data Readiness" `
-    -Action (New-PowerShellAction -ScriptPath $fridayScript -Arguments $fridayArgs) `
+    -Action (New-PowerShellActionFromSpec $specByName["Friday Data Readiness"]) `
     -Triggers $fridayReadiness `
     -Principal $systemPrincipal `
     -Settings $healthSettings `
@@ -364,7 +385,7 @@ Register-DeskTask `
 
 Register-DeskTask `
     -Name "Weekly Storage Archive" `
-    -Action (New-PowerShellAction -ScriptPath $weeklyScript -Arguments $weeklyArgs) `
+    -Action (New-PowerShellActionFromSpec $specByName["Weekly Storage Archive"]) `
     -Triggers $weeklyArchive `
     -Principal $systemPrincipal `
     -Settings $maintenanceSettings `
@@ -372,7 +393,7 @@ Register-DeskTask `
 
 Register-DeskTask `
     -Name "Sunday Pre-Open Readiness" `
-    -Action (New-PowerShellAction -ScriptPath $healthScript -Arguments $healthSundayArgs) `
+    -Action (New-PowerShellActionFromSpec $specByName["Sunday Pre-Open Readiness"]) `
     -Triggers $sundayPreOpen `
     -Principal $systemPrincipal `
     -Settings $healthSettings `
@@ -380,7 +401,7 @@ Register-DeskTask `
 
 Register-DeskTask `
     -Name "Storage Health Check" `
-    -Action (New-PowerShellAction -ScriptPath $healthScript -Arguments $healthDailyArgs) `
+    -Action (New-PowerShellActionFromSpec $specByName["Storage Health Check"]) `
     -Triggers $healthDaily `
     -Principal $systemPrincipal `
     -Settings $healthSettings `
@@ -388,16 +409,15 @@ Register-DeskTask `
 
 Register-DeskTask `
     -Name "T Drive Low Disk Alarm" `
-    -Action (New-PowerShellAction -ScriptPath $diskScript -Arguments $diskArgs) `
+    -Action (New-PowerShellActionFromSpec $specByName["T Drive Low Disk Alarm"]) `
     -Triggers $diskAlarm `
     -Principal $systemPrincipal `
     -Settings $alarmSettings `
     -Description "Every 30 minutes: logs/alerts if T: below 40 GB or X: below 50 GB free. SYSTEM msg targets interactive user when possible."
 
-$monthlyArgs = "-Mode CompactOnly -Confirm -AbortIfMcpRunning -MinFreelistGb 50"
 Register-DeskTask `
     -Name "Monthly Storage Compaction" `
-    -Action (New-PowerShellAction -ScriptPath $reclaimScript -Arguments $monthlyArgs) `
+    -Action (New-PowerShellActionFromSpec $specByName["Monthly Storage Compaction"]) `
     -Triggers $monthlyCompact `
     -Principal $systemPrincipal `
     -Settings $maintenanceSettings `

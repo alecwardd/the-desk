@@ -126,3 +126,46 @@ With separate authorization, build and run the offline IDEA-035 leg-engine
 replay against this isolated, quality-gated RTH day set and the locked
 `k × p × N × bin-size` grid. Stage 2 remains locked unless that later study
 documents a Stage 1 pass and receives trader confirmation.
+
+## Superseding correction (2026-08-22): PROVENANCE_UNVERIFIED
+
+**Status:** NEEDS_CORRECTION - PROVENANCE_UNVERIFIED
+**Applies to:** the entire record above, including the Verdict, every N count, and every table.
+
+**Effect.** The `PREREQ_MET` verdict, `N=163`, `N=36`, the 81/81 bucket counts, the
+observed/expected day tables, the gap and exclusion tables, and the non-monotonic record
+counts are all reclassified as **reported observations only**. They are not verified
+results. They **do not** open IDEA-035 Stage 1, **do not** open Stage 2, and **do not**
+authorize the offline leg-engine replay binary, `get_leg_profile`, signal work, ACSIL
+work, or any live or trading change. Any such work requires a provenance-complete record
+first.
+
+**Why.** The record does not carry the evidence needed to reproduce or independently audit
+it. None of the following was captured at run time, and none exists in this repository:
+
+- a source commit for the scanner that produced these counts;
+- a saved scanner, script, or binary - the repository tracks no IDEA-035 code, and the
+  originating commit `b5d4502` added this document and nothing else;
+- a reproducible command line, parameter set, or environment record;
+- a run-time hash manifest of the inputs (`NQH6.CME.scid`, `NQM6.CME.scid`,
+  `NQU6.CME.scid`) or of the outputs.
+
+**Post-hoc artifact snapshot (measured 2026-08-22).** The run directory named at the top of
+this record still exists, and its three artifacts were hashed on 2026-08-22, four days
+after the run. These digests are a **post-hoc snapshot only**: they record what the files
+contain now. They do **not** establish what was produced at run time, and they cannot
+detect any change made between the run and the measurement.
+
+| Artifact | SHA-256 (measured 2026-08-22) | Bytes | Modified (local) |
+|---|---|---:|---|
+| `coverage_probe.json` | `814E5D432D18C28A4A6D086514A54472E8B45D648745DE8DEDD7E4A477D2DC9F` | 1680 | 2026-08-18 03:27:22 |
+| `coverage.db` | `1DB468F65E9067AF8DBFE4C9CDD2DF79275704B8952BE9819539783F8AC97579` | 65536 | 2026-08-18 03:27:23 |
+| `summary.json` | `BC41AF91C76EE62BF20A86F211397357ACA638FD22B78C112BF3E60E39365399` | 4098 | 2026-08-18 03:27:23 |
+
+**Acceptance requirement.** Before any figure in this record is treated as accepted
+evidence, either rerun the coverage check with a committed scanner, a recorded command
+line, and an input/output hash manifest captured at run time, or produce an equivalent
+provenance-complete record. Until one of those exists, this document is a preliminary
+observation log and nothing further may be gated on it.
+
+No provenance has been reconstructed, inferred, or invented for this correction.

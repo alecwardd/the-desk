@@ -1030,3 +1030,30 @@ This note does not implement ACSIL (#23), Vs3dProvider (#16), SIL-OPS backups (#
 This note does not introduce Vs3dProvider, Capsules, Feature-IR, ACSIL, Journal Frame writer changes, or event lifecycle.
 
 **Consequences:** Agents can hand-enter dealer maps with no scrape and no ToS. Later capture writes the same rows. Coaching copy stays "your annotated sessions / your methodology say…".
+
+---
+
+### Provenance note (2026-08-21): source classification for ADR-022, ADR-023, ADR-025
+
+**Date:** 2026-08-21
+**Status:** Correction — additive. No existing ADR text is amended or removed.
+
+**Context:** The **Source:** lines on ADR-022, ADR-023, and ADR-025 name research inputs
+that are intentionally absent from the public checkout and retained privately under owner
+control. They are historical private-provenance references, not public reproducibility
+links. This note records their classification.
+
+**Source categories:**
+
+1. **ADR-022** — a superseded SIL process artifact: design input that preceded the plan
+   rather than a living document. The shipped SIL-M0 through SIL-M5e outcome is
+   authoritative; the process artifact is not.
+2. **ADR-023** — parked Feature-IR research.
+3. **ADR-025** — parked VS3D research, pending owner review and leak scanning for
+   vendor-derived material before any publication decision.
+
+**Consequences:** The ADR outcomes recorded in this log are the public artifacts. They can
+be read and applied without the source bodies; verifying their provenance requires
+authorized local review. No source bodies, vendor material, or raw captures are reproduced
+here. Publishing any of these inputs would be a separate owner decision, and the parked
+VS3D category would additionally require the leak scan named above.

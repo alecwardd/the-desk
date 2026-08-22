@@ -25,25 +25,6 @@ Shared convention (`scripts/ops/Desk-ExitCodes.ps1`):
 
 Weekend maintenance must not look green when it skipped: `Run-Weekly-Archive.ps1` exits **2** when `the-desk-mcp` is running, logs `DEFERRED`, and writes `X:\TheDesk\logs\last-deferred-maintenance.json`. On success it writes `X:\TheDesk\logs\last-successful-maintenance.json`.
 
-## Timezone note
-
-Scheduled task triggers use **machine local wall-clock** time. This trading workstation is expected to be set to **Central Time**. ET equivalents in the table below are CT+1 (standard offset used in descriptions; ignore DST edge cases for ops planning and prefer the local times on the box).
-
-## Exit codes (ops scripts)
-
-Shared convention (`scripts/ops/Desk-ExitCodes.ps1`):
-
-| Code | Meaning |
-| --- | --- |
-| 0 | Success |
-| 2 | Deferred (MCP writer active / maintenance blocked) — **not** silent success |
-| 3 | Config error (including `Register-DeskTasks.ps1 -Verify` mismatches) |
-| 4 | Integrity failure (stale/missing maintenance marker, health criticals) |
-| 5 | Storage failure (X: missing, free space critical, temp unusable) |
-| 1 | General failure |
-
-Weekend maintenance must not look green when it skipped: `Run-Weekly-Archive.ps1` exits **2** when `the-desk-mcp` is running, logs `DEFERRED`, and writes `X:\TheDesk\logs\last-deferred-maintenance.json`. On success it writes `X:\TheDesk\logs\last-successful-maintenance.json`.
-
 ## Scheduled Tasks
 
 All tasks are registered under `\TheDesk\` by `scripts\ops\Register-DeskTasks.ps1`.
